@@ -11,6 +11,7 @@ dependencies = [
   "alembic>=1.13,<2.0",
   "fastapi>=0.115,<1.0",
   "httpx>=0.27,<1.0",
+  "minio>=7.2,<8.0",
   "pydantic-settings>=2.4,<3.0",
   "psycopg[binary]>=3.2,<4.0",
   "redis>=5.0,<6.0",
@@ -32,6 +33,8 @@ packages = [
   "packages/visiox-common/src/visiox_common",
   "packages/visiox-db/src/visiox_db",
   "packages/visiox-messaging/src/visiox_messaging",
+  "packages/visiox-storage/src/visiox_storage",
+  "workers/model-worker/src/visiox_model_worker",
 ]
 
 [tool.pytest.ini_options]
@@ -40,5 +43,7 @@ pythonpath = [
   "packages/visiox-common/src",
   "packages/visiox-db/src",
   "packages/visiox-messaging/src",
+  "packages/visiox-storage/src",
+  "workers/model-worker/src",
 ]
 testpaths = ["tests"]
