@@ -7,6 +7,7 @@ from alembic.config import Config
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from visiox_api.main import create_app
@@ -247,6 +248,116 @@ def test_post_base_model_download_reuses_active_task_even_before_status_updates(
     with session_factory() as session:
         tasks = session.scalars(select(Task).where(Task.resource_id == model_id)).all()
         model = session.get(BaseModel, model_id)
+
+    assert len(tasks) == 1
+    assert model.status == "remote_available"
+
+
+def test_database_rejects_duplicate_active_download_task_for_same_resource(session_factory):
+    with session_factory() as session:
+        _, models = seed_source_and_models(session)
+        model_id = models[0].id
+        first = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="QUEUED",
+            resource_type="base_model",
+            resource_id=model_id,
+            payload={"base_model_id": model_id},
+        )
+        second = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="RUNNING",
+            resource_type="base_model",
+            resource_id=model_id,
+            payload={"base_model_id": model_id},
+        )
+        session.add(first)
+        session.commit()
+        session.add(second)
+
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+        session.rollback()
+        failed = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="FAILED",
+            resource_type="base_model",
+            resource_id=model_id,
+            payload={"base_model_id": model_id},
+        )
+        session.add(failed)
+        session.commit()
+
+
+def test_post_base_model_download_reuses_active_task_after_integrity_error(
+    tmp_path,
+    stream_producer: FakeStreamProducer,
+):
+    database_path = tmp_path / "visiox-race.db"
+    database_url = f"sqlite:///{database_path}"
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    normal_session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    race_state = {"armed": True, "model_id": None, "task_id": None}
+
+    class RacingSession(Session):
+        def commit(self) -> None:
+            has_new_download = any(
+                isinstance(item, Task)
+                and item.task_type == "DOWNLOAD_BASE_MODEL"
+                and item.resource_id == race_state["model_id"]
+                for item in self.new
+            )
+            if race_state["armed"] and has_new_download:
+                race_state["armed"] = False
+                with normal_session_factory() as competing_session:
+                    competing_task = Task(
+                        task_type="DOWNLOAD_BASE_MODEL",
+                        status="QUEUED",
+                        resource_type="base_model",
+                        resource_id=race_state["model_id"],
+                        payload={"base_model_id": race_state["model_id"]},
+                    )
+                    competing_session.add(competing_task)
+                    competing_session.commit()
+                    race_state["task_id"] = competing_task.id
+                raise IntegrityError("duplicate active task", params=None, orig=RuntimeError("unique"))
+            return super().commit()
+
+    racing_session_factory = sessionmaker(
+        bind=engine,
+        class_=RacingSession,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+
+    with normal_session_factory() as session:
+        _, models = seed_source_and_models(session)
+        race_state["model_id"] = models[0].id
+
+    app = create_app()
+
+    def override_session() -> Generator[Session]:
+        with racing_session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_base_model_session] = override_session
+    app.dependency_overrides[get_stream_producer] = lambda: stream_producer
+
+    with TestClient(app) as client:
+        response = client.post(f"/base-models/{race_state['model_id']}/download")
+
+    assert response.status_code == 200
+    assert response.json()["task_id"] == race_state["task_id"]
+    assert response.json()["status"] == "remote_available"
+    assert stream_producer.commands == []
+
+    with normal_session_factory() as session:
+        tasks = session.scalars(select(Task).where(Task.resource_id == race_state["model_id"])).all()
+        model = session.get(BaseModel, race_state["model_id"])
 
     assert len(tasks) == 1
     assert model.status == "remote_available"

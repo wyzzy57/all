@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from visiox_common.tasks import TaskCommand, TaskStatus, TaskType
@@ -163,7 +164,19 @@ async def create_base_model_download_task(
     )
     base_model.status = "downloading"
     session.add_all([task, base_model])
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        active_task = _find_active_download_task(session, base_model_id)
+        current_model = _base_model_or_404(session, base_model_id)
+        if active_task is not None:
+            return BaseModelDownloadResponse(
+                base_model_id=current_model.id,
+                status=current_model.status,
+                task_id=active_task.id,
+            )
+        raise
     session.refresh(task)
     session.refresh(base_model)
 
