@@ -8,10 +8,12 @@ version = "0.1.0"
 description = "Private YOLO26 model management platform"
 requires-python = ">=3.12"
 dependencies = [
+  "alembic>=1.13,<2.0",
   "fastapi>=0.115,<1.0",
   "httpx>=0.27,<1.0",
   "pydantic-settings>=2.4,<3.0",
   "psycopg[binary]>=3.2,<4.0",
+  "sqlalchemy>=2.0,<3.0",
   "uvicorn[standard]>=0.30,<1.0",
 ]
 
@@ -27,11 +29,13 @@ dev = [
 packages = [
   "apps/api-service/src/visiox_api",
   "packages/visiox-common/src/visiox_common",
+  "packages/visiox-db/src/visiox_db",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = [
   "apps/api-service/src",
   "packages/visiox-common/src",
+  "packages/visiox-db/src",
 ]
 testpaths = ["tests"]

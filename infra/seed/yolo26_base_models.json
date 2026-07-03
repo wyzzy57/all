@@ -1,0 +1,272 @@
+[
+  {
+    "id": "yolo26-detect-n",
+    "family": "yolo26",
+    "task": "detect",
+    "scale": "n",
+    "filename": "yolo26n.pt",
+    "source_path": "yolo26/detect/yolo26n.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-detect-s",
+    "family": "yolo26",
+    "task": "detect",
+    "scale": "s",
+    "filename": "yolo26s.pt",
+    "source_path": "yolo26/detect/yolo26s.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-detect-m",
+    "family": "yolo26",
+    "task": "detect",
+    "scale": "m",
+    "filename": "yolo26m.pt",
+    "source_path": "yolo26/detect/yolo26m.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-detect-l",
+    "family": "yolo26",
+    "task": "detect",
+    "scale": "l",
+    "filename": "yolo26l.pt",
+    "source_path": "yolo26/detect/yolo26l.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-detect-x",
+    "family": "yolo26",
+    "task": "detect",
+    "scale": "x",
+    "filename": "yolo26x.pt",
+    "source_path": "yolo26/detect/yolo26x.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-segment-n",
+    "family": "yolo26",
+    "task": "segment",
+    "scale": "n",
+    "filename": "yolo26n-seg.pt",
+    "source_path": "yolo26/segment/yolo26n-seg.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-segment-s",
+    "family": "yolo26",
+    "task": "segment",
+    "scale": "s",
+    "filename": "yolo26s-seg.pt",
+    "source_path": "yolo26/segment/yolo26s-seg.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-segment-m",
+    "family": "yolo26",
+    "task": "segment",
+    "scale": "m",
+    "filename": "yolo26m-seg.pt",
+    "source_path": "yolo26/segment/yolo26m-seg.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-segment-l",
+    "family": "yolo26",
+    "task": "segment",
+    "scale": "l",
+    "filename": "yolo26l-seg.pt",
+    "source_path": "yolo26/segment/yolo26l-seg.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-segment-x",
+    "family": "yolo26",
+    "task": "segment",
+    "scale": "x",
+    "filename": "yolo26x-seg.pt",
+    "source_path": "yolo26/segment/yolo26x-seg.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-semantic-n",
+    "family": "yolo26",
+    "task": "semantic",
+    "scale": "n",
+    "filename": "yolo26n-sem.pt",
+    "source_path": "yolo26/semantic/yolo26n-sem.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-semantic-s",
+    "family": "yolo26",
+    "task": "semantic",
+    "scale": "s",
+    "filename": "yolo26s-sem.pt",
+    "source_path": "yolo26/semantic/yolo26s-sem.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-semantic-m",
+    "family": "yolo26",
+    "task": "semantic",
+    "scale": "m",
+    "filename": "yolo26m-sem.pt",
+    "source_path": "yolo26/semantic/yolo26m-sem.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-semantic-l",
+    "family": "yolo26",
+    "task": "semantic",
+    "scale": "l",
+    "filename": "yolo26l-sem.pt",
+    "source_path": "yolo26/semantic/yolo26l-sem.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-semantic-x",
+    "family": "yolo26",
+    "task": "semantic",
+    "scale": "x",
+    "filename": "yolo26x-sem.pt",
+    "source_path": "yolo26/semantic/yolo26x-sem.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-pose-n",
+    "family": "yolo26",
+    "task": "pose",
+    "scale": "n",
+    "filename": "yolo26n-pose.pt",
+    "source_path": "yolo26/pose/yolo26n-pose.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-pose-s",
+    "family": "yolo26",
+    "task": "pose",
+    "scale": "s",
+    "filename": "yolo26s-pose.pt",
+    "source_path": "yolo26/pose/yolo26s-pose.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-pose-m",
+    "family": "yolo26",
+    "task": "pose",
+    "scale": "m",
+    "filename": "yolo26m-pose.pt",
+    "source_path": "yolo26/pose/yolo26m-pose.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-pose-l",
+    "family": "yolo26",
+    "task": "pose",
+    "scale": "l",
+    "filename": "yolo26l-pose.pt",
+    "source_path": "yolo26/pose/yolo26l-pose.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-pose-x",
+    "family": "yolo26",
+    "task": "pose",
+    "scale": "x",
+    "filename": "yolo26x-pose.pt",
+    "source_path": "yolo26/pose/yolo26x-pose.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-obb-n",
+    "family": "yolo26",
+    "task": "obb",
+    "scale": "n",
+    "filename": "yolo26n-obb.pt",
+    "source_path": "yolo26/obb/yolo26n-obb.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-obb-s",
+    "family": "yolo26",
+    "task": "obb",
+    "scale": "s",
+    "filename": "yolo26s-obb.pt",
+    "source_path": "yolo26/obb/yolo26s-obb.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-obb-m",
+    "family": "yolo26",
+    "task": "obb",
+    "scale": "m",
+    "filename": "yolo26m-obb.pt",
+    "source_path": "yolo26/obb/yolo26m-obb.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-obb-l",
+    "family": "yolo26",
+    "task": "obb",
+    "scale": "l",
+    "filename": "yolo26l-obb.pt",
+    "source_path": "yolo26/obb/yolo26l-obb.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-obb-x",
+    "family": "yolo26",
+    "task": "obb",
+    "scale": "x",
+    "filename": "yolo26x-obb.pt",
+    "source_path": "yolo26/obb/yolo26x-obb.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-classify-n",
+    "family": "yolo26",
+    "task": "classify",
+    "scale": "n",
+    "filename": "yolo26n-cls.pt",
+    "source_path": "yolo26/classify/yolo26n-cls.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-classify-s",
+    "family": "yolo26",
+    "task": "classify",
+    "scale": "s",
+    "filename": "yolo26s-cls.pt",
+    "source_path": "yolo26/classify/yolo26s-cls.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-classify-m",
+    "family": "yolo26",
+    "task": "classify",
+    "scale": "m",
+    "filename": "yolo26m-cls.pt",
+    "source_path": "yolo26/classify/yolo26m-cls.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-classify-l",
+    "family": "yolo26",
+    "task": "classify",
+    "scale": "l",
+    "filename": "yolo26l-cls.pt",
+    "source_path": "yolo26/classify/yolo26l-cls.pt",
+    "status": "remote_available"
+  },
+  {
+    "id": "yolo26-classify-x",
+    "family": "yolo26",
+    "task": "classify",
+    "scale": "x",
+    "filename": "yolo26x-cls.pt",
+    "source_path": "yolo26/classify/yolo26x-cls.pt",
+    "status": "remote_available"
+  }
+]
