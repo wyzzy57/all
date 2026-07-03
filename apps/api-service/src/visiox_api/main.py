@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 
 from visiox_common.settings import get_settings
+from visiox_api.routes.tasks import router as tasks_router
+from visiox_api.ws.tasks import router as task_progress_router
 
 
 def create_app() -> FastAPI:
@@ -21,6 +23,9 @@ def create_app() -> FastAPI:
                 "label_studio": settings.label_studio_url,
             },
         }
+
+    app.include_router(tasks_router)
+    app.include_router(task_progress_router)
 
     return app
 
