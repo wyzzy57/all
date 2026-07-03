@@ -60,6 +60,7 @@ Visiox 是一个私有化部署在客户内网的综合模型管理平台。第�
 - 模型空间
 - 训练产线
 - 训练任务
+- 数据准备
 - 数据集
 - Label Studio 标注同步
 - 摄像头管理
@@ -70,11 +71,80 @@ Visiox 是一个私有化部署在客户内网的综合模型管理平台。第�
 - 系统配置
 - 操作/任务日志
 
-## 5. 模型空间
+## 5. 数据准备模块
+
+数据准备模块是独立的一等模块，不只存在于创建产线向导中。它负责把原始数据上传到平台、组织成数据集、发起 Label Studio 标注、同步标注结果，并为训练产线提供可用数据。
+
+第一版支持两条入口：
+
+1. 平台内上传数据
+   - 上传图片或压缩包
+   - 选择任务类型
+   - 创建数据集
+   - 管理样本、类别、标签状态
+   - 执行数据分析、可视化和格式检验
+
+2. Label Studio 标注闭环
+   - 从平台数据集创建 Label Studio 项目
+   - 将样本同步到 Label Studio
+   - 用户在 Label Studio 中标注
+   - 平台同步标注结果
+   - 转换为内部 annotation schema
+   - 生成 Ultralytics 训练格式
+
+数据准备模块的核心对象：
+
+```text
+dataset
+- id
+- name
+- task
+- status
+- class_schema
+- sample_count
+- annotation_count
+- source: upload | label_studio | camera_capture
+- storage_uri
+
+dataset_sample
+- id
+- dataset_id
+- file_uri
+- width
+- height
+- checksum
+- split: train | val | test | unassigned
+- annotation_status: unlabeled | labeling | labeled | invalid
+
+annotation
+- id
+- dataset_sample_id
+- source: label_studio | import | manual
+- raw_payload_uri
+- internal_payload
+- validation_status
+
+label_project
+- id
+- dataset_id
+- provider: label_studio
+- external_project_id
+- sync_status
+- last_sync_at
+```
+
+数据准备模块输出两类结果：
+
+- 可供训练产线选择的数据集版本
+- 可供训练 Worker 使用的 Ultralytics 训练目录和 `data.yaml`
+
+创建产线中的“数据准备”步骤复用该模块能力。用户可以在产线向导内选择已有数据集，也可以跳转到数据准备模块上传数据、创建 Label Studio 标注项目并同步结果。
+
+## 6. 模型空间
 
 模型空间分三类对象。
 
-### 5.1 基础模型
+### 6.1 基础模型
 
 基础模型是 YOLO26 官方预训练模型。平台安装时不强制内置权重，首次使用时从客户内网镜像/文件服务器下载，并缓存到平台对象存储。
 
@@ -107,7 +177,7 @@ base_model
 
 训练提交前基础模型必须处于 `ready` 状态。
 
-### 5.2 训练产线
+### 6.2 训练产线
 
 训练产线是可复用配置对象，不等同于一次训练任务。产线保存：
 
@@ -119,7 +189,7 @@ base_model
 - 参数模板
 - 默认训练环境
 
-### 5.3 训练模型
+### 6.3 训练模型
 
 训练模型是训练任务成功后的模型版本。它可用于：
 
@@ -129,11 +199,11 @@ base_model
 - 打包边缘应用
 - 部署到边缘设备
 
-## 6. 创建产线流程
+## 7. 创建产线流程
 
 创建产线采用四步向导。
 
-### 6.1 基础信息
+### 7.1 基础信息
 
 用户填写：
 
@@ -147,12 +217,14 @@ base_model
 - `segment + s -> yolo26s-seg.pt`
 - `semantic + m -> yolo26m-sem.pt`
 
-### 6.2 数据准备
+### 7.2 数据准备
 
 数据准备包含：
 
-- 选择或创建数据集
+- 选择已有数据集，或跳转到数据准备模块上传数据并创建数据集
+- 创建或关联 Label Studio 标注项目
 - 同步 Label Studio 标注
+- 将标注结果同步回平台
 - 数据清洗
 - 数据集划分：`train / val / test`
 - 类别映射
@@ -169,7 +241,7 @@ base_model
 - 空标注比例
 - 异常样本列表
 
-### 6.3 参数准备
+### 7.3 参数准备
 
 训练参数分层管理：
 
@@ -178,7 +250,7 @@ base_model
 - 增强参数：`hsv_h`、`hsv_s`、`hsv_v`、`degrees`、`translate`、`scale`、`fliplr`
 - 高级配置：允许编辑 YAML/JSON，但必须做字段白名单校验
 
-### 6.4 提交训练
+### 7.4 提交训练
 
 提交训练前执行预检查：
 
@@ -189,7 +261,7 @@ base_model
 
 通过后创建 `TRAIN_MODEL` 任务，由 `training-worker` 消费执行。
 
-## 7. YOLO26 支持范围
+## 8. YOLO26 支持范围
 
 第一版只支持 Ultralytics YOLO26，并完整打通六类任务：
 
@@ -204,7 +276,7 @@ base_model
 
 每类任务支持五个尺度：`n / s / m / l / x`，共 30 个基础模型权重。
 
-## 8. Label Studio 与数据转换
+## 9. Label Studio 与数据转换
 
 平台需要独立的 `Dataset Converter`，负责三层转换：
 
@@ -244,7 +316,7 @@ Pose 规则：
 - 关键点名称、顺序、可见性规则固定
 - 导出时生成 YOLO pose 所需配置，例如 `kpt_shape`、`flip_idx`
 
-## 9. Task Center
+## 10. Task Center
 
 所有长任务统一进入 Task Center。
 
@@ -283,7 +355,7 @@ PENDING -> QUEUED -> RUNNING -> SUCCESS
 - 是否可重试
 - 创建时间和结束时间
 
-## 10. Redis 通信规则
+## 11. Redis 通信规则
 
 Redis 职责限定如下：
 
@@ -310,7 +382,7 @@ device:{device_id}:heartbeat
 task:{task_id}:progress
 ```
 
-## 11. 边缘设备与 Edge Agent
+## 12. 边缘设备与 Edge Agent
 
 平台主动访问边缘设备上的 Edge Agent。Agent 是设备侧控制入口，不负责算法推理。
 
@@ -336,7 +408,7 @@ Agent 职责：
 - `GET /apps/{id}/logs`
 - `POST /camera/test`
 
-## 12. 边缘应用
+## 13. 边缘应用
 
 边缘应用是平台部署到设备的业务单元，不只是模型文件。
 
@@ -385,12 +457,13 @@ iou: 0.7
 
 摄像头实时业务推理由推理服务直接拉 RTSP；Agent 只做摄像头测试和截图辅助。
 
-## 13. MVP 范围
+## 14. MVP 范围
 
 第一版必须打通：
 
 - Docker Compose 部署平台基础服务
 - 模型空间三类对象：基础模型、训练产线、训练模型
+- 数据准备模块：数据上传、数据集管理、样本管理、数据分析、格式检验
 - YOLO26 六类任务和五个尺度
 - 基础模型首次使用下载与缓存
 - Label Studio 数据同步和标注回流
@@ -412,7 +485,7 @@ iou: 0.7
 - 自定义 pose 关键点模板
 - 复杂告警中心
 
-## 14. 未决事项
+## 15. 未决事项
 
 - 内网模型文件服务器协议和路径规范需落地。
 - YOLO26-sem 的 Ultralytics 训练目录细节需要用官方示例验证。
