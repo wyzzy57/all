@@ -1,0 +1,20 @@
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="VISIOX_", env_file=".env", extra="ignore")
+
+    environment: str = Field(default="local", validation_alias="VISIOX_ENV")
+    postgres_dsn: str = "postgresql+psycopg://visiox:visiox@postgres:5432/visiox"
+    redis_url: str = "redis://redis:6379/0"
+    minio_endpoint: str = "minio:9000"
+    registry_url: str = "registry:5000"
+    label_studio_url: str = "http://label-studio:8080"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

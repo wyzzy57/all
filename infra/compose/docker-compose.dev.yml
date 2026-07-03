@@ -1,0 +1,13 @@
+services:
+  api-service:
+    volumes:
+      - ../../apps/api-service/src:/app/apps/api-service/src
+      - ../../packages/visiox-common/src:/app/packages/visiox-common/src
+    command:
+      - uvicorn
+      - visiox_api.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload

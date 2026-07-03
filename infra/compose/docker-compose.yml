@@ -1,0 +1,72 @@
+services:
+  api-service:
+    build:
+      context: ../..
+      dockerfile: apps/api-service/Dockerfile
+    env_file:
+      - ../../.env.example
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      registry:
+        condition: service_started
+      label-studio:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-visiox}
+      POSTGRES_USER: ${POSTGRES_USER:-visiox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-visiox}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:RELEASE.2026-06-13T11-33-47Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-visiox}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-visiox123}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  registry:
+    image: registry:2
+    ports:
+      - "5000:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+
+  label-studio:
+    image: heartexlabs/label-studio:latest
+    environment:
+      LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK: ${LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK:-true}
+      LABEL_STUDIO_USERNAME: ${LABEL_STUDIO_USERNAME:-admin@example.com}
+      LABEL_STUDIO_PASSWORD: ${LABEL_STUDIO_PASSWORD:-visiox123}
+    ports:
+      - "8080:8080"
+    volumes:
+      - label-studio-data:/label-studio/data
+
+volumes:
+  postgres-data:
+  minio-data:
+  registry-data:
+  label-studio-data:
