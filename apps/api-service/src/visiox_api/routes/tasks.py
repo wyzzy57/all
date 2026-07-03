@@ -3,12 +3,11 @@ from collections.abc import Generator
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from visiox_common.settings import get_settings
 from visiox_common.tasks import TaskCommand, TaskProgressEvent, TaskStatus, TaskType
 from visiox_db.models import Task
 from visiox_db.session import get_session
@@ -57,11 +56,8 @@ def get_task_session() -> Generator[Session]:
     yield from get_session()
 
 
-def get_stream_producer() -> RedisStreamProducer:
-    from redis import asyncio as redis
-
-    redis_client = redis.from_url(get_settings().redis_url, decode_responses=True)
-    return RedisStreamProducer(redis_client)
+def get_stream_producer(request: Request) -> RedisStreamProducer:
+    return RedisStreamProducer(request.app.state.redis)
 
 
 def _utc_now() -> datetime:
@@ -160,6 +156,9 @@ def update_task_progress(
     progress_broker: Any | None = None,
 ) -> Task:
     task = _task_or_404(session, task_id)
+    if task.status == TaskStatus.CANCELED.value and event.status != TaskStatus.CANCELED:
+        return task
+
     task.status = event.status.value
     task.progress = event.progress
     task.stage = event.stage

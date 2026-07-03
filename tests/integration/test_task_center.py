@@ -24,6 +24,11 @@ class FakeStreamProducer:
         return "1-0"
 
 
+class FailingStreamProducer:
+    async def enqueue(self, command):
+        raise RuntimeError("redis unavailable")
+
+
 @pytest.fixture()
 def session_factory(tmp_path):
     database_path = tmp_path / "visiox-task-center.db"
@@ -102,6 +107,40 @@ def test_post_tasks_persists_queued_task_and_enqueues_command(
     assert command.payload_version == 1
 
 
+def test_post_tasks_marks_task_failed_when_enqueue_fails(session_factory):
+    app = create_app()
+
+    def override_session() -> Generator[Session]:
+        with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_task_session] = override_session
+    app.dependency_overrides[get_stream_producer] = lambda: FailingStreamProducer()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/tasks",
+            json={
+                "task_type": "TRAIN_MODEL",
+                "resource_refs": {"pipeline_id": "pipeline-1"},
+                "payload": {"epochs": 1},
+            },
+        )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "FAILED"
+    assert body["error_code"] == "ENQUEUE_FAILED"
+    assert "redis unavailable" in body["error_message"]
+    assert body["finished_at"] is not None
+
+    with session_factory() as session:
+        saved = session.get(Task, body["id"])
+        assert saved.status == "FAILED"
+        assert saved.error_code == "ENQUEUE_FAILED"
+        assert saved.finished_at is not None
+
+
 def test_get_tasks_and_get_task_read_persisted_tasks(
     client: TestClient,
     session_factory,
@@ -173,6 +212,41 @@ def test_update_task_progress_persists_database_state_and_publishes_event(
         assert saved.stage == "prepare"
 
     assert progress_broker.published[-1].task_id == task_id
+
+
+def test_update_task_progress_does_not_revive_canceled_task(
+    session_factory,
+    progress_broker: InMemoryTaskProgressBroker,
+):
+    with session_factory() as session:
+        task = Task(task_type="TRAIN_MODEL", status="CANCELED", progress=10, payload={})
+        session.add(task)
+        session.commit()
+        task_id = task.id
+
+        updated = update_task_progress(
+            session,
+            task_id,
+            TaskProgressEvent(
+                task_id=task_id,
+                status=TaskStatus.SUCCESS,
+                progress=100,
+                stage="complete",
+            ),
+            progress_broker,
+        )
+
+        assert updated.status == "CANCELED"
+        assert updated.progress == 10
+        assert updated.stage is None
+
+    with session_factory() as session:
+        saved = session.get(Task, task_id)
+        assert saved.status == "CANCELED"
+        assert saved.progress == 10
+        assert saved.stage is None
+
+    assert progress_broker.published == []
 
 
 def test_task_progress_websocket_receives_matching_task_events(
@@ -268,3 +342,33 @@ def test_update_task_progress_sets_finished_at_for_terminal_status(session_facto
 
         assert updated.finished_at is not None
         assert session.scalar(select(Task).where(Task.id == task.id)).status == "SUCCESS"
+
+
+def test_app_lifespan_reuses_and_closes_redis_client(monkeypatch):
+    from redis import asyncio as redis
+
+    class FakeRedis:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    redis_clients: list[FakeRedis] = []
+
+    def fake_from_url(url: str, decode_responses: bool):
+        assert url == "redis://redis:6379/0"
+        assert decode_responses is True
+        client = FakeRedis()
+        redis_clients.append(client)
+        return client
+
+    monkeypatch.setattr(redis, "from_url", fake_from_url)
+
+    app = create_app()
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert len(redis_clients) == 1
+        assert app.state.redis is redis_clients[0]
+
+    assert redis_clients[0].closed is True

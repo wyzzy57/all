@@ -1,17 +1,13 @@
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 
-from visiox_common.settings import get_settings
 from visiox_messaging.pubsub import RedisTaskProgressBroker, TaskProgressBroker
 
 
 router = APIRouter(tags=["task-progress"])
 
 
-def get_progress_broker() -> TaskProgressBroker:
-    from redis import asyncio as redis
-
-    redis_client = redis.from_url(get_settings().redis_url, decode_responses=True)
-    return RedisTaskProgressBroker(redis_client)
+def get_progress_broker(websocket: WebSocket) -> TaskProgressBroker:
+    return RedisTaskProgressBroker(websocket.app.state.redis)
 
 
 @router.websocket("/ws/tasks/{task_id}")

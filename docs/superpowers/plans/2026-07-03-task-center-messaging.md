@@ -259,5 +259,6 @@ git commit -m "feat: add task center messaging"
 
 - 规格覆盖：本计划覆盖 Task 3 要求的任务状态模型、Redis Stream producer/consumer、Pub/Sub progress publisher、任务 API、任务进度 WebSocket、任务创建/入队/状态更新/进度事件测试。
 - 有意延后：不实现真实 worker、不实现业务模块触发任务、不实现前端 Task Center 页面、不要求本地真实 Redis/Docker。
+- 残余风险：第一版只处理 `xadd` 抛异常时把任务标记为 `FAILED`；如果数据库 commit 后、Redis Stream `xadd` 前进程崩溃，可能留下 `QUEUED` 但未入队的任务。本任务不引入 outbox；后续可用 outbox 或 reconciler 扫描修复。
 - 数据一致性：数据库 `tasks` 表是最终状态事实来源；Redis 只负责命令投递和实时通知，不作为最终状态事实来源。
 - 文档语言：本文档正文使用中文；代码、路径、命令、API、状态值和消息字段保持英文。
