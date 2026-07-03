@@ -12,6 +12,8 @@ dependencies = [
   "fastapi>=0.115,<1.0",
   "httpx>=0.27,<1.0",
   "minio>=7.2,<8.0",
+  "pillow>=10.0,<12.0",
+  "python-multipart>=0.0.9,<1.0",
   "pydantic-settings>=2.4,<3.0",
   "psycopg[binary]>=3.2,<4.0",
   "redis>=5.0,<6.0",
@@ -34,6 +36,7 @@ packages = [
   "packages/visiox-db/src/visiox_db",
   "packages/visiox-messaging/src/visiox_messaging",
   "packages/visiox-storage/src/visiox_storage",
+  "packages/visiox-yolo26/src/visiox_yolo26",
   "workers/model-worker/src/visiox_model_worker",
 ]
 
@@ -44,6 +47,7 @@ pythonpath = [
   "packages/visiox-db/src",
   "packages/visiox-messaging/src",
   "packages/visiox-storage/src",
+  "packages/visiox-yolo26/src",
   "workers/model-worker/src",
 ]
 testpaths = ["tests"]
