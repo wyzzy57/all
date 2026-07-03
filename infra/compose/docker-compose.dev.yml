@@ -1,5 +1,7 @@
 services:
   api-service:
+    environment:
+      PYTHONPATH: /app/apps/api-service/src:/app/packages/visiox-common/src
     volumes:
       - ../../apps/api-service/src:/app/apps/api-service/src
       - ../../packages/visiox-common/src:/app/packages/visiox-common/src
