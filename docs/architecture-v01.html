@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Visiox v0.1 Architecture</title>
+  <title>Visiox v0.1 架构</title>
   <style>
     :root {
       --bg: #f6f8fb;
@@ -85,34 +85,34 @@
 </head>
 <body>
   <main>
-    <h1>Visiox v0.1 Architecture</h1>
+    <h1>Visiox v0.1 架构</h1>
     <p>私有化部署，Docker Compose，Python 服务，Redis Stream 任务编排，YOLO26 六类任务端到端训练和边缘部署。</p>
 
     <h2>总体架构</h2>
     <section class="panel">
       <div class="grid-3">
         <div class="box alt">
-          <span class="label">Web Console</span>
-          <h3>Frontend</h3>
+          <span class="label">Web 管理台</span>
+          <h3>前端</h3>
           <div class="item">Vue 3 + TypeScript + Element Plus</div>
           <div class="item">模型空间</div>
           <div class="item">数据准备</div>
           <div class="item">创建产线向导</div>
-          <div class="item">Task Center</div>
+          <div class="item">任务中心</div>
         </div>
 
         <div class="box">
-          <span class="label">Docker Compose Platform</span>
-          <h3>Core Services</h3>
+          <span class="label">Docker Compose 平台</span>
+          <h3>核心服务</h3>
           <div class="items-2">
-            <div class="item">FastAPI API Service</div>
+            <div class="item">FastAPI API 服务</div>
             <div class="item">PostgreSQL</div>
             <div class="item">Redis Stream / PubSub</div>
-            <div class="item">MinIO Object Store</div>
+            <div class="item">MinIO 对象存储</div>
             <div class="item">Registry</div>
             <div class="item">Label Studio</div>
           </div>
-          <h3>Workers</h3>
+          <h3>Worker</h3>
           <div class="items-2">
             <div class="item">training-worker</div>
             <div class="item">deployment-worker</div>
@@ -122,13 +122,13 @@
         </div>
 
         <div class="box alt">
-          <span class="label">Customer LAN Edge</span>
-          <h3>Edge Device</h3>
+          <span class="label">客户内网边缘侧</span>
+          <h3>边缘设备</h3>
           <div class="item">Edge Agent API</div>
-          <div class="item">Docker Runtime</div>
-          <div class="item">YOLO26 Inference Container</div>
-          <div class="item">Camera Streams</div>
-          <div class="item">Business Rules</div>
+          <div class="item">Docker 运行时</div>
+          <div class="item">YOLO26 推理容器</div>
+          <div class="item">摄像头流</div>
+          <div class="item">业务规则</div>
         </div>
       </div>
 
@@ -143,33 +143,33 @@
     <section class="panel">
       <div class="grid-4">
         <div class="box">
-          <span class="label">Step 1</span>
+          <span class="label">步骤 1</span>
           <h3>基础信息</h3>
           <p>产线名称、YOLO26 任务类型、模型尺度。</p>
           <div class="item">detect / seg / sem / pose / obb / cls</div>
         </div>
         <div class="box">
-          <span class="label">Step 2</span>
+          <span class="label">步骤 2</span>
           <h3>数据准备</h3>
           <p>上传数据、创建数据集、Label Studio 标注同步、数据处理、分析、格式检验。</p>
-          <div class="item">Dataset Converter</div>
-          <div class="item">Upload / Label Studio Sync</div>
+          <div class="item">数据集转换器</div>
+          <div class="item">上传 / Label Studio 同步</div>
         </div>
         <div class="box">
-          <span class="label">Step 3</span>
+          <span class="label">步骤 3</span>
           <h3>参数准备</h3>
           <p>epochs、imgsz、batch、optimizer、增强参数、高级配置。</p>
-          <div class="item">Validated YAML/JSON</div>
+          <div class="item">已校验 YAML/JSON</div>
         </div>
         <div class="box">
-          <span class="label">Step 4</span>
+          <span class="label">步骤 4</span>
           <h3>提交训练</h3>
           <p>选择训练环境，执行预检查，创建训练任务。</p>
-          <div class="item">Task Center</div>
+          <div class="item">任务中心</div>
         </div>
       </div>
       <div class="chain">
-        Base Model -> Pipeline -> Dataset Conversion -> Training Job -> Model Version -> Export -> Edge App Package -> Edge Deployment
+        基础模型 -> 产线 -> 数据集转换 -> 训练任务 -> 模型版本 -> 导出 -> 边缘应用包 -> 边缘部署
       </div>
     </section>
   </main>

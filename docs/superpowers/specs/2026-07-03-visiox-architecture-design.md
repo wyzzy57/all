@@ -67,7 +67,7 @@ Visiox 是一个私有化部署在客户内网的综合模型管理平台。第�
 - 边缘设备管理
 - 边缘应用
 - 部署任务
-- Task Center
+- 任务中心
 - 系统配置
 - 操作/任务日志
 
@@ -278,7 +278,7 @@ base_model
 
 ## 9. Label Studio 与数据转换
 
-平台需要独立的 `Dataset Converter`，负责三层转换：
+平台需要独立的 `Dataset Converter`（数据集转换器），负责三层转换：
 
 ```text
 Label Studio JSON
@@ -301,7 +301,7 @@ Label Studio JSON
 - Label Studio 使用多边形/画笔标注
 - 平台按原图尺寸生成语义 mask
 - 类别区域不应重叠
-- 如发生重叠，默认后导出的标注覆盖先导出的标注，并记录 warning
+- 如发生重叠，默认后导出的标注覆盖先导出的标注，并记录警告
 
 OBB 规则：
 
@@ -316,9 +316,9 @@ Pose 规则：
 - 关键点名称、顺序、可见性规则固定
 - 导出时生成 YOLO pose 所需配置，例如 `kpt_shape`、`flip_idx`
 
-## 10. Task Center
+## 10. 任务中心
 
-所有长任务统一进入 Task Center。
+所有长任务统一进入任务中心。
 
 任务类型：
 
@@ -467,14 +467,14 @@ iou: 0.7
 - YOLO26 六类任务和五个尺度
 - 基础模型首次使用下载与缓存
 - Label Studio 数据同步和标注回流
-- Dataset Converter
+- 数据集转换器
 - 创建产线四步向导
 - 训练任务执行、日志、指标和模型版本登记
 - 模型导出
 - 边缘应用打包
 - Edge Agent 部署接口
 - 统一 YOLO26 推理镜像
-- 部署任务和 Task Center
+- 部署任务和任务中心
 
 暂不做：
 

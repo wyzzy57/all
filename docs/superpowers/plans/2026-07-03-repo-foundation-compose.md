@@ -1,84 +1,89 @@
-# Repository Foundation And Compose Implementation Plan
+# 仓库基础与 Compose 实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **给 agentic worker：** 必须使用子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans，按任务逐项实现本计划。步骤使用复选框（`- [ ]`）语法跟踪。
 
-**Goal:** Build the first runnable Visiox repository foundation with a minimal FastAPI health endpoint, Python packaging, Docker Compose infrastructure, and an integration test.
+**目标：** 构建第一版可运行的 Visiox 仓库基础，包含最小 FastAPI health endpoint、Python packaging、Docker Compose 基础设施和集成测试。
 
-**Architecture:** Keep Task 1 intentionally thin: one API service package, one shared settings package, Compose definitions for infrastructure, and a health endpoint that reports configuration without requiring business tables. Do not introduce database models, Redis task contracts, storage clients, frontend code, or workers in this task.
+**架构：** 任务 1 刻意保持轻量：一个 API service package、一个共享 settings package、基础设施 Compose 定义，以及一个只报告配置且不依赖业务表的 health endpoint。本任务不引入数据库 model、Redis task contract、storage client、前端代码或 worker。
 
-**Tech Stack:** Python 3.12, FastAPI, Pydantic Settings, pytest, httpx, Docker Compose, PostgreSQL, Redis, MinIO, Registry, Label Studio.
+**技术栈：** Python 3.12、FastAPI、Pydantic Settings、pytest、httpx、ruff、Docker Compose、PostgreSQL、Redis、MinIO、Registry、Label Studio。
 
 ---
 
-## Files
+## 文件
 
-- Create: `pyproject.toml` for workspace Python dependencies and pytest configuration.
-- Create: `package.json` for repository-level convenience scripts.
-- Create: `.env.example` for local Compose configuration.
-- Create: `infra/compose/docker-compose.yml` for the minimal platform stack.
-- Create: `infra/compose/docker-compose.dev.yml` for local source-mounted API development.
-- Create: `apps/api-service/Dockerfile` for the API service image.
-- Create: `apps/api-service/src/visiox_api/__init__.py`.
-- Create: `apps/api-service/src/visiox_api/main.py` with `GET /health`.
-- Create: `packages/visiox-common/src/visiox_common/__init__.py`.
-- Create: `packages/visiox-common/src/visiox_common/settings.py`.
-- Create: `tests/integration/test_api_health.py`.
-- Modify: `.gitignore`.
+- 创建：用于 workspace Python dependency、pytest 配置和 ruff dependency 的 `pyproject.toml`。
+- 创建：包含仓库级便捷脚本的 `package.json`。
+- 创建：本地 Compose 配置的 `.env.example`。
+- 创建：最小平台栈 `infra/compose/docker-compose.yml`。
+- 创建：本地源码挂载式 API 开发配置 `infra/compose/docker-compose.dev.yml`。
+- 创建：API service 镜像文件 `apps/api-service/Dockerfile`。
+- 创建：`apps/api-service/src/visiox_api/__init__.py`。
+- 创建：包含 `GET /health` 的 `apps/api-service/src/visiox_api/main.py`。
+- 创建：`packages/visiox-common/src/visiox_common/__init__.py`。
+- 创建：`packages/visiox-common/src/visiox_common/settings.py`。
+- 创建：`tests/integration/test_api_health.py`。
+- 修改：`.gitignore`。
 
-## Task 1: Add Failing Health Test
+## 任务 1：添加失败的 Health 测试
 
-- [ ] **Step 1: Write the failing integration test**
+- [ ] **步骤 1：编写失败的集成测试**
 
-Create `tests/integration/test_api_health.py`:
+创建 `tests/integration/test_api_health.py`。测试必须在设置环境变量前调用 `get_settings.cache_clear()`，并在 `finally` 中再次调用 `get_settings.cache_clear()`，避免 Pydantic settings cache 污染其他测试：
 
 ```python
 from fastapi.testclient import TestClient
 
+from visiox_common.settings import get_settings
 from visiox_api.main import create_app
 
 
 def test_health_returns_service_status_and_dependency_configuration(monkeypatch):
-    monkeypatch.setenv("VISIOX_ENV", "test")
-    monkeypatch.setenv("VISIOX_POSTGRES_DSN", "postgresql+psycopg://visiox:visiox@postgres:5432/visiox")
-    monkeypatch.setenv("VISIOX_REDIS_URL", "redis://redis:6379/0")
-    monkeypatch.setenv("VISIOX_MINIO_ENDPOINT", "minio:9000")
-    monkeypatch.setenv("VISIOX_REGISTRY_URL", "registry:5000")
-    monkeypatch.setenv("VISIOX_LABEL_STUDIO_URL", "http://label-studio:8080")
+    get_settings.cache_clear()
+    try:
+        monkeypatch.setenv("VISIOX_ENV", "test")
+        monkeypatch.setenv("VISIOX_POSTGRES_DSN", "postgresql+psycopg://visiox:visiox@postgres:5432/visiox")
+        monkeypatch.setenv("VISIOX_REDIS_URL", "redis://redis:6379/0")
+        monkeypatch.setenv("VISIOX_MINIO_ENDPOINT", "minio:9000")
+        monkeypatch.setenv("VISIOX_REGISTRY_URL", "registry:5000")
+        monkeypatch.setenv("VISIOX_LABEL_STUDIO_URL", "http://label-studio:8080")
 
-    client = TestClient(create_app())
+        client = TestClient(create_app())
 
-    response = client.get("/health")
+        response = client.get("/health")
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "service": "api-service",
-        "status": "ok",
-        "environment": "test",
-        "dependencies": {
-            "postgres": "postgresql+psycopg://visiox:visiox@postgres:5432/visiox",
-            "redis": "redis://redis:6379/0",
-            "minio": "minio:9000",
-            "registry": "registry:5000",
-            "label_studio": "http://label-studio:8080",
-        },
-    }
+        assert response.status_code == 200
+        assert response.json() == {
+            "service": "api-service",
+            "status": "ok",
+            "environment": "test",
+            "dependencies": {
+                "postgres": "postgresql+psycopg://visiox:visiox@postgres:5432/visiox",
+                "redis": "redis://redis:6379/0",
+                "minio": "minio:9000",
+                "registry": "registry:5000",
+                "label_studio": "http://label-studio:8080",
+            },
+        }
+    finally:
+        get_settings.cache_clear()
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **步骤 2：运行测试并确认失败**
 
-Run:
+运行：
 
 ```bash
 pytest tests/integration/test_api_health.py -v
 ```
 
-Expected: FAIL because `visiox_api` is not importable yet.
+预期：FAIL，因为 `visiox_api` 尚不可导入。
 
-## Task 2: Add Python Packaging And Settings
+## 任务 2：添加 Python Packaging 与 Settings
 
-- [ ] **Step 1: Create Python package metadata**
+- [ ] **步骤 1：创建 Python package metadata**
 
-Create `pyproject.toml`:
+创建 `pyproject.toml`：
 
 ```toml
 [build-system]
@@ -102,6 +107,9 @@ dependencies = [
 test = [
   "pytest>=8.3,<9.0",
 ]
+dev = [
+  "ruff>=0.8,<1.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = [
@@ -117,23 +125,23 @@ pythonpath = [
 testpaths = ["tests"]
 ```
 
-- [ ] **Step 2: Create package init files**
+- [ ] **步骤 2：创建 package init 文件**
 
-Create `apps/api-service/src/visiox_api/__init__.py`:
+创建 `apps/api-service/src/visiox_api/__init__.py`：
 
 ```python
 """Visiox API service."""
 ```
 
-Create `packages/visiox-common/src/visiox_common/__init__.py`:
+创建 `packages/visiox-common/src/visiox_common/__init__.py`：
 
 ```python
 """Shared Visiox package utilities."""
 ```
 
-- [ ] **Step 3: Create settings module**
+- [ ] **步骤 3：创建 settings module**
 
-Create `packages/visiox-common/src/visiox_common/settings.py`:
+创建 `packages/visiox-common/src/visiox_common/settings.py`：
 
 ```python
 from functools import lru_cache
@@ -157,11 +165,11 @@ def get_settings() -> Settings:
     return Settings()
 ```
 
-## Task 3: Implement Minimal API Health Endpoint
+## 任务 3：实现最小 API Health Endpoint
 
-- [ ] **Step 1: Create FastAPI application**
+- [ ] **步骤 1：创建 FastAPI application**
 
-Create `apps/api-service/src/visiox_api/main.py`:
+创建 `apps/api-service/src/visiox_api/main.py`：
 
 ```python
 from fastapi import FastAPI
@@ -194,21 +202,21 @@ def create_app() -> FastAPI:
 app = create_app()
 ```
 
-- [ ] **Step 2: Run the health test to verify it passes**
+- [ ] **步骤 2：运行 health 测试并确认通过**
 
-Run:
+运行：
 
 ```bash
 pytest tests/integration/test_api_health.py -v
 ```
 
-Expected: PASS.
+预期：PASS。
 
-## Task 4: Add Compose And Runtime Files
+## 任务 4：添加 Compose 和 Runtime 文件
 
-- [ ] **Step 1: Add environment example**
+- [ ] **步骤 1：添加环境变量示例**
 
-Create `.env.example`:
+创建 `.env.example`：
 
 ```dotenv
 VISIOX_ENV=local
@@ -230,9 +238,9 @@ LABEL_STUDIO_USERNAME=admin@example.com
 LABEL_STUDIO_PASSWORD=visiox123
 ```
 
-- [ ] **Step 2: Add API Dockerfile**
+- [ ] **步骤 2：添加 API Dockerfile**
 
-Create `apps/api-service/Dockerfile`:
+创建 `apps/api-service/Dockerfile`：
 
 ```dockerfile
 FROM python:3.12-slim
@@ -253,9 +261,9 @@ EXPOSE 8000
 CMD ["uvicorn", "visiox_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-- [ ] **Step 3: Add Compose stack**
+- [ ] **步骤 3：添加 Compose stack**
 
-Create `infra/compose/docker-compose.yml`:
+创建 `infra/compose/docker-compose.yml`。`minio` 镜像必须固定为 `minio/minio:RELEASE.2025-09-07T16-13-09Z`：
 
 ```yaml
 services:
@@ -296,7 +304,7 @@ services:
       - "6379:6379"
 
   minio:
-    image: minio/minio:RELEASE.2026-06-13T11-33-47Z
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-visiox}
@@ -332,13 +340,15 @@ volumes:
   label-studio-data:
 ```
 
-- [ ] **Step 4: Add dev Compose override**
+- [ ] **步骤 4：添加 dev Compose override**
 
-Create `infra/compose/docker-compose.dev.yml`:
+创建 `infra/compose/docker-compose.dev.yml`。dev Compose 必须显式设置 `PYTHONPATH`，让源码挂载后可导入本地 package：
 
 ```yaml
 services:
   api-service:
+    environment:
+      PYTHONPATH: /app/apps/api-service/src:/app/packages/visiox-common/src
     volumes:
       - ../../apps/api-service/src:/app/apps/api-service/src
       - ../../packages/visiox-common/src:/app/packages/visiox-common/src
@@ -352,9 +362,9 @@ services:
       - --reload
 ```
 
-- [ ] **Step 5: Add npm convenience scripts**
+- [ ] **步骤 5：添加 npm 便捷脚本**
 
-Create `package.json`:
+创建 `package.json`，其中必须包含 `lint` 脚本：
 
 ```json
 {
@@ -362,6 +372,7 @@ Create `package.json`:
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "lint": "ruff check apps packages tests",
     "test": "pytest",
     "test:health": "pytest tests/integration/test_api_health.py -v",
     "compose:up": "docker compose -f infra/compose/docker-compose.yml up --build",
@@ -371,9 +382,9 @@ Create `package.json`:
 }
 ```
 
-- [ ] **Step 6: Modify `.gitignore`**
+- [ ] **步骤 6：修改 `.gitignore`**
 
-Ensure `.gitignore` contains:
+确保 `.gitignore` 包含：
 
 ```gitignore
 .superpowers/
@@ -385,51 +396,61 @@ __pycache__/
 .env
 ```
 
-## Task 5: Verify And Commit
+## 任务 5：验证并提交
 
-- [ ] **Step 1: Run focused test**
+- [ ] **步骤 1：运行 focused test**
 
-Run:
+运行：
 
 ```bash
 pytest tests/integration/test_api_health.py -v
 ```
 
-Expected: PASS.
+预期：PASS。
 
-- [ ] **Step 2: Validate Compose configuration**
+- [ ] **步骤 2：运行 lint**
 
-Run:
+运行：
+
+```bash
+ruff check apps packages tests
+```
+
+预期：exit code 0。
+
+- [ ] **步骤 3：校验 Compose 配置**
+
+运行：
 
 ```bash
 docker compose -f infra/compose/docker-compose.yml config
 ```
 
-Expected: exit code 0 and rendered services include `api-service`, `postgres`, `redis`, `minio`, `registry`, and `label-studio`.
+预期：exit code 0，渲染后的服务包含 `api-service`、`postgres`、`redis`、`minio`、`registry` 和 `label-studio`。
 
-- [ ] **Step 3: Optionally run Compose build/start if Docker is available**
+- [ ] **步骤 4：如 Docker 可用，可选运行 Compose build/start**
 
-Run:
+运行：
 
 ```bash
 docker compose -f infra/compose/docker-compose.yml up --build
 ```
 
-Expected: platform services start and `GET /health` returns HTTP 200. If Docker is unavailable or images cannot be pulled, record the exact blocker and do not claim Compose startup passed.
+预期：平台服务启动，`GET /health` 返回 HTTP 200。如果 Docker 不可用或镜像无法拉取，记录准确阻塞原因，不要声称 Compose startup 已通过。
 
-- [ ] **Step 4: Commit**
+- [ ] **步骤 5：提交**
 
-Run:
+运行：
 
 ```bash
 git add pyproject.toml package.json .env.example .gitignore infra apps packages tests docs/superpowers/plans/2026-07-03-repo-foundation-compose.md
 git commit -m "chore: scaffold platform foundation"
 ```
 
-Expected: commit succeeds on `task1-repo-foundation`.
+预期：在 `task1-repo-foundation` 上提交成功。
 
-## Self-Review
+## 自查
 
-- Spec coverage: This plan implements Task 1 only: packaging, health endpoint, Compose services, Dockerfile, environment template, and health integration test.
-- Intentional deferral: No SQLAlchemy models, Alembic, Redis messaging abstractions, MinIO SDK wrapper, frontend, workers, or business APIs are introduced in this task.
-- Verification standard: Passing `pytest tests/integration/test_api_health.py -v` verifies application behavior. Passing `docker compose -f infra/compose/docker-compose.yml config` verifies Compose syntax. Full Compose startup is attempted only when Docker and network access are available.
+- 规格覆盖：本计划只实现任务 1：packaging、health endpoint、Compose 服务、Dockerfile、environment template、lint 脚本和 health 集成测试。
+- 有意延后：不引入 SQLAlchemy model、Alembic、Redis messaging abstraction、MinIO SDK wrapper、前端、worker 或业务 API。
+- 验证标准：`pytest tests/integration/test_api_health.py -v` 通过验证应用行为。`ruff check apps packages tests` 通过验证代码风格。`docker compose -f infra/compose/docker-compose.yml config` 通过验证 Compose 语法。仅在 Docker 和网络访问可用时尝试完整 Compose startup。
