@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Visiox v0.1 Architecture</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --muted: #64748b;
+      --text: #0f172a;
+      --line: #d8dee9;
+      --blue: #eaf3ff;
+      --green: #ecfdf3;
+      --orange: #fff7ed;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+    main { max-width: 1280px; margin: 0 auto; padding: 32px; }
+    h1 { margin: 0 0 8px; font-size: 30px; }
+    h2 { margin: 32px 0 12px; font-size: 22px; }
+    h3 { margin: 8px 0 12px; font-size: 17px; }
+    p { margin: 0 0 12px; color: var(--muted); }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+    }
+    .grid-3 { display: grid; grid-template-columns: 1fr 1.15fr 1fr; gap: 16px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+    .box {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 14px;
+      min-height: 100%;
+    }
+    .box.alt { background: #f8fafc; }
+    .label {
+      display: block;
+      color: #475569;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+    .item {
+      border: 1px dashed #cbd5e1;
+      background: #f8fafc;
+      border-radius: 6px;
+      padding: 8px 10px;
+      margin: 8px 0;
+      color: #334155;
+      font-size: 14px;
+    }
+    .items-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .note-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px; }
+    .note { padding: 12px; border-radius: 8px; border: 1px solid var(--line); font-size: 14px; }
+    .note.blue { background: var(--blue); border-color: #bfdbfe; }
+    .note.green { background: var(--green); border-color: #bbf7d0; }
+    .note.orange { background: var(--orange); border-color: #fed7aa; }
+    .chain {
+      margin-top: 16px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+      font-weight: 600;
+    }
+    @media (max-width: 980px) {
+      main { padding: 18px; }
+      .grid-3, .grid-4, .note-grid, .items-2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Visiox v0.1 Architecture</h1>
+    <p>私有化部署，Docker Compose，Python 服务，Redis Stream 任务编排，YOLO26 六类任务端到端训练和边缘部署。</p>
+
+    <h2>总体架构</h2>
+    <section class="panel">
+      <div class="grid-3">
+        <div class="box alt">
+          <span class="label">Web Console</span>
+          <h3>Frontend</h3>
+          <div class="item">Vue 3 + TypeScript + Element Plus</div>
+          <div class="item">模型空间</div>
+          <div class="item">创建产线向导</div>
+          <div class="item">Task Center</div>
+        </div>
+
+        <div class="box">
+          <span class="label">Docker Compose Platform</span>
+          <h3>Core Services</h3>
+          <div class="items-2">
+            <div class="item">FastAPI API Service</div>
+            <div class="item">PostgreSQL</div>
+            <div class="item">Redis Stream / PubSub</div>
+            <div class="item">MinIO Object Store</div>
+            <div class="item">Registry</div>
+            <div class="item">Label Studio</div>
+          </div>
+          <h3>Workers</h3>
+          <div class="items-2">
+            <div class="item">training-worker</div>
+            <div class="item">deployment-worker</div>
+            <div class="item">label-sync-worker</div>
+            <div class="item">camera-worker</div>
+          </div>
+        </div>
+
+        <div class="box alt">
+          <span class="label">Customer LAN Edge</span>
+          <h3>Edge Device</h3>
+          <div class="item">Edge Agent API</div>
+          <div class="item">Docker Runtime</div>
+          <div class="item">YOLO26 Inference Container</div>
+          <div class="item">Camera Streams</div>
+          <div class="item">Business Rules</div>
+        </div>
+      </div>
+
+      <div class="note-grid">
+        <div class="note blue"><strong>HTTP/WebSocket</strong><br>前端访问 API，API 推送任务进度。</div>
+        <div class="note green"><strong>Redis Stream</strong><br>可靠异步任务：训练、同步、部署、导出、校验。</div>
+        <div class="note orange"><strong>Agent API</strong><br>平台主动访问边缘设备并下发边缘应用。</div>
+      </div>
+    </section>
+
+    <h2>创建产线流程</h2>
+    <section class="panel">
+      <div class="grid-4">
+        <div class="box">
+          <span class="label">Step 1</span>
+          <h3>基础信息</h3>
+          <p>产线名称、YOLO26 任务类型、模型尺度。</p>
+          <div class="item">detect / seg / sem / pose / obb / cls</div>
+        </div>
+        <div class="box">
+          <span class="label">Step 2</span>
+          <h3>数据准备</h3>
+          <p>数据集、Label Studio 同步、数据处理、分析、格式检验。</p>
+          <div class="item">Dataset Converter</div>
+        </div>
+        <div class="box">
+          <span class="label">Step 3</span>
+          <h3>参数准备</h3>
+          <p>epochs、imgsz、batch、optimizer、增强参数、高级配置。</p>
+          <div class="item">Validated YAML/JSON</div>
+        </div>
+        <div class="box">
+          <span class="label">Step 4</span>
+          <h3>提交训练</h3>
+          <p>选择训练环境，执行预检查，创建训练任务。</p>
+          <div class="item">Task Center</div>
+        </div>
+      </div>
+      <div class="chain">
+        Base Model -> Pipeline -> Dataset Conversion -> Training Job -> Model Version -> Export -> Edge App Package -> Edge Deployment
+      </div>
+    </section>
+  </main>
+</body>
+</html>
