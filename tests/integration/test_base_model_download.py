@@ -31,6 +31,11 @@ class FakeStreamProducer:
         return "1-0"
 
 
+class FailingStreamProducer:
+    async def enqueue(self, command):
+        raise RuntimeError("redis unavailable")
+
+
 @pytest.fixture()
 def session_factory(tmp_path):
     database_path = tmp_path / "visiox-base-models.db"
@@ -211,6 +216,71 @@ def test_post_base_model_download_is_idempotent_while_downloading(
     assert len(stream_producer.commands) == 1
 
 
+def test_post_base_model_download_reuses_active_task_even_before_status_updates(
+    client: TestClient,
+    session_factory,
+    stream_producer: FakeStreamProducer,
+):
+    with session_factory() as session:
+        _, models = seed_source_and_models(session)
+        model_id = models[0].id
+        task = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="QUEUED",
+            resource_type="base_model",
+            resource_id=model_id,
+            payload={"base_model_id": model_id},
+        )
+        session.add(task)
+        session.commit()
+        task_id = task.id
+
+    response = client.post(f"/base-models/{model_id}/download")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "base_model_id": model_id,
+        "status": "remote_available",
+        "task_id": task_id,
+    }
+    assert stream_producer.commands == []
+    with session_factory() as session:
+        tasks = session.scalars(select(Task).where(Task.resource_id == model_id)).all()
+        model = session.get(BaseModel, model_id)
+
+    assert len(tasks) == 1
+    assert model.status == "remote_available"
+
+
+def test_post_base_model_download_restores_model_status_when_enqueue_fails(session_factory):
+    app = create_app()
+
+    def override_session() -> Generator[Session]:
+        with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_base_model_session] = override_session
+    app.dependency_overrides[get_stream_producer] = lambda: FailingStreamProducer()
+
+    with session_factory() as session:
+        _, models = seed_source_and_models(session)
+        model_id = models[0].id
+
+    with TestClient(app) as client:
+        response = client.post(f"/base-models/{model_id}/download")
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "remote_available"
+
+    with session_factory() as session:
+        model = session.get(BaseModel, model_id)
+        task = session.scalar(select(Task).where(Task.resource_id == model_id))
+
+    assert model.status == "remote_available"
+    assert task.status == "FAILED"
+    assert task.error_code == "ENQUEUE_FAILED"
+
+
 def test_ensure_base_model_ready_returns_ready_model_and_rejects_other_statuses(session_factory):
     with session_factory() as session:
         _, models = seed_source_and_models(session)
@@ -313,6 +383,62 @@ def test_download_base_model_checksum_mismatch_marks_model_and_task_failed(
     assert "expected" in saved_task.error_message
     assert "actual" in saved_task.error_message
     assert saved_task.retryable is True
+
+
+def test_download_base_model_failure_does_not_overwrite_model_made_ready_by_other_task(
+    tmp_path,
+    session_factory,
+):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    model_bytes = b"model"
+    (source_dir / "yolo26n.pt").write_bytes(model_bytes)
+
+    class FailingStorageAfterReady:
+        def put_file(
+            self,
+            bucket: str,
+            object_name: str,
+            path: Path,
+            content_type: str | None = None,
+        ) -> str:
+            del bucket, object_name, path, content_type
+            model = session.get(BaseModel, model_id)
+            model.status = "ready"
+            model.local_uri = "memory://models/base/other-task/yolo26n.pt"
+            model.checksum = sha256_bytes(model_bytes)
+            model.size_bytes = len(model_bytes)
+            session.add(model)
+            session.flush()
+            raise RuntimeError("object storage unavailable")
+
+        def get_file(self, bucket: str, object_name: str, destination: Path) -> Path:
+            raise AssertionError("not used")
+
+    with session_factory() as session:
+        _, models = seed_source_and_models(session, source_dir)
+        model_id = models[0].id
+        task = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="QUEUED",
+            resource_type="base_model",
+            resource_id=model_id,
+            payload={"base_model_id": model_id},
+        )
+        session.add(task)
+        session.commit()
+        task_id = task.id
+
+        with pytest.raises(RuntimeError, match="object storage unavailable"):
+            download_base_model(session, task_id, model_id, FailingStorageAfterReady())
+
+    with session_factory() as session:
+        saved_model = session.get(BaseModel, model_id)
+        saved_task = session.get(Task, task_id)
+
+    assert saved_model.status == "ready"
+    assert saved_model.local_uri == "memory://models/base/other-task/yolo26n.pt"
+    assert saved_task.status == "FAILED"
 
 
 def test_download_base_model_rejects_task_for_different_base_model(tmp_path, session_factory):
@@ -544,3 +670,40 @@ def test_minio_put_file_treats_bucket_already_exists_race_as_success(tmp_path):
 
     assert uri == "minio://models/base/model.pt"
     assert client._client.puts == [("models", "base/model.pt", str(model_file), None)]
+
+
+def test_minio_put_file_reraises_unexpected_make_bucket_s3_error(tmp_path):
+    from minio.error import S3Error
+
+    class FakeMinio:
+        def bucket_exists(self, bucket: str) -> bool:
+            assert bucket == "models"
+            return False
+
+        def make_bucket(self, bucket: str) -> None:
+            raise S3Error(
+                None,
+                "AccessDenied",
+                "access denied",
+                bucket,
+                "request-id",
+                "host-id",
+                bucket,
+            )
+
+        def fput_object(
+            self,
+            bucket: str,
+            object_name: str,
+            path: str,
+            content_type: str | None = None,
+        ) -> None:
+            raise AssertionError("unexpected upload after make_bucket failure")
+
+    model_file = tmp_path / "model.pt"
+    model_file.write_bytes(b"model")
+    client = MinioObjectStorageClient.__new__(MinioObjectStorageClient)
+    client._client = FakeMinio()
+
+    with pytest.raises(S3Error, match="AccessDenied"):
+        client.put_file("models", "base/model.pt", model_file)

@@ -144,14 +144,15 @@ async def create_base_model_download_task(
     base_model = _base_model_or_404(session, base_model_id)
     if base_model.status == "ready":
         return BaseModelDownloadResponse(base_model_id=base_model.id, status=base_model.status, task_id=None)
-    if base_model.status == "downloading":
-        active_task = _find_active_download_task(session, base_model.id)
+    active_task = _find_active_download_task(session, base_model.id)
+    if active_task is not None:
         return BaseModelDownloadResponse(
             base_model_id=base_model.id,
             status=base_model.status,
-            task_id=active_task.id if active_task is not None else None,
+            task_id=active_task.id,
         )
 
+    original_status = base_model.status
     task = Task(
         task_type=TaskType.DOWNLOAD_BASE_MODEL.value,
         status=TaskStatus.QUEUED.value,
@@ -160,9 +161,13 @@ async def create_base_model_download_task(
         resource_id=base_model.id,
         payload={"base_model_id": base_model.id},
     )
-    session.add(task)
+    base_model.status = "downloading"
+    session.add_all([task, base_model])
     session.commit()
     session.refresh(task)
+    session.refresh(base_model)
+
+    response.status_code = status.HTTP_201_CREATED
 
     command = TaskCommand(
         task_id=task.id,
@@ -177,15 +182,11 @@ async def create_base_model_download_task(
         task.error_code = "ENQUEUE_FAILED"
         task.error_message = str(exc)
         task.finished_at = _utc_now()
-        session.add(task)
+        base_model.status = original_status
+        session.add_all([task, base_model])
         session.commit()
         session.refresh(task)
+        session.refresh(base_model)
         return BaseModelDownloadResponse(base_model_id=base_model.id, status=base_model.status, task_id=task.id)
 
-    base_model.status = "downloading"
-    session.add(base_model)
-    session.commit()
-    session.refresh(base_model)
-
-    response.status_code = status.HTTP_201_CREATED
     return BaseModelDownloadResponse(base_model_id=base_model.id, status=base_model.status, task_id=task.id)

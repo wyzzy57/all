@@ -49,8 +49,10 @@ def _mark_failed(
     error: Exception,
 ) -> None:
     if base_model is not None:
-        base_model.status = "failed"
-        session.add(base_model)
+        session.refresh(base_model)
+        if base_model.status != "ready":
+            base_model.status = "failed"
+            session.add(base_model)
     if task is not None:
         task.status = TaskStatus.FAILED.value
         task.error_code = "BASE_MODEL_DOWNLOAD_FAILED"
