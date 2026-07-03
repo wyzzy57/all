@@ -16,6 +16,11 @@ from visiox_messaging.streams import RedisStreamProducer
 
 
 router = APIRouter(prefix="/base-models", tags=["base-models"])
+ACTIVE_DOWNLOAD_STATUSES = {
+    TaskStatus.PENDING.value,
+    TaskStatus.QUEUED.value,
+    TaskStatus.RUNNING.value,
+}
 
 
 class BaseModelResponse(PydanticBaseModel):
@@ -85,6 +90,20 @@ def ensure_base_model_ready(session: Session, base_model_id: str) -> BaseModel:
     return base_model
 
 
+def _find_active_download_task(session: Session, base_model_id: str) -> Task | None:
+    return session.scalars(
+        select(Task)
+        .where(
+            Task.task_type == TaskType.DOWNLOAD_BASE_MODEL.value,
+            Task.resource_type == "base_model",
+            Task.resource_id == base_model_id,
+            Task.status.in_(ACTIVE_DOWNLOAD_STATUSES),
+        )
+        .order_by(Task.created_at, Task.id)
+        .limit(1)
+    ).first()
+
+
 @router.get("", response_model=BaseModelListResponse)
 def list_base_models(
     task: str | None = None,
@@ -125,6 +144,13 @@ async def create_base_model_download_task(
     base_model = _base_model_or_404(session, base_model_id)
     if base_model.status == "ready":
         return BaseModelDownloadResponse(base_model_id=base_model.id, status=base_model.status, task_id=None)
+    if base_model.status == "downloading":
+        active_task = _find_active_download_task(session, base_model.id)
+        return BaseModelDownloadResponse(
+            base_model_id=base_model.id,
+            status=base_model.status,
+            task_id=active_task.id if active_task is not None else None,
+        )
 
     task = Task(
         task_type=TaskType.DOWNLOAD_BASE_MODEL.value,

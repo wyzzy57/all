@@ -34,7 +34,11 @@ class MinioObjectStorageClient:
         content_type: str | None = None,
     ) -> str:
         if not self._client.bucket_exists(bucket):
-            self._client.make_bucket(bucket)
+            try:
+                self._client.make_bucket(bucket)
+            except Exception as exc:
+                if not _is_bucket_exists_race(exc):
+                    raise
         self._client.fput_object(bucket, object_name, str(path), content_type=content_type)
         return f"minio://{bucket}/{object_name}"
 
@@ -63,3 +67,14 @@ class InMemoryObjectStorageClient:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(self.objects[(bucket, object_name)])
         return destination
+
+
+def _is_bucket_exists_race(exc: Exception) -> bool:
+    try:
+        from minio.error import S3Error
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(exc, S3Error) and exc.code in {
+        "BucketAlreadyOwnedByYou",
+        "BucketAlreadyExists",
+    }

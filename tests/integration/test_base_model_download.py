@@ -17,9 +17,9 @@ from visiox_api.routes.base_models import (
 )
 from visiox_common.tasks import TaskType
 from visiox_db.models import BaseModel, ModelSource, Task
-from visiox_model_worker.main import download_base_model
+from visiox_model_worker.main import BaseModelDownloadError, download_base_model
 from visiox_storage.checksum import sha256_bytes
-from visiox_storage.client import InMemoryObjectStorageClient
+from visiox_storage.client import InMemoryObjectStorageClient, MinioObjectStorageClient
 
 
 class FakeStreamProducer:
@@ -185,6 +185,32 @@ def test_post_base_model_download_returns_ready_model_without_task(
     assert stream_producer.commands == []
 
 
+def test_post_base_model_download_is_idempotent_while_downloading(
+    client: TestClient,
+    session_factory,
+    stream_producer: FakeStreamProducer,
+):
+    with session_factory() as session:
+        _, models = seed_source_and_models(session)
+        model_id = models[0].id
+
+    first_response = client.post(f"/base-models/{model_id}/download")
+    second_response = client.post(f"/base-models/{model_id}/download")
+
+    assert first_response.status_code == 201
+    assert second_response.status_code == 200
+    first_body = first_response.json()
+    second_body = second_response.json()
+    assert second_body["status"] == "downloading"
+    assert second_body["task_id"] == first_body["task_id"]
+
+    with session_factory() as session:
+        tasks = session.scalars(select(Task).where(Task.resource_id == model_id)).all()
+
+    assert len(tasks) == 1
+    assert len(stream_producer.commands) == 1
+
+
 def test_ensure_base_model_ready_returns_ready_model_and_rejects_other_statuses(session_factory):
     with session_factory() as session:
         _, models = seed_source_and_models(session)
@@ -287,3 +313,234 @@ def test_download_base_model_checksum_mismatch_marks_model_and_task_failed(
     assert "expected" in saved_task.error_message
     assert "actual" in saved_task.error_message
     assert saved_task.retryable is True
+
+
+def test_download_base_model_rejects_task_for_different_base_model(tmp_path, session_factory):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "yolo26n.pt").write_bytes(b"model")
+
+    with session_factory() as session:
+        _, models = seed_source_and_models(session, source_dir)
+        model_id = models[0].id
+        task = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="QUEUED",
+            resource_type="base_model",
+            resource_id="other-model",
+            payload={"base_model_id": "other-model"},
+        )
+        session.add(task)
+        session.commit()
+        task_id = task.id
+
+        with pytest.raises(BaseModelDownloadError, match="does not match"):
+            download_base_model(session, task_id, model_id, InMemoryObjectStorageClient())
+
+    with session_factory() as session:
+        assert session.get(BaseModel, model_id).status == "remote_available"
+
+
+def test_download_base_model_does_not_rerun_terminal_task_or_fail_model(tmp_path, session_factory):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+
+    with session_factory() as session:
+        _, models = seed_source_and_models(session, source_dir)
+        model_id = models[0].id
+        task = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="SUCCESS",
+            progress=100,
+            resource_type="base_model",
+            resource_id=model_id,
+            payload={"base_model_id": model_id},
+        )
+        session.add(task)
+        session.commit()
+        task_id = task.id
+
+        with pytest.raises(BaseModelDownloadError, match="terminal"):
+            download_base_model(session, task_id, model_id, InMemoryObjectStorageClient())
+
+    with session_factory() as session:
+        model = session.get(BaseModel, model_id)
+        saved_task = session.get(Task, task_id)
+
+    assert model.status == "remote_available"
+    assert saved_task.status == "SUCCESS"
+
+
+def test_download_base_model_ready_model_marks_task_success_without_redownloading(
+    session_factory,
+):
+    with session_factory() as session:
+        _, models = seed_source_and_models(session)
+        model_id = models[1].id
+        task = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="QUEUED",
+            resource_type="base_model",
+            resource_id=model_id,
+            payload={"base_model_id": model_id},
+        )
+        session.add(task)
+        session.commit()
+        task_id = task.id
+        storage = InMemoryObjectStorageClient()
+
+        result = download_base_model(session, task_id, model_id, storage)
+
+        assert result.local_uri == "memory://models/base/ready/yolo26s-seg.pt"
+        assert storage.objects == {}
+
+    with session_factory() as session:
+        saved_task = session.get(Task, task_id)
+        saved_model = session.get(BaseModel, model_id)
+
+    assert saved_task.status == "SUCCESS"
+    assert saved_task.progress == 100
+    assert saved_model.status == "ready"
+
+
+def test_download_base_model_ready_model_keeps_success_terminal_task(session_factory):
+    with session_factory() as session:
+        _, models = seed_source_and_models(session)
+        model_id = models[1].id
+        task = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="SUCCESS",
+            progress=100,
+            resource_type="base_model",
+            resource_id=model_id,
+            payload={"base_model_id": model_id},
+        )
+        session.add(task)
+        session.commit()
+        task_id = task.id
+        storage = InMemoryObjectStorageClient()
+
+        result = download_base_model(session, task_id, model_id, storage)
+
+        assert result.local_uri == "memory://models/base/ready/yolo26s-seg.pt"
+        assert storage.objects == {}
+
+    with session_factory() as session:
+        saved_task = session.get(Task, task_id)
+        saved_model = session.get(BaseModel, model_id)
+
+    assert saved_task.status == "SUCCESS"
+    assert saved_model.status == "ready"
+
+
+@pytest.mark.parametrize("unsafe_source_path", [r"..\outside.pt", "../outside.pt"])
+def test_download_base_model_rejects_local_mount_path_traversal(
+    tmp_path,
+    session_factory,
+    unsafe_source_path: str,
+):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (tmp_path / "outside.pt").write_bytes(b"outside")
+
+    with session_factory() as session:
+        _, models = seed_source_and_models(session, source_dir)
+        model_id = models[0].id
+        model = session.get(BaseModel, model_id)
+        model.source_path = unsafe_source_path
+        task = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="QUEUED",
+            resource_type="base_model",
+            resource_id=model_id,
+            payload={"base_model_id": model_id},
+        )
+        session.add(task)
+        session.commit()
+
+        with pytest.raises(BaseModelDownloadError, match="unsafe"):
+            download_base_model(session, task.id, model_id, InMemoryObjectStorageClient())
+
+
+@pytest.mark.parametrize(
+    "unsafe_source_path",
+    ["https://example.com/model.pt", "//example.com/model.pt", "../model.pt"],
+)
+def test_download_base_model_rejects_unsafe_http_source_paths(
+    session_factory,
+    unsafe_source_path: str,
+):
+    with session_factory() as session:
+        source = ModelSource(
+            name=f"http-{unsafe_source_path}",
+            type="http",
+            base_url="https://models.internal/base/",
+            enabled=True,
+        )
+        session.add(source)
+        session.flush()
+        model = BaseModel(
+            family="yolo26",
+            task="detect",
+            scale="x",
+            filename="unsafe.pt",
+            source_path=unsafe_source_path,
+            status="remote_available",
+            model_source_id=source.id,
+        )
+        task = Task(
+            task_type="DOWNLOAD_BASE_MODEL",
+            status="QUEUED",
+            resource_type="base_model",
+            payload={},
+        )
+        session.add_all([model, task])
+        session.flush()
+        task.resource_id = model.id
+        task.payload = {"base_model_id": model.id}
+        session.commit()
+
+        with pytest.raises(BaseModelDownloadError, match="unsafe"):
+            download_base_model(session, task.id, model.id, InMemoryObjectStorageClient())
+
+
+def test_minio_put_file_treats_bucket_already_exists_race_as_success(tmp_path):
+    from minio.error import S3Error
+
+    class FakeMinio:
+        def __init__(self) -> None:
+            self.puts = []
+
+        def bucket_exists(self, bucket: str) -> bool:
+            assert bucket == "models"
+            return False
+
+        def make_bucket(self, bucket: str) -> None:
+            raise S3Error(
+                None,
+                "BucketAlreadyOwnedByYou",
+                "bucket exists",
+                bucket,
+                "request-id",
+                "host-id",
+                bucket,
+            )
+
+        def fput_object(
+            self,
+            bucket: str,
+            object_name: str,
+            path: str,
+            content_type: str | None = None,
+        ) -> None:
+            self.puts.append((bucket, object_name, path, content_type))
+
+    model_file = tmp_path / "model.pt"
+    model_file.write_bytes(b"model")
+    client = MinioObjectStorageClient.__new__(MinioObjectStorageClient)
+    client._client = FakeMinio()
+
+    uri = client.put_file("models", "base/model.pt", model_file)
+
+    assert uri == "minio://models/base/model.pt"
+    assert client._client.puts == [("models", "base/model.pt", str(model_file), None)]
