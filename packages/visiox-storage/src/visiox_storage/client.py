@@ -13,6 +13,8 @@ class ObjectStorageClient(Protocol):
 
     def get_file(self, bucket: str, object_name: str, destination: Path) -> Path: ...
 
+    def delete_file(self, bucket: str, object_name: str) -> None: ...
+
 
 class MinioObjectStorageClient:
     def __init__(
@@ -47,6 +49,13 @@ class MinioObjectStorageClient:
         self._client.fget_object(bucket, object_name, str(destination))
         return destination
 
+    def delete_file(self, bucket: str, object_name: str) -> None:
+        try:
+            self._client.remove_object(bucket, object_name)
+        except Exception as exc:
+            if not _is_object_missing(exc):
+                raise
+
 
 class InMemoryObjectStorageClient:
     def __init__(self) -> None:
@@ -68,6 +77,9 @@ class InMemoryObjectStorageClient:
         destination.write_bytes(self.objects[(bucket, object_name)])
         return destination
 
+    def delete_file(self, bucket: str, object_name: str) -> None:
+        self.objects.pop((bucket, object_name), None)
+
 
 def _is_bucket_exists_race(exc: Exception) -> bool:
     try:
@@ -78,3 +90,11 @@ def _is_bucket_exists_race(exc: Exception) -> bool:
         "BucketAlreadyOwnedByYou",
         "BucketAlreadyExists",
     }
+
+
+def _is_object_missing(exc: Exception) -> bool:
+    try:
+        from minio.error import S3Error
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(exc, S3Error) and exc.code in {"NoSuchKey", "NoSuchObject"}

@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     minio_access_key: str = "visiox"
     minio_secret_key: str = "visiox123"
     minio_secure: bool = False
+    max_dataset_upload_bytes: int = 100 * 1024 * 1024
+    max_dataset_image_bytes: int = 25 * 1024 * 1024
+    max_dataset_zip_entries: int = 10_000
+    max_dataset_zip_uncompressed_bytes: int = 500 * 1024 * 1024
     registry_url: str = "registry:5000"
     label_studio_url: str = "http://label-studio:8080"
 

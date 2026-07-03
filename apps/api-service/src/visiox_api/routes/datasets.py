@@ -145,7 +145,7 @@ def create_dataset_analysis_task(
     result = analyze_dataset(session, dataset_id)
     now = _utc_now()
     task = Task(
-        task_type="ANALYZE_DATASET",
+        task_type=TaskType.ANALYZE_DATASET.value,
         status=TaskStatus.SUCCESS.value,
         progress=100,
         resource_type="dataset",

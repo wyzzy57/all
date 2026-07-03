@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from visiox_api.routes.datasets import dataset_or_404
+from visiox_common.settings import Settings, get_settings
 from visiox_db.models import Dataset, DatasetSample
 from visiox_db.session import get_session
 from visiox_storage.checksum import sha256_bytes
@@ -81,25 +82,33 @@ async def upload_samples(
     file: UploadFile = File(...),
     session: Session = Depends(get_dataset_sample_session),
     storage: ObjectStorageClient = Depends(get_object_storage_client),
+    settings: Settings = Depends(get_settings),
 ) -> SampleUploadResponse:
     dataset = dataset_or_404(session, dataset_id)
     filename = file.filename or "upload"
     data = await file.read()
+    _ensure_size_within_limit(len(data), settings.max_dataset_upload_bytes, "Upload file is too large")
     extension = PurePosixPath(filename.replace("\\", "/")).suffix.lower()
 
-    if extension in IMAGE_EXTENSIONS:
-        result = _store_image(session, storage, dataset, _safe_basename(filename), data)
-    elif extension in ZIP_EXTENSIONS:
-        result = _store_zip(session, storage, dataset, data)
-    else:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported upload file type")
+    result = _UploadResult()
+    try:
+        if extension in IMAGE_EXTENSIONS:
+            result = _store_image(session, storage, dataset, _safe_basename(filename), data, settings)
+        elif extension in ZIP_EXTENSIONS:
+            result = _store_zip(session, storage, dataset, data, settings)
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported upload file type")
 
-    dataset.sample_count = _dataset_sample_count(session, dataset.id)
-    session.add(dataset)
-    session.commit()
-    for sample in result.samples:
-        session.refresh(sample)
-    session.refresh(dataset)
+        dataset.sample_count = _dataset_sample_count(session, dataset.id)
+        session.add(dataset)
+        session.commit()
+        for sample in result.samples:
+            session.refresh(sample)
+        session.refresh(dataset)
+    except Exception:
+        session.rollback()
+        _cleanup_stored_objects(storage, result.stored_objects)
+        raise
     if result.created_count == 0 and result.duplicate_count > 0:
         response.status_code = status.HTTP_200_OK
     return SampleUploadResponse(
@@ -170,6 +179,7 @@ class _UploadResult:
         self.created_count = 0
         self.duplicate_count = 0
         self.skipped_count = 0
+        self.stored_objects: list[tuple[str, str]] = []
 
 
 def _store_zip(
@@ -177,26 +187,39 @@ def _store_zip(
     storage: ObjectStorageClient,
     dataset: Dataset,
     data: bytes,
+    settings: Settings,
 ) -> _UploadResult:
     result = _UploadResult()
     try:
         with ZipFile(_bytes_file(data)) as archive:
-            for info in archive.infolist():
-                if info.is_dir():
-                    continue
+            entries = [info for info in archive.infolist() if not info.is_dir()]
+            if len(entries) > settings.max_dataset_zip_entries:
+                raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Zip file has too many entries")
+            total_uncompressed = sum(info.file_size for info in entries)
+            _ensure_size_within_limit(
+                total_uncompressed,
+                settings.max_dataset_zip_uncompressed_bytes,
+                "Zip file is too large after extraction",
+            )
+            for info in entries:
                 _validate_zip_entry(info.filename)
                 filename = _safe_basename(info.filename)
                 if PurePosixPath(filename).suffix.lower() not in IMAGE_EXTENSIONS:
                     result.skipped_count += 1
                     continue
+                _ensure_size_within_limit(info.file_size, settings.max_dataset_image_bytes, "Image file is too large")
                 image_data = archive.read(info)
-                image_result = _store_image(session, storage, dataset, filename, image_data)
+                image_result = _store_image(session, storage, dataset, filename, image_data, settings)
                 result.samples.extend(image_result.samples)
                 result.created_count += image_result.created_count
                 result.duplicate_count += image_result.duplicate_count
                 result.skipped_count += image_result.skipped_count
+                result.stored_objects.extend(image_result.stored_objects)
     except BadZipFile as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid zip file") from exc
+    except Exception:
+        _cleanup_stored_objects(storage, result.stored_objects)
+        raise
     return result
 
 
@@ -206,8 +229,10 @@ def _store_image(
     dataset: Dataset,
     filename: str,
     data: bytes,
+    settings: Settings,
 ) -> _UploadResult:
     result = _UploadResult()
+    _ensure_size_within_limit(len(data), settings.max_dataset_image_bytes, "Image file is too large")
     checksum = sha256_bytes(data)
     duplicate = session.scalar(
         select(DatasetSample).where(DatasetSample.dataset_id == dataset.id, DatasetSample.checksum == checksum)
@@ -224,6 +249,7 @@ def _store_image(
         temp_path = Path(temp_file.name)
     try:
         file_uri = storage.put_file("datasets", object_name, temp_path)
+        result.stored_objects.append(("datasets", object_name))
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -248,8 +274,11 @@ def _image_dimensions(data: bytes) -> tuple[int, int]:
 
     try:
         with Image.open(_bytes_file(data)) as image:
+            image.verify()
+        with Image.open(_bytes_file(data)) as image:
+            image.load()
             return image.size
-    except UnidentifiedImageError as exc:
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid image file") from exc
 
 
@@ -280,3 +309,16 @@ def _dataset_sample_count(session: Session, dataset_id: str) -> int:
     return session.scalar(
         select(func.count()).select_from(DatasetSample).where(DatasetSample.dataset_id == dataset_id)
     ) or 0
+
+
+def _ensure_size_within_limit(size_bytes: int, max_bytes: int, detail: str) -> None:
+    if size_bytes > max_bytes:
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=detail)
+
+
+def _cleanup_stored_objects(storage: ObjectStorageClient, stored_objects: list[tuple[str, str]]) -> None:
+    for bucket, object_name in reversed(stored_objects):
+        try:
+            storage.delete_file(bucket, object_name)
+        except Exception:
+            pass

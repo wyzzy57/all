@@ -8,7 +8,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from PIL import Image
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 
 import visiox_api.main as api_main
@@ -21,6 +21,7 @@ from visiox_api.routes.dataset_samples import (
 from visiox_api.routes.datasets import get_dataset_session
 from visiox_api.routes.tasks import get_task_session
 from visiox_db.models import Annotation, Dataset, DatasetSample
+from visiox_common.settings import Settings, get_settings
 from visiox_storage.checksum import sha256_bytes
 from visiox_storage.client import InMemoryObjectStorageClient, MinioObjectStorageClient
 from visiox_yolo26.datasets.analysis import analyze_dataset
@@ -56,6 +57,7 @@ def client(session_factory, storage: InMemoryObjectStorageClient) -> Generator[T
     app.dependency_overrides[get_dataset_sample_session] = override_session
     app.dependency_overrides[get_object_storage_client] = lambda: storage
     app.dependency_overrides[get_task_session] = override_session
+    app.dependency_overrides[get_settings] = lambda: Settings()
 
     with TestClient(app) as test_client:
         yield test_client
@@ -271,6 +273,128 @@ def test_upload_duplicate_checksum_returns_existing_sample(client: TestClient):
     assert duplicate_response.json()["created_count"] == 0
     assert duplicate_response.json()["duplicate_count"] == 1
     assert duplicate_response.json()["samples"][0]["id"] == first_response.json()["samples"][0]["id"]
+
+
+def test_dataset_sample_checksum_unique_index_exists(session_factory):
+    bind = session_factory.kw["bind"]
+    indexes = inspect(bind).get_indexes("dataset_samples")
+
+    assert any(index["name"] == "uq_dataset_samples_dataset_checksum" and index["unique"] for index in indexes)
+
+
+def test_upload_rejects_oversized_file_before_storage(
+    session_factory,
+    storage: InMemoryObjectStorageClient,
+):
+    app = create_app()
+
+    def override_session() -> Generator[Session]:
+        with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_dataset_session] = override_session
+    app.dependency_overrides[get_dataset_sample_session] = override_session
+    app.dependency_overrides[get_object_storage_client] = lambda: storage
+    app.dependency_overrides[get_task_session] = override_session
+    app.dependency_overrides[get_settings] = lambda: Settings(max_dataset_upload_bytes=8)
+
+    with TestClient(app) as test_client:
+        dataset = create_dataset(test_client)
+        response = test_client.post(
+            f"/datasets/{dataset['id']}/samples:upload",
+            files={"file": ("part.png", make_image_bytes(), "image/png")},
+        )
+
+    assert response.status_code == 413
+    assert storage.objects == {}
+
+
+def test_upload_zip_rejects_too_many_entries(
+    session_factory,
+    storage: InMemoryObjectStorageClient,
+):
+    app = create_app()
+
+    def override_session() -> Generator[Session]:
+        with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_dataset_session] = override_session
+    app.dependency_overrides[get_dataset_sample_session] = override_session
+    app.dependency_overrides[get_object_storage_client] = lambda: storage
+    app.dependency_overrides[get_task_session] = override_session
+    app.dependency_overrides[get_settings] = lambda: Settings(max_dataset_zip_entries=1)
+
+    with TestClient(app) as test_client:
+        dataset = create_dataset(test_client)
+        response = test_client.post(
+            f"/datasets/{dataset['id']}/samples:upload",
+            files={"file": ("batch.zip", make_zip_bytes({"a.txt": b"a", "b.txt": b"b"}), "application/zip")},
+        )
+
+    assert response.status_code == 413
+    assert storage.objects == {}
+
+
+def test_upload_zip_rejects_uncompressed_size_before_read(
+    session_factory,
+    storage: InMemoryObjectStorageClient,
+):
+    app = create_app()
+
+    def override_session() -> Generator[Session]:
+        with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_dataset_session] = override_session
+    app.dependency_overrides[get_dataset_sample_session] = override_session
+    app.dependency_overrides[get_object_storage_client] = lambda: storage
+    app.dependency_overrides[get_task_session] = override_session
+    app.dependency_overrides[get_settings] = lambda: Settings(max_dataset_zip_uncompressed_bytes=1)
+
+    with TestClient(app) as test_client:
+        dataset = create_dataset(test_client)
+        response = test_client.post(
+            f"/datasets/{dataset['id']}/samples:upload",
+            files={"file": ("batch.zip", make_zip_bytes({"a.txt": b"abc"}), "application/zip")},
+        )
+
+    assert response.status_code == 413
+    assert storage.objects == {}
+
+
+def test_upload_rejects_truncated_image_and_keeps_storage_empty(
+    client: TestClient,
+    storage: InMemoryObjectStorageClient,
+):
+    dataset = create_dataset(client)
+    response = client.post(
+        f"/datasets/{dataset['id']}/samples:upload",
+        files={"file": ("broken.png", make_image_bytes()[:12], "image/png")},
+    )
+
+    assert response.status_code == 400
+    assert storage.objects == {}
+
+
+def test_upload_zip_cleans_previously_stored_objects_when_later_entry_fails(
+    client: TestClient,
+    storage: InMemoryObjectStorageClient,
+):
+    dataset = create_dataset(client)
+    response = client.post(
+        f"/datasets/{dataset['id']}/samples:upload",
+        files={
+            "file": (
+                "batch.zip",
+                make_zip_bytes({"first.png": make_image_bytes(), "broken.png": b"not an image"}),
+                "application/zip",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert storage.objects == {}
 
 
 def test_list_samples_supports_split_and_annotation_status_filters(client: TestClient):

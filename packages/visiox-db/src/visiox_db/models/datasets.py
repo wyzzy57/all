@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from visiox_db.base import Base, IdMixin, TimestampMixin
@@ -22,6 +22,16 @@ class Dataset(IdMixin, TimestampMixin, Base):
 
 class DatasetSample(IdMixin, TimestampMixin, Base):
     __tablename__ = "dataset_samples"
+    __table_args__ = (
+        Index(
+            "uq_dataset_samples_dataset_checksum",
+            "dataset_id",
+            "checksum",
+            unique=True,
+            postgresql_where=text("checksum IS NOT NULL"),
+            sqlite_where=text("checksum IS NOT NULL"),
+        ),
+    )
 
     dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), nullable=False, index=True)
     file_uri: Mapped[str] = mapped_column(Text, nullable=False)
