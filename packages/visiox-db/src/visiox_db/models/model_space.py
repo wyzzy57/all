@@ -52,7 +52,7 @@ class TrainingJob(IdMixin, TimestampMixin, Base):
 
     pipeline_id: Mapped[str] = mapped_column(ForeignKey("training_pipelines.id"), nullable=False)
     task_id: Mapped[str | None] = mapped_column(ForeignKey("tasks.id"))
-    trained_model_id: Mapped[str | None] = mapped_column(ForeignKey("trained_models.id"))
+    trained_model_id: Mapped[str | None] = mapped_column(String(36))
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="pending", index=True)
     params: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

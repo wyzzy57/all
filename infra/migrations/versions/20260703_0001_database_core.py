@@ -247,7 +247,6 @@ def upgrade() -> None:
         pk("training_jobs"),
         sa.ForeignKeyConstraint(["pipeline_id"], ["training_pipelines.id"], name="fk_training_jobs_pipeline_id_training_pipelines"),
         sa.ForeignKeyConstraint(["task_id"], ["tasks.id"], name="fk_training_jobs_task_id_tasks"),
-        sa.ForeignKeyConstraint(["trained_model_id"], ["trained_models.id"], name="fk_training_jobs_trained_model_id_trained_models"),
     )
     op.create_index("ix_training_jobs_status", "training_jobs", ["status"])
 

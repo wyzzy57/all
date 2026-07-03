@@ -44,6 +44,18 @@ def test_alembic_upgrade_creates_database_core_tables(tmp_path):
     assert {"users", "roles", "permissions"}.isdisjoint(table_names)
 
 
+def test_training_jobs_does_not_reference_trained_models(tmp_path):
+    database_path = tmp_path / "visiox.db"
+    database_url = f"sqlite:///{database_path}"
+
+    command.upgrade(_alembic_config(database_url), "head")
+
+    engine = create_engine(database_url)
+    foreign_keys = inspect(engine).get_foreign_keys("training_jobs")
+
+    assert "trained_models" not in {foreign_key["referred_table"] for foreign_key in foreign_keys}
+
+
 def test_yolo26_base_model_seed_has_all_tasks_and_scales():
     seed_path = Path("infra/seed/yolo26_base_models.json")
 
