@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "lint": "ruff check apps packages tests",
     "test": "pytest",
     "test:health": "pytest tests/integration/test_api_health.py -v",
     "compose:up": "docker compose -f infra/compose/docker-compose.yml up --build",
