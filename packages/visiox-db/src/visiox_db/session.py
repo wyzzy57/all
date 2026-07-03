@@ -15,9 +15,7 @@ def create_session_factory(engine: Engine | None = None) -> sessionmaker[Session
     return sessionmaker(bind=engine or create_db_engine(), autoflush=False, expire_on_commit=False)
 
 
-SessionLocal = create_session_factory()
-
-
 def get_session() -> Generator[Session]:
-    with SessionLocal() as session:
+    session_factory = create_session_factory()
+    with session_factory() as session:
         yield session

@@ -30,10 +30,10 @@ target_metadata = Base.metadata
 
 
 def _database_url() -> str:
-    configured_url = config.get_main_option("sqlalchemy.url")
-    if configured_url:
-        return configured_url
-    return os.environ["VISIOX_POSTGRES_DSN"]
+    environment_url = os.environ.get("VISIOX_POSTGRES_DSN")
+    if environment_url:
+        return environment_url
+    return config.get_main_option("sqlalchemy.url")
 
 
 def run_migrations_offline() -> None:
