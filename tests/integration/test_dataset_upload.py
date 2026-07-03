@@ -1,5 +1,6 @@
 from collections.abc import Generator
 from io import BytesIO
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
@@ -10,13 +11,18 @@ from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+import visiox_api.main as api_main
 from visiox_api.main import create_app
-from visiox_api.routes.dataset_samples import get_dataset_sample_session, get_object_storage_client
+from visiox_api.routes.dataset_samples import (
+    _validate_zip_entry,
+    get_dataset_sample_session,
+    get_object_storage_client,
+)
 from visiox_api.routes.datasets import get_dataset_session
 from visiox_api.routes.tasks import get_task_session
 from visiox_db.models import Annotation, Dataset, DatasetSample
 from visiox_storage.checksum import sha256_bytes
-from visiox_storage.client import InMemoryObjectStorageClient
+from visiox_storage.client import InMemoryObjectStorageClient, MinioObjectStorageClient
 from visiox_yolo26.datasets.analysis import analyze_dataset
 from visiox_yolo26.datasets.validation import validate_dataset_format
 
@@ -168,6 +174,83 @@ def test_upload_zip_indexes_images_skips_non_images_and_rejects_zip_slip(client:
 
     assert unsafe_response.status_code == 400
     assert "unsafe" in unsafe_response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    "unsafe_entry",
+    [
+        "C:/outside.png",
+        "C:\\outside.png",
+        "\\\\server\\share\\outside.png",
+        "/outside.png",
+    ],
+)
+def test_upload_zip_rejects_windows_absolute_and_backslash_entries(
+    client: TestClient,
+    unsafe_entry: str,
+):
+    dataset = create_dataset(client)
+    unsafe_zip = make_zip_bytes({unsafe_entry: make_image_bytes()})
+
+    response = client.post(
+        f"/datasets/{dataset['id']}/samples:upload",
+        files={"file": ("unsafe.zip", unsafe_zip, "application/zip")},
+    )
+
+    assert response.status_code == 400
+    assert "unsafe" in response.json()["detail"].lower()
+
+
+def test_zip_entry_validator_rejects_relative_backslash_path():
+    with pytest.raises(Exception) as error:
+        _validate_zip_entry("nested\\outside.png")
+
+    assert getattr(error.value, "status_code") == 400
+    assert "unsafe" in error.value.detail.lower()
+
+
+def test_get_object_storage_client_requires_app_state_storage():
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+    with pytest.raises(Exception) as error:
+        get_object_storage_client(request)
+
+    assert getattr(error.value, "status_code") == 500
+    assert "object storage" in error.value.detail.lower()
+
+
+def test_create_app_lifespan_configures_minio_object_storage(monkeypatch):
+    created_clients = []
+
+    class FakeMinioObjectStorageClient:
+        def __init__(
+            self,
+            endpoint: str,
+            access_key: str,
+            secret_key: str,
+            secure: bool = False,
+        ) -> None:
+            self.endpoint = endpoint
+            self.access_key = access_key
+            self.secret_key = secret_key
+            self.secure = secure
+            created_clients.append(self)
+
+    monkeypatch.setattr(api_main, "MinioObjectStorageClient", FakeMinioObjectStorageClient, raising=False)
+
+    app = create_app()
+
+    with TestClient(app):
+        storage = app.state.object_storage
+
+    assert storage is created_clients[0]
+    assert isinstance(storage, FakeMinioObjectStorageClient)
+    assert storage.endpoint == "minio:9000"
+    assert storage.access_key == "visiox"
+    assert storage.secret_key == "visiox123"
+    assert storage.secure is False
+    assert not isinstance(storage, InMemoryObjectStorageClient)
+    assert not isinstance(storage, MinioObjectStorageClient)
 
 
 def test_upload_duplicate_checksum_returns_existing_sample(client: TestClient):

@@ -13,7 +13,7 @@ from visiox_api.routes.datasets import dataset_or_404
 from visiox_db.models import Dataset, DatasetSample
 from visiox_db.session import get_session
 from visiox_storage.checksum import sha256_bytes
-from visiox_storage.client import InMemoryObjectStorageClient, ObjectStorageClient
+from visiox_storage.client import ObjectStorageClient
 
 
 router = APIRouter(prefix="/datasets/{dataset_id}/samples", tags=["dataset-samples"])
@@ -68,7 +68,10 @@ def get_object_storage_client(request: Request) -> ObjectStorageClient:
     storage = getattr(request.app.state, "object_storage", None)
     if storage is not None:
         return storage
-    return InMemoryObjectStorageClient()
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Object storage client is not configured",
+    )
 
 
 @router.post(":upload", response_model=SampleUploadResponse, status_code=status.HTTP_201_CREATED)
@@ -257,9 +260,13 @@ def _bytes_file(data: bytes):
 
 
 def _validate_zip_entry(filename: str) -> None:
+    if "\\" in filename:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe zip entry: {filename}")
+    if len(filename) >= 2 and filename[1] == ":":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe zip entry: {filename}")
     normalized = filename.replace("\\", "/")
     path = PurePosixPath(normalized)
-    if path.is_absolute() or any(part == ".." for part in path.parts):
+    if normalized.startswith("//") or path.is_absolute() or any(part == ".." for part in path.parts):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe zip entry: {filename}")
 
 

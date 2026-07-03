@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     postgres_dsn: str = "postgresql+psycopg://visiox:visiox@postgres:5432/visiox"
     redis_url: str = "redis://redis:6379/0"
     minio_endpoint: str = "minio:9000"
+    minio_access_key: str = "visiox"
+    minio_secret_key: str = "visiox123"
+    minio_secure: bool = False
     registry_url: str = "registry:5000"
     label_studio_url: str = "http://label-studio:8080"
 

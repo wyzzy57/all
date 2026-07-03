@@ -10,13 +10,21 @@ from visiox_api.routes.dataset_samples import router as dataset_samples_router
 from visiox_api.routes.datasets import router as datasets_router
 from visiox_api.routes.tasks import router as tasks_router
 from visiox_api.ws.tasks import router as task_progress_router
+from visiox_storage.client import MinioObjectStorageClient
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from redis import asyncio as redis
 
-    app.state.redis = redis.from_url(get_settings().redis_url, decode_responses=True)
+    settings = get_settings()
+    app.state.redis = redis.from_url(settings.redis_url, decode_responses=True)
+    app.state.object_storage = MinioObjectStorageClient(
+        endpoint=settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        secure=settings.minio_secure,
+    )
     try:
         yield
     finally:
