@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from visiox_common.settings import get_settings
 from visiox_api.routes.base_models import router as base_models_router
@@ -14,6 +15,7 @@ from visiox_api.routes.edge_apps import router as edge_apps_router
 from visiox_api.routes.label_projects import router as label_projects_router
 from visiox_api.routes.pipelines import router as pipelines_router
 from visiox_api.routes.tasks import router as tasks_router
+from visiox_api.routes.trained_models import router as trained_models_router
 from visiox_api.routes.training_jobs import router as training_jobs_router
 from visiox_api.ws.tasks import router as task_progress_router
 from visiox_storage.client import MinioObjectStorageClient
@@ -41,6 +43,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Visiox API", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -68,6 +76,7 @@ def create_app() -> FastAPI:
     app.include_router(label_projects_router)
     app.include_router(pipelines_router)
     app.include_router(training_jobs_router)
+    app.include_router(trained_models_router)
     app.include_router(task_progress_router)
 
     return app
