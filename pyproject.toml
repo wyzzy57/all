@@ -32,6 +32,7 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = [
   "apps/api-service/src/visiox_api",
+  "apps/edge-agent/src/visiox_edge_agent",
   "packages/visiox-common/src/visiox_common",
   "packages/visiox-db/src/visiox_db",
   "packages/visiox-messaging/src/visiox_messaging",
@@ -39,12 +40,14 @@ packages = [
   "packages/visiox-yolo26/src/visiox_yolo26",
   "workers/label-sync-worker/src/visiox_label_sync_worker",
   "workers/model-worker/src/visiox_model_worker",
+  "workers/deployment-worker/src/visiox_deployment_worker",
   "workers/training-worker/src/visiox_training_worker",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = [
   "apps/api-service/src",
+  "apps/edge-agent/src",
   "packages/visiox-common/src",
   "packages/visiox-db/src",
   "packages/visiox-messaging/src",
@@ -52,6 +55,7 @@ pythonpath = [
   "packages/visiox-yolo26/src",
   "workers/label-sync-worker/src",
   "workers/model-worker/src",
+  "workers/deployment-worker/src",
   "workers/training-worker/src",
 ]
 testpaths = ["tests"]
