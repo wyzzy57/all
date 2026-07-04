@@ -33,6 +33,7 @@ dev = [
 packages = [
   "apps/api-service/src/visiox_api",
   "apps/edge-agent/src/visiox_edge_agent",
+  "apps/yolo26-inference/src/visiox_yolo26_inference",
   "packages/visiox-common/src/visiox_common",
   "packages/visiox-db/src/visiox_db",
   "packages/visiox-messaging/src/visiox_messaging",
@@ -48,6 +49,7 @@ packages = [
 pythonpath = [
   "apps/api-service/src",
   "apps/edge-agent/src",
+  "apps/yolo26-inference/src",
   "packages/visiox-common/src",
   "packages/visiox-db/src",
   "packages/visiox-messaging/src",
