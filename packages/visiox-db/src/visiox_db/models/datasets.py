@@ -54,6 +54,14 @@ class Annotation(IdMixin, TimestampMixin, Base):
 
 class LabelProject(IdMixin, TimestampMixin, Base):
     __tablename__ = "label_projects"
+    __table_args__ = (
+        Index(
+            "uq_label_projects_dataset_provider",
+            "dataset_id",
+            "provider",
+            unique=True,
+        ),
+    )
 
     dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), nullable=False, index=True)
     provider: Mapped[str] = mapped_column(String(80), nullable=False)

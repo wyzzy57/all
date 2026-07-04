@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from visiox_api.routes.datasets import dataset_or_404
@@ -72,8 +73,12 @@ def get_label_sync_stream_producer(request: Request) -> RedisStreamProducer:
     return RedisStreamProducer(request.app.state.redis)
 
 
-def get_label_studio_client(settings: Settings = Depends(get_settings)) -> LabelStudioClient:
-    return LabelStudioClient(base_url=settings.label_studio_url, token=settings.label_studio_token)
+def get_label_studio_client(settings: Settings = Depends(get_settings)) -> Generator[LabelStudioClient]:
+    client = LabelStudioClient(base_url=settings.label_studio_url, token=settings.label_studio_token)
+    try:
+        yield client
+    finally:
+        client.close()
 
 
 async def _enqueue(producer: Any, command: TaskCommand) -> str:
@@ -104,6 +109,7 @@ def create_label_project(
     request = request or LabelProjectCreateRequest()
     external_project_id = request.external_project_id
     if external_project_id:
+        _validate_external_project_id(external_project_id)
         label_studio.get_project(external_project_id)
     else:
         label_config = build_label_config(dataset.task, dataset.class_schema)
@@ -117,7 +123,15 @@ def create_label_project(
         sync_status="pending",
     )
     session.add(label_project)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        existing = _find_dataset_label_project(session, dataset_id)
+        if existing is not None:
+            response.status_code = status.HTTP_200_OK
+            return existing
+        raise
     session.refresh(label_project)
     return label_project
 
@@ -224,3 +238,11 @@ def _label_project_or_404(session: Session, project_id: str) -> LabelProject:
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Label project not found")
     return project
+
+
+def _validate_external_project_id(external_project_id: str) -> None:
+    if not external_project_id.isdecimal() or int(external_project_id) <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="external_project_id must be a positive integer string",
+        )

@@ -7,6 +7,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from visiox_api.main import create_app
@@ -60,6 +61,9 @@ class FakeLabelStudioClient:
     def export_annotations(self, project_id: str | int) -> list[dict[str, object]]:
         del project_id
         return self.export_payload
+
+    def close(self) -> None:
+        pass
 
 
 class FailingLabelStudioClient(FakeLabelStudioClient):
@@ -190,6 +194,32 @@ def test_label_studio_client_uses_token_and_raises_on_http_errors():
     assert client.create_project("dataset", "<View />") == {"id": 12}
     with pytest.raises(LabelStudioError, match="500"):
         client.get_project(12)
+    client.close()
+
+
+def test_label_studio_client_supports_context_manager():
+    closed = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json={"id": 12})
+
+    with LabelStudioClient(
+        base_url="http://label-studio.local/",
+        token="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        assert client.get_project(12) == {"id": 12}
+        original_close = client.close
+
+        def close_once() -> None:
+            nonlocal closed
+            closed = True
+            original_close()
+
+        client.close = close_once
+
+    assert closed is True
 
 
 def test_create_label_project_calls_label_studio_and_is_idempotent(
@@ -234,6 +264,22 @@ def test_link_existing_label_project_does_not_create_external_project(
     assert label_client.created_projects == []
 
 
+def test_link_existing_label_project_rejects_unsafe_external_project_id(
+    client: TestClient,
+    session_factory,
+    label_client: FakeLabelStudioClient,
+):
+    dataset_id = create_dataset_row(session_factory)
+
+    response = client.post(
+        f"/datasets/{dataset_id}/label-projects",
+        json={"external_project_id": "123/../../bad"},
+    )
+
+    assert response.status_code == 422
+    assert label_client.created_projects == []
+
+
 def test_sync_samples_endpoint_creates_task_and_enqueues_command(
     client: TestClient,
     session_factory,
@@ -251,6 +297,29 @@ def test_sync_samples_endpoint_creates_task_and_enqueues_command(
     assert body["payload"] == {"dataset_id": dataset_id, "label_project_id": project["id"]}
     assert len(stream_producer.commands) == 1
     assert stream_producer.commands[0].task_type == TaskType.SYNC_LABEL_STUDIO_DATA
+
+
+def test_database_rejects_duplicate_label_project_for_dataset_provider(session_factory):
+    dataset_id = create_dataset_row(session_factory)
+    with session_factory() as session:
+        session.add_all(
+            [
+                LabelProject(
+                    dataset_id=dataset_id,
+                    provider="label_studio",
+                    external_project_id="1",
+                    sync_status="pending",
+                ),
+                LabelProject(
+                    dataset_id=dataset_id,
+                    provider="label_studio",
+                    external_project_id="2",
+                    sync_status="pending",
+                ),
+            ]
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
 
 
 def test_sync_samples_endpoint_marks_task_failed_when_enqueue_fails(session_factory, label_client):
@@ -289,12 +358,15 @@ def test_worker_syncs_samples_to_label_studio(session_factory, label_client: Fak
             task_type=TaskType.SYNC_LABEL_STUDIO_DATA.value,
             status=TaskStatus.QUEUED.value,
             resource_type="label_project",
-            payload={"label_project_id": "pending"},
+            payload={},
         )
         session.add_all([project, task])
         session.commit()
         project_id = project.id
         task_id = task.id
+        task.payload = {"label_project_id": project_id}
+        session.add(task)
+        session.commit()
 
     with session_factory() as session:
         sync_label_project_samples(session, label_client, task_id, project_id)
@@ -356,12 +428,15 @@ def test_worker_imports_annotations_and_writes_raw_payload_to_storage(session_fa
             task_type=TaskType.IMPORT_LABEL_STUDIO_ANNOTATION.value,
             status=TaskStatus.QUEUED.value,
             resource_type="label_project",
-            payload={"label_project_id": "pending"},
+            payload={},
         )
         session.add_all([project, task])
         session.commit()
         project_id = project.id
         task_id = task.id
+        task.payload = {"label_project_id": project_id}
+        session.add(task)
+        session.commit()
 
     with session_factory() as session:
         import_label_project_annotations(session, storage, label_client, task_id, project_id)
@@ -381,6 +456,56 @@ def test_worker_imports_annotations_and_writes_raw_payload_to_storage(session_fa
     assert len(storage.objects) == 1
 
 
+def test_worker_cleans_raw_payload_when_later_annotation_import_fails(session_factory):
+    dataset_id, sample_id = create_dataset_with_sample(session_factory)
+    storage = InMemoryObjectStorageClient()
+    label_client = FakeLabelStudioClient()
+    label_client.export_payload = [
+        {
+            "id": 101,
+            "data": {"visiox_sample_id": sample_id},
+            "annotations": [{"id": 1, "result": []}],
+        },
+        {
+            "id": 102,
+            "data": {"visiox_sample_id": "missing-sample"},
+            "annotations": [{"id": 2, "result": []}],
+        },
+    ]
+
+    with session_factory() as session:
+        project = LabelProject(
+            dataset_id=dataset_id,
+            provider="label_studio",
+            external_project_id="9001",
+            sync_status="synced",
+        )
+        task = Task(
+            task_type=TaskType.IMPORT_LABEL_STUDIO_ANNOTATION.value,
+            status=TaskStatus.QUEUED.value,
+            resource_type="label_project",
+            resource_id=None,
+            payload={},
+        )
+        session.add_all([project, task])
+        session.commit()
+        project_id = project.id
+        task_id = task.id
+        task.payload = {"label_project_id": project_id}
+        session.add(task)
+        session.commit()
+
+    with session_factory() as session:
+        import_label_project_annotations(session, storage, label_client, task_id, project_id)
+
+    with session_factory() as session:
+        task = session.get(Task, task_id)
+        assert task.status == TaskStatus.FAILED.value
+        assert task.error_code == "LABEL_STUDIO_IMPORT_FAILED"
+
+    assert storage.objects == {}
+
+
 def test_worker_marks_task_and_project_failed_when_label_studio_errors(session_factory):
     dataset_id, _sample_id = create_dataset_with_sample(session_factory)
     with session_factory() as session:
@@ -394,12 +519,15 @@ def test_worker_marks_task_and_project_failed_when_label_studio_errors(session_f
             task_type=TaskType.SYNC_LABEL_STUDIO_DATA.value,
             status=TaskStatus.QUEUED.value,
             resource_type="label_project",
-            payload={"label_project_id": "pending"},
+            payload={},
         )
         session.add_all([project, task])
         session.commit()
         project_id = project.id
         task_id = task.id
+        task.payload = {"label_project_id": project_id}
+        session.add(task)
+        session.commit()
 
     with session_factory() as session:
         sync_label_project_samples(session, FailingLabelStudioClient(), task_id, project_id)

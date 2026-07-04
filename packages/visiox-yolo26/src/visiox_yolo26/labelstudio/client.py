@@ -1,4 +1,5 @@
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -27,16 +28,25 @@ class LabelStudioClient:
         return self._request("POST", "/api/projects", json={"title": title, "label_config": label_config})
 
     def get_project(self, project_id: str | int) -> dict[str, Any]:
-        return self._request("GET", f"/api/projects/{project_id}")
+        return self._request("GET", f"/api/projects/{_safe_project_id(project_id)}")
 
     def import_tasks(self, project_id: str | int, tasks: list[dict[str, Any]]) -> dict[str, Any]:
-        return self._request("POST", f"/api/projects/{project_id}/import", json=tasks)
+        return self._request("POST", f"/api/projects/{_safe_project_id(project_id)}/import", json=tasks)
 
     def export_annotations(self, project_id: str | int) -> list[dict[str, Any]]:
-        result = self._request("GET", f"/api/projects/{project_id}/export")
+        result = self._request("GET", f"/api/projects/{_safe_project_id(project_id)}/export")
         if not isinstance(result, list):
             raise LabelStudioError("Label Studio export response must be a list")
         return result
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "LabelStudioClient":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         response = self._client.request(method, path, **kwargs)
@@ -46,3 +56,7 @@ class LabelStudioClient:
         if response.content:
             return response.json()
         return {}
+
+
+def _safe_project_id(project_id: str | int) -> str:
+    return quote(str(project_id), safe="")

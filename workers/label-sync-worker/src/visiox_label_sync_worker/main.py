@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from visiox_common.tasks import TaskStatus
+from visiox_common.tasks import TaskStatus, TaskType
 from visiox_db.models import Annotation, Dataset, DatasetSample, LabelProject, Task
 from visiox_storage.client import ObjectStorageClient
 from visiox_yolo26.labelstudio.importer import normalize_label_studio_task
@@ -17,6 +17,7 @@ def sync_label_project_samples(session: Session, client: Any, task_id: str, labe
     task = _start_task(session, task_id, "syncing_samples")
     project = _label_project_or_raise(session, label_project_id)
     try:
+        _validate_task(task, project, TaskType.SYNC_LABEL_STUDIO_DATA)
         samples = session.scalars(
             select(DatasetSample)
             .where(DatasetSample.dataset_id == project.dataset_id)
@@ -56,14 +57,17 @@ def import_label_project_annotations(
 ) -> Task:
     task = _start_task(session, task_id, "importing_annotations")
     project = _label_project_or_raise(session, label_project_id)
+    stored_objects: list[tuple[str, str]] = []
     try:
+        _validate_task(task, project, TaskType.IMPORT_LABEL_STUDIO_ANNOTATION)
         export_payload = client.export_annotations(project.external_project_id)
         for task_payload in export_payload:
             normalized = normalize_label_studio_task(task_payload)
             sample = session.get(DatasetSample, normalized.sample_id)
             if sample is None or sample.dataset_id != project.dataset_id:
                 raise ValueError(f"Unknown dataset sample in Label Studio export: {normalized.sample_id}")
-            raw_payload_uri = _store_raw_payload(storage, project, sample, task_payload)
+            raw_payload_uri, stored_object = _store_raw_payload(storage, project, sample, task_payload)
+            stored_objects.append(stored_object)
             annotation = session.scalar(
                 select(Annotation).where(
                     Annotation.dataset_sample_id == sample.id,
@@ -96,6 +100,7 @@ def import_label_project_annotations(
         session.refresh(task)
         return task
     except Exception as exc:
+        _cleanup_stored_objects(storage, stored_objects)
         return _fail_task(session, task, project, "LABEL_STUDIO_IMPORT_FAILED", exc)
 
 
@@ -131,13 +136,14 @@ def _store_raw_payload(
     project: LabelProject,
     sample: DatasetSample,
     payload: dict[str, Any],
-) -> str:
+) -> tuple[str, tuple[str, str]]:
+    bucket = "label-studio"
     object_name = f"{project.dataset_id}/label-studio/{project.id}/{sample.id}.json"
     with NamedTemporaryFile("w", encoding="utf-8", delete=False) as temp_file:
         json.dump(payload, temp_file, ensure_ascii=True, separators=(",", ":"))
         temp_path = Path(temp_file.name)
     try:
-        return storage.put_file("label-studio", object_name, temp_path, content_type="application/json")
+        return storage.put_file(bucket, object_name, temp_path, content_type="application/json"), (bucket, object_name)
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -154,6 +160,24 @@ def _label_project_or_raise(session: Session, label_project_id: str) -> LabelPro
     if project is None:
         raise ValueError(f"Label project not found: {label_project_id}")
     return project
+
+
+def _validate_task(task: Task, project: LabelProject, expected_type: TaskType) -> None:
+    if task.task_type != expected_type.value:
+        raise ValueError(f"Task {task.id} is not {expected_type.value}")
+    if task.resource_id is not None and task.resource_id != project.id:
+        raise ValueError(f"Task {task.id} does not target label project {project.id}")
+    payload_project_id = task.payload.get("label_project_id")
+    if payload_project_id is not None and payload_project_id != project.id:
+        raise ValueError(f"Task {task.id} payload does not target label project {project.id}")
+
+
+def _cleanup_stored_objects(storage: ObjectStorageClient, stored_objects: list[tuple[str, str]]) -> None:
+    for bucket, object_name in reversed(stored_objects):
+        try:
+            storage.delete_file(bucket, object_name)
+        except Exception:
+            pass
 
 
 def _utc_now() -> datetime:

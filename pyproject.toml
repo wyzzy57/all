@@ -42,8 +42,6 @@ packages = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "--basetemp=.pytest_tmp"
-cache_dir = ".pytest_tmp/cache"
 pythonpath = [
   "apps/api-service/src",
   "packages/visiox-common/src",
