@@ -39,6 +39,7 @@ packages = [
   "packages/visiox-yolo26/src/visiox_yolo26",
   "workers/label-sync-worker/src/visiox_label_sync_worker",
   "workers/model-worker/src/visiox_model_worker",
+  "workers/training-worker/src/visiox_training_worker",
 ]
 
 [tool.pytest.ini_options]
@@ -51,5 +52,6 @@ pythonpath = [
   "packages/visiox-yolo26/src",
   "workers/label-sync-worker/src",
   "workers/model-worker/src",
+  "workers/training-worker/src",
 ]
 testpaths = ["tests"]

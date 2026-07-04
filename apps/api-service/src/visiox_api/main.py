@@ -9,7 +9,9 @@ from visiox_api.routes.base_models import router as base_models_router
 from visiox_api.routes.dataset_samples import router as dataset_samples_router
 from visiox_api.routes.datasets import router as datasets_router
 from visiox_api.routes.label_projects import router as label_projects_router
+from visiox_api.routes.pipelines import router as pipelines_router
 from visiox_api.routes.tasks import router as tasks_router
+from visiox_api.routes.training_jobs import router as training_jobs_router
 from visiox_api.ws.tasks import router as task_progress_router
 from visiox_storage.client import MinioObjectStorageClient
 
@@ -58,6 +60,8 @@ def create_app() -> FastAPI:
     app.include_router(datasets_router)
     app.include_router(dataset_samples_router)
     app.include_router(label_projects_router)
+    app.include_router(pipelines_router)
+    app.include_router(training_jobs_router)
     app.include_router(task_progress_router)
 
     return app
