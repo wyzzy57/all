@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from visiox_db.base import Base, IdMixin, TimestampMixin
@@ -38,6 +38,7 @@ class EdgeApp(IdMixin, TimestampMixin, Base):
 
 class EdgeAppVersion(IdMixin, TimestampMixin, Base):
     __tablename__ = "edge_app_versions"
+    __table_args__ = (Index("uq_edge_app_versions_edge_app_id_version", "edge_app_id", "version", unique=True),)
 
     edge_app_id: Mapped[str] = mapped_column(ForeignKey("edge_apps.id"), nullable=False, index=True)
     trained_model_id: Mapped[str | None] = mapped_column(ForeignKey("trained_models.id"))

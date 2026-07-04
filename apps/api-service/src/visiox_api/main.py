@@ -8,6 +8,7 @@ from visiox_common.settings import get_settings
 from visiox_api.routes.base_models import router as base_models_router
 from visiox_api.routes.dataset_samples import router as dataset_samples_router
 from visiox_api.routes.datasets import router as datasets_router
+from visiox_api.routes.edge_apps import router as edge_apps_router
 from visiox_api.routes.label_projects import router as label_projects_router
 from visiox_api.routes.pipelines import router as pipelines_router
 from visiox_api.routes.tasks import router as tasks_router
@@ -59,6 +60,7 @@ def create_app() -> FastAPI:
     app.include_router(base_models_router)
     app.include_router(datasets_router)
     app.include_router(dataset_samples_router)
+    app.include_router(edge_apps_router)
     app.include_router(label_projects_router)
     app.include_router(pipelines_router)
     app.include_router(training_jobs_router)
