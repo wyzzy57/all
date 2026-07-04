@@ -1,0 +1,29 @@
+[
+  {
+    "id": 101,
+    "data": {
+      "image": "memory://datasets/sample-one.png",
+      "visiox_sample_id": "sample-one"
+    },
+    "annotations": [
+      {
+        "id": 201,
+        "result": [
+          {
+            "id": "rect-1",
+            "from_name": "label",
+            "to_name": "image",
+            "type": "rectanglelabels",
+            "value": {
+              "x": 10,
+              "y": 20,
+              "width": 30,
+              "height": 40,
+              "rectanglelabels": ["defect"]
+            }
+          }
+        ]
+      }
+    ]
+  }
+]

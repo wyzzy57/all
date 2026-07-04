@@ -37,10 +37,13 @@ packages = [
   "packages/visiox-messaging/src/visiox_messaging",
   "packages/visiox-storage/src/visiox_storage",
   "packages/visiox-yolo26/src/visiox_yolo26",
+  "workers/label-sync-worker/src/visiox_label_sync_worker",
   "workers/model-worker/src/visiox_model_worker",
 ]
 
 [tool.pytest.ini_options]
+addopts = "--basetemp=.pytest_tmp"
+cache_dir = ".pytest_tmp/cache"
 pythonpath = [
   "apps/api-service/src",
   "packages/visiox-common/src",
@@ -48,6 +51,7 @@ pythonpath = [
   "packages/visiox-messaging/src",
   "packages/visiox-storage/src",
   "packages/visiox-yolo26/src",
+  "workers/label-sync-worker/src",
   "workers/model-worker/src",
 ]
 testpaths = ["tests"]

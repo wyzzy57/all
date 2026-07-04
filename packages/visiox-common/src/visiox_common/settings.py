@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     max_dataset_zip_uncompressed_bytes: int = 500 * 1024 * 1024
     registry_url: str = "registry:5000"
     label_studio_url: str = "http://label-studio:8080"
+    label_studio_token: str = ""
+    label_studio_sync_stream: str = "stream:label_sync.commands"
 
 
 @lru_cache
