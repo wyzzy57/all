@@ -5,20 +5,27 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from visiox_common.tasks import TaskStatus, TaskType
-from visiox_db.models import BaseModel, Task, TrainedModel, TrainingJob, TrainingPipeline
+from visiox_db.models import BaseModel, Dataset, Task, TrainedModel, TrainingJob, TrainingPipeline
 from visiox_storage.client import ObjectStorageClient
 from visiox_yolo26.converters import export_yolo26_dataset
 from visiox_yolo26.converters.internal_schema import parse_storage_uri
 from visiox_yolo26.training.commands import build_train_command
+from visiox_yolo26.training.prechecks import validate_training_resources
 
 
 TERMINAL_TASK_STATUSES = {TaskStatus.SUCCESS.value, TaskStatus.FAILED.value, TaskStatus.CANCELED.value}
 
 
 class TrainingWorkerError(RuntimeError):
+    pass
+
+
+class InvalidTaskPayloadError(TrainingWorkerError):
     pass
 
 
@@ -57,25 +64,46 @@ def run_training_job(
     if task.status in TERMINAL_TASK_STATUSES and task.status != TaskStatus.SUCCESS.value:
         raise TrainingWorkerError(f"task is terminal: {task.status}")
 
-    pipeline = session.get(TrainingPipeline, job.pipeline_id)
-    if pipeline is None:
-        raise TrainingWorkerError("training pipeline not found")
-    base_model = session.get(BaseModel, pipeline.base_model_id)
-    if base_model is None or base_model.local_uri is None:
-        raise TrainingWorkerError("base model artifact not found")
-
     work_dir.mkdir(parents=True, exist_ok=True)
     now = _utc_now()
-    task.status = TaskStatus.RUNNING.value
-    task.stage = "prepare"
-    task.started_at = task.started_at or now
+    claimed = session.execute(
+        update(Task)
+        .where(Task.id == task.id, Task.status == TaskStatus.QUEUED.value)
+        .values(status=TaskStatus.RUNNING.value, stage="prepare", started_at=task.started_at or now)
+    ).rowcount
+    if claimed != 1:
+        session.rollback()
+        task = _require_task(session, task_id, training_job_id)
+        job = _require_job(session, training_job_id, task_id)
+        if job.status == "success" and job.trained_model_id is not None:
+            return TrainingResult(training_job_id=job.id, trained_model_id=job.trained_model_id, status=job.status)
+        raise TrainingWorkerError(f"task is already claimed: {task.status}")
     job.status = "running"
     job.started_at = job.started_at or now
-    session.add_all([task, job])
+    session.add(job)
     session.commit()
+    task = _require_task(session, task_id, training_job_id)
+    job = _require_job(session, training_job_id, task_id)
+    stored_objects: list[tuple[str, str]] = []
 
     try:
-        base_model_path = _download_base_model(storage, base_model, work_dir / "base-model" / base_model.filename)
+        pipeline = session.get(TrainingPipeline, job.pipeline_id)
+        if pipeline is None:
+            raise TrainingWorkerError("training pipeline not found")
+        base_model = session.get(BaseModel, pipeline.base_model_id)
+        dataset = session.get(Dataset, pipeline.dataset_id)
+        if base_model is None or dataset is None:
+            raise TrainingWorkerError("pipeline resources are missing")
+        validate_training_resources(
+            session,
+            task=pipeline.task,
+            scale=pipeline.scale,
+            base_model_id=base_model.id,
+            dataset_id=dataset.id,
+        )
+        _validate_task_payload(task, job, pipeline, base_model, dataset)
+
+        base_model_path = _download_base_model(storage, base_model, work_dir / "base-model" / "base.pt")
         dataset_dir = work_dir / "dataset"
         task.stage = "export_dataset"
         session.add(task)
@@ -119,10 +147,14 @@ def run_training_job(
         )
         session.add(trained_model)
         session.flush()
-        artifact_uri = storage.put_file("models", f"trained/{trained_model.id}/best.pt", result.artifact_path)
+        artifact_object = f"trained/{trained_model.id}/best.pt"
+        artifact_uri = storage.put_file("models", artifact_object, result.artifact_path)
+        stored_objects.append(("models", artifact_object))
         log_path = work_dir / "training.log"
         log_path.write_text(_format_log(result), encoding="utf-8")
-        log_uri = storage.put_file("training", f"jobs/{job.id}/training.log", log_path, content_type="text/plain")
+        log_object = f"jobs/{job.id}/training.log"
+        log_uri = storage.put_file("training", log_object, log_path, content_type="text/plain")
+        stored_objects.append(("training", log_object))
 
         trained_model.artifact_uri = artifact_uri
         job.trained_model_id = trained_model.id
@@ -138,15 +170,23 @@ def run_training_job(
         task.error_message = None
         task.retryable = False
         session.add_all([trained_model, job, task])
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            existing_model = _trained_model_for_job(session, job.id)
+            if existing_model is not None:
+                return TrainingResult(training_job_id=job.id, trained_model_id=existing_model.id, status="success")
+            raise
         return TrainingResult(training_job_id=job.id, trained_model_id=trained_model.id, status=job.status)
     except Exception as exc:
         session.rollback()
+        _cleanup_stored_objects(storage, stored_objects)
         task = session.get(Task, task_id)
         job = session.get(TrainingJob, training_job_id)
         if task is not None:
             task.status = TaskStatus.FAILED.value
-            task.error_code = "TRAINING_FAILED"
+            task.error_code = "INVALID_TASK_PAYLOAD" if isinstance(exc, InvalidTaskPayloadError) else "TRAINING_FAILED"
             task.error_message = str(exc)
             task.retryable = True
             task.finished_at = _utc_now()
@@ -186,6 +226,41 @@ def _require_job(session: Session, training_job_id: str, task_id: str) -> Traini
 def _download_base_model(storage: ObjectStorageClient, base_model: BaseModel, destination: Path) -> Path:
     bucket, object_name = parse_storage_uri(str(base_model.local_uri))
     return storage.get_file(bucket, object_name, destination)
+
+
+def _trained_model_for_job(session: Session, training_job_id: str) -> TrainedModel | None:
+    return session.query(TrainedModel).filter(TrainedModel.training_job_id == training_job_id).one_or_none()
+
+
+def _validate_task_payload(
+    task: Task,
+    job: TrainingJob,
+    pipeline: TrainingPipeline,
+    base_model: BaseModel,
+    dataset: Dataset,
+) -> None:
+    payload = task.payload or {}
+    expected = {
+        "pipeline_id": pipeline.id,
+        "training_job_id": job.id,
+        "dataset_id": dataset.id,
+        "base_model_id": base_model.id,
+    }
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            raise InvalidTaskPayloadError(f"task payload {key} does not match training job")
+    if payload.get("params") != (job.params or {}):
+        raise InvalidTaskPayloadError("task payload params do not match training job")
+    if "environment" in payload and not isinstance(payload["environment"], dict):
+        raise InvalidTaskPayloadError("task payload environment must be an object")
+
+
+def _cleanup_stored_objects(storage: ObjectStorageClient, stored_objects: list[tuple[str, str]]) -> None:
+    for bucket, object_name in reversed(stored_objects):
+        try:
+            storage.delete_file(bucket, object_name)
+        except Exception:
+            pass
 
 
 def _format_log(result: CommandResult) -> str:

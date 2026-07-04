@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from visiox_db.base import Base, IdMixin, TimestampMixin
@@ -63,6 +63,15 @@ class TrainingJob(IdMixin, TimestampMixin, Base):
 
 class TrainedModel(IdMixin, TimestampMixin, Base):
     __tablename__ = "trained_models"
+    __table_args__ = (
+        Index(
+            "uq_trained_models_training_job",
+            "training_job_id",
+            unique=True,
+            postgresql_where=text("training_job_id IS NOT NULL"),
+            sqlite_where=text("training_job_id IS NOT NULL"),
+        ),
+    )
 
     pipeline_id: Mapped[str | None] = mapped_column(ForeignKey("training_pipelines.id"))
     training_job_id: Mapped[str | None] = mapped_column(ForeignKey("training_jobs.id"))

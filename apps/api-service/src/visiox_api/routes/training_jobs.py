@@ -7,11 +7,12 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request, status
 from pydantic import BaseModel as PydanticBaseModel
+from pydantic import Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from visiox_common.tasks import TaskCommand, TaskStatus, TaskType
-from visiox_db.models import BaseModel, Dataset, Task, TrainingJob, TrainingPipeline
+from visiox_db.models import Task, TrainingJob, TrainingPipeline
 from visiox_db.session import get_session
 from visiox_messaging.streams import RedisStreamProducer
 from visiox_yolo26.training.params import (
@@ -19,14 +20,15 @@ from visiox_yolo26.training.params import (
     merge_training_params,
     validate_training_environment,
 )
+from visiox_yolo26.training.prechecks import TrainingPrecheckError, validate_training_resources
 
 
 router = APIRouter(tags=["training-jobs"])
 
 
 class TrainingJobCreateRequest(PydanticBaseModel):
-    params: dict[str, Any] = {}
-    environment: dict[str, Any] = {}
+    params: dict[str, Any] = Field(default_factory=dict)
+    environment: dict[str, Any] = Field(default_factory=dict)
 
 
 class TrainingJobResponse(PydanticBaseModel):
@@ -36,7 +38,7 @@ class TrainingJobResponse(PydanticBaseModel):
     trained_model_id: str | None
     status: str
     params: dict[str, Any]
-    environment: dict[str, Any] = {}
+    environment: dict[str, Any] = Field(default_factory=dict)
     metrics: dict[str, Any]
     log_uri: str | None
     started_at: datetime | None
@@ -106,10 +108,16 @@ async def create_training_job(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
     if pipeline.status != "ready":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Pipeline is not ready: {pipeline.status}")
-    base_model = session.get(BaseModel, pipeline.base_model_id)
-    dataset = session.get(Dataset, pipeline.dataset_id)
-    if base_model is None or dataset is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Pipeline references missing resources")
+    try:
+        resources = validate_training_resources(
+            session,
+            task=pipeline.task,
+            scale=pipeline.scale,
+            base_model_id=str(pipeline.base_model_id),
+            dataset_id=str(pipeline.dataset_id),
+        )
+    except TrainingPrecheckError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     try:
         params = merge_training_params(pipeline.params_template, request.params)
         environment = {**validate_training_environment(pipeline.default_environment), **validate_training_environment(request.environment)}
@@ -131,8 +139,8 @@ async def create_training_job(
     task.payload = {
         "pipeline_id": pipeline.id,
         "training_job_id": job.id,
-        "dataset_id": dataset.id,
-        "base_model_id": base_model.id,
+        "dataset_id": resources.dataset.id,
+        "base_model_id": resources.base_model.id,
         "params": params,
         "environment": environment,
     }

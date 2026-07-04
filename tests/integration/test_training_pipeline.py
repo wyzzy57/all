@@ -7,6 +7,7 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from visiox_api.main import create_app
@@ -65,6 +66,13 @@ class FailingRunner:
         raise RuntimeError("cuda out of memory")
 
 
+class FailingLogStorage(InMemoryObjectStorageClient):
+    def put_file(self, bucket: str, object_name: str, file_path: Path, content_type: str | None = None) -> str:
+        if bucket == "training":
+            raise RuntimeError("log upload failed")
+        return super().put_file(bucket, object_name, file_path, content_type)
+
+
 @pytest.fixture()
 def session_factory(tmp_path):
     database_path = tmp_path / "visiox-training.db"
@@ -106,7 +114,9 @@ def seed_training_ready_rows(
     task: str = "detect",
     scale: str = "n",
     base_status: str = "ready",
+    base_filename: str | None = None,
     dataset_task: str | None = None,
+    dataset_status: str = "validated",
     sample_count: int = 1,
     annotation_count: int = 1,
 ) -> tuple[str, str, str | None]:
@@ -116,7 +126,7 @@ def seed_training_ready_rows(
             family="yolo26",
             task=task,
             scale=scale,
-            filename=f"yolo26{scale}-{task}.pt",
+            filename=base_filename or f"yolo26{scale}-{task}.pt",
             source_path=f"yolo26{scale}-{task}.pt",
             local_uri=f"memory://models/base/{task}-{scale}.pt",
             status=base_status,
@@ -124,7 +134,7 @@ def seed_training_ready_rows(
         dataset = Dataset(
             name=f"{dataset_task}-dataset-{base_status}-{sample_count}-{annotation_count}",
             task=dataset_task,
-            status="validated",
+            status=dataset_status,
             class_schema={"names": ["ok", "defect"]},
             sample_count=sample_count,
             annotation_count=annotation_count,
@@ -227,6 +237,7 @@ def test_create_pipeline_validates_base_model_dataset_and_lists_filters(client: 
     ("seed_kwargs", "payload_overrides", "expected_status"),
     [
         ({"base_status": "remote_available"}, {}, 409),
+        ({"dataset_status": "created"}, {}, 409),
         ({}, {"scale": "s"}, 409),
         ({"dataset_task": "segment"}, {}, 409),
         ({"sample_count": 0, "annotation_count": 0}, {}, 409),
@@ -290,6 +301,23 @@ def test_create_training_job_creates_task_and_enqueues_command(
     detail_response = client.get(f"/training-jobs/{body['id']}")
     assert list_response.json()["total"] == 1
     assert detail_response.json()["task_id"] == body["task_id"]
+
+
+def test_create_training_job_revalidates_pipeline_resources(client: TestClient, session_factory):
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    with session_factory() as session:
+        dataset = session.get(Dataset, dataset_id)
+        dataset.status = "created"
+        session.add(dataset)
+        session.commit()
+
+    response = client.post(f"/pipelines/{pipeline_id}/jobs", json={})
+
+    assert response.status_code == 409
+    with session_factory() as session:
+        jobs = session.scalars(select(TrainingJob)).all()
+    assert jobs == []
 
 
 def test_create_training_job_marks_job_and_task_failed_when_enqueue_fails(session_factory):
@@ -415,6 +443,117 @@ def test_worker_marks_task_and_job_failed_when_runner_fails(session_factory, tmp
     assert not any(bucket == "models" and object_name.startswith("trained/") for bucket, object_name in storage.objects)
 
 
+def test_worker_rejects_payload_mismatch_and_marks_failed(session_factory, tmp_path):
+    storage = InMemoryObjectStorageClient()
+    task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
+    runner = FakeRunner()
+    with session_factory() as session:
+        task = session.get(Task, task_id)
+        task.payload = {**task.payload, "dataset_id": "wrong-dataset"}
+        session.add(task)
+        session.commit()
+
+    with session_factory() as session:
+        with pytest.raises(RuntimeError, match="dataset_id"):
+            run_training_job(session, storage, runner, task_id, job_id, tmp_path / "work")
+
+    with session_factory() as session:
+        job = session.get(TrainingJob, job_id)
+        task = session.get(Task, task_id)
+
+    assert runner.commands == []
+    assert job.status == "failed"
+    assert task.status == TaskStatus.FAILED.value
+    assert task.error_code == "INVALID_TASK_PAYLOAD"
+
+
+def test_worker_does_not_run_when_task_is_already_claimed(session_factory, tmp_path):
+    storage = InMemoryObjectStorageClient()
+    task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
+    runner = FakeRunner()
+    with session_factory() as session:
+        task = session.get(Task, task_id)
+        task.status = TaskStatus.RUNNING.value
+        session.add(task)
+        session.commit()
+
+    with session_factory() as session:
+        with pytest.raises(RuntimeError, match="already claimed"):
+            run_training_job(session, storage, runner, task_id, job_id, tmp_path / "work")
+
+    assert runner.commands == []
+
+
+def test_worker_uses_safe_base_model_download_filename(session_factory, tmp_path):
+    storage = InMemoryObjectStorageClient()
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(
+        session_factory,
+        storage,
+        tmp_path,
+        base_filename="../escape.pt",
+    )
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            name="safe-filename-pipeline",
+            task="detect",
+            scale="n",
+            base_model_id=base_model_id,
+            dataset_id=dataset_id,
+            params_template={"epochs": 2, "batch": 4, "imgsz": 640},
+            default_environment={"device": "cpu"},
+            status="ready",
+        )
+        session.add(pipeline)
+        session.flush()
+        job = TrainingJob(pipeline_id=pipeline.id, status="queued", params={"epochs": 2, "batch": 4, "imgsz": 640})
+        task = Task(
+            task_type=TaskType.TRAIN_MODEL.value,
+            status=TaskStatus.QUEUED.value,
+            resource_type="training_job",
+            payload={},
+        )
+        session.add_all([job, task])
+        session.flush()
+        job.task_id = task.id
+        task.resource_id = job.id
+        task.payload = {
+            "pipeline_id": pipeline.id,
+            "training_job_id": job.id,
+            "dataset_id": dataset_id,
+            "base_model_id": base_model_id,
+            "params": job.params,
+            "environment": {},
+        }
+        session.commit()
+        task_id = task.id
+        job_id = job.id
+
+    with session_factory() as session:
+        run_training_job(session, storage, FakeRunner(), task_id, job_id, tmp_path / "work")
+
+    assert (tmp_path / "work" / "base-model" / "base.pt").exists()
+    assert not (tmp_path / "work" / "escape.pt").exists()
+
+
+def test_worker_cleans_uploaded_artifacts_when_later_persist_fails(session_factory, tmp_path):
+    storage = FailingLogStorage()
+    task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
+
+    with session_factory() as session:
+        with pytest.raises(RuntimeError, match="log upload failed"):
+            run_training_job(session, storage, FakeRunner(), task_id, job_id, tmp_path / "work")
+
+    assert not any(bucket == "models" and object_name.startswith("trained/") for bucket, object_name in storage.objects)
+    with session_factory() as session:
+        job = session.get(TrainingJob, job_id)
+        task = session.get(Task, task_id)
+        trained_models = session.scalars(select(TrainedModel)).all()
+
+    assert job.status == "failed"
+    assert task.status == TaskStatus.FAILED.value
+    assert trained_models == []
+
+
 def test_worker_is_idempotent_for_successful_training_job(session_factory, tmp_path):
     storage = InMemoryObjectStorageClient()
     task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
@@ -427,3 +566,30 @@ def test_worker_is_idempotent_for_successful_training_job(session_factory, tmp_p
 
     assert second.trained_model_id == first.trained_model_id
     assert len(runner.commands) == 1
+
+
+def test_trained_model_training_job_id_is_unique(session_factory, tmp_path):
+    storage = InMemoryObjectStorageClient()
+    _task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
+    with session_factory() as session:
+        first = TrainedModel(
+            training_job_id=job_id,
+            name="first",
+            version="v1",
+            task="detect",
+            artifact_uri="memory://models/trained/first/best.pt",
+            status="ready",
+        )
+        duplicate = TrainedModel(
+            training_job_id=job_id,
+            name="duplicate",
+            version="v2",
+            task="detect",
+            artifact_uri="memory://models/trained/duplicate/best.pt",
+            status="ready",
+        )
+        session.add(first)
+        session.commit()
+        session.add(duplicate)
+        with pytest.raises(IntegrityError):
+            session.commit()
