@@ -59,6 +59,7 @@ def _create_dataset(
     height: int | None = 80,
     split: str | None = "train",
     class_schema: dict[str, object] | None = None,
+    file_uri: str = "memory://datasets/samples/sample.png",
 ) -> str:
     with session_factory() as session:
         dataset = Dataset(
@@ -74,7 +75,7 @@ def _create_dataset(
         session.flush()
         sample = DatasetSample(
             dataset_id=dataset.id,
-            file_uri="memory://datasets/samples/sample.png",
+            file_uri=file_uri,
             width=width,
             height=height,
             checksum=f"{task}-sample",
@@ -98,6 +99,61 @@ def _create_dataset(
                 validation_status="valid",
             )
         )
+        session.commit()
+        return dataset.id
+
+
+def _create_dataset_with_two_same_basename_samples(session_factory) -> str:
+    with session_factory() as session:
+        dataset = Dataset(
+            name=f"detect-{uuid4()}",
+            task="detect",
+            status="created",
+            class_schema={"names": ["ok", "defect"]},
+            sample_count=2,
+            annotation_count=2,
+            source="upload",
+        )
+        session.add(dataset)
+        session.flush()
+        samples = [
+            DatasetSample(
+                dataset_id=dataset.id,
+                file_uri="memory://datasets/first/sample.png",
+                width=100,
+                height=80,
+                checksum="first",
+                split="train",
+                annotation_status="labeled",
+            ),
+            DatasetSample(
+                dataset_id=dataset.id,
+                file_uri="memory://datasets/second/sample.png",
+                width=100,
+                height=80,
+                checksum="second",
+                split="train",
+                annotation_status="labeled",
+            ),
+        ]
+        session.add_all(samples)
+        session.flush()
+        for sample in samples:
+            session.add(
+                Annotation(
+                    dataset_sample_id=sample.id,
+                    source="label_studio",
+                    internal_payload={
+                        "annotations": [
+                            {
+                                "source_annotation_id": f"annotation-{sample.checksum}",
+                                "results": [_result("rectangle", x=10, y=20, width=30, height=40)],
+                            }
+                        ]
+                    },
+                    validation_status="valid",
+                )
+            )
         session.commit()
         return dataset.id
 
@@ -146,8 +202,13 @@ def test_detect_converter_writes_yolo_rectangle_labels_and_data_yaml(session_fac
 
     report, output_dir = _export(session_factory, storage, tmp_path, dataset_id)
 
-    assert _read_text(output_dir, "labels/train/sample.txt") == "1 0.25 0.4 0.3 0.4\n"
-    assert (output_dir / "images/train/sample.png").read_bytes() == storage.objects[("datasets", "samples/sample.png")]
+    label_files = list((output_dir / "labels/train").glob("*.txt"))
+    image_files = list((output_dir / "images/train").glob("*.png"))
+    assert len(label_files) == 1
+    assert len(image_files) == 1
+    assert label_files[0].stem == image_files[0].stem
+    assert label_files[0].read_text(encoding="utf-8") == "1 0.25 0.4 0.3 0.4\n"
+    assert image_files[0].read_bytes() == storage.objects[("datasets", "samples/sample.png")]
     _assert_common_data_yaml(output_dir, "detect")
     assert report.sample_count == 1
     assert report.annotation_count == 1
@@ -163,7 +224,9 @@ def test_segment_converter_writes_polygon_labels(session_factory, storage, tmp_p
 
     _report, output_dir = _export(session_factory, storage, tmp_path, dataset_id)
 
-    assert _read_text(output_dir, "labels/train/sample.txt") == "1 0.1 0.1 0.5 0.1 0.5 0.5 0.1 0.5\n"
+    assert next((output_dir / "labels/train").glob("*.txt")).read_text(encoding="utf-8") == (
+        "1 0.1 0.1 0.5 0.1 0.5 0.5 0.1 0.5\n"
+    )
     _assert_common_data_yaml(output_dir, "segment")
 
 
@@ -180,7 +243,8 @@ def test_semantic_converter_rasterizes_masks_and_warns_on_overlap(session_factor
 
     report, output_dir = _export(session_factory, storage, tmp_path, dataset_id)
 
-    with Image.open(output_dir / "masks/train/sample.png") as mask:
+    mask_path = next((output_dir / "masks/train").glob("*.png"))
+    with Image.open(mask_path) as mask:
         assert mask.mode == "L"
         assert mask.getpixel((20, 20)) == 1
         assert mask.getpixel((50, 50)) == 2
@@ -223,7 +287,7 @@ def test_semantic_converter_accepts_decoded_brush_mask(session_factory, storage,
 
     _report, output_dir = _export(session_factory, storage, tmp_path, dataset_id)
 
-    with Image.open(output_dir / "masks/train/sample.png") as mask:
+    with Image.open(next((output_dir / "masks/train").glob("*.png"))) as mask:
         assert list(mask.getdata()) == [0, 2, 0, 2, 2, 0, 0, 0, 0]
 
 
@@ -240,7 +304,7 @@ def test_pose_converter_writes_coco17_keypoints_with_missing_points(session_fact
 
     _report, output_dir = _export(session_factory, storage, tmp_path, dataset_id)
 
-    values = _read_text(output_dir, "labels/train/sample.txt").strip().split(" ")
+    values = next((output_dir / "labels/train").glob("*.txt")).read_text(encoding="utf-8").strip().split(" ")
     assert values[:5] == ["1", "0.25", "0.4", "0.3", "0.4"]
     assert values[5:11] == ["0.2", "0.3", "2", "0.25", "0.35", "2"]
     assert values[11:] == ["0", "0", "0"] * 15
@@ -261,8 +325,12 @@ def test_obb_converter_accepts_polygon_and_rectangle(session_factory, storage, t
     )
     _report, rectangle_output = _export(session_factory, storage, tmp_path / "rectangle", rectangle_dataset_id)
 
-    assert _read_text(polygon_output, "labels/train/sample.txt") == "1 0.1 0.1 0.5 0.1 0.5 0.4 0.1 0.4\n"
-    assert _read_text(rectangle_output, "labels/train/sample.txt") == "1 0.1 0.2 0.4 0.2 0.4 0.6 0.1 0.6\n"
+    assert next((polygon_output / "labels/train").glob("*.txt")).read_text(encoding="utf-8") == (
+        "1 0.1 0.1 0.5 0.1 0.5 0.4 0.1 0.4\n"
+    )
+    assert next((rectangle_output / "labels/train").glob("*.txt")).read_text(encoding="utf-8") == (
+        "1 0.1 0.2 0.4 0.2 0.4 0.6 0.1 0.6\n"
+    )
 
 
 def test_classify_converter_copies_image_to_class_directory_and_writes_data_yaml(session_factory, storage, tmp_path):
@@ -274,7 +342,8 @@ def test_classify_converter_copies_image_to_class_directory_and_writes_data_yaml
 
     _report, output_dir = _export(session_factory, storage, tmp_path, dataset_id)
 
-    assert (output_dir / "train/defect/sample.png").read_bytes() == storage.objects[("datasets", "samples/sample.png")]
+    assert len(list((output_dir / "train/class_1").glob("*.png"))) == 1
+    assert next((output_dir / "train/class_1").glob("*.png")).read_bytes() == storage.objects[("datasets", "samples/sample.png")]
     assert _read_text(output_dir, "data.yaml") == (
         "path: .\n"
         "train: train\n"
@@ -285,6 +354,85 @@ def test_classify_converter_copies_image_to_class_directory_and_writes_data_yaml
         "  1: defect\n"
         "task: classify\n"
     )
+
+
+def test_unassigned_split_exports_to_train(session_factory, storage, tmp_path):
+    dataset_id = _create_dataset(
+        session_factory,
+        "detect",
+        [_result("rectangle", x=10, y=20, width=30, height=40)],
+        split="unassigned",
+    )
+
+    _report, output_dir = _export(session_factory, storage, tmp_path, dataset_id)
+
+    assert len(list((output_dir / "images/train").glob("*.png"))) == 1
+    assert not (output_dir / "images/unassigned").exists()
+
+
+def test_same_basename_samples_do_not_overwrite_each_other(session_factory, tmp_path):
+    storage = InMemoryObjectStorageClient()
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    Image.new("RGB", (100, 80), color=(12, 34, 56)).save(first)
+    Image.new("RGB", (100, 80), color=(90, 80, 70)).save(second)
+    storage.put_file("datasets", "first/sample.png", first)
+    storage.put_file("datasets", "second/sample.png", second)
+    dataset_id = _create_dataset_with_two_same_basename_samples(session_factory)
+
+    _report, output_dir = _export(session_factory, storage, tmp_path, dataset_id)
+
+    assert len(list((output_dir / "images/train").glob("*.png"))) == 2
+    assert len(list((output_dir / "labels/train").glob("*.txt"))) == 2
+
+
+def test_export_cleans_managed_output_directories(session_factory, storage, tmp_path):
+    dataset_id = _create_dataset(
+        session_factory,
+        "detect",
+        [_result("rectangle", x=10, y=20, width=30, height=40)],
+    )
+    stale = tmp_path / "export" / "labels" / "train" / "stale.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale\n", encoding="utf-8")
+
+    _report, output_dir = _export(session_factory, storage, tmp_path, dataset_id)
+
+    assert not (output_dir / "labels/train/stale.txt").exists()
+
+
+def test_classify_dangerous_class_names_do_not_escape_output_dir(session_factory, storage, tmp_path):
+    dataset_id = _create_dataset(
+        session_factory,
+        "classify",
+        [{"source_result_id": "class-1", "class_name": "../escape", "shape": "classification"}],
+        class_schema={"names": ["ok", "../escape"]},
+    )
+
+    _report, output_dir = _export(session_factory, storage, tmp_path, dataset_id)
+
+    assert len(list((output_dir / "train/class_1").glob("*.png"))) == 1
+    assert not (tmp_path / "escape").exists()
+
+
+def test_semantic_decoded_brush_mask_errors_include_context(session_factory, storage, tmp_path):
+    dataset_id = _create_dataset(
+        session_factory,
+        "semantic",
+        [_result("brush", "defect", "brush-bad", mask=[[1]])],
+        width=3,
+        height=3,
+    )
+
+    with session_factory() as session:
+        with pytest.raises(ConversionError) as exc_info:
+            export_yolo26_dataset(session, storage, dataset_id, tmp_path / "export")
+
+    message = str(exc_info.value)
+    assert "decoded brush mask height" in message
+    assert f"dataset={dataset_id}" in message
+    assert "sample=" in message
+    assert "source_result_id=brush-bad" in message
 
 
 @pytest.mark.parametrize(

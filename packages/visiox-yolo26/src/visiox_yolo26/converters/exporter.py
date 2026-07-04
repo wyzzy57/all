@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -16,6 +17,7 @@ from visiox_yolo26.converters.internal_schema import (
     parse_class_map,
     parse_storage_uri,
     require_dimensions,
+    safe_class_dir,
     sample_stem,
     source_image_name,
 )
@@ -45,7 +47,7 @@ def export_yolo26_dataset(
     if dataset.task not in YOLO26_TASKS:
         raise ConversionError(f"unsupported YOLO26 task: {dataset.task}", dataset_id=dataset_id)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_output_dir(output_dir)
     class_map = parse_class_map(dataset.class_schema or {})
     report = ConversionReport(dataset_id=dataset.id, task=dataset.task, output_dir=output_dir)
 
@@ -57,7 +59,7 @@ def export_yolo26_dataset(
         )
     )
     for sample in samples:
-        split = sample.split or "train"
+        split = _export_split(sample.split)
         annotations = list(
             session.scalars(
                 select(Annotation)
@@ -112,8 +114,8 @@ def _export_classify_sample(
     output_dir: Path,
     report: ConversionReport,
 ) -> None:
-    class_name = classify.class_for_sample(dataset, sample, results, class_map)
-    image_path = _copy_image(storage, sample, output_dir / split / class_name / source_image_name(sample))
+    class_id = classify.class_id_for_sample(dataset, sample, results, class_map)
+    image_path = _copy_image(storage, sample, output_dir / split / safe_class_dir(class_id) / source_image_name(sample))
     report.written_files.append(image_path)
 
 
@@ -150,3 +152,21 @@ def _write_data_yaml(path: Path, task: str, names: tuple[str, ...], report: Conv
         lines.append("mask: masks")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     report.written_files.append(path)
+
+
+def _export_split(split: str | None) -> str:
+    if split in {None, "unassigned"}:
+        return "train"
+    if split in {"train", "val", "test"}:
+        return split
+    return "train"
+
+
+def _prepare_output_dir(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for child in ("images", "labels", "masks", "train", "val", "test", "data.yaml"):
+        path = output_dir / child
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()

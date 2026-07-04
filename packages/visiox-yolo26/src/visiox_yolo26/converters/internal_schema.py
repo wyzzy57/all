@@ -174,11 +174,16 @@ def yolo_rectangle_values(rect: tuple[float, float, float, float]) -> list[str]:
 
 
 def source_image_name(sample: DatasetSample) -> str:
-    return Path(parse_storage_uri(sample.file_uri)[1]).name
+    source_suffix = Path(parse_storage_uri(sample.file_uri)[1]).suffix or ".jpg"
+    return f"{sample.id}{source_suffix.lower()}"
 
 
 def sample_stem(sample: DatasetSample) -> str:
     return Path(source_image_name(sample)).stem
+
+
+def safe_class_dir(class_id: int) -> str:
+    return f"class_{class_id}"
 
 
 def parse_storage_uri(uri: str) -> tuple[str, str]:

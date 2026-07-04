@@ -3,14 +3,7 @@ from typing import Any
 from PIL import Image, ImageDraw
 
 from visiox_db.models import Dataset, DatasetSample
-from visiox_yolo26.converters.internal_schema import (
-    ClassMap,
-    ConversionWarning,
-    ConversionError,
-    polygon_points,
-    require_dimensions,
-    result_error,
-)
+from visiox_yolo26.converters.internal_schema import ClassMap, ConversionWarning, polygon_points, require_dimensions, result_error
 
 
 def convert_sample(
@@ -62,7 +55,7 @@ def _candidate_mask(
     candidate = Image.new("L", (width, height), 0)
     candidate_mask = Image.new("L", (width, height), 0)
     if result.get("shape") == "brush" and result.get("mask") is not None:
-        _draw_decoded_mask(candidate, candidate_mask, result, class_id, width, height)
+        _draw_decoded_mask(candidate, candidate_mask, dataset, sample, result, class_id, width, height)
         return candidate, candidate_mask
 
     points = [(round(x / 100 * width), round(y / 100 * height)) for x, y in polygon_points(result, dataset, sample)]
@@ -74,6 +67,8 @@ def _candidate_mask(
 def _draw_decoded_mask(
     candidate: Image.Image,
     candidate_mask: Image.Image,
+    dataset: Dataset,
+    sample: DatasetSample,
     result: dict[str, Any],
     class_id: int,
     width: int,
@@ -81,12 +76,12 @@ def _draw_decoded_mask(
 ) -> None:
     mask_payload = result.get("mask")
     if not isinstance(mask_payload, list) or len(mask_payload) != height:
-        raise ConversionError(f"decoded brush mask height must be {height}")
+        raise result_error(f"decoded brush mask height must be {height}", dataset, sample, result)
     candidate_pixels = candidate.load()
     candidate_mask_pixels = candidate_mask.load()
     for y, row in enumerate(mask_payload):
         if not isinstance(row, list) or len(row) != width:
-            raise ConversionError(f"decoded brush mask width must be {width}")
+            raise result_error(f"decoded brush mask width must be {width}", dataset, sample, result)
         for x, value in enumerate(row):
             if value:
                 candidate_pixels[x, y] = class_id + 1
