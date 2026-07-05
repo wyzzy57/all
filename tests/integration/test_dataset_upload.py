@@ -1,5 +1,6 @@
 from collections.abc import Generator
 from io import BytesIO
+import json
 from types import SimpleNamespace
 from zipfile import ZipFile
 
@@ -214,6 +215,55 @@ def test_upload_yolo_detect_folder_batch_indexes_images_and_labels(client: TestC
     assert sample.annotation_status == "labeled"
     assert annotation.source == "yolo"
     assert annotation.internal_payload["annotations"][0]["results"][0]["class_name"] == "defect"
+
+
+def test_upload_coco_detect_folder_batch_converts_boxes_to_internal_annotations(client: TestClient, session_factory):
+    dataset = create_dataset(client, name="coco-folder", task="detect")
+    image_bytes = make_image_bytes((100, 50))
+    coco_payload = {
+        "images": [{"id": 10, "file_name": "seed_001.jpg", "width": 100, "height": 50}],
+        "annotations": [{"id": 99, "image_id": 10, "category_id": 7, "bbox": [10, 5, 40, 20], "area": 800, "iscrowd": 0}],
+        "categories": [
+            {"id": 5, "name": "ok", "supercategory": "none"},
+            {"id": 7, "name": "defect", "supercategory": "none"},
+        ],
+    }
+
+    response = client.post(
+        f"/datasets/{dataset['id']}/samples:upload-batch",
+        files=[
+            ("files", ("dataset/annotations/instance_train.json", json.dumps(coco_payload).encode("utf-8"), "application/json")),
+            ("files", ("dataset/images/seed_001.jpg", image_bytes, "image/jpeg")),
+        ],
+        data={
+            "relative_paths": [
+                "dataset/annotations/instance_train.json",
+                "dataset/images/seed_001.jpg",
+            ]
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["created_count"] == 1
+    assert body["skipped_count"] == 1
+
+    with session_factory() as session:
+        saved_dataset = session.get(Dataset, dataset["id"])
+        sample = session.get(DatasetSample, body["samples"][0]["id"])
+        annotation = session.scalar(select(Annotation).where(Annotation.dataset_sample_id == sample.id))
+
+    assert saved_dataset.class_schema == {"names": ["ok", "defect"]}
+    assert saved_dataset.annotation_count == 1
+    assert sample.split == "train"
+    result = annotation.internal_payload["annotations"][0]["results"][0]
+    assert result["source_result_id"] == "99"
+    assert result["class_id"] == 1
+    assert result["class_name"] == "defect"
+    assert result["x"] == 10
+    assert result["y"] == 10
+    assert result["width"] == 40
+    assert result["height"] == 40
 
 
 @pytest.mark.parametrize(

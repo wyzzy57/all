@@ -1,5 +1,6 @@
 from collections.abc import Generator
 from pathlib import Path, PurePosixPath
+import json
 from tempfile import NamedTemporaryFile
 from typing import Any
 from zipfile import BadZipFile, ZipFile
@@ -22,6 +23,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 ZIP_EXTENSIONS = {".zip"}
 LABEL_EXTENSIONS = {".txt"}
 YAML_EXTENSIONS = {".yaml", ".yml"}
+JSON_EXTENSIONS = {".json"}
 ALLOWED_SPLITS = {"train", "val", "test", "unassigned"}
 
 
@@ -274,7 +276,8 @@ def _store_dataset_entries(
     result = _UploadResult()
     try:
         labels = _label_entries(entries)
-        _apply_class_schema_from_yaml(dataset, entries)
+        coco = _coco_annotations(entries)
+        _apply_class_schema_from_dataset_metadata(dataset, entries, coco)
         for filename, data in entries:
             _validate_dataset_entry(filename)
             extension = PurePosixPath(filename.replace("\\", "/")).suffix.lower()
@@ -289,7 +292,20 @@ def _store_dataset_entries(
                 sample = image_result.samples[0] if image_result.created_count == 1 else None
                 if sample is not None:
                     label_text = _matching_label_text(filename, labels)
-                    if label_text:
+                    coco_payload = _matching_coco_payload(filename, coco)
+                    if coco_payload:
+                        sample.split = coco_payload["split"]
+                        sample.annotation_status = "labeled"
+                        session.add(
+                            Annotation(
+                                dataset_sample_id=sample.id,
+                                source="coco",
+                                internal_payload={"annotations": [{"source_annotation_id": f"coco-{sample.id}", "results": coco_payload["results"]}]},
+                                validation_status="valid",
+                            )
+                        )
+                        dataset.annotation_count = (dataset.annotation_count or 0) + 1
+                    elif label_text:
                         sample.split = _split_from_path(filename)
                         sample.annotation_status = "labeled"
                         session.add(
@@ -301,7 +317,7 @@ def _store_dataset_entries(
                             )
                         )
                         dataset.annotation_count = (dataset.annotation_count or 0) + 1
-            elif extension in LABEL_EXTENSIONS or extension in YAML_EXTENSIONS:
+            elif extension in LABEL_EXTENSIONS or extension in YAML_EXTENSIONS or extension in JSON_EXTENSIONS:
                 result.skipped_count += 1
             else:
                 result.skipped_count += 1
@@ -435,6 +451,94 @@ def _matching_label_text(image_filename: str, labels: dict[str, str]) -> str | N
     return None
 
 
+def _coco_annotations(entries: list[tuple[str, bytes]]) -> dict[str, Any]:
+    result = {"names": [], "by_image": {}}
+    for filename, data in entries:
+        normalized = filename.replace("\\", "/")
+        if PurePosixPath(normalized).suffix.lower() not in JSON_EXTENSIONS:
+            continue
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid COCO json: {filename}") from exc
+        if not _looks_like_coco(payload):
+            continue
+        split = _split_from_path(normalized)
+        if split == "unassigned":
+            lowered = PurePosixPath(normalized).name.lower()
+            if "train" in lowered:
+                split = "train"
+            elif "val" in lowered:
+                split = "val"
+            elif "test" in lowered:
+                split = "test"
+        categories = sorted(payload.get("categories", []), key=lambda item: item.get("id", 0))
+        category_to_index = {category["id"]: index for index, category in enumerate(categories)}
+        names = [str(category.get("name", category.get("id"))) for category in categories]
+        if names:
+            result["names"] = names
+        images = {image["id"]: image for image in payload.get("images", [])}
+        annotations_by_image: dict[Any, list[dict[str, Any]]] = {}
+        for annotation in payload.get("annotations", []):
+            annotations_by_image.setdefault(annotation.get("image_id"), []).append(annotation)
+        for image_id, image in images.items():
+            file_name = str(image.get("file_name", ""))
+            width = float(image.get("width") or 0)
+            height = float(image.get("height") or 0)
+            if not file_name or width <= 0 or height <= 0:
+                continue
+            results = []
+            for index, annotation in enumerate(annotations_by_image.get(image_id, []), start=1):
+                bbox = annotation.get("bbox")
+                if not isinstance(bbox, list) or len(bbox) != 4:
+                    continue
+                category_id = annotation.get("category_id")
+                if category_id not in category_to_index:
+                    continue
+                x, y, box_width, box_height = [float(value) for value in bbox]
+                class_id = category_to_index[category_id]
+                results.append(
+                    {
+                        "source_result_id": str(annotation.get("id", f"{image_id}-{index}")),
+                        "shape": "rectangle",
+                        "class_id": class_id,
+                        "class_name": names[class_id],
+                        "x": x / width * 100,
+                        "y": y / height * 100,
+                        "width": box_width / width * 100,
+                        "height": box_height / height * 100,
+                    }
+                )
+            if results:
+                for key in _image_match_keys(file_name):
+                    result["by_image"][key] = {"split": split, "results": results}
+    return result
+
+
+def _looks_like_coco(payload: Any) -> bool:
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("images"), list)
+        and isinstance(payload.get("annotations"), list)
+        and isinstance(payload.get("categories"), list)
+    )
+
+
+def _matching_coco_payload(image_filename: str, coco: dict[str, Any]) -> dict[str, Any] | None:
+    by_image = coco.get("by_image", {})
+    if not isinstance(by_image, dict):
+        return None
+    for key in _image_match_keys(image_filename):
+        if key in by_image:
+            return by_image[key]
+    return None
+
+
+def _image_match_keys(filename: str) -> list[str]:
+    path = PurePosixPath(filename.replace("\\", "/"))
+    return [str(path), path.name, path.stem]
+
+
 def _split_from_path(filename: str) -> str:
     parts = set(PurePosixPath(filename.replace("\\", "/")).parts)
     for split in ("train", "val", "test"):
@@ -482,8 +586,14 @@ def _class_names(class_schema: dict[str, Any]) -> list[str]:
     return ["class_0"]
 
 
-def _apply_class_schema_from_yaml(dataset: Dataset, entries: list[tuple[str, bytes]]) -> None:
-    if dataset.class_schema.get("names"):
+def _apply_class_schema_from_dataset_metadata(
+    dataset: Dataset,
+    entries: list[tuple[str, bytes]],
+    coco: dict[str, Any],
+) -> None:
+    coco_names = coco.get("names")
+    if isinstance(coco_names, list) and coco_names:
+        dataset.class_schema = {**(dataset.class_schema or {}), "names": coco_names}
         return
     for filename, data in entries:
         if PurePosixPath(filename.replace("\\", "/")).suffix.lower() not in YAML_EXTENSIONS:

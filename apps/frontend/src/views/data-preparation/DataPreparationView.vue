@@ -38,10 +38,10 @@
                 <el-option label="obb" value="obb" />
                 <el-option label="classify" value="classify" />
               </el-select>
-            </el-form-item>
-            <el-form-item label="类别">
-              <el-input v-model="newDataset.classNames" placeholder="用英文逗号分隔，例如 ok,defect" />
-            </el-form-item>
+                </el-form-item>
+                <el-form-item label="类别">
+                  <el-input v-model="newDataset.classNames" placeholder="可留空；COCO/data.yaml 会自动读取" />
+                </el-form-item>
           </template>
           <el-form-item v-else label="目标数据集">
             <el-select v-model="uploadDatasetId" filterable placeholder="选择要追加样本的数据集">
@@ -60,7 +60,7 @@
             class="visually-hidden"
                 type="file"
                 multiple
-                accept=".jpg,.jpeg,.png,.bmp,.webp,.zip,.txt,.yaml,.yml,image/*"
+            accept=".jpg,.jpeg,.png,.bmp,.webp,.zip,.txt,.yaml,.yml,.json,image/*"
                 @change="handleNativeFiles"
           />
           <input
@@ -310,7 +310,7 @@ const uploadModeOptions = [
   { label: "追加样本", value: "existing" },
 ];
 const uploadDatasetId = ref("");
-const newDataset = ref({ name: "", task: "detect", classNames: "ok,defect" });
+const newDataset = ref({ name: "", task: "detect", classNames: "" });
 const uploadFiles = ref<File[]>([]);
 const uploading = ref(false);
 const fileInputRef = ref<HTMLInputElement>();
@@ -366,7 +366,7 @@ const uploadPreview = computed(() =>
 const canUpload = computed(() => {
   if (uploadFiles.value.length === 0 || uploading.value) return false;
   if (uploadMode.value === "existing") return Boolean(uploadDatasetId.value);
-  return Boolean(newDataset.value.name.trim()) && parseClassNames().length > 0;
+  return Boolean(newDataset.value.name.trim());
 });
 
 onMounted(() => {
@@ -561,7 +561,7 @@ function applyFolderDatasetName(files: File[]) {
 
 function isSupportedUploadFile(file: File) {
   const name = file.name.toLowerCase();
-  return [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".zip", ".txt", ".yaml", ".yml"].some((suffix) =>
+  return [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".zip", ".txt", ".yaml", ".yml", ".json"].some((suffix) =>
     name.endsWith(suffix),
   );
 }
