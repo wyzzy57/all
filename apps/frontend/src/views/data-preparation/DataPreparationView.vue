@@ -58,10 +58,10 @@
           <input
             ref="fileInputRef"
             class="visually-hidden"
-            type="file"
-            multiple
-            accept=".jpg,.jpeg,.png,.bmp,.webp,.zip,image/*"
-            @change="handleNativeFiles"
+                type="file"
+                multiple
+                accept=".jpg,.jpeg,.png,.bmp,.webp,.zip,.txt,.yaml,.yml,image/*"
+                @change="handleNativeFiles"
           />
           <input
             ref="folderInputRef"
@@ -73,7 +73,7 @@
           />
           <div class="upload-copy">
             <strong>选择图片、zip 或整个数据文件夹</strong>
-            <span>文件夹会按图片文件逐个上传；zip 会交给后端批量解析。</span>
+                <span>支持 YOLO 目录：data.yaml、images/、labels/ 会一起上传。</span>
           </div>
           <div class="upload-actions">
             <el-button @click="fileInputRef?.click()">选择文件</el-button>
@@ -506,12 +506,12 @@ async function uploadPendingFiles() {
   let skipped = 0;
   try {
     const datasetId = await resolveUploadDatasetId();
-    for (const file of uploadFiles.value) {
-      const result = await api.uploadDatasetSample(datasetId, file);
-      created += result.created_count;
-      duplicate += result.duplicate_count;
-      skipped += result.skipped_count;
-    }
+    const result = shouldUseBatchUpload()
+      ? await api.uploadDatasetBatch(datasetId, uploadFiles.value)
+      : await api.uploadDatasetSample(datasetId, uploadFiles.value[0]);
+    created += result.created_count;
+    duplicate += result.duplicate_count;
+    skipped += result.skipped_count;
     ElMessage.success(`上传完成：新增 ${created}，重复 ${duplicate}，跳过 ${skipped}`);
     clearUploads();
     await loadDatasets();
@@ -524,6 +524,10 @@ async function uploadPendingFiles() {
 
 function clearUploads() {
   uploadFiles.value = [];
+}
+
+function shouldUseBatchUpload() {
+  return uploadFiles.value.length > 1 || uploadFiles.value.some((file) => Boolean(file.webkitRelativePath));
 }
 
 async function resolveUploadDatasetId() {
@@ -557,7 +561,9 @@ function applyFolderDatasetName(files: File[]) {
 
 function isSupportedUploadFile(file: File) {
   const name = file.name.toLowerCase();
-  return [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".zip"].some((suffix) => name.endsWith(suffix));
+  return [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".zip", ".txt", ".yaml", ".yml"].some((suffix) =>
+    name.endsWith(suffix),
+  );
 }
 
 function fileIdentity(file: File) {

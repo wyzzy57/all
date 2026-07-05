@@ -4,14 +4,14 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 from zipfile import BadZipFile, ZipFile
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from visiox_api.routes.datasets import dataset_or_404
 from visiox_common.settings import Settings, get_settings
-from visiox_db.models import Dataset, DatasetSample
+from visiox_db.models import Annotation, Dataset, DatasetSample
 from visiox_db.session import get_session
 from visiox_storage.checksum import sha256_bytes
 from visiox_storage.client import ObjectStorageClient
@@ -20,6 +20,8 @@ from visiox_storage.client import ObjectStorageClient
 router = APIRouter(prefix="/datasets/{dataset_id}/samples", tags=["dataset-samples"])
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 ZIP_EXTENSIONS = {".zip"}
+LABEL_EXTENSIONS = {".txt"}
+YAML_EXTENSIONS = {".yaml", ".yml"}
 ALLOWED_SPLITS = {"train", "val", "test", "unassigned"}
 
 
@@ -99,6 +101,52 @@ async def upload_samples(
         else:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported upload file type")
 
+        dataset.sample_count = _dataset_sample_count(session, dataset.id)
+        session.add(dataset)
+        session.commit()
+        for sample in result.samples:
+            session.refresh(sample)
+        session.refresh(dataset)
+    except Exception:
+        session.rollback()
+        _cleanup_stored_objects(storage, result.stored_objects)
+        raise
+    if result.created_count == 0 and result.duplicate_count > 0:
+        response.status_code = status.HTTP_200_OK
+    return SampleUploadResponse(
+        samples=result.samples,
+        created_count=result.created_count,
+        duplicate_count=result.duplicate_count,
+        skipped_count=result.skipped_count,
+    )
+
+
+@router.post(":upload-batch", response_model=SampleUploadResponse, status_code=status.HTTP_201_CREATED)
+async def upload_sample_batch(
+    dataset_id: str,
+    response: Response,
+    files: list[UploadFile] = File(...),
+    relative_paths: list[str] | None = Form(default=None),
+    session: Session = Depends(get_dataset_sample_session),
+    storage: ObjectStorageClient = Depends(get_object_storage_client),
+    settings: Settings = Depends(get_settings),
+) -> SampleUploadResponse:
+    dataset = dataset_or_404(session, dataset_id)
+    if len(files) > settings.max_dataset_zip_entries:
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Upload has too many files")
+
+    entries: list[tuple[str, bytes]] = []
+    total_size = 0
+    for index, upload in enumerate(files):
+        filename = _upload_relative_path(upload, relative_paths, index)
+        _validate_dataset_entry(filename)
+        data = await upload.read()
+        total_size += len(data)
+        _ensure_size_within_limit(total_size, settings.max_dataset_zip_uncompressed_bytes, "Upload is too large")
+        entries.append((filename, data))
+
+    result = _store_dataset_entries(session, storage, dataset, entries, settings)
+    try:
         dataset.sample_count = _dataset_sample_count(session, dataset.id)
         session.add(dataset)
         session.commit()
@@ -201,22 +249,62 @@ def _store_zip(
                 settings.max_dataset_zip_uncompressed_bytes,
                 "Zip file is too large after extraction",
             )
-            for info in entries:
-                _validate_zip_entry(info.filename)
-                filename = _safe_basename(info.filename)
-                if PurePosixPath(filename).suffix.lower() not in IMAGE_EXTENSIONS:
-                    result.skipped_count += 1
-                    continue
-                _ensure_size_within_limit(info.file_size, settings.max_dataset_image_bytes, "Image file is too large")
-                image_data = archive.read(info)
-                image_result = _store_image(session, storage, dataset, filename, image_data, settings)
+            result = _store_dataset_entries(
+                session,
+                storage,
+                dataset,
+                [(info.filename, archive.read(info)) for info in entries],
+                settings,
+            )
+    except BadZipFile as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid zip file") from exc
+    except Exception:
+        _cleanup_stored_objects(storage, result.stored_objects)
+        raise
+    return result
+
+
+def _store_dataset_entries(
+    session: Session,
+    storage: ObjectStorageClient,
+    dataset: Dataset,
+    entries: list[tuple[str, bytes]],
+    settings: Settings,
+) -> _UploadResult:
+    result = _UploadResult()
+    try:
+        labels = _label_entries(entries)
+        _apply_class_schema_from_yaml(dataset, entries)
+        for filename, data in entries:
+            _validate_dataset_entry(filename)
+            extension = PurePosixPath(filename.replace("\\", "/")).suffix.lower()
+            if extension in IMAGE_EXTENSIONS:
+                _ensure_size_within_limit(len(data), settings.max_dataset_image_bytes, "Image file is too large")
+                image_result = _store_image(session, storage, dataset, _safe_basename(filename), data, settings)
                 result.samples.extend(image_result.samples)
                 result.created_count += image_result.created_count
                 result.duplicate_count += image_result.duplicate_count
                 result.skipped_count += image_result.skipped_count
                 result.stored_objects.extend(image_result.stored_objects)
-    except BadZipFile as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid zip file") from exc
+                sample = image_result.samples[0] if image_result.created_count == 1 else None
+                if sample is not None:
+                    label_text = _matching_label_text(filename, labels)
+                    if label_text:
+                        sample.split = _split_from_path(filename)
+                        sample.annotation_status = "labeled"
+                        session.add(
+                            Annotation(
+                                dataset_sample_id=sample.id,
+                                source="yolo",
+                                internal_payload=_parse_yolo_detect_label(label_text, dataset, sample),
+                                validation_status="valid",
+                            )
+                        )
+                        dataset.annotation_count = (dataset.annotation_count or 0) + 1
+            elif extension in LABEL_EXTENSIONS or extension in YAML_EXTENSIONS:
+                result.skipped_count += 1
+            else:
+                result.skipped_count += 1
     except Exception:
         _cleanup_stored_objects(storage, result.stored_objects)
         raise
@@ -289,20 +377,142 @@ def _bytes_file(data: bytes):
 
 
 def _validate_zip_entry(filename: str) -> None:
+    _validate_dataset_entry(filename)
+
+
+def _validate_dataset_entry(filename: str) -> None:
     if "\\" in filename:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe zip entry: {filename}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe dataset entry: {filename}")
     if len(filename) >= 2 and filename[1] == ":":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe zip entry: {filename}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe dataset entry: {filename}")
     normalized = filename.replace("\\", "/")
     path = PurePosixPath(normalized)
     if normalized.startswith("//") or path.is_absolute() or any(part == ".." for part in path.parts):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe zip entry: {filename}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe dataset entry: {filename}")
 
 
 def _safe_basename(filename: str) -> str:
     basename = PurePosixPath(filename.replace("\\", "/")).name
     cleaned = "".join(character if character.isalnum() or character in {".", "-", "_"} else "_" for character in basename)
     return cleaned or "upload"
+
+
+def _upload_relative_path(upload: UploadFile, relative_paths: list[str] | None, index: int) -> str:
+    if relative_paths is not None and index < len(relative_paths) and relative_paths[index]:
+        return relative_paths[index]
+    return upload.filename or "upload"
+
+
+def _label_entries(entries: list[tuple[str, bytes]]) -> dict[str, str]:
+    labels = {}
+    for filename, data in entries:
+        normalized = filename.replace("\\", "/")
+        if PurePosixPath(normalized).suffix.lower() in LABEL_EXTENSIONS:
+            labels[_label_key(normalized)] = data.decode("utf-8")
+    return labels
+
+
+def _label_key(filename: str) -> str:
+    path = PurePosixPath(filename)
+    parts = list(path.with_suffix("").parts)
+    normalized_parts = ["labels" if part == "images" else part for part in parts]
+    return "/".join(normalized_parts)
+
+
+def _matching_label_text(image_filename: str, labels: dict[str, str]) -> str | None:
+    normalized = image_filename.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    image_key = _label_key(normalized)
+    candidates = [
+        image_key,
+        "/".join(["labels" if part == "images" else part for part in path.with_suffix("").parts]),
+        "/".join([*path.parent.parts, path.stem]),
+        path.stem,
+    ]
+    for candidate in candidates:
+        if candidate in labels:
+            return labels[candidate]
+    return None
+
+
+def _split_from_path(filename: str) -> str:
+    parts = set(PurePosixPath(filename.replace("\\", "/")).parts)
+    for split in ("train", "val", "test"):
+        if split in parts:
+            return split
+    return "unassigned"
+
+
+def _parse_yolo_detect_label(label_text: str, dataset: Dataset, sample: DatasetSample) -> dict[str, Any]:
+    names = _class_names(dataset.class_schema)
+    results = []
+    for line_number, line in enumerate(label_text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split()
+        if len(parts) != 5:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid YOLO label line {line_number}")
+        class_id = int(parts[0])
+        values = [float(value) for value in parts[1:]]
+        if class_id < 0 or class_id >= len(names) or any(value < 0 or value > 1 for value in values):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid YOLO label line {line_number}")
+        x_center, y_center, width, height = values
+        results.append(
+            {
+                "source_result_id": f"{sample.id}-{line_number}",
+                "shape": "rectangle",
+                "class_id": class_id,
+                "class_name": names[class_id],
+                "x": (x_center - width / 2) * 100,
+                "y": (y_center - height / 2) * 100,
+                "width": width * 100,
+                "height": height * 100,
+            }
+        )
+    return {"annotations": [{"source_annotation_id": f"yolo-{sample.id}", "results": results}]}
+
+
+def _class_names(class_schema: dict[str, Any]) -> list[str]:
+    names = class_schema.get("names")
+    if isinstance(names, list) and names:
+        return [str(name) for name in names]
+    if isinstance(names, dict) and names:
+        return [str(names[str(index)] if str(index) in names else names[index]) for index in range(len(names))]
+    return ["class_0"]
+
+
+def _apply_class_schema_from_yaml(dataset: Dataset, entries: list[tuple[str, bytes]]) -> None:
+    if dataset.class_schema.get("names"):
+        return
+    for filename, data in entries:
+        if PurePosixPath(filename.replace("\\", "/")).suffix.lower() not in YAML_EXTENSIONS:
+            continue
+        names = _parse_names_from_yaml_text(data.decode("utf-8", errors="ignore"))
+        if names:
+            dataset.class_schema = {**(dataset.class_schema or {}), "names": names}
+            return
+
+
+def _parse_names_from_yaml_text(text: str) -> list[str]:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("names:"):
+            value = stripped.partition(":")[2].strip()
+            if value.startswith("[") and value.endswith("]"):
+                return [item.strip().strip("'\"") for item in value.strip("[]").split(",") if item.strip()]
+            names = []
+            for nested in lines[index + 1 :]:
+                nested_stripped = nested.strip()
+                if not nested.startswith(" ") or not nested_stripped:
+                    break
+                if ":" in nested_stripped:
+                    names.append(nested_stripped.partition(":")[2].strip().strip("'\""))
+                elif nested_stripped.startswith("-"):
+                    names.append(nested_stripped[1:].strip().strip("'\""))
+            return [name for name in names if name]
+    return []
 
 
 def _dataset_sample_count(session: Session, dataset_id: str) -> int:

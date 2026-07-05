@@ -176,6 +176,17 @@ export const api = {
       body: formData
     });
   },
+  uploadDatasetBatch: (datasetId: string, files: File[]) => {
+    const formData = new FormData();
+    files.forEach((file) => {
+      formData.append("files", file, file.name);
+      formData.append("relative_paths", file.webkitRelativePath || file.name);
+    });
+    return request<SampleUploadResponse>(`/datasets/${datasetId}/samples:upload-batch`, {
+      method: "POST",
+      body: formData
+    });
+  },
   analyzeDataset: (id: string) => request<unknown>(`/datasets/${id}/analyze`, { method: "POST" }),
   validateDataset: (id: string) => request<unknown>(`/datasets/${id}/validate`, { method: "POST" }),
   listLabelProjects: (datasetId: string) =>

@@ -8,7 +8,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from PIL import Image
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.orm import Session, sessionmaker
 
 import visiox_api.main as api_main
@@ -176,6 +176,44 @@ def test_upload_zip_indexes_images_skips_non_images_and_rejects_zip_slip(client:
 
     assert unsafe_response.status_code == 400
     assert "unsafe" in unsafe_response.json()["detail"].lower()
+
+
+def test_upload_yolo_detect_folder_batch_indexes_images_and_labels(client: TestClient, session_factory):
+    dataset = create_dataset(client, name="yolo-folder", task="detect")
+    image_bytes = make_image_bytes((20, 10))
+
+    response = client.post(
+        f"/datasets/{dataset['id']}/samples:upload-batch",
+        files=[
+            ("files", ("dataset/data.yaml", b"names: [ok, defect]\n", "text/yaml")),
+            ("files", ("dataset/images/train/part.png", image_bytes, "image/png")),
+            ("files", ("dataset/labels/train/part.txt", b"1 0.5 0.5 0.4 0.2\n", "text/plain")),
+        ],
+        data={
+            "relative_paths": [
+                "dataset/data.yaml",
+                "dataset/images/train/part.png",
+                "dataset/labels/train/part.txt",
+            ]
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["created_count"] == 1
+    assert body["skipped_count"] == 2
+
+    with session_factory() as session:
+        saved_dataset = session.get(Dataset, dataset["id"])
+        sample = session.get(DatasetSample, body["samples"][0]["id"])
+        annotation = session.scalar(select(Annotation).where(Annotation.dataset_sample_id == sample.id))
+
+    assert saved_dataset.sample_count == 1
+    assert saved_dataset.annotation_count == 1
+    assert sample.split == "train"
+    assert sample.annotation_status == "labeled"
+    assert annotation.source == "yolo"
+    assert annotation.internal_payload["annotations"][0]["results"][0]["class_name"] == "defect"
 
 
 @pytest.mark.parametrize(
