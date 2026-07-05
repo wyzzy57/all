@@ -63,7 +63,7 @@
                 {{ formatTime(row.updated_at || row.created_at) }}
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="210" fixed="right">
+            <el-table-column label="操作" width="300" fixed="right">
               <template #default="{ row }">
                 <el-button
                   size="small"
@@ -80,6 +80,9 @@
                   @click="validate(row)"
                 >
                   校验
+                </el-button>
+                <el-button size="small" @click="openLabelProjects(row)">
+                  标注
                 </el-button>
               </template>
             </el-table-column>
@@ -144,6 +147,81 @@
         </div>
       </el-col>
     </el-row>
+
+    <el-drawer v-model="labelDrawer" title="Label Studio 标注" size="560px">
+      <template v-if="selectedDataset">
+        <div class="label-drawer-head">
+          <div>
+            <div class="drawer-title">{{ selectedDataset.name || selectedDataset.id }}</div>
+            <div class="drawer-subtitle">{{ selectedDataset.task }} / {{ selectedDataset.status }}</div>
+          </div>
+          <el-button :loading="labelLoading" @click="loadLabelProjects">刷新</el-button>
+        </div>
+
+        <el-alert
+          v-if="labelError"
+          :title="labelError"
+          type="warning"
+          show-icon
+          :closable="false"
+          class="drawer-section"
+        />
+
+        <el-form :model="labelForm" label-width="120px" class="drawer-section">
+          <el-form-item label="已有项目 ID">
+            <el-input v-model="labelForm.external_project_id" placeholder="留空则新建 Label Studio 项目" />
+          </el-form-item>
+          <el-form-item>
+            <el-button
+              type="primary"
+              :loading="labelAction === 'create'"
+              @click="createLabelProject"
+            >
+              创建/关联项目
+            </el-button>
+          </el-form-item>
+        </el-form>
+
+        <el-table
+          v-loading="labelLoading"
+          :data="labelProjects"
+          row-key="id"
+          empty-text="暂无 Label Studio 项目"
+        >
+          <el-table-column prop="external_project_id" label="外部项目" min-width="120" />
+          <el-table-column prop="sync_status" label="同步状态" width="120">
+            <template #default="{ row }">
+              <el-tag :type="labelStatusType(row.sync_status)">{{ row.sync_status }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="更新时间" width="170">
+            <template #default="{ row }">
+              {{ formatTime(row.last_sync_at || row.updated_at) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="190" fixed="right">
+            <template #default="{ row }">
+              <el-button
+                size="small"
+                :loading="labelAction === `${row.id}:sync`"
+                @click="syncSamples(row.id)"
+              >
+                同步样本
+              </el-button>
+              <el-button
+                size="small"
+                type="primary"
+                plain
+                :loading="labelAction === `${row.id}:import`"
+                @click="importAnnotations(row.id)"
+              >
+                导入标注
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+    </el-drawer>
   </section>
 </template>
 
@@ -152,7 +230,7 @@ import type { UploadFile, UploadFiles } from "element-plus";
 import { ElMessage } from "element-plus";
 import { computed, onMounted, ref } from "vue";
 
-import { api } from "@/api/client";
+import { api, type LabelProjectRecord } from "@/api/client";
 
 type AnyRecord = Record<string, unknown>;
 
@@ -173,6 +251,13 @@ const errorMessage = ref("");
 const keyword = ref("");
 const datasets = ref<DatasetRow[]>([]);
 const uploadFiles = ref<UploadFile[]>([]);
+const labelDrawer = ref(false);
+const labelLoading = ref(false);
+const labelError = ref("");
+const labelAction = ref("");
+const selectedDataset = ref<DatasetRow | null>(null);
+const labelProjects = ref<LabelProjectRecord[]>([]);
+const labelForm = ref({ external_project_id: "" });
 
 const filteredDatasets = computed(() => {
   const term = keyword.value.trim().toLowerCase();
@@ -232,6 +317,74 @@ async function validate(row: DatasetRow) {
   await runDatasetAction(row, "validate", () => api.validateDataset(row.id), "已提交校验任务");
 }
 
+async function openLabelProjects(row: DatasetRow) {
+  selectedDataset.value = row;
+  labelDrawer.value = true;
+  labelForm.value.external_project_id = "";
+  await loadLabelProjects();
+}
+
+async function loadLabelProjects() {
+  if (!selectedDataset.value) return;
+  labelLoading.value = true;
+  labelError.value = "";
+  try {
+    labelProjects.value = (await api.listLabelProjects(selectedDataset.value.id)).items;
+  } catch (error) {
+    labelProjects.value = [];
+    labelError.value = getErrorMessage(error, "Label Studio 项目加载失败");
+  } finally {
+    labelLoading.value = false;
+  }
+}
+
+async function createLabelProject() {
+  if (!selectedDataset.value) return;
+  labelAction.value = "create";
+  labelError.value = "";
+  try {
+    const externalProjectId = labelForm.value.external_project_id.trim();
+    await api.createLabelProject(
+      selectedDataset.value.id,
+      externalProjectId ? { external_project_id: externalProjectId } : {},
+    );
+    ElMessage.success("Label Studio 项目已就绪");
+    labelForm.value.external_project_id = "";
+    await loadLabelProjects();
+  } catch (error) {
+    labelError.value = getErrorMessage(error, "Label Studio 项目创建失败");
+  } finally {
+    labelAction.value = "";
+  }
+}
+
+async function syncSamples(projectId: string) {
+  await runLabelAction(projectId, "sync", () => api.syncLabelProjectSamples(projectId), "已提交样本同步任务");
+}
+
+async function importAnnotations(projectId: string) {
+  await runLabelAction(projectId, "import", () => api.importLabelProjectAnnotations(projectId), "已提交标注导入任务");
+}
+
+async function runLabelAction(
+  projectId: string,
+  action: string,
+  request: () => Promise<unknown>,
+  successMessage: string,
+) {
+  labelAction.value = `${projectId}:${action}`;
+  labelError.value = "";
+  try {
+    await request();
+    ElMessage.success(successMessage);
+    await loadLabelProjects();
+  } catch (error) {
+    labelError.value = getErrorMessage(error, "Label Studio 操作失败");
+  } finally {
+    labelAction.value = "";
+  }
+}
+
 async function runDatasetAction(
   row: DatasetRow,
   action: string,
@@ -289,6 +442,13 @@ function statusTag(status?: string) {
   if (status === "validated" || status === "ready") return "success";
   if (status === "failed" || status === "invalid") return "danger";
   if (status === "analyzing" || status === "validating") return "warning";
+  return "info";
+}
+
+function labelStatusType(status?: string) {
+  if (status === "synced" || status === "imported") return "success";
+  if (status === "failed") return "danger";
+  if (status === "pending") return "warning";
   return "info";
 }
 
@@ -376,5 +536,27 @@ function getErrorMessage(error: unknown, fallback: string) {
 .status-grid strong {
   color: #111827;
   font-size: 24px;
+}
+
+.label-drawer-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.drawer-title {
+  color: #111827;
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.drawer-subtitle {
+  color: #6b7280;
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.drawer-section {
+  margin-top: 16px;
 }
 </style>

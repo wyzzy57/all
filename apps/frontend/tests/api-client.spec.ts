@@ -20,6 +20,9 @@ describe("api client", () => {
     await api.downloadBaseModel("base-1");
     await api.analyzeDataset("dataset-1");
     await api.validateDataset("dataset-1");
+    await api.createLabelProject("dataset-1", { external_project_id: "9001" });
+    await api.syncLabelProjectSamples("label-project-1");
+    await api.importLabelProjectAnnotations("label-project-1");
     await api.createTrainingJob("pipeline-1", {});
 
     expect(fetchMock).toHaveBeenNthCalledWith(
@@ -39,6 +42,21 @@ describe("api client", () => {
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       4,
+      "/datasets/dataset-1/label-projects",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      "/label-projects/label-project-1/sync-samples",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      "/label-projects/label-project-1/import-annotations",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      7,
       "/pipelines/pipeline-1/jobs",
       expect.objectContaining({ method: "POST" }),
     );

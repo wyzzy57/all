@@ -24,6 +24,17 @@ export type DatasetRecord = {
   annotation_count: number;
 };
 
+export type LabelProjectRecord = {
+  id: string;
+  dataset_id: string;
+  provider: string;
+  external_project_id?: string | null;
+  sync_status: string;
+  last_sync_at?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type TrainingPipelineRecord = {
   id: string;
   name: string;
@@ -138,6 +149,17 @@ export const api = {
     request<ListResponse<DatasetRecord>>(`/datasets${query(params)}`),
   analyzeDataset: (id: string) => request<unknown>(`/datasets/${id}/analyze`, { method: "POST" }),
   validateDataset: (id: string) => request<unknown>(`/datasets/${id}/validate`, { method: "POST" }),
+  listLabelProjects: (datasetId: string) =>
+    request<{ items: LabelProjectRecord[]; total: number }>(`/datasets/${datasetId}/label-projects`),
+  createLabelProject: (datasetId: string, payload: { external_project_id?: string } = {}) =>
+    request<LabelProjectRecord>(`/datasets/${datasetId}/label-projects`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  syncLabelProjectSamples: (projectId: string) =>
+    request<TaskRecord>(`/label-projects/${projectId}/sync-samples`, { method: "POST" }),
+  importLabelProjectAnnotations: (projectId: string) =>
+    request<TaskRecord>(`/label-projects/${projectId}/import-annotations`, { method: "POST" }),
   createPipeline: (payload: Record<string, unknown>) =>
     request<TrainingPipelineRecord>("/pipelines", { method: "POST", body: JSON.stringify(payload) }),
   listPipelines: () => request<ListResponse<TrainingPipelineRecord>>("/pipelines"),
