@@ -166,6 +166,8 @@ export const api = {
   listTrainedModels: () => request<ListResponse<Record<string, unknown>>>("/trained-models"),
   listDatasets: (params: { task?: string; status?: string } = {}) =>
     request<ListResponse<DatasetRecord>>(`/datasets${query(params)}`),
+  createDataset: (payload: { name: string; task: string; class_schema: Record<string, unknown>; source?: string }) =>
+    request<DatasetRecord>("/datasets", { method: "POST", body: JSON.stringify(payload) }),
   uploadDatasetSample: (datasetId: string, file: File) => {
     const formData = new FormData();
     formData.set("file", file, file.name);

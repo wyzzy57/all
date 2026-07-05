@@ -95,8 +95,29 @@
           <el-card shadow="never">
             <template #header>样本上传入口</template>
             <el-form label-position="top">
-              <el-form-item label="目标数据集">
-                <el-select v-model="uploadDatasetId" filterable placeholder="选择要上传到的数据集">
+              <el-form-item label="上传方式">
+                <el-segmented v-model="uploadMode" :options="uploadModeOptions" />
+              </el-form-item>
+              <template v-if="uploadMode === 'new'">
+                <el-form-item label="数据集名称">
+                  <el-input v-model="newDataset.name" placeholder="选择文件夹后自动填入" />
+                </el-form-item>
+                <el-form-item label="任务类型">
+                  <el-select v-model="newDataset.task">
+                    <el-option label="detect" value="detect" />
+                    <el-option label="segment" value="segment" />
+                    <el-option label="semantic" value="semantic" />
+                    <el-option label="pose" value="pose" />
+                    <el-option label="obb" value="obb" />
+                    <el-option label="classify" value="classify" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="类别">
+                  <el-input v-model="newDataset.classNames" placeholder="用英文逗号分隔，例如 ok,defect" />
+                </el-form-item>
+              </template>
+              <el-form-item v-else label="目标数据集">
+                <el-select v-model="uploadDatasetId" filterable placeholder="选择要追加样本的数据集">
                   <el-option
                     v-for="dataset in datasets"
                     :key="dataset.id"
@@ -142,7 +163,7 @@
                   size="small"
                   type="primary"
                   :loading="uploading"
-                  :disabled="!uploadDatasetId || uploadFiles.length === 0"
+                  :disabled="!canUpload"
                   @click="uploadPendingFiles"
                 >
                   上传
@@ -289,7 +310,13 @@ const actingId = ref("");
 const errorMessage = ref("");
 const keyword = ref("");
 const datasets = ref<DatasetRow[]>([]);
+const uploadMode = ref("new");
+const uploadModeOptions = [
+  { label: "新建数据集", value: "new" },
+  { label: "追加样本", value: "existing" },
+];
 const uploadDatasetId = ref("");
+const newDataset = ref({ name: "", task: "detect", classNames: "ok,defect" });
 const uploadFiles = ref<File[]>([]);
 const uploading = ref(false);
 const fileInputRef = ref<HTMLInputElement>();
@@ -341,6 +368,12 @@ const uploadPreview = computed(() =>
     size: formatBytes(file.size),
   })),
 );
+
+const canUpload = computed(() => {
+  if (uploadFiles.value.length === 0 || uploading.value) return false;
+  if (uploadMode.value === "existing") return Boolean(uploadDatasetId.value);
+  return Boolean(newDataset.value.name.trim()) && parseClassNames().length > 0;
+});
 
 onMounted(() => {
   void loadDatasets();
@@ -457,6 +490,7 @@ async function runDatasetAction(
 function handleNativeFiles(event: Event) {
   const input = event.target as HTMLInputElement;
   const files = Array.from(input.files || []).filter(isSupportedUploadFile);
+  applyFolderDatasetName(files);
   const existing = new Set(uploadFiles.value.map(fileIdentity));
   const next = [...uploadFiles.value];
   for (const file of files) {
@@ -471,14 +505,15 @@ function handleNativeFiles(event: Event) {
 }
 
 async function uploadPendingFiles() {
-  if (!uploadDatasetId.value || uploadFiles.value.length === 0) return;
+  if (!canUpload.value) return;
   uploading.value = true;
   let created = 0;
   let duplicate = 0;
   let skipped = 0;
   try {
+    const datasetId = await resolveUploadDatasetId();
     for (const file of uploadFiles.value) {
-      const result = await api.uploadDatasetSample(uploadDatasetId.value, file);
+      const result = await api.uploadDatasetSample(datasetId, file);
       created += result.created_count;
       duplicate += result.duplicate_count;
       skipped += result.skipped_count;
@@ -495,6 +530,35 @@ async function uploadPendingFiles() {
 
 function clearUploads() {
   uploadFiles.value = [];
+}
+
+async function resolveUploadDatasetId() {
+  if (uploadMode.value === "existing") return uploadDatasetId.value;
+  const dataset = await api.createDataset({
+    name: newDataset.value.name.trim(),
+    task: newDataset.value.task,
+    class_schema: { names: parseClassNames() },
+    source: "upload",
+  });
+  uploadDatasetId.value = dataset.id;
+  return dataset.id;
+}
+
+function parseClassNames() {
+  return newDataset.value.classNames
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function applyFolderDatasetName(files: File[]) {
+  if (uploadMode.value !== "new" || newDataset.value.name.trim()) return;
+  const firstPath = files.find((file) => file.webkitRelativePath)?.webkitRelativePath;
+  if (!firstPath) return;
+  const folderName = firstPath.split("/").filter(Boolean)[0];
+  if (folderName) {
+    newDataset.value.name = folderName;
+  }
 }
 
 function isSupportedUploadFile(file: File) {
@@ -597,7 +661,6 @@ function getErrorMessage(error: unknown, fallback: string) {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 24px 8px;
 }
 
 .upload-copy span,
@@ -608,6 +671,30 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 .upload-footer {
   margin-top: 12px;
+}
+
+.upload-picker {
+  border: 1px dashed #cbd5e1;
+  border-radius: 6px;
+  padding: 16px;
+}
+
+.upload-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.upload-table {
+  margin-top: 12px;
+}
+
+.visually-hidden {
+  height: 1px;
+  opacity: 0;
+  overflow: hidden;
+  position: absolute;
+  width: 1px;
 }
 
 .status-grid {
