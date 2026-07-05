@@ -24,6 +24,22 @@ export type DatasetRecord = {
   annotation_count: number;
 };
 
+export type SampleUploadResponse = {
+  created_count: number;
+  duplicate_count: number;
+  skipped_count: number;
+  samples: Array<{
+    id: string;
+    dataset_id: string;
+    file_uri: string;
+    width?: number | null;
+    height?: number | null;
+    checksum?: string | null;
+    split?: string | null;
+    annotation_status: string;
+  }>;
+};
+
 export type LabelProjectRecord = {
   id: string;
   dataset_id: string;
@@ -115,11 +131,14 @@ export type DeploymentRecord = {
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const isFormData = init?.body instanceof FormData;
   const response = await fetch(`${API_BASE_URL}${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {})
-    },
+    headers: isFormData
+      ? init?.headers
+      : {
+          "Content-Type": "application/json",
+          ...(init?.headers ?? {})
+        },
     ...init
   });
   if (!response.ok) {
@@ -147,6 +166,14 @@ export const api = {
   listTrainedModels: () => request<ListResponse<Record<string, unknown>>>("/trained-models"),
   listDatasets: (params: { task?: string; status?: string } = {}) =>
     request<ListResponse<DatasetRecord>>(`/datasets${query(params)}`),
+  uploadDatasetSample: (datasetId: string, file: File) => {
+    const formData = new FormData();
+    formData.set("file", file, file.name);
+    return request<SampleUploadResponse>(`/datasets/${datasetId}/samples:upload`, {
+      method: "POST",
+      body: formData
+    });
+  },
   analyzeDataset: (id: string) => request<unknown>(`/datasets/${id}/analyze`, { method: "POST" }),
   validateDataset: (id: string) => request<unknown>(`/datasets/${id}/validate`, { method: "POST" }),
   listLabelProjects: (datasetId: string) =>

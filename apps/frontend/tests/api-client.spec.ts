@@ -17,6 +17,7 @@ describe("api client", () => {
   it("uses backend route contracts for task actions", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(() => mockJsonResponse({ items: [], total: 0 }));
 
+    await api.uploadDatasetSample("dataset-1", new File(["image"], "part.png", { type: "image/png" }));
     await api.downloadBaseModel("base-1");
     await api.analyzeDataset("dataset-1");
     await api.validateDataset("dataset-1");
@@ -27,36 +28,45 @@ describe("api client", () => {
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
+      "/datasets/dataset-1/samples:upload",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.any(FormData),
+        headers: undefined,
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
       "/base-models/base-1/download",
       expect.objectContaining({ method: "POST" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
+      3,
       "/datasets/dataset-1/analyze",
       expect.objectContaining({ method: "POST" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      3,
+      4,
       "/datasets/dataset-1/validate",
       expect.objectContaining({ method: "POST" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      4,
+      5,
       "/datasets/dataset-1/label-projects",
       expect.objectContaining({ method: "POST" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      5,
+      6,
       "/label-projects/label-project-1/sync-samples",
       expect.objectContaining({ method: "POST" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      6,
+      7,
       "/label-projects/label-project-1/import-annotations",
       expect.objectContaining({ method: "POST" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      7,
+      8,
       "/pipelines/pipeline-1/jobs",
       expect.objectContaining({ method: "POST" }),
     );

@@ -94,25 +94,65 @@
         <div class="side-stack">
           <el-card shadow="never">
             <template #header>样本上传入口</template>
-            <el-upload
-              drag
-              multiple
-              :auto-upload="false"
-              :file-list="uploadFiles"
-              :on-change="handleUploadChange"
-              :on-remove="handleUploadRemove"
-            >
+            <el-form label-position="top">
+              <el-form-item label="目标数据集">
+                <el-select v-model="uploadDatasetId" filterable placeholder="选择要上传到的数据集">
+                  <el-option
+                    v-for="dataset in datasets"
+                    :key="dataset.id"
+                    :label="dataset.name || dataset.id"
+                    :value="dataset.id"
+                  />
+                </el-select>
+              </el-form-item>
+            </el-form>
+            <div class="upload-picker">
+              <input
+                ref="fileInputRef"
+                class="visually-hidden"
+                type="file"
+                multiple
+                accept=".jpg,.jpeg,.png,.bmp,.webp,.zip,image/*"
+                @change="handleNativeFiles"
+              />
+              <input
+                ref="folderInputRef"
+                class="visually-hidden"
+                type="file"
+                multiple
+                webkitdirectory
+                @change="handleNativeFiles"
+              />
               <div class="upload-copy">
-                <strong>拖入图片、视频帧或标注文件</strong>
-                <span>当前仅作为上传入口占位，接入上传 API 后可直接提交。</span>
+                <strong>选择图片、zip 或整个数据文件夹</strong>
+                <span>文件夹会按图片文件逐个上传；zip 会交给后端批量解析。</span>
               </div>
-            </el-upload>
-            <div class="upload-footer">
-              <span>{{ uploadFiles.length }} 个待处理文件</span>
-              <el-button size="small" :disabled="uploadFiles.length === 0" @click="clearUploads">
-                清空
-              </el-button>
+              <div class="upload-actions">
+                <el-button @click="fileInputRef?.click()">选择文件</el-button>
+                <el-button @click="folderInputRef?.click()">选择文件夹</el-button>
+              </div>
             </div>
+            <div class="upload-footer">
+              <span>{{ uploadFiles.length }} 个待上传文件</span>
+              <div>
+                <el-button size="small" :disabled="uploadFiles.length === 0" @click="clearUploads">
+                清空
+                </el-button>
+                <el-button
+                  size="small"
+                  type="primary"
+                  :loading="uploading"
+                  :disabled="!uploadDatasetId || uploadFiles.length === 0"
+                  @click="uploadPendingFiles"
+                >
+                  上传
+                </el-button>
+              </div>
+            </div>
+            <el-table v-if="uploadFiles.length" :data="uploadPreview" size="small" class="upload-table" max-height="220">
+              <el-table-column prop="name" label="文件" min-width="180" show-overflow-tooltip />
+              <el-table-column prop="size" label="大小" width="90" />
+            </el-table>
           </el-card>
 
           <el-card shadow="never">
@@ -226,7 +266,6 @@
 </template>
 
 <script setup lang="ts">
-import type { UploadFile, UploadFiles } from "element-plus";
 import { ElMessage } from "element-plus";
 import { computed, onMounted, ref } from "vue";
 
@@ -250,7 +289,11 @@ const actingId = ref("");
 const errorMessage = ref("");
 const keyword = ref("");
 const datasets = ref<DatasetRow[]>([]);
-const uploadFiles = ref<UploadFile[]>([]);
+const uploadDatasetId = ref("");
+const uploadFiles = ref<File[]>([]);
+const uploading = ref(false);
+const fileInputRef = ref<HTMLInputElement>();
+const folderInputRef = ref<HTMLInputElement>();
 const labelDrawer = ref(false);
 const labelLoading = ref(false);
 const labelError = ref("");
@@ -291,6 +334,13 @@ const statusSummary = computed(() => {
   }
   return Array.from(groups.entries()).map(([status, count]) => ({ status, count }));
 });
+
+const uploadPreview = computed(() =>
+  uploadFiles.value.slice(0, 200).map((file) => ({
+    name: file.webkitRelativePath || file.name,
+    size: formatBytes(file.size),
+  })),
+);
 
 onMounted(() => {
   void loadDatasets();
@@ -404,16 +454,62 @@ async function runDatasetAction(
   }
 }
 
-function handleUploadChange(_file: UploadFile, files: UploadFiles) {
-  uploadFiles.value = [...files];
+function handleNativeFiles(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files || []).filter(isSupportedUploadFile);
+  const existing = new Set(uploadFiles.value.map(fileIdentity));
+  const next = [...uploadFiles.value];
+  for (const file of files) {
+    const identity = fileIdentity(file);
+    if (!existing.has(identity)) {
+      existing.add(identity);
+      next.push(file);
+    }
+  }
+  uploadFiles.value = next;
+  input.value = "";
 }
 
-function handleUploadRemove(_file: UploadFile, files: UploadFiles) {
-  uploadFiles.value = [...files];
+async function uploadPendingFiles() {
+  if (!uploadDatasetId.value || uploadFiles.value.length === 0) return;
+  uploading.value = true;
+  let created = 0;
+  let duplicate = 0;
+  let skipped = 0;
+  try {
+    for (const file of uploadFiles.value) {
+      const result = await api.uploadDatasetSample(uploadDatasetId.value, file);
+      created += result.created_count;
+      duplicate += result.duplicate_count;
+      skipped += result.skipped_count;
+    }
+    ElMessage.success(`上传完成：新增 ${created}，重复 ${duplicate}，跳过 ${skipped}`);
+    clearUploads();
+    await loadDatasets();
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, "样本上传失败"));
+  } finally {
+    uploading.value = false;
+  }
 }
 
 function clearUploads() {
   uploadFiles.value = [];
+}
+
+function isSupportedUploadFile(file: File) {
+  const name = file.name.toLowerCase();
+  return [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".zip"].some((suffix) => name.endsWith(suffix));
+}
+
+function fileIdentity(file: File) {
+  return `${file.webkitRelativePath || file.name}:${file.size}:${file.lastModified}`;
+}
+
+function formatBytes(size: number) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function normalizeRows<T extends AnyRecord>(payload: unknown): T[] {
