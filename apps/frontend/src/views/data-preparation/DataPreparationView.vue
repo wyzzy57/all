@@ -18,9 +18,123 @@
       :closable="false"
     />
 
-    <el-row :gutter="16">
-      <el-col :xs="24" :lg="16">
-        <el-card shadow="never">
+    <div class="top-stack">
+      <el-card shadow="never">
+        <template #header>样本上传入口</template>
+        <el-form label-position="top" class="upload-form">
+          <el-form-item label="上传方式">
+            <el-segmented v-model="uploadMode" :options="uploadModeOptions" />
+          </el-form-item>
+          <template v-if="uploadMode === 'new'">
+            <el-form-item label="数据集名称">
+              <el-input v-model="newDataset.name" placeholder="选择文件夹后自动填入" />
+            </el-form-item>
+            <el-form-item label="任务类型">
+              <el-select v-model="newDataset.task">
+                <el-option label="detect" value="detect" />
+                <el-option label="segment" value="segment" />
+                <el-option label="semantic" value="semantic" />
+                <el-option label="pose" value="pose" />
+                <el-option label="obb" value="obb" />
+                <el-option label="classify" value="classify" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="类别">
+              <el-input v-model="newDataset.classNames" placeholder="用英文逗号分隔，例如 ok,defect" />
+            </el-form-item>
+          </template>
+          <el-form-item v-else label="目标数据集">
+            <el-select v-model="uploadDatasetId" filterable placeholder="选择要追加样本的数据集">
+              <el-option
+                v-for="dataset in datasets"
+                :key="dataset.id"
+                :label="dataset.name || dataset.id"
+                :value="dataset.id"
+              />
+            </el-select>
+          </el-form-item>
+        </el-form>
+        <div class="upload-picker">
+          <input
+            ref="fileInputRef"
+            class="visually-hidden"
+            type="file"
+            multiple
+            accept=".jpg,.jpeg,.png,.bmp,.webp,.zip,image/*"
+            @change="handleNativeFiles"
+          />
+          <input
+            ref="folderInputRef"
+            class="visually-hidden"
+            type="file"
+            multiple
+            webkitdirectory
+            @change="handleNativeFiles"
+          />
+          <div class="upload-copy">
+            <strong>选择图片、zip 或整个数据文件夹</strong>
+            <span>文件夹会按图片文件逐个上传；zip 会交给后端批量解析。</span>
+          </div>
+          <div class="upload-actions">
+            <el-button @click="fileInputRef?.click()">选择文件</el-button>
+            <el-button @click="folderInputRef?.click()">选择文件夹</el-button>
+          </div>
+        </div>
+        <div class="upload-footer">
+          <span>{{ uploadFiles.length }} 个待上传文件</span>
+          <div>
+            <el-button size="small" :disabled="uploadFiles.length === 0" @click="clearUploads">
+            清空
+            </el-button>
+            <el-button
+              size="small"
+              type="primary"
+              :loading="uploading"
+              :disabled="!canUpload"
+              @click="uploadPendingFiles"
+            >
+              上传
+            </el-button>
+          </div>
+        </div>
+        <el-table v-if="uploadFiles.length" :data="uploadPreview" size="small" class="upload-table" max-height="220">
+          <el-table-column prop="name" label="文件" min-width="180" show-overflow-tooltip />
+          <el-table-column prop="size" label="大小" width="90" />
+        </el-table>
+      </el-card>
+
+      <el-card shadow="never">
+        <template #header>样本状态摘要</template>
+        <div class="status-grid">
+          <div>
+            <span>数据集</span>
+            <strong>{{ datasets.length }}</strong>
+          </div>
+          <div>
+            <span>样本总数</span>
+            <strong>{{ totalSamples }}</strong>
+          </div>
+          <div>
+            <span>标注总数</span>
+            <strong>{{ totalAnnotations }}</strong>
+          </div>
+          <div>
+            <span>已验证</span>
+            <strong>{{ validatedCount }}</strong>
+          </div>
+        </div>
+      </el-card>
+
+      <el-card shadow="never">
+        <template #header>状态分布</template>
+        <el-table :data="statusSummary" size="small" empty-text="暂无状态">
+          <el-table-column prop="status" label="状态" />
+          <el-table-column prop="count" label="数量" width="90" />
+        </el-table>
+      </el-card>
+    </div>
+
+    <el-card shadow="never">
           <template #header>
             <div class="card-header">
               <span>数据集列表</span>
@@ -87,127 +201,7 @@
               </template>
             </el-table-column>
           </el-table>
-        </el-card>
-      </el-col>
-
-      <el-col :xs="24" :lg="8">
-        <div class="side-stack">
-          <el-card shadow="never">
-            <template #header>样本上传入口</template>
-            <el-form label-position="top">
-              <el-form-item label="上传方式">
-                <el-segmented v-model="uploadMode" :options="uploadModeOptions" />
-              </el-form-item>
-              <template v-if="uploadMode === 'new'">
-                <el-form-item label="数据集名称">
-                  <el-input v-model="newDataset.name" placeholder="选择文件夹后自动填入" />
-                </el-form-item>
-                <el-form-item label="任务类型">
-                  <el-select v-model="newDataset.task">
-                    <el-option label="detect" value="detect" />
-                    <el-option label="segment" value="segment" />
-                    <el-option label="semantic" value="semantic" />
-                    <el-option label="pose" value="pose" />
-                    <el-option label="obb" value="obb" />
-                    <el-option label="classify" value="classify" />
-                  </el-select>
-                </el-form-item>
-                <el-form-item label="类别">
-                  <el-input v-model="newDataset.classNames" placeholder="用英文逗号分隔，例如 ok,defect" />
-                </el-form-item>
-              </template>
-              <el-form-item v-else label="目标数据集">
-                <el-select v-model="uploadDatasetId" filterable placeholder="选择要追加样本的数据集">
-                  <el-option
-                    v-for="dataset in datasets"
-                    :key="dataset.id"
-                    :label="dataset.name || dataset.id"
-                    :value="dataset.id"
-                  />
-                </el-select>
-              </el-form-item>
-            </el-form>
-            <div class="upload-picker">
-              <input
-                ref="fileInputRef"
-                class="visually-hidden"
-                type="file"
-                multiple
-                accept=".jpg,.jpeg,.png,.bmp,.webp,.zip,image/*"
-                @change="handleNativeFiles"
-              />
-              <input
-                ref="folderInputRef"
-                class="visually-hidden"
-                type="file"
-                multiple
-                webkitdirectory
-                @change="handleNativeFiles"
-              />
-              <div class="upload-copy">
-                <strong>选择图片、zip 或整个数据文件夹</strong>
-                <span>文件夹会按图片文件逐个上传；zip 会交给后端批量解析。</span>
-              </div>
-              <div class="upload-actions">
-                <el-button @click="fileInputRef?.click()">选择文件</el-button>
-                <el-button @click="folderInputRef?.click()">选择文件夹</el-button>
-              </div>
-            </div>
-            <div class="upload-footer">
-              <span>{{ uploadFiles.length }} 个待上传文件</span>
-              <div>
-                <el-button size="small" :disabled="uploadFiles.length === 0" @click="clearUploads">
-                清空
-                </el-button>
-                <el-button
-                  size="small"
-                  type="primary"
-                  :loading="uploading"
-                  :disabled="!canUpload"
-                  @click="uploadPendingFiles"
-                >
-                  上传
-                </el-button>
-              </div>
-            </div>
-            <el-table v-if="uploadFiles.length" :data="uploadPreview" size="small" class="upload-table" max-height="220">
-              <el-table-column prop="name" label="文件" min-width="180" show-overflow-tooltip />
-              <el-table-column prop="size" label="大小" width="90" />
-            </el-table>
-          </el-card>
-
-          <el-card shadow="never">
-            <template #header>样本状态摘要</template>
-            <div class="status-grid">
-              <div>
-                <span>数据集</span>
-                <strong>{{ datasets.length }}</strong>
-              </div>
-              <div>
-                <span>样本总数</span>
-                <strong>{{ totalSamples }}</strong>
-              </div>
-              <div>
-                <span>标注总数</span>
-                <strong>{{ totalAnnotations }}</strong>
-              </div>
-              <div>
-                <span>已验证</span>
-                <strong>{{ validatedCount }}</strong>
-              </div>
-            </div>
-          </el-card>
-
-          <el-card shadow="never">
-            <template #header>状态分布</template>
-            <el-table :data="statusSummary" size="small" empty-text="暂无状态">
-              <el-table-column prop="status" label="状态" />
-              <el-table-column prop="count" label="数量" width="90" />
-            </el-table>
-          </el-card>
-        </div>
-      </el-col>
-    </el-row>
+    </el-card>
 
     <el-drawer v-model="labelDrawer" title="Label Studio 标注" size="560px">
       <template v-if="selectedDataset">
@@ -651,10 +645,20 @@ function getErrorMessage(error: unknown, fallback: string) {
   max-width: 280px;
 }
 
-.side-stack {
-  display: flex;
-  flex-direction: column;
+.top-stack {
+  display: grid;
   gap: 16px;
+  grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr) minmax(220px, 0.8fr);
+}
+
+.upload-form {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+}
+
+.upload-form :deep(.el-form-item) {
+  margin-bottom: 0;
 }
 
 .upload-copy {
@@ -683,6 +687,13 @@ function getErrorMessage(error: unknown, fallback: string) {
   display: flex;
   gap: 8px;
   margin-top: 16px;
+}
+
+@media (max-width: 1180px) {
+  .top-stack,
+  .upload-form {
+    grid-template-columns: 1fr;
+  }
 }
 
 .upload-table {
