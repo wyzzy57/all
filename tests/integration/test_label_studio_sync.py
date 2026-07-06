@@ -238,8 +238,10 @@ def test_create_label_project_calls_label_studio_and_is_idempotent(
     assert first.json()["id"] == second.json()["id"]
     assert first.json()["provider"] == "label_studio"
     assert first.json()["external_project_id"] == "9001"
+    assert first.json()["project_url"] == "http://label-studio:8080/projects/9001/data"
     assert first.json()["sync_status"] == "pending"
     assert list_response.json()["total"] == 1
+    assert list_response.json()["items"][0]["project_url"] == "http://label-studio:8080/projects/9001/data"
     assert len(label_client.created_projects) == 1
 
     with session_factory() as session:
@@ -261,6 +263,7 @@ def test_link_existing_label_project_does_not_create_external_project(
 
     assert response.status_code == 201
     assert response.json()["external_project_id"] == "12345"
+    assert response.json()["project_url"] == "http://label-studio:8080/projects/12345/data"
     assert label_client.created_projects == []
 
 

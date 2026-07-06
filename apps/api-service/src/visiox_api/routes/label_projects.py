@@ -34,6 +34,7 @@ class LabelProjectResponse(BaseModel):
     dataset_id: str
     provider: str
     external_project_id: str | None
+    project_url: str | None = None
     sync_status: str
     last_sync_at: datetime | None
     created_at: datetime
@@ -98,13 +99,14 @@ def create_label_project(
     response: Response,
     request: LabelProjectCreateRequest | None = None,
     session: Session = Depends(get_label_project_session),
+    settings: Settings = Depends(get_settings),
     label_studio: LabelStudioClient = Depends(get_label_studio_client),
-) -> LabelProject:
+) -> LabelProjectResponse:
     dataset = dataset_or_404(session, dataset_id)
     existing = _find_dataset_label_project(session, dataset_id)
     if existing is not None:
         response.status_code = status.HTTP_200_OK
-        return existing
+        return _label_project_response(existing, settings)
 
     request = request or LabelProjectCreateRequest()
     external_project_id = request.external_project_id
@@ -130,16 +132,17 @@ def create_label_project(
         existing = _find_dataset_label_project(session, dataset_id)
         if existing is not None:
             response.status_code = status.HTTP_200_OK
-            return existing
+            return _label_project_response(existing, settings)
         raise
     session.refresh(label_project)
-    return label_project
+    return _label_project_response(label_project, settings)
 
 
 @router.get("/datasets/{dataset_id}/label-projects", response_model=LabelProjectListResponse)
 def list_label_projects(
     dataset_id: str,
     session: Session = Depends(get_label_project_session),
+    settings: Settings = Depends(get_settings),
 ) -> LabelProjectListResponse:
     dataset_or_404(session, dataset_id)
     projects = session.scalars(
@@ -147,7 +150,10 @@ def list_label_projects(
         .where(LabelProject.dataset_id == dataset_id, LabelProject.provider == LABEL_STUDIO_PROVIDER)
         .order_by(LabelProject.created_at, LabelProject.id)
     ).all()
-    return LabelProjectListResponse(items=list(projects), total=len(projects))
+    return LabelProjectListResponse(
+        items=[_label_project_response(project, settings) for project in projects],
+        total=len(projects),
+    )
 
 
 @router.post(
@@ -231,6 +237,15 @@ def _find_dataset_label_project(session: Session, dataset_id: str) -> LabelProje
         .order_by(LabelProject.created_at, LabelProject.id)
         .limit(1)
     ).first()
+
+
+def _label_project_response(project: LabelProject, settings: Settings) -> LabelProjectResponse:
+    project_url = None
+    if project.external_project_id:
+        project_url = f"{settings.label_studio_url.rstrip('/')}/projects/{project.external_project_id}/data"
+    response = LabelProjectResponse.model_validate(project)
+    response.project_url = project_url
+    return response
 
 
 def _label_project_or_404(session: Session, project_id: str) -> LabelProject:

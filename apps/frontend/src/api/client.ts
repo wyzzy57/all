@@ -45,6 +45,7 @@ export type LabelProjectRecord = {
   dataset_id: string;
   provider: string;
   external_project_id?: string | null;
+  project_url?: string | null;
   sync_status: string;
   last_sync_at?: string | null;
   created_at: string;

@@ -1,13 +1,7 @@
 <template>
   <section class="data-preparation-view">
-    <header class="page-header">
-      <div>
-        <p class="eyebrow">数据准备</p>
-        <h1>数据集与样本管理</h1>
-      </div>
-      <el-button type="primary" :loading="loading" @click="loadDatasets">
-        刷新
-      </el-button>
+    <header class="page-title">
+      <h1>数据准备</h1>
     </header>
 
     <el-alert
@@ -18,265 +12,151 @@
       :closable="false"
     />
 
-    <div class="top-stack">
-      <el-card shadow="never">
-        <template #header>样本上传入口</template>
-        <el-form label-position="top" class="upload-form">
-          <el-form-item label="上传方式">
-            <el-segmented v-model="uploadMode" :options="uploadModeOptions" />
-          </el-form-item>
-          <template v-if="uploadMode === 'new'">
-            <el-form-item label="数据集名称">
-              <el-input v-model="newDataset.name" placeholder="选择文件夹后自动填入" />
-            </el-form-item>
-            <el-form-item label="任务类型">
-              <el-select v-model="newDataset.task">
-                <el-option label="detect" value="detect" />
-                <el-option label="segment" value="segment" />
-                <el-option label="semantic" value="semantic" />
-                <el-option label="pose" value="pose" />
-                <el-option label="obb" value="obb" />
-                <el-option label="classify" value="classify" />
-              </el-select>
-                </el-form-item>
-                <el-form-item label="类别">
-                  <el-input v-model="newDataset.classNames" placeholder="可留空；COCO/data.yaml 会自动读取" />
-                </el-form-item>
-          </template>
-          <el-form-item v-else label="目标数据集">
-            <el-select v-model="uploadDatasetId" filterable placeholder="选择要追加样本的数据集">
-              <el-option
-                v-for="dataset in datasets"
-                :key="dataset.id"
-                :label="dataset.name || dataset.id"
-                :value="dataset.id"
-              />
-            </el-select>
-          </el-form-item>
-        </el-form>
-        <div class="upload-picker">
-          <input
-            ref="fileInputRef"
-            class="visually-hidden"
-                type="file"
-                multiple
-            accept=".jpg,.jpeg,.png,.bmp,.webp,.zip,.txt,.yaml,.yml,.json,image/*"
-                @change="handleNativeFiles"
-          />
-          <input
-            ref="folderInputRef"
-            class="visually-hidden"
-            type="file"
-            multiple
-            webkitdirectory
-            @change="handleNativeFiles"
-          />
-          <div class="upload-copy">
-            <strong>选择图片、zip 或整个数据文件夹</strong>
-                <span>支持 YOLO 目录：data.yaml、images/、labels/ 会一起上传。</span>
-          </div>
-          <div class="upload-actions">
-            <el-button @click="fileInputRef?.click()">选择文件</el-button>
-            <el-button @click="folderInputRef?.click()">选择文件夹</el-button>
-          </div>
-        </div>
-        <div class="upload-footer">
-          <span>{{ uploadFiles.length }} 个待上传文件</span>
-          <div>
-            <el-button size="small" :disabled="uploadFiles.length === 0" @click="clearUploads">
-            清空
-            </el-button>
-            <el-button
-              size="small"
-              type="primary"
-              :loading="uploading"
-              :disabled="!canUpload"
-              @click="uploadPendingFiles"
-            >
-              上传
-            </el-button>
-          </div>
-        </div>
-        <el-table v-if="uploadFiles.length" :data="uploadPreview" size="small" class="upload-table" max-height="220">
-          <el-table-column prop="name" label="文件" min-width="180" show-overflow-tooltip />
-          <el-table-column prop="size" label="大小" width="90" />
-        </el-table>
-      </el-card>
+    <div class="import-grid">
+      <article class="import-card import-card-green">
+        <div class="import-icon">↓</div>
+        <h2>未标注数据导入</h2>
+        <p>上传未标注的数据文件，支持图片、压缩包和数据文件夹</p>
+        <el-button type="success" size="large" @click="startUnlabeledImport">
+          导入数据
+        </el-button>
+      </article>
 
-      <el-card shadow="never">
-        <template #header>样本状态摘要</template>
-        <div class="status-grid">
-          <div>
-            <span>数据集</span>
-            <strong>{{ datasets.length }}</strong>
-          </div>
-          <div>
-            <span>样本总数</span>
-            <strong>{{ totalSamples }}</strong>
-          </div>
-          <div>
-            <span>标注总数</span>
-            <strong>{{ totalAnnotations }}</strong>
-          </div>
-          <div>
-            <span>已验证</span>
-            <strong>{{ validatedCount }}</strong>
-          </div>
-        </div>
-      </el-card>
+      <article class="import-card import-card-blue">
+        <div class="import-icon">↓</div>
+        <h2>已标注数据导入</h2>
+        <p>上传已标注的数据文件，支持 COCO、YOLO 等常用数据集格式</p>
+        <el-button type="primary" size="large" @click="startLabeledImport">
+          导入数据
+        </el-button>
+      </article>
 
-      <el-card shadow="never">
-        <template #header>状态分布</template>
-        <el-table :data="statusSummary" size="small" empty-text="暂无状态">
-          <el-table-column prop="status" label="状态" />
-          <el-table-column prop="count" label="数量" width="90" />
-        </el-table>
-      </el-card>
+      <article class="import-card import-card-purple">
+        <div class="import-icon">▶</div>
+        <h2>视频文件导入</h2>
+        <p>上传视频文件，选择模型和切帧策略进行处理</p>
+        <el-button class="video-button" size="large" @click="startVideoImport">
+          视频文件导入
+        </el-button>
+      </article>
     </div>
 
-    <el-card shadow="never">
-          <template #header>
-            <div class="card-header">
-              <span>数据集列表</span>
-              <el-input
-                v-model="keyword"
-                class="search-input"
-                clearable
-                placeholder="搜索名称 / 任务 / 状态"
-              />
-            </div>
-          </template>
+    <section class="upload-config">
+      <el-form label-position="top" class="upload-form">
+        <el-form-item label="上传方式">
+          <el-segmented v-model="uploadMode" :options="uploadModeOptions" />
+        </el-form-item>
+        <template v-if="uploadMode === 'new'">
+          <el-form-item label="数据集名称">
+            <el-input v-model="newDataset.name" placeholder="选择文件夹后自动填入" />
+          </el-form-item>
+          <el-form-item label="任务类型">
+            <el-select v-model="newDataset.task">
+              <el-option label="图像检测" value="detect" />
+              <el-option label="图像分割" value="segment" />
+              <el-option label="语义分割" value="semantic" />
+              <el-option label="姿态估计" value="pose" />
+              <el-option label="旋转框检测" value="obb" />
+              <el-option label="图像分类" value="classify" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="类别">
+            <el-input v-model="newDataset.classNames" placeholder="可留空；COCO/data.yaml 会自动读取" />
+          </el-form-item>
+        </template>
+        <el-form-item v-else label="目标数据集">
+          <el-select v-model="uploadDatasetId" filterable placeholder="选择要追加样本的数据集">
+            <el-option
+              v-for="dataset in datasets"
+              :key="dataset.id"
+              :label="dataset.name || dataset.id"
+              :value="dataset.id"
+            />
+          </el-select>
+        </el-form-item>
+      </el-form>
 
-          <el-table
-            v-loading="loading"
-            :data="filteredDatasets"
-            border
-            empty-text="暂无数据集"
-          >
-            <el-table-column prop="name" label="名称" min-width="180" />
-            <el-table-column prop="task" label="任务" width="120" />
-            <el-table-column label="状态" width="130">
-              <template #default="{ row }">
-                <el-tag :type="statusTag(row.status)">
-                  {{ row.status || "unknown" }}
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="样本" width="120">
-              <template #default="{ row }">
-                {{ numberValue(row.sample_count) }}
-              </template>
-            </el-table-column>
-            <el-table-column label="标注" width="120">
-              <template #default="{ row }">
-                {{ numberValue(row.annotation_count) }}
-              </template>
-            </el-table-column>
-            <el-table-column label="更新时间" width="180">
-              <template #default="{ row }">
-                {{ formatTime(row.updated_at || row.created_at) }}
-              </template>
-            </el-table-column>
-            <el-table-column label="操作" width="300" fixed="right">
-              <template #default="{ row }">
-                <el-button
-                  size="small"
-                  :loading="actingId === `${row.id}:analyze`"
-                  @click="analyze(row)"
-                >
-                  分析
-                </el-button>
-                <el-button
-                  size="small"
-                  type="primary"
-                  plain
-                  :loading="actingId === `${row.id}:validate`"
-                  @click="validate(row)"
-                >
-                  校验
-                </el-button>
-                <el-button size="small" @click="openLabelProjects(row)">
-                  标注
-                </el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-    </el-card>
+      <input
+        ref="fileInputRef"
+        class="visually-hidden"
+        type="file"
+        multiple
+        accept=".jpg,.jpeg,.png,.bmp,.webp,.zip,.txt,.yaml,.yml,.json,image/*"
+        @change="handleNativeFiles"
+      />
+      <input
+        ref="folderInputRef"
+        class="visually-hidden"
+        type="file"
+        multiple
+        webkitdirectory
+        @change="handleNativeFiles"
+      />
 
-    <el-drawer v-model="labelDrawer" title="Label Studio 标注" size="560px">
-      <template v-if="selectedDataset">
-        <div class="label-drawer-head">
-          <div>
-            <div class="drawer-title">{{ selectedDataset.name || selectedDataset.id }}</div>
-            <div class="drawer-subtitle">{{ selectedDataset.task }} / {{ selectedDataset.status }}</div>
-          </div>
-          <el-button :loading="labelLoading" @click="loadLabelProjects">刷新</el-button>
+      <div class="upload-strip">
+        <div>
+          <strong>{{ uploadFiles.length }} 个待上传文件</strong>
+          <span>支持 COCO 文件夹、YOLO 文件夹、图片和 zip；文件夹上传会保留相对路径。</span>
         </div>
+        <div class="upload-actions">
+          <el-button @click="fileInputRef?.click()">选择文件</el-button>
+          <el-button @click="folderInputRef?.click()">选择文件夹</el-button>
+          <el-button :disabled="uploadFiles.length === 0" @click="clearUploads">清空</el-button>
+          <el-button type="primary" :loading="uploading" :disabled="!canUpload" @click="uploadPendingFiles">
+            上传
+          </el-button>
+        </div>
+      </div>
 
-        <el-alert
-          v-if="labelError"
-          :title="labelError"
-          type="warning"
-          show-icon
-          :closable="false"
-          class="drawer-section"
-        />
+      <el-table v-if="uploadFiles.length" :data="uploadPreview" size="small" class="upload-table" max-height="180">
+        <el-table-column prop="name" label="文件" min-width="180" show-overflow-tooltip />
+        <el-table-column prop="size" label="大小" width="100" />
+      </el-table>
+    </section>
 
-        <el-form :model="labelForm" label-width="120px" class="drawer-section">
-          <el-form-item label="已有项目 ID">
-            <el-input v-model="labelForm.external_project_id" placeholder="留空则新建 Label Studio 项目" />
-          </el-form-item>
-          <el-form-item>
-            <el-button
-              type="primary"
-              :loading="labelAction === 'create'"
-              @click="createLabelProject"
-            >
-              创建/关联项目
-            </el-button>
-          </el-form-item>
-        </el-form>
+    <div class="workspace-tabs">
+      <div class="tab-list">
+        <button :class="{ active: activeTab === 'prepare' }" @click="activeTab = 'prepare'">数据准备</button>
+        <button :class="{ active: activeTab === 'datasets' }" @click="activeTab = 'datasets'">数据集</button>
+      </div>
+      <div class="toolbar">
+        <el-button type="primary" :loading="syncingAll" @click="syncVisibleDatasets">
+          数据同步
+        </el-button>
+        <el-input v-model="keyword" class="search-input" clearable placeholder="搜索" />
+      </div>
+    </div>
 
-        <el-table
-          v-loading="labelLoading"
-          :data="labelProjects"
-          row-key="id"
-          empty-text="暂无 Label Studio 项目"
-        >
-          <el-table-column prop="external_project_id" label="外部项目" min-width="120" />
-          <el-table-column prop="sync_status" label="同步状态" width="120">
-            <template #default="{ row }">
-              <el-tag :type="labelStatusType(row.sync_status)">{{ row.sync_status }}</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="更新时间" width="170">
-            <template #default="{ row }">
-              {{ formatTime(row.last_sync_at || row.updated_at) }}
-            </template>
-          </el-table-column>
-          <el-table-column label="操作" width="190" fixed="right">
-            <template #default="{ row }">
-              <el-button
-                size="small"
-                :loading="labelAction === `${row.id}:sync`"
-                @click="syncSamples(row.id)"
-              >
-                同步样本
-              </el-button>
-              <el-button
-                size="small"
-                type="primary"
-                plain
-                :loading="labelAction === `${row.id}:import`"
-                @click="importAnnotations(row.id)"
-              >
-                导入标注
-              </el-button>
-            </template>
-          </el-table-column>
-        </el-table>
-      </template>
-    </el-drawer>
+    <div v-loading="loading" class="dataset-grid">
+      <button
+        v-for="dataset in filteredDatasets"
+        :key="dataset.id"
+        class="dataset-card"
+        type="button"
+        @click="openDatasetLabelStudio(dataset)"
+      >
+        <div class="dataset-head">
+          <strong>{{ dataset.name || dataset.id }}</strong>
+          <span class="warning-mark">△</span>
+        </div>
+        <div class="chip-row">
+          <span class="chip chip-success">✓ {{ datasetStatusText(dataset.status) }}</span>
+          <span class="chip chip-success">▣ 导入</span>
+          <span class="chip">{{ taskText(dataset.task) }}</span>
+          <span v-if="primaryLabelProject(dataset)" class="chip">labelstudio导入</span>
+        </div>
+        <div class="dataset-meta">
+          <span>{{ formatTime(dataset.updated_at || dataset.created_at) }}</span>
+          <a href="#" @click.prevent.stop="openDatasetLabelStudio(dataset)">Label Studio</a>
+        </div>
+        <div class="dataset-stats">
+          <span>样本 {{ numberValue(dataset.sample_count) }}</span>
+          <span>标注 {{ numberValue(dataset.annotation_count) }}</span>
+        </div>
+      </button>
+
+      <el-empty v-if="!loading && filteredDatasets.length === 0" description="暂无数据集" />
+    </div>
   </section>
 </template>
 
@@ -299,11 +179,12 @@ interface DatasetRow extends AnyRecord {
   updated_at?: string;
 }
 
+const activeTab = ref("prepare");
 const loading = ref(false);
-const actingId = ref("");
 const errorMessage = ref("");
 const keyword = ref("");
 const datasets = ref<DatasetRow[]>([]);
+const labelProjectsByDataset = ref<Record<string, LabelProjectRecord[]>>({});
 const uploadMode = ref("new");
 const uploadModeOptions = [
   { label: "新建数据集", value: "new" },
@@ -313,15 +194,10 @@ const uploadDatasetId = ref("");
 const newDataset = ref({ name: "", task: "detect", classNames: "" });
 const uploadFiles = ref<File[]>([]);
 const uploading = ref(false);
+const syncingAll = ref(false);
+const openingDatasetId = ref("");
 const fileInputRef = ref<HTMLInputElement>();
 const folderInputRef = ref<HTMLInputElement>();
-const labelDrawer = ref(false);
-const labelLoading = ref(false);
-const labelError = ref("");
-const labelAction = ref("");
-const selectedDataset = ref<DatasetRow | null>(null);
-const labelProjects = ref<LabelProjectRecord[]>([]);
-const labelForm = ref({ external_project_id: "" });
 
 const filteredDatasets = computed(() => {
   const term = keyword.value.trim().toLowerCase();
@@ -333,27 +209,6 @@ const filteredDatasets = computed(() => {
       .toLowerCase()
       .includes(term),
   );
-});
-
-const totalSamples = computed(() =>
-  datasets.value.reduce((total, dataset) => total + numberValue(dataset.sample_count), 0),
-);
-
-const totalAnnotations = computed(() =>
-  datasets.value.reduce((total, dataset) => total + numberValue(dataset.annotation_count), 0),
-);
-
-const validatedCount = computed(
-  () => datasets.value.filter((dataset) => dataset.status === "validated").length,
-);
-
-const statusSummary = computed(() => {
-  const groups = new Map<string, number>();
-  for (const dataset of datasets.value) {
-    const status = dataset.status || "unknown";
-    groups.set(status, (groups.get(status) || 0) + 1);
-  }
-  return Array.from(groups.entries()).map(([status, count]) => ({ status, count }));
 });
 
 const uploadPreview = computed(() =>
@@ -378,106 +233,92 @@ async function loadDatasets() {
   errorMessage.value = "";
   try {
     datasets.value = normalizeRows<DatasetRow>(await api.listDatasets());
+    await loadLabelProjectsForDatasets(datasets.value);
   } catch (error) {
     datasets.value = [];
+    labelProjectsByDataset.value = {};
     errorMessage.value = getErrorMessage(error, "数据集加载失败，已显示空表。");
   } finally {
     loading.value = false;
   }
 }
 
-async function analyze(row: DatasetRow) {
-  await runDatasetAction(row, "analyze", () => api.analyzeDataset(row.id), "已提交分析任务");
+async function loadLabelProjectsForDatasets(rows: DatasetRow[]) {
+  const entries = await Promise.all(
+    rows.map(async (dataset) => {
+      try {
+        const response = await api.listLabelProjects(dataset.id);
+        return [dataset.id, response.items] as const;
+      } catch {
+        return [dataset.id, []] as const;
+      }
+    }),
+  );
+  labelProjectsByDataset.value = Object.fromEntries(entries);
 }
 
-async function validate(row: DatasetRow) {
-  await runDatasetAction(row, "validate", () => api.validateDataset(row.id), "已提交校验任务");
+function startUnlabeledImport() {
+  uploadMode.value = "new";
+  fileInputRef.value?.click();
 }
 
-async function openLabelProjects(row: DatasetRow) {
-  selectedDataset.value = row;
-  labelDrawer.value = true;
-  labelForm.value.external_project_id = "";
-  await loadLabelProjects();
+function startLabeledImport() {
+  uploadMode.value = "new";
+  folderInputRef.value?.click();
 }
 
-async function loadLabelProjects() {
-  if (!selectedDataset.value) return;
-  labelLoading.value = true;
-  labelError.value = "";
+function startVideoImport() {
+  ElMessage.warning("视频文件导入会在后续接入切帧任务；当前请先上传图片或数据集文件夹。");
+}
+
+async function openDatasetLabelStudio(row: DatasetRow) {
+  if (openingDatasetId.value) return;
+  openingDatasetId.value = row.id;
   try {
-    labelProjects.value = (await api.listLabelProjects(selectedDataset.value.id)).items;
+    const project = await ensureLabelProject(row);
+    if (!project.project_url) {
+      ElMessage.warning("Label Studio 项目已创建，但缺少可打开的项目地址。");
+      return;
+    }
+    window.open(project.project_url, "_blank", "noopener,noreferrer");
   } catch (error) {
-    labelProjects.value = [];
-    labelError.value = getErrorMessage(error, "Label Studio 项目加载失败");
+    ElMessage.error(getErrorMessage(error, "Label Studio 项目打开失败"));
   } finally {
-    labelLoading.value = false;
+    openingDatasetId.value = "";
   }
 }
 
-async function createLabelProject() {
-  if (!selectedDataset.value) return;
-  labelAction.value = "create";
-  labelError.value = "";
+async function ensureLabelProject(row: DatasetRow) {
+  const existing = primaryLabelProject(row);
+  if (existing) return existing;
+  const project = await api.createLabelProject(row.id);
+  labelProjectsByDataset.value = {
+    ...labelProjectsByDataset.value,
+    [row.id]: [project],
+  };
+  return project;
+}
+
+function primaryLabelProject(row: DatasetRow) {
+  return labelProjectsByDataset.value[row.id]?.[0];
+}
+
+async function syncVisibleDatasets() {
+  if (filteredDatasets.value.length === 0) return;
+  syncingAll.value = true;
+  let submitted = 0;
   try {
-    const externalProjectId = labelForm.value.external_project_id.trim();
-    await api.createLabelProject(
-      selectedDataset.value.id,
-      externalProjectId ? { external_project_id: externalProjectId } : {},
-    );
-    ElMessage.success("Label Studio 项目已就绪");
-    labelForm.value.external_project_id = "";
-    await loadLabelProjects();
-  } catch (error) {
-    labelError.value = getErrorMessage(error, "Label Studio 项目创建失败");
-  } finally {
-    labelAction.value = "";
-  }
-}
-
-async function syncSamples(projectId: string) {
-  await runLabelAction(projectId, "sync", () => api.syncLabelProjectSamples(projectId), "已提交样本同步任务");
-}
-
-async function importAnnotations(projectId: string) {
-  await runLabelAction(projectId, "import", () => api.importLabelProjectAnnotations(projectId), "已提交标注导入任务");
-}
-
-async function runLabelAction(
-  projectId: string,
-  action: string,
-  request: () => Promise<unknown>,
-  successMessage: string,
-) {
-  labelAction.value = `${projectId}:${action}`;
-  labelError.value = "";
-  try {
-    await request();
-    ElMessage.success(successMessage);
-    await loadLabelProjects();
-  } catch (error) {
-    labelError.value = getErrorMessage(error, "Label Studio 操作失败");
-  } finally {
-    labelAction.value = "";
-  }
-}
-
-async function runDatasetAction(
-  row: DatasetRow,
-  action: string,
-  request: () => Promise<unknown>,
-  successMessage: string,
-) {
-  if (!row.id) return;
-  actingId.value = `${row.id}:${action}`;
-  try {
-    await request();
-    ElMessage.success(successMessage);
+    for (const dataset of filteredDatasets.value) {
+      const project = await ensureLabelProject(dataset);
+      await api.syncLabelProjectSamples(project.id);
+      submitted += 1;
+    }
+    ElMessage.success(`已提交 ${submitted} 个数据集的 Label Studio 同步任务`);
     await loadDatasets();
   } catch (error) {
-    ElMessage.error(getErrorMessage(error, "操作失败"));
+    ElMessage.error(getErrorMessage(error, "数据同步失败"));
   } finally {
-    actingId.value = "";
+    syncingAll.value = false;
   }
 }
 
@@ -598,18 +439,23 @@ function formatTime(value?: string) {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
-function statusTag(status?: string) {
-  if (status === "validated" || status === "ready") return "success";
-  if (status === "failed" || status === "invalid") return "danger";
-  if (status === "analyzing" || status === "validating") return "warning";
-  return "info";
+function datasetStatusText(status?: string) {
+  if (status === "ready" || status === "validated") return "已完成";
+  if (status === "failed" || status === "invalid") return "失败";
+  if (status === "analyzing" || status === "validating") return "处理中";
+  return status || "待处理";
 }
 
-function labelStatusType(status?: string) {
-  if (status === "synced" || status === "imported") return "success";
-  if (status === "failed") return "danger";
-  if (status === "pending") return "warning";
-  return "info";
+function taskText(task?: string) {
+  const map: Record<string, string> = {
+    classify: "图像分类",
+    detect: "目标检测",
+    obb: "旋转框检测",
+    pose: "姿态估计",
+    segment: "图像分割",
+    semantic: "语义分割",
+  };
+  return task ? map[task] || task : "未设置";
 }
 
 function getErrorMessage(error: unknown, fallback: string) {
@@ -622,88 +468,142 @@ function getErrorMessage(error: unknown, fallback: string) {
 .data-preparation-view {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 24px;
+  gap: 24px;
+  padding: 28px 20px 32px;
 }
 
-.page-header,
-.card-header,
-.upload-footer {
-  align-items: center;
-  display: flex;
-  justify-content: space-between;
-}
-
-.page-header h1 {
-  font-size: 24px;
-  font-weight: 650;
+.page-title h1 {
+  color: #07111f;
+  font-size: 28px;
+  font-weight: 700;
   line-height: 1.25;
-  margin: 4px 0 0;
-}
-
-.eyebrow {
-  color: #6b7280;
-  font-size: 13px;
   margin: 0;
 }
 
-.search-input {
-  max-width: 280px;
+.import-grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-.top-stack {
-  display: grid;
-  gap: 16px;
-  grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr) minmax(220px, 0.8fr);
+.import-card {
+  background: #ffffff;
+  border: 1px solid #dbe3ef;
+  border-radius: 4px;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+  display: flex;
+  flex-direction: column;
+  min-height: 252px;
+  padding: 26px 25px 22px;
+}
+
+.import-icon {
+  align-items: center;
+  border-radius: 12px;
+  color: #ffffff;
+  display: flex;
+  font-size: 28px;
+  font-weight: 700;
+  height: 75px;
+  justify-content: center;
+  margin-bottom: 18px;
+  width: 75px;
+}
+
+.import-card h2 {
+  color: #07111f;
+  font-size: 25px;
+  font-weight: 700;
+  line-height: 1.25;
+  margin: 0 0 12px;
+}
+
+.import-card p {
+  color: #738096;
+  flex: 1;
+  font-size: 19px;
+  line-height: 1.45;
+  margin: 0 0 20px;
+}
+
+.import-card :deep(.el-button) {
+  border-radius: 4px;
+  font-size: 18px;
+  font-weight: 700;
+  height: 56px;
+  width: 100%;
+}
+
+.import-card-green .import-icon {
+  background: #16a34a;
+  box-shadow: 0 0 0 20px #dcfce7;
+}
+
+.import-card-blue .import-icon {
+  background: #2f7cf6;
+  box-shadow: 0 0 0 20px #dbeafe;
+}
+
+.import-card-purple .import-icon {
+  background: #9333ea;
+  box-shadow: 0 0 0 20px #f3e8ff;
+}
+
+.video-button {
+  --el-button-bg-color: #9333ea;
+  --el-button-border-color: #9333ea;
+  --el-button-hover-bg-color: #8b28df;
+  --el-button-hover-border-color: #8b28df;
+  --el-button-text-color: #ffffff;
+}
+
+.upload-config {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
 }
 
 .upload-form {
   display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 14px;
+  grid-template-columns: repeat(4, minmax(180px, 1fr));
 }
 
 .upload-form :deep(.el-form-item) {
   margin-bottom: 0;
 }
 
-.upload-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.upload-copy span,
-.upload-footer span {
-  color: #6b7280;
-  font-size: 13px;
-}
-
-.upload-footer {
-  margin-top: 12px;
-}
-
-.upload-picker {
+.upload-strip {
+  align-items: center;
+  background: #f8fafc;
   border: 1px dashed #cbd5e1;
-  border-radius: 6px;
-  padding: 16px;
+  border-radius: 4px;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+  padding: 14px;
+}
+
+.upload-strip span {
+  color: #64748b;
+  display: block;
+  font-size: 13px;
+  margin-top: 5px;
 }
 
 .upload-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
-  margin-top: 16px;
-}
-
-@media (max-width: 1180px) {
-  .top-stack,
-  .upload-form {
-    grid-template-columns: 1fr;
-  }
+  justify-content: flex-end;
 }
 
 .upload-table {
-  margin-top: 12px;
+  margin-top: 2px;
 }
 
 .visually-hidden {
@@ -714,49 +614,188 @@ function getErrorMessage(error: unknown, fallback: string) {
   width: 1px;
 }
 
-.status-grid {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.status-grid div {
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
-  padding: 12px;
-}
-
-.status-grid span {
-  color: #6b7280;
-  display: block;
-  font-size: 13px;
-  margin-bottom: 8px;
-}
-
-.status-grid strong {
-  color: #111827;
-  font-size: 24px;
-}
-
-.label-drawer-head {
+.workspace-tabs {
   align-items: center;
+  border-bottom: 1px solid #e5e7eb;
   display: flex;
   justify-content: space-between;
+  margin-top: 2px;
+  min-height: 76px;
 }
 
-.drawer-title {
-  color: #111827;
+.tab-list {
+  align-self: stretch;
+  display: flex;
+  gap: 34px;
+}
+
+.tab-list button {
+  background: transparent;
+  border: 0;
+  color: #1f2937;
+  cursor: pointer;
+  font-size: 20px;
+  font-weight: 500;
+  padding: 0;
+  position: relative;
+}
+
+.tab-list button.active {
+  color: #2563eb;
+  font-weight: 700;
+}
+
+.tab-list button.active::after {
+  background: #2563eb;
+  bottom: 0;
+  content: "";
+  height: 3px;
+  left: 6px;
+  position: absolute;
+  right: 6px;
+}
+
+.toolbar {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+}
+
+.toolbar :deep(.el-button) {
+  border-radius: 4px;
+  font-size: 16px;
+  font-weight: 700;
+  height: 50px;
+  min-width: 120px;
+}
+
+.search-input {
+  width: 330px;
+}
+
+.search-input :deep(.el-input__wrapper) {
+  background: #f3f4f6;
+  border-radius: 4px;
+  box-shadow: none;
+  height: 50px;
+}
+
+.dataset-grid {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: repeat(4, minmax(250px, 1fr));
+  min-height: 220px;
+}
+
+.dataset-card {
+  background: #ffffff;
+  border: 1px solid #dce3ee;
+  border-radius: 4px;
+  cursor: pointer;
+  min-height: 180px;
+  padding: 26px 25px;
+  text-align: left;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.dataset-card:hover {
+  border-color: #93c5fd;
+  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.08);
+  transform: translateY(-1px);
+}
+
+.dataset-head {
+  align-items: center;
+  display: flex;
+  gap: 5px;
+  margin-bottom: 16px;
+}
+
+.dataset-head strong {
+  color: #07111f;
+  font-size: 21px;
+  line-height: 1.25;
+  word-break: break-word;
+}
+
+.warning-mark {
+  color: #60a5fa;
   font-size: 18px;
-  font-weight: 650;
 }
 
-.drawer-subtitle {
-  color: #6b7280;
-  font-size: 13px;
-  margin-top: 4px;
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
 }
 
-.drawer-section {
-  margin-top: 16px;
+.chip {
+  align-items: center;
+  background: #f1f5f9;
+  border-radius: 999px;
+  color: #0f172a;
+  display: inline-flex;
+  font-size: 16px;
+  line-height: 1.2;
+  min-height: 40px;
+  padding: 8px 14px;
+}
+
+.chip-success {
+  background: #dcfce7;
+  color: #16a34a;
+}
+
+.dataset-meta {
+  align-items: center;
+  color: #58677a;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 16px;
+  gap: 10px;
+}
+
+.dataset-meta a {
+  color: #2563eb;
+  text-decoration: none;
+}
+
+.dataset-stats {
+  color: #64748b;
+  display: flex;
+  gap: 14px;
+  font-size: 14px;
+  margin-top: 12px;
+}
+
+@media (max-width: 1280px) {
+  .import-grid,
+  .dataset-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 980px) {
+  .import-grid,
+  .dataset-grid,
+  .upload-form {
+    grid-template-columns: 1fr;
+  }
+
+  .workspace-tabs,
+  .upload-strip {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .toolbar {
+    width: 100%;
+  }
+
+  .search-input {
+    flex: 1;
+    width: auto;
+  }
 }
 </style>
