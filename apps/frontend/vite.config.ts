@@ -2,6 +2,11 @@ import vue from "@vitejs/plugin-vue";
 import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vite";
 
+const apiProxy = {
+  target: "http://127.0.0.1:8000",
+  changeOrigin: true
+};
+
 export default defineConfig({
   plugins: [vue()],
   resolve: {
@@ -10,6 +15,24 @@ export default defineConfig({
     }
   },
   server: {
-    port: 5173
+    port: 5173,
+    proxy: {
+      "/base-models": apiProxy,
+      "/cameras": apiProxy,
+      "/datasets": apiProxy,
+      "/deployments": apiProxy,
+      "/devices": apiProxy,
+      "/edge-apps": apiProxy,
+      "/health": apiProxy,
+      "/label-projects": apiProxy,
+      "/pipelines": apiProxy,
+      "/tasks": apiProxy,
+      "/trained-models": apiProxy,
+      "/training-jobs": apiProxy,
+      "/ws": {
+        target: "ws://127.0.0.1:8000",
+        ws: true
+      }
+    }
   }
 });

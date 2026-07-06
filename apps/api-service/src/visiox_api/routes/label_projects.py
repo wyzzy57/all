@@ -15,7 +15,7 @@ from visiox_common.tasks import TaskCommand, TaskStatus, TaskType
 from visiox_db.models import LabelProject, Task
 from visiox_db.session import get_session
 from visiox_messaging.streams import RedisStreamProducer
-from visiox_yolo26.labelstudio.client import LabelStudioClient
+from visiox_yolo26.labelstudio.client import LabelStudioClient, LabelStudioError
 from visiox_yolo26.labelstudio.templates import build_label_config
 
 
@@ -110,13 +110,19 @@ def create_label_project(
 
     request = request or LabelProjectCreateRequest()
     external_project_id = request.external_project_id
-    if external_project_id:
-        _validate_external_project_id(external_project_id)
-        label_studio.get_project(external_project_id)
-    else:
-        label_config = build_label_config(dataset.task, dataset.class_schema)
-        external_project = label_studio.create_project(dataset.name, label_config)
-        external_project_id = str(external_project["id"])
+    try:
+        if external_project_id:
+            _validate_external_project_id(external_project_id)
+            label_studio.get_project(external_project_id)
+        else:
+            label_config = build_label_config(dataset.task, dataset.class_schema)
+            external_project = label_studio.create_project(dataset.name, label_config)
+            external_project_id = str(external_project["id"])
+    except LabelStudioError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Label Studio 服务不可用，请确认服务已启动并可访问：{exc}",
+        ) from exc
 
     label_project = LabelProject(
         dataset_id=dataset.id,

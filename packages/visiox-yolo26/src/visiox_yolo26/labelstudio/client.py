@@ -49,7 +49,10 @@ class LabelStudioClient:
         self.close()
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        response = self._client.request(method, path, **kwargs)
+        try:
+            response = self._client.request(method, path, **kwargs)
+        except httpx.HTTPError as exc:
+            raise LabelStudioError(f"Label Studio service unavailable: {exc}") from exc
         if response.status_code < 200 or response.status_code >= 300:
             summary = response.text[:300]
             raise LabelStudioError(f"Label Studio request failed: {response.status_code} {summary}")

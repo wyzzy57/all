@@ -72,6 +72,12 @@ class FailingLabelStudioClient(FakeLabelStudioClient):
         raise LabelStudioError("Label Studio request failed: 500 server error")
 
 
+class UnavailableLabelStudioClient(FakeLabelStudioClient):
+    def create_project(self, title: str, label_config: str) -> dict[str, object]:
+        del title, label_config
+        raise LabelStudioError("Label Studio service unavailable: connection refused")
+
+
 @pytest.fixture()
 def session_factory(tmp_path):
     database_path = tmp_path / "visiox-label-studio.db"
@@ -281,6 +287,19 @@ def test_link_existing_label_project_rejects_unsafe_external_project_id(
 
     assert response.status_code == 422
     assert label_client.created_projects == []
+
+
+def test_create_label_project_returns_503_when_label_studio_is_unavailable(
+    client: TestClient,
+    session_factory,
+):
+    dataset_id = create_dataset_row(session_factory)
+    client.app.dependency_overrides[get_label_studio_client] = lambda: UnavailableLabelStudioClient()
+
+    response = client.post(f"/datasets/{dataset_id}/label-projects")
+
+    assert response.status_code == 503
+    assert "Label Studio 服务不可用" in response.json()["detail"]
 
 
 def test_sync_samples_endpoint_creates_task_and_enqueues_command(
