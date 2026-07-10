@@ -8,10 +8,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict
 from pydantic import Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from visiox_db.models import TrainingPipeline
+from visiox_db.models import BaseModel, TrainingJob, TrainingPipeline
 from visiox_db.session import get_session
 from visiox_yolo26.training.params import (
     TrainingParamsError,
@@ -34,6 +34,19 @@ class PipelineCreateRequest(PydanticBaseModel):
     default_environment: dict[str, Any] = Field(default_factory=dict)
 
 
+class PipelineUpdateRequest(PydanticBaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    task: str | None = None
+    scale: str | None = None
+    base_model_id: str | None = None
+    dataset_id: str | None = None
+    params_template: dict[str, Any] | None = None
+    default_environment: dict[str, Any] | None = None
+    is_public: bool | None = None
+    public_scope: dict[str, Any] | None = None
+    is_favorite: bool | None = None
+
+
 class PipelineResponse(PydanticBaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -46,6 +59,9 @@ class PipelineResponse(PydanticBaseModel):
     params_template: dict[str, Any]
     default_environment: dict[str, Any]
     status: str
+    is_public: bool
+    public_scope: dict[str, Any]
+    is_favorite: bool
     created_at: datetime
     updated_at: datetime
 
@@ -133,3 +149,87 @@ def get_pipeline(pipeline_id: str, session: Session = Depends(get_pipeline_sessi
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
     return pipeline
+
+
+@router.patch("/{pipeline_id}", response_model=PipelineResponse)
+def update_pipeline(
+    pipeline_id: str,
+    request: PipelineUpdateRequest,
+    session: Session = Depends(get_pipeline_session),
+) -> TrainingPipeline:
+    pipeline = session.get(TrainingPipeline, pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    touches_training_config = any(
+        value is not None
+        for value in (
+            request.task,
+            request.scale,
+            request.base_model_id,
+            request.dataset_id,
+            request.params_template,
+            request.default_environment,
+        )
+    )
+    if touches_training_config and pipeline.status == "running":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Running pipeline cannot be edited")
+
+    if request.name is not None:
+        pipeline.name = request.name.strip()
+    if request.base_model_id is not None or request.dataset_id is not None or request.task is not None or request.scale is not None:
+        base_model_id = request.base_model_id or pipeline.base_model_id
+        dataset_id = request.dataset_id or pipeline.dataset_id
+        if base_model_id is None or dataset_id is None:
+            raise _unprocessable("base_model_id and dataset_id are required")
+        base_model = session.get(BaseModel, base_model_id)
+        if base_model is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Base model not found")
+        task = request.task or base_model.task or pipeline.task
+        scale = request.scale or base_model.scale or pipeline.scale
+        try:
+            validate_training_resources(
+                session,
+                task=task,
+                scale=scale,
+                base_model_id=base_model_id,
+                dataset_id=dataset_id,
+            )
+        except TrainingPrecheckError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        pipeline.task = task
+        pipeline.scale = scale
+        pipeline.base_model_id = base_model_id
+        pipeline.dataset_id = dataset_id
+    if request.params_template is not None:
+        try:
+            pipeline.params_template = validate_training_params(request.params_template)
+        except TrainingParamsError as exc:
+            raise _unprocessable(str(exc)) from exc
+    if request.default_environment is not None:
+        try:
+            pipeline.default_environment = validate_training_environment(request.default_environment)
+        except TrainingParamsError as exc:
+            raise _unprocessable(str(exc)) from exc
+    if request.is_public is not None:
+        pipeline.is_public = request.is_public
+    if request.public_scope is not None:
+        pipeline.public_scope = request.public_scope
+    if request.is_favorite is not None:
+        pipeline.is_favorite = request.is_favorite
+    if touches_training_config:
+        pipeline.status = "ready"
+
+    session.add(pipeline)
+    session.commit()
+    session.refresh(pipeline)
+    return pipeline
+
+
+@router.delete("/{pipeline_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_pipeline(pipeline_id: str, session: Session = Depends(get_pipeline_session)) -> None:
+    pipeline = session.get(TrainingPipeline, pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    session.execute(delete(TrainingJob).where(TrainingJob.pipeline_id == pipeline_id))
+    session.delete(pipeline)
+    session.commit()

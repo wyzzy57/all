@@ -8,14 +8,13 @@ describe("router", () => {
 
     expect(paths).toEqual(
       expect.arrayContaining([
+        "/workbench",
         "/model-space",
         "/data-preparation",
-        "/pipelines",
+        "/services",
         "/tasks",
-        "/devices",
-        "/edge-apps",
-        "/deployments",
       ]),
     );
+    expect(paths).not.toEqual(expect.arrayContaining(["/pipelines", "/devices", "/edge-apps", "/deployments"]));
   });
 });

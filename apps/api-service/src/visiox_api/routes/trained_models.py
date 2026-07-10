@@ -2,8 +2,8 @@ from collections.abc import Generator
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -37,6 +37,17 @@ class TrainedModelListResponse(BaseModel):
     offset: int
 
 
+class TrainedModelUpdateRequest(BaseModel):
+    deployment_name: str = Field(min_length=1, max_length=64, pattern=r"^[\w\u4e00-\u9fff-]+$")
+
+    @field_validator("deployment_name")
+    @classmethod
+    def validate_deployment_name(cls, value: str) -> str:
+        if value[0] in "-_" or value[-1] in "-_":
+            raise ValueError("deployment_name cannot start or end with punctuation")
+        return value
+
+
 def get_trained_model_session() -> Generator[Session]:
     yield from get_session()
 
@@ -44,6 +55,7 @@ def get_trained_model_session() -> Generator[Session]:
 @router.get("", response_model=TrainedModelListResponse)
 def list_trained_models(
     task: str | None = None,
+    pipeline_id: str | None = None,
     status_filter: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -52,6 +64,8 @@ def list_trained_models(
     filters = []
     if task is not None:
         filters.append(TrainedModel.task == task)
+    if pipeline_id is not None:
+        filters.append(TrainedModel.pipeline_id == pipeline_id)
     if status_filter is not None:
         filters.append(TrainedModel.status == status_filter)
 
@@ -64,3 +78,19 @@ def list_trained_models(
     total = session.scalar(total_query) or 0
     items = session.scalars(list_query.limit(limit).offset(offset)).all()
     return TrainedModelListResponse(items=list(items), total=total, limit=limit, offset=offset)
+
+
+@router.patch("/{model_id}", response_model=TrainedModelResponse)
+def update_trained_model(
+    model_id: str,
+    payload: TrainedModelUpdateRequest,
+    session: Session = Depends(get_trained_model_session),
+) -> TrainedModel:
+    model = session.get(TrainedModel, model_id)
+    if model is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trained model not found")
+    model.metrics = {**(model.metrics or {}), "deployment_name": payload.deployment_name}
+    session.add(model)
+    session.commit()
+    session.refresh(model)
+    return model

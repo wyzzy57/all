@@ -14,10 +14,14 @@ EXPECTED_TABLES = {
     "trained_models",
     "training_pipelines",
     "training_jobs",
+    "pipeline_evaluations",
     "datasets",
     "dataset_samples",
     "annotations",
     "label_projects",
+}
+
+REMOVED_TABLES = {
     "devices",
     "cameras",
     "edge_apps",
@@ -46,6 +50,7 @@ def test_alembic_upgrade_creates_database_core_tables(tmp_path):
     table_names = set(inspect(engine).get_table_names())
 
     assert EXPECTED_TABLES.issubset(table_names)
+    assert REMOVED_TABLES.isdisjoint(table_names)
     assert {"users", "roles", "permissions"}.isdisjoint(table_names)
 
 
@@ -60,6 +65,7 @@ def test_alembic_uses_environment_database_url_over_ini_default(tmp_path, monkey
     table_names = set(inspect(engine).get_table_names())
 
     assert EXPECTED_TABLES.issubset(table_names)
+    assert REMOVED_TABLES.isdisjoint(table_names)
 
 
 def test_training_jobs_does_not_reference_trained_models(tmp_path):
@@ -104,3 +110,5 @@ def test_yolo26_base_model_seed_has_all_tasks_and_scales():
     assert {record["scale"] for record in records} == {"n", "s", "m", "l", "x"}
     assert len({record["id"] for record in records}) == 30
     assert len({record["filename"] for record in records}) == 30
+    assert {record["status"] for record in records} == {"ready"}
+    assert all(record["local_uri"].startswith("minio://models/base/") for record in records)

@@ -146,7 +146,7 @@ def test_get_tasks_and_get_task_read_persisted_tasks(
     session_factory,
 ):
     with session_factory() as session:
-        task = Task(task_type="DEPLOY_APP", status="QUEUED", payload={"target": "edge-1"})
+        task = Task(task_type="TRAIN_MODEL", status="QUEUED", payload={"training_job_id": "job-1"})
         session.add(task)
         session.commit()
         task_id = task.id
@@ -158,7 +158,7 @@ def test_get_tasks_and_get_task_read_persisted_tasks(
     assert [item["id"] for item in list_response.json()["items"]] == [task_id]
     assert detail_response.status_code == 200
     assert detail_response.json()["id"] == task_id
-    assert detail_response.json()["task_type"] == "DEPLOY_APP"
+    assert detail_response.json()["task_type"] == "TRAIN_MODEL"
 
 
 def test_cancel_queued_task_and_reject_finished_task(client: TestClient, session_factory):
@@ -287,15 +287,15 @@ def test_task_command_serializes_to_stream_fields():
 
     command = TaskCommand(
         task_id="task-1",
-        task_type=TaskType.CAPTURE_CAMERA_SAMPLE,
-        resource_refs={"camera_id": "camera-1"},
+        task_type=TaskType.TRAIN_MODEL,
+        resource_refs={"training_job_id": "job-1"},
         payload={"count": 3},
     )
 
     assert command.to_stream_fields() == {
         "task_id": "task-1",
-        "task_type": "CAPTURE_CAMERA_SAMPLE",
-        "resource_refs": '{"camera_id":"camera-1"}',
+        "task_type": "TRAIN_MODEL",
+        "resource_refs": '{"training_job_id":"job-1"}',
         "payload": '{"count":3}',
         "payload_version": "1",
     }

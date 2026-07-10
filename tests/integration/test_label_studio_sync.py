@@ -25,6 +25,7 @@ from visiox_yolo26.labelstudio.client import LabelStudioClient, LabelStudioError
 from visiox_yolo26.labelstudio.importer import normalize_label_studio_task
 from visiox_yolo26.labelstudio.templates import build_label_config
 from visiox_label_sync_worker.main import import_label_project_annotations, sync_label_project_samples
+from visiox_label_sync_worker.runner import run_pending_label_sync_tasks
 
 
 class FakeStreamProducer:
@@ -116,7 +117,10 @@ def client(
     app.dependency_overrides[get_label_project_session] = override_session
     app.dependency_overrides[get_label_studio_client] = lambda: label_client
     app.dependency_overrides[get_label_sync_stream_producer] = lambda: stream_producer
-    app.dependency_overrides[get_settings] = lambda: Settings(label_studio_token="test-token")
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        label_studio_token="test-token",
+        label_studio_public_url="",
+    )
 
     with TestClient(app) as test_client:
         yield test_client
@@ -273,6 +277,34 @@ def test_link_existing_label_project_does_not_create_external_project(
     assert label_client.created_projects == []
 
 
+def test_label_project_response_uses_public_url_when_configured(
+    session_factory,
+    label_client: FakeLabelStudioClient,
+    stream_producer: FakeStreamProducer,
+):
+    app = create_app()
+
+    def override_session() -> Generator[Session]:
+        with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_dataset_session] = override_session
+    app.dependency_overrides[get_label_project_session] = override_session
+    app.dependency_overrides[get_label_studio_client] = lambda: label_client
+    app.dependency_overrides[get_label_sync_stream_producer] = lambda: stream_producer
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        label_studio_token="test-token",
+        label_studio_public_url="http://127.0.0.1:8080",
+    )
+
+    with TestClient(app) as test_client:
+        dataset_id = create_dataset_row(session_factory)
+        response = test_client.post(f"/datasets/{dataset_id}/label-projects")
+
+    assert response.status_code == 201
+    assert response.json()["project_url"] == "http://127.0.0.1:8080/projects/9001/data"
+
+
 def test_link_existing_label_project_rejects_unsafe_external_project_id(
     client: TestClient,
     session_factory,
@@ -355,7 +387,10 @@ def test_sync_samples_endpoint_marks_task_failed_when_enqueue_fails(session_fact
     app.dependency_overrides[get_label_project_session] = override_session
     app.dependency_overrides[get_label_studio_client] = lambda: label_client
     app.dependency_overrides[get_label_sync_stream_producer] = lambda: FailingStreamProducer()
-    app.dependency_overrides[get_settings] = lambda: Settings(label_studio_token="test-token")
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        label_studio_token="test-token",
+        label_studio_public_url="",
+    )
 
     with TestClient(app) as test_client:
         dataset_id = create_dataset_row(session_factory)
@@ -410,6 +445,148 @@ def test_worker_syncs_samples_to_label_studio(session_factory, label_client: Fak
     with session_factory() as session:
         assert session.get(Task, task_id).status == TaskStatus.SUCCESS.value
         assert session.get(LabelProject, project_id).sync_status == "synced"
+
+
+def test_label_sync_runner_processes_queued_sync_tasks(session_factory, label_client: FakeLabelStudioClient):
+    dataset_id, sample_id = create_dataset_with_sample(session_factory)
+    storage = InMemoryObjectStorageClient()
+    with session_factory() as session:
+        project = LabelProject(
+            dataset_id=dataset_id,
+            provider="label_studio",
+            external_project_id="9001",
+            sync_status="pending",
+        )
+        task = Task(
+            task_type=TaskType.SYNC_LABEL_STUDIO_DATA.value,
+            status=TaskStatus.QUEUED.value,
+            resource_type="label_project",
+            payload={},
+        )
+        session.add_all([project, task])
+        session.commit()
+        project_id = project.id
+        task_id = task.id
+        task.payload = {"label_project_id": project_id}
+        session.add(task)
+        session.commit()
+
+    with session_factory() as session:
+        processed = run_pending_label_sync_tasks(session, storage, label_client)
+
+    assert [task.id for task in processed] == [task_id]
+    assert label_client.imported_tasks[0]["tasks"][0]["data"]["visiox_sample_id"] == sample_id
+    with session_factory() as session:
+        assert session.get(Task, task_id).status == TaskStatus.SUCCESS.value
+        assert session.get(LabelProject, project_id).sync_status == "synced"
+
+
+def test_worker_converts_minio_sample_uri_to_public_url(
+    session_factory,
+    label_client: FakeLabelStudioClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VISIOX_MINIO_PUBLIC_URL", "http://127.0.0.1:9000")
+    get_settings.cache_clear()
+    dataset_id, sample_id = create_dataset_with_sample(session_factory)
+    with session_factory() as session:
+        sample = session.get(DatasetSample, sample_id)
+        sample.file_uri = "minio://datasets/folder with spaces/sample-one.png"
+        project = LabelProject(
+            dataset_id=dataset_id,
+            provider="label_studio",
+            external_project_id="9001",
+            sync_status="pending",
+        )
+        task = Task(
+            task_type=TaskType.SYNC_LABEL_STUDIO_DATA.value,
+            status=TaskStatus.QUEUED.value,
+            resource_type="label_project",
+            payload={},
+        )
+        session.add_all([sample, project, task])
+        session.commit()
+        project_id = project.id
+        task_id = task.id
+        task.payload = {"label_project_id": project_id}
+        session.add(task)
+        session.commit()
+
+    try:
+        with session_factory() as session:
+            sync_label_project_samples(session, label_client, task_id, project_id)
+    finally:
+        get_settings.cache_clear()
+
+    imported_task = label_client.imported_tasks[0]["tasks"][0]
+    assert imported_task["data"]["image"] == "http://127.0.0.1:9000/datasets/folder%20with%20spaces/sample-one.png"
+
+
+def test_worker_syncs_existing_annotations_to_label_studio(session_factory, label_client: FakeLabelStudioClient):
+    dataset_id, sample_id = create_dataset_with_sample(session_factory)
+    with session_factory() as session:
+        session.add(
+            Annotation(
+                dataset_sample_id=sample_id,
+                source="coco",
+                internal_payload={
+                    "annotations": [
+                        {
+                            "source_annotation_id": "coco-one",
+                            "results": [
+                                {
+                                    "shape": "rectangle",
+                                    "class_name": "defect",
+                                    "x": 10,
+                                    "y": 20,
+                                    "width": 30,
+                                    "height": 40,
+                                }
+                            ],
+                        }
+                    ]
+                },
+                validation_status="valid",
+            )
+        )
+        project = LabelProject(
+            dataset_id=dataset_id,
+            provider="label_studio",
+            external_project_id="9001",
+            sync_status="pending",
+        )
+        task = Task(
+            task_type=TaskType.SYNC_LABEL_STUDIO_DATA.value,
+            status=TaskStatus.QUEUED.value,
+            resource_type="label_project",
+            payload={},
+        )
+        session.add_all([project, task])
+        session.commit()
+        project_id = project.id
+        task_id = task.id
+        task.payload = {"label_project_id": project_id}
+        session.add(task)
+        session.commit()
+
+    with session_factory() as session:
+        sync_label_project_samples(session, label_client, task_id, project_id)
+
+    imported_task = label_client.imported_tasks[0]["tasks"][0]
+    assert imported_task["annotations"][0]["result"] == [
+        {
+            "from_name": "label",
+            "to_name": "image",
+            "type": "rectanglelabels",
+            "value": {
+                "x": 10,
+                "y": 20,
+                "width": 30,
+                "height": 40,
+                "rectanglelabels": ["defect"],
+            },
+        }
+    ]
 
 
 def test_importer_normalizes_label_studio_rectangle_payload():

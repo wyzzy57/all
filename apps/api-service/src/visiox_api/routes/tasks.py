@@ -9,14 +9,14 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from visiox_common.tasks import TaskCommand, TaskProgressEvent, TaskStatus, TaskType
-from visiox_db.models import Task
+from visiox_db.models import Task, TrainingJob, TrainingPipeline
 from visiox_db.session import get_session
 from visiox_messaging.streams import RedisStreamProducer
 
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 TERMINAL_STATUSES = {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELED}
-CANCELABLE_STATUSES = {TaskStatus.PENDING, TaskStatus.QUEUED}
+CANCELABLE_STATUSES = {TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.RUNNING}
 
 
 class CreateTaskRequest(BaseModel):
@@ -138,12 +138,24 @@ def cancel_task(task_id: str, session: Session = Depends(get_task_session)) -> T
     if TaskStatus(task.status) not in CANCELABLE_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Only PENDING or QUEUED tasks can be canceled",
+            detail="Only PENDING, QUEUED or RUNNING tasks can be canceled",
         )
 
+    now = _utc_now()
     task.status = TaskStatus.CANCELED.value
-    task.finished_at = _utc_now()
+    task.error_code = "TRAINING_CANCELED" if task.task_type == TaskType.TRAIN_MODEL.value else task.error_code
+    task.finished_at = now
     session.add(task)
+    if task.task_type == TaskType.TRAIN_MODEL.value and task.resource_id:
+        job = session.get(TrainingJob, task.resource_id)
+        if job is not None:
+            job.status = "canceled"
+            job.finished_at = now
+            session.add(job)
+            pipeline = session.get(TrainingPipeline, job.pipeline_id)
+            if pipeline is not None:
+                pipeline.status = "canceled"
+                session.add(pipeline)
     session.commit()
     session.refresh(task)
     return task

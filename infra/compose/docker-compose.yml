@@ -4,7 +4,7 @@ services:
       context: ../..
       dockerfile: apps/api-service/Dockerfile
     env_file:
-      - ../../.env.example
+      - ../../.env
     ports:
       - "8000:8000"
     depends_on:
@@ -18,6 +18,46 @@ services:
         condition: service_started
       label-studio:
         condition: service_started
+
+  label-sync-worker:
+    build:
+      context: ../..
+      dockerfile: apps/api-service/Dockerfile
+    env_file:
+      - ../../.env
+    command:
+      - python
+      - -m
+      - visiox_label_sync_worker.runner
+    depends_on:
+      postgres:
+        condition: service_started
+      minio:
+        condition: service_started
+      label-studio:
+        condition: service_started
+
+  training-worker:
+    build:
+      context: ../..
+      dockerfile: apps/api-service/Dockerfile
+    env_file:
+      - ../../.env
+    command:
+      - python
+      - -m
+      - visiox_training_worker.runner
+      - --work-dir
+      - /workspace/training-runs
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+    volumes:
+      - training-runs:/workspace/training-runs
 
   postgres:
     image: postgres:16-alpine
@@ -56,10 +96,23 @@ services:
 
   label-studio:
     image: heartexlabs/label-studio:latest
+    command:
+      - label-studio
+      - start
+      - --host
+      - http://127.0.0.1:8080
+      - --username
+      - ${LABEL_STUDIO_USERNAME:-admin@example.com}
+      - --password
+      - ${LABEL_STUDIO_PASSWORD:-visiox123}
+      - --user-token
+      - ${LABEL_STUDIO_USER_TOKEN:-visiox-label-studio-token}
+      - --enable-legacy-api-token
     environment:
       LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK: ${LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK:-true}
       LABEL_STUDIO_USERNAME: ${LABEL_STUDIO_USERNAME:-admin@example.com}
       LABEL_STUDIO_PASSWORD: ${LABEL_STUDIO_PASSWORD:-visiox123}
+      LABEL_STUDIO_USER_TOKEN: ${LABEL_STUDIO_USER_TOKEN:-visiox-label-studio-token}
     ports:
       - "8080:8080"
     volumes:
@@ -70,3 +123,4 @@ volumes:
   minio-data:
   registry-data:
   label-studio-data:
+  training-runs:

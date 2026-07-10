@@ -30,7 +30,7 @@ class BaseModel(IdMixin, TimestampMixin, Base):
     local_uri: Mapped[str | None] = mapped_column(Text)
     checksum: Mapped[str | None] = mapped_column(String(128))
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)
-    status: Mapped[str] = mapped_column(String(40), nullable=False, default="remote_available", index=True)
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="ready", index=True)
     model_source_id: Mapped[str | None] = mapped_column(ForeignKey("model_sources.id"))
 
 
@@ -45,6 +45,9 @@ class TrainingPipeline(IdMixin, TimestampMixin, Base):
     params_template: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     default_environment: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="draft", index=True)
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    public_scope: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    is_favorite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class TrainingJob(IdMixin, TimestampMixin, Base):
@@ -59,6 +62,19 @@ class TrainingJob(IdMixin, TimestampMixin, Base):
     log_uri: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PipelineEvaluation(IdMixin, TimestampMixin, Base):
+    __tablename__ = "pipeline_evaluations"
+
+    pipeline_id: Mapped[str] = mapped_column(ForeignKey("training_pipelines.id"), nullable=False)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), nullable=False)
+    evaluation_set: Mapped[str] = mapped_column(String(40), nullable=False)
+    model_weight: Mapped[str] = mapped_column(String(160), nullable=False)
+    environment: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="completed", index=True)
+    score: Mapped[float | None] = mapped_column()
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
 
 class TrainedModel(IdMixin, TimestampMixin, Base):

@@ -35,16 +35,16 @@ MVP 计划已经按 13 个任务推进并基本落地：
 1. 仓库基础与 Docker Compose
 2. 数据库核心与迁移
 3. Redis Messaging 与 Task Center
-4. 对象存储与基础模型下载
+4. 对象存储与基础模型自动准备
 5. 数据准备模块
 6. Label Studio 集成
 7. YOLO26 Dataset Converter
 8. 训练产线与 Training Worker
-9. 模型导出与边缘应用打包
-10. Edge Agent 与部署 Worker
-11. 统一 YOLO26 推理服务
-12. 前端管理台
-13. MVP 端到端验证
+9. 统一 YOLO26 推理服务
+10. 前端管理台
+11. MVP 端到端验证
+
+边缘应用、部署记录、设备与摄像头、Edge Agent、部署 Worker 和手动基础模型下载链路已从当前产品范围删除。
 
 最近与数据准备相关的提交：
 

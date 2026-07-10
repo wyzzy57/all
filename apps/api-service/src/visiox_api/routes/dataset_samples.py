@@ -6,6 +6,7 @@ from typing import Any
 from zipfile import BadZipFile, ZipFile
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -63,6 +64,12 @@ class SplitAssignment(BaseModel):
 
 class SplitAssignmentRequest(BaseModel):
     assignments: list[SplitAssignment] = Field(min_length=1)
+
+
+class SplitRatioRequest(BaseModel):
+    train_ratio: int = Field(ge=0, le=100)
+    val_ratio: int = Field(ge=0, le=100)
+    test_ratio: int = Field(ge=0, le=100)
 
 
 def get_dataset_sample_session() -> Generator[Session]:
@@ -192,6 +199,25 @@ def list_samples(
     return DatasetSampleListResponse(items=list(samples), total=total, limit=limit, offset=offset)
 
 
+@router.get("/{sample_id}/content")
+def get_sample_content(
+    dataset_id: str,
+    sample_id: str,
+    session: Session = Depends(get_dataset_sample_session),
+    storage: ObjectStorageClient = Depends(get_object_storage_client),
+) -> FileResponse:
+    dataset_or_404(session, dataset_id)
+    sample = session.get(DatasetSample, sample_id)
+    if sample is None or sample.dataset_id != dataset_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sample not found")
+    bucket, object_name = _parse_storage_uri(sample.file_uri)
+    suffix = PurePosixPath(object_name).suffix or ".img"
+    with NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+        temp_path = Path(temp_file.name)
+    storage.get_file(bucket, object_name, temp_path)
+    return FileResponse(temp_path, media_type=_image_media_type(suffix), background=_DeleteFileTask(temp_path))
+
+
 @router.post("/splits", response_model=DatasetSampleListResponse)
 def assign_splits(
     dataset_id: str,
@@ -221,6 +247,38 @@ def assign_splits(
 
     samples = list(samples_by_id.values())
     return DatasetSampleListResponse(items=samples, total=len(samples), limit=len(samples), offset=0)
+
+
+@router.post("/splits:ratio", response_model=DatasetSampleListResponse)
+def assign_splits_by_ratio(
+    dataset_id: str,
+    request: SplitRatioRequest,
+    session: Session = Depends(get_dataset_sample_session),
+) -> DatasetSampleListResponse:
+    dataset_or_404(session, dataset_id)
+    ratio_total = request.train_ratio + request.val_ratio + request.test_ratio
+    if ratio_total != 100:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Split ratios must add up to 100")
+
+    samples = list(
+        session.scalars(select(DatasetSample).where(DatasetSample.dataset_id == dataset_id).order_by(DatasetSample.id)).all()
+    )
+    total = len(samples)
+    train_count = round(total * request.train_ratio / 100)
+    val_count = round(total * request.val_ratio / 100)
+    if train_count + val_count > total:
+        val_count = max(0, total - train_count)
+    test_count = total - train_count - val_count
+
+    split_sequence = ["train"] * train_count + ["val"] * val_count + ["test"] * test_count
+    for sample, split in zip(samples, split_sequence, strict=False):
+        sample.split = split
+        session.add(sample)
+    session.commit()
+    for sample in samples:
+        session.refresh(sample)
+
+    return DatasetSampleListResponse(items=samples[:200], total=total, limit=min(total, 200), offset=0)
 
 
 class _UploadResult:
@@ -390,6 +448,35 @@ def _bytes_file(data: bytes):
     from io import BytesIO
 
     return BytesIO(data)
+
+
+class _DeleteFileTask:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    async def __call__(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+def _parse_storage_uri(uri: str) -> tuple[str, str]:
+    marker = "://"
+    if marker not in uri:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sample file is not available")
+    remainder = uri.split(marker, 1)[1]
+    bucket, separator, object_name = remainder.partition("/")
+    if not separator or not bucket or not object_name:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sample file is not available")
+    return bucket, object_name
+
+
+def _image_media_type(suffix: str) -> str:
+    return {
+        ".bmp": "image/bmp",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(suffix.lower(), "application/octet-stream")
 
 
 def _validate_zip_entry(filename: str) -> None:

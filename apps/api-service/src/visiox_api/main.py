@@ -1,4 +1,5 @@
 import inspect
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -9,16 +10,20 @@ from visiox_common.settings import get_settings
 from visiox_api.routes.base_models import router as base_models_router
 from visiox_api.routes.dataset_samples import router as dataset_samples_router
 from visiox_api.routes.datasets import router as datasets_router
-from visiox_api.routes.deployments import router as deployments_router
-from visiox_api.routes.devices import router as devices_router
-from visiox_api.routes.edge_apps import router as edge_apps_router
 from visiox_api.routes.label_projects import router as label_projects_router
+from visiox_api.routes.pipeline_evaluation import router as pipeline_evaluation_router
+from visiox_api.routes.pipeline_inference import router as pipeline_inference_router
 from visiox_api.routes.pipelines import router as pipelines_router
 from visiox_api.routes.tasks import router as tasks_router
 from visiox_api.routes.trained_models import router as trained_models_router
 from visiox_api.routes.training_jobs import router as training_jobs_router
+from visiox_api.seed_base_models import seed_yolo26_base_models
 from visiox_api.ws.tasks import router as task_progress_router
+from visiox_db.session import create_session_factory
 from visiox_storage.client import MinioObjectStorageClient
+
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -33,6 +38,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         secret_key=settings.minio_secret_key,
         secure=settings.minio_secure,
     )
+    if settings.seed_base_models_on_startup:
+        try:
+            session_factory = create_session_factory()
+            with session_factory() as session:
+                seed_yolo26_base_models(session, storage=app.state.object_storage)
+        except Exception:
+            logger.exception("Failed to seed YOLO26 base models")
     try:
         yield
     finally:
@@ -70,11 +82,10 @@ def create_app() -> FastAPI:
     app.include_router(base_models_router)
     app.include_router(datasets_router)
     app.include_router(dataset_samples_router)
-    app.include_router(devices_router)
-    app.include_router(deployments_router)
-    app.include_router(edge_apps_router)
     app.include_router(label_projects_router)
     app.include_router(pipelines_router)
+    app.include_router(pipeline_evaluation_router)
+    app.include_router(pipeline_inference_router)
     app.include_router(training_jobs_router)
     app.include_router(trained_models_router)
     app.include_router(task_progress_router)

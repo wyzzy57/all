@@ -65,3 +65,44 @@ def test_trained_models_list_supports_filters_and_cors_preflight(tmp_path):
     body = response.json()
     assert body["total"] == 1
     assert body["items"][0]["name"] == "detect-ready"
+
+
+def test_trained_model_deployment_name_can_be_marked_without_renaming_weight(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'visiox-trained-model-mark.db'}"
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "head")
+
+    engine = create_engine(database_url)
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    with session_factory() as session:
+        model = TrainedModel(
+            id="model-1",
+            name="best.pt",
+            version="best.pt",
+            task="detect",
+            artifact_uri="memory://models/trained/detect/best.pt",
+            metrics={"mAP50": 0.9},
+            status="ready",
+        )
+        session.add(model)
+        session.commit()
+
+    app = create_app()
+
+    def override_session() -> Generator[Session]:
+        with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_trained_model_session] = override_session
+    with TestClient(app) as client:
+        response = client.patch("/trained-models/model-1", json={"deployment_name": "best_model"})
+        invalid = client.patch("/trained-models/model-1", json={"deployment_name": "bad/name"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "best.pt"
+    assert body["version"] == "best.pt"
+    assert body["metrics"]["mAP50"] == 0.9
+    assert body["metrics"]["deployment_name"] == "best_model"
+    assert invalid.status_code == 422

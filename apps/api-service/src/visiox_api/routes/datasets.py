@@ -1,16 +1,24 @@
 from collections.abc import Generator
 from datetime import UTC, datetime
+import json
+from pathlib import Path, PurePosixPath
+from tempfile import NamedTemporaryFile
 from typing import Any
+from zipfile import ZipFile
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
 from visiox_common.tasks import TaskStatus, TaskType
-from visiox_db.models import Dataset, Task
+from visiox_db.models import Annotation, Dataset, DatasetSample, LabelProject, Task, TrainingPipeline
 from visiox_db.session import get_session
+from visiox_storage.client import ObjectStorageClient
 from visiox_yolo26.datasets.analysis import analyze_dataset
+from visiox_yolo26.datasets.processing import process_dataset
 from visiox_yolo26.datasets.validation import SUPPORTED_TASKS, validate_dataset_format
 
 
@@ -67,8 +75,21 @@ class TaskResponse(BaseModel):
     updated_at: datetime
 
 
+class DatasetProcessRequest(BaseModel):
+    augment: dict[str, bool] = Field(default_factory=dict)
+    clean: dict[str, bool] = Field(default_factory=dict)
+    max_samples: int = Field(default=200, ge=1, le=1000)
+
+
 def get_dataset_session() -> Generator[Session]:
     yield from get_session()
+
+
+def get_dataset_object_storage_client(request: Request) -> ObjectStorageClient:
+    storage = getattr(request.app.state, "object_storage", None)
+    if storage is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Object storage is not configured")
+    return storage
 
 
 def _utc_now() -> datetime:
@@ -131,9 +152,135 @@ def list_datasets(
     return DatasetListResponse(items=list(datasets), total=total, limit=limit, offset=offset)
 
 
+@router.get("/{dataset_id}/export")
+def export_dataset(
+    dataset_id: str,
+    session: Session = Depends(get_dataset_session),
+    storage: ObjectStorageClient = Depends(get_dataset_object_storage_client),
+) -> FileResponse:
+    dataset = dataset_or_404(session, dataset_id)
+    samples = session.scalars(
+        select(DatasetSample).where(DatasetSample.dataset_id == dataset.id).order_by(DatasetSample.created_at, DatasetSample.id)
+    ).all()
+    sample_ids = [sample.id for sample in samples]
+    annotations_by_sample: dict[str, list[Annotation]] = {sample.id: [] for sample in samples}
+    if sample_ids:
+        annotations = session.scalars(select(Annotation).where(Annotation.dataset_sample_id.in_(sample_ids))).all()
+        for annotation in annotations:
+            annotations_by_sample.setdefault(annotation.dataset_sample_id, []).append(annotation)
+
+    with NamedTemporaryFile(delete=False, suffix=".zip") as temp_file:
+        export_path = Path(temp_file.name)
+
+    try:
+        with ZipFile(export_path, "w") as archive:
+            archive.writestr(
+                "metadata.json",
+                json.dumps(
+                    {
+                        "id": dataset.id,
+                        "name": dataset.name,
+                        "task": dataset.task,
+                        "status": dataset.status,
+                        "class_schema": dataset.class_schema,
+                        "sample_count": dataset.sample_count,
+                        "annotation_count": dataset.annotation_count,
+                        "source": dataset.source,
+                        "created_at": dataset.created_at.isoformat(),
+                        "updated_at": dataset.updated_at.isoformat(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+            archive.writestr(
+                "annotations.json",
+                json.dumps(
+                    {
+                        "samples": [
+                            {
+                                "id": sample.id,
+                                "file_uri": sample.file_uri,
+                                "width": sample.width,
+                                "height": sample.height,
+                                "split": sample.split,
+                                "annotation_status": sample.annotation_status,
+                                "annotations": [
+                                    {
+                                        "id": annotation.id,
+                                        "source": annotation.source,
+                                        "validation_status": annotation.validation_status,
+                                        "payload": annotation.internal_payload,
+                                    }
+                                    for annotation in annotations_by_sample.get(sample.id, [])
+                                ],
+                            }
+                            for sample in samples
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+            for index, sample in enumerate(samples, start=1):
+                parsed = _parse_storage_uri(sample.file_uri)
+                if parsed is None:
+                    continue
+                bucket, object_name = parsed
+                suffix = PurePosixPath(object_name).suffix or ".bin"
+                with NamedTemporaryFile(delete=False, suffix=suffix) as sample_file:
+                    sample_path = Path(sample_file.name)
+                try:
+                    storage.get_file(bucket, object_name, sample_path)
+                    archive.write(sample_path, f"images/{index:06d}_{_safe_export_name(object_name, suffix)}")
+                finally:
+                    sample_path.unlink(missing_ok=True)
+    except Exception:
+        export_path.unlink(missing_ok=True)
+        raise
+
+    filename = f"{_safe_export_name(dataset.name or dataset.id, '.zip')}"
+    return FileResponse(
+        export_path,
+        media_type="application/zip",
+        filename=filename,
+        background=BackgroundTask(export_path.unlink, missing_ok=True),
+    )
+
+
 @router.get("/{dataset_id}", response_model=DatasetResponse)
 def get_dataset(dataset_id: str, session: Session = Depends(get_dataset_session)) -> Dataset:
     return dataset_or_404(session, dataset_id)
+
+
+@router.delete("/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_dataset(
+    dataset_id: str,
+    session: Session = Depends(get_dataset_session),
+    storage: ObjectStorageClient = Depends(get_dataset_object_storage_client),
+) -> Response:
+    dataset = dataset_or_404(session, dataset_id)
+    samples = session.scalars(select(DatasetSample).where(DatasetSample.dataset_id == dataset.id)).all()
+    sample_ids = [sample.id for sample in samples]
+    label_projects = session.scalars(select(LabelProject).where(LabelProject.dataset_id == dataset.id)).all()
+    label_project_ids = [project.id for project in label_projects]
+    object_uris = [sample.file_uri for sample in samples]
+    if sample_ids:
+        annotations = session.scalars(select(Annotation).where(Annotation.dataset_sample_id.in_(sample_ids))).all()
+        object_uris.extend(annotation.raw_payload_uri for annotation in annotations if annotation.raw_payload_uri)
+
+    if label_project_ids:
+        session.execute(delete(Task).where(Task.resource_type == "label_project", Task.resource_id.in_(label_project_ids)))
+    session.execute(delete(Task).where(Task.resource_type == "dataset", Task.resource_id == dataset.id))
+    session.execute(update(TrainingPipeline).where(TrainingPipeline.dataset_id == dataset.id).values(dataset_id=None))
+    if sample_ids:
+        session.execute(delete(Annotation).where(Annotation.dataset_sample_id.in_(sample_ids)))
+        session.execute(delete(DatasetSample).where(DatasetSample.id.in_(sample_ids)))
+    session.execute(delete(LabelProject).where(LabelProject.dataset_id == dataset.id))
+    session.delete(dataset)
+    session.commit()
+    _delete_storage_objects(storage, object_uris)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/{dataset_id}/analyze", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
@@ -161,15 +308,100 @@ def create_dataset_analysis_task(
     return task
 
 
+@router.post("/{dataset_id}/process", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
+def create_dataset_processing_task(
+    dataset_id: str,
+    request: DatasetProcessRequest,
+    session: Session = Depends(get_dataset_session),
+    storage: ObjectStorageClient = Depends(get_dataset_object_storage_client),
+) -> Task:
+    dataset_or_404(session, dataset_id)
+    now = _utc_now()
+    try:
+        result = process_dataset(
+            session=session,
+            storage=storage,
+            dataset_id=dataset_id,
+            augment_rules=request.augment,
+            clean_rules=request.clean,
+            max_samples=request.max_samples,
+        )
+        task = Task(
+            task_type=TaskType.PROCESS_DATASET.value,
+            status=TaskStatus.SUCCESS.value,
+            progress=100,
+            resource_type="dataset",
+            resource_id=dataset_id,
+            stage="completed",
+            payload={"dataset_id": dataset_id, "result": result},
+            started_at=now,
+            finished_at=_utc_now(),
+        )
+    except Exception as exc:
+        session.rollback()
+        task = Task(
+            task_type=TaskType.PROCESS_DATASET.value,
+            status=TaskStatus.FAILED.value,
+            progress=100,
+            resource_type="dataset",
+            resource_id=dataset_id,
+            stage="failed",
+            payload={"dataset_id": dataset_id},
+            error_code="PROCESS_DATASET_FAILED",
+            error_message=str(exc),
+            retryable=True,
+            started_at=now,
+            finished_at=_utc_now(),
+        )
+    session.add(task)
+    session.commit()
+    session.refresh(task)
+    return task
+
+
+def _delete_storage_objects(storage: ObjectStorageClient, uris: list[str]) -> None:
+    for uri in uris:
+        parsed = _parse_storage_uri(uri)
+        if parsed is None:
+            continue
+        bucket, object_name = parsed
+        try:
+            storage.delete_file(bucket, object_name)
+        except Exception:
+            pass
+
+
+def _parse_storage_uri(uri: str) -> tuple[str, str] | None:
+    marker = "://"
+    if marker not in uri:
+        return None
+    remainder = uri.split(marker, 1)[1]
+    bucket, separator, object_name = remainder.partition("/")
+    if not separator or not bucket or not object_name:
+        return None
+    return bucket, object_name
+
+
+def _safe_export_name(value: str, fallback_suffix: str) -> str:
+    name = PurePosixPath(value.replace("\\", "/")).name or "dataset"
+    cleaned = "".join(character if character.isalnum() or character in {".", "-", "_"} else "_" for character in name)
+    if "." not in cleaned and fallback_suffix:
+        cleaned = f"{cleaned}{fallback_suffix}"
+    return cleaned
+
+
 @router.post("/{dataset_id}/validate", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 def create_dataset_validation_task(
     dataset_id: str,
     session: Session = Depends(get_dataset_session),
 ) -> Task:
-    dataset_or_404(session, dataset_id)
+    dataset = dataset_or_404(session, dataset_id)
     result = validate_dataset_format(session, dataset_id)
     first_error = result["errors"][0]["code"] if result["errors"] else None
     now = _utc_now()
+    if result["valid"]:
+        dataset.status = "validated"
+        session.add(dataset)
     task = Task(
         task_type=TaskType.VALIDATE_DATASET_FORMAT.value,
         status=TaskStatus.SUCCESS.value if result["valid"] else TaskStatus.FAILED.value,

@@ -13,6 +13,8 @@ class ObjectStorageClient(Protocol):
 
     def get_file(self, bucket: str, object_name: str, destination: Path) -> Path: ...
 
+    def object_size(self, bucket: str, object_name: str) -> int: ...
+
     def delete_file(self, bucket: str, object_name: str) -> None: ...
 
 
@@ -49,6 +51,9 @@ class MinioObjectStorageClient:
         self._client.fget_object(bucket, object_name, str(destination))
         return destination
 
+    def object_size(self, bucket: str, object_name: str) -> int:
+        return int(self._client.stat_object(bucket, object_name).size)
+
     def delete_file(self, bucket: str, object_name: str) -> None:
         try:
             self._client.remove_object(bucket, object_name)
@@ -76,6 +81,9 @@ class InMemoryObjectStorageClient:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(self.objects[(bucket, object_name)])
         return destination
+
+    def object_size(self, bucket: str, object_name: str) -> int:
+        return len(self.objects[(bucket, object_name)])
 
     def delete_file(self, bucket: str, object_name: str) -> None:
         self.objects.pop((bucket, object_name), None)

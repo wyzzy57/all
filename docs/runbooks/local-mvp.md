@@ -33,7 +33,7 @@ Copy-Item .env.example .env
 后端和 worker 的确定性集成测试不依赖真实 Redis、MinIO、Label Studio、GPU 或 Docker：
 
 ```powershell
-.\.venv\Scripts\pytest -q tests\integration\test_mvp_yolo26_detect_flow.py tests\integration\test_mvp_labelstudio_flow.py
+.\.venv\Scripts\pytest -q tests\integration\test_dataset_upload.py tests\integration\test_label_studio_sync.py tests\integration\test_training_pipeline.py tests\integration\test_task_center.py
 .\.venv\Scripts\ruff check apps packages tests infra workers
 npm run test --prefix apps/frontend
 npm run build --prefix apps/frontend
@@ -45,8 +45,6 @@ npm run build --prefix apps/frontend
 - 写入最小 detect 标注，执行数据集分析和训练前校验。
 - 创建训练产线和训练 Job。
 - 通过训练 worker 导出 YOLO26 数据集、执行假训练命令并登记训练模型。
-- 创建边缘应用版本，通过打包 worker 生成边缘应用包。
-- 注册测试 Edge Agent 设备，创建部署并通过部署 worker 调用 fake Agent。
 - 创建 Label Studio 项目、同步样本、导入标注并落库。
 
 ## 启动 Compose 栈
@@ -90,17 +88,14 @@ npm run dev --prefix apps/frontend -- --host 127.0.0.1 --port 5173
 1. 在“数据准备”创建 detect 数据集并上传图片或 zip。
 2. 使用 Label Studio 创建标注项目并同步样本。
 3. 标注完成后导入标注，确认数据集样本和标注计数正确。
-4. 在“模型空间”确认基础模型已就绪；未就绪时先触发下载。
+4. 在“模型空间”确认 30 个 YOLO26 基础模型已自动就绪。
 5. 在“训练产线”选择基础模型、数据集和训练参数，创建训练 Job。
 6. 在“任务中心”观察任务状态、进度和错误信息。
-7. 训练成功后创建边缘应用版本，等待打包任务完成。
-8. 在“设备与摄像头”注册测试 Edge Agent 并测试摄像头连接。
-9. 在“部署记录”创建部署，确认部署状态进入 running。
 
 ## 已知限制
 
 - MVP 不包含登录、RBAC、租户或审计审批。
-- 本地确定性测试使用 fake 训练、fake 导出、fake Agent 和内存对象存储；真实 GPU 训练需要额外配置 YOLO26 运行环境。
+- 本地确定性测试使用 fake 训练、fake 导出和内存对象存储；真实 GPU 训练需要额外配置 YOLO26 运行环境。
 - Compose 级验证需要本机 Docker 可用，并且镜像拉取可访问。
 - 当前前端 API client 为手写契约，后续可接入 OpenAPI 生成。
 - 前端生产构建会提示 Element Plus 相关 bundle 较大，这是当前 MVP 可接受限制。

@@ -3,18 +3,23 @@ from __future__ import annotations
 import inspect
 from collections.abc import Generator
 from datetime import UTC, datetime
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
 from visiox_common.tasks import TaskCommand, TaskStatus, TaskType
-from visiox_db.models import Task, TrainingJob, TrainingPipeline
+from visiox_db.models import Task, TrainedModel, TrainingJob, TrainingPipeline
 from visiox_db.session import get_session
 from visiox_messaging.streams import RedisStreamProducer
+from visiox_storage.client import ObjectStorageClient
 from visiox_yolo26.training.params import (
     TrainingParamsError,
     merge_training_params,
@@ -54,12 +59,30 @@ class TrainingJobListResponse(PydanticBaseModel):
     offset: int
 
 
+class TrainingArtifactResponse(PydanticBaseModel):
+    name: str
+    kind: str
+    size_bytes: int
+    download_url: str
+
+
+class TrainingArtifactListResponse(PydanticBaseModel):
+    items: list[TrainingArtifactResponse]
+
+
 def get_training_job_session() -> Generator[Session]:
     yield from get_session()
 
 
 def get_training_stream_producer(request: Request) -> RedisStreamProducer:
     return RedisStreamProducer(request.app.state.redis)
+
+
+def get_training_object_storage_client(request: Request) -> ObjectStorageClient:
+    storage = getattr(request.app.state, "object_storage", None)
+    if storage is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Object storage is not configured")
+    return storage
 
 
 async def _enqueue(producer: Any, command: TaskCommand) -> str:
@@ -144,6 +167,8 @@ async def create_training_job(
         "params": params,
         "environment": environment,
     }
+    pipeline.status = "running"
+    session.add(pipeline)
     session.commit()
     session.refresh(job)
     session.refresh(task)
@@ -161,12 +186,13 @@ async def create_training_job(
         now = _utc_now()
         job.status = "failed"
         job.finished_at = now
+        pipeline.status = "failed"
         task.status = TaskStatus.FAILED.value
         task.error_code = "ENQUEUE_FAILED"
         task.error_message = str(exc)
         task.finished_at = now
         task.retryable = True
-        session.add_all([job, task])
+        session.add_all([job, pipeline, task])
         session.commit()
         session.refresh(job)
         session.refresh(task)
@@ -205,3 +231,166 @@ def get_training_job(training_job_id: str, session: Session = Depends(get_traini
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
     task = session.get(Task, job.task_id) if job.task_id else None
     return _job_response(job, task=task)
+
+
+@router.get("/training-jobs/{training_job_id}/log")
+def get_training_job_log(
+    training_job_id: str,
+    session: Session = Depends(get_training_job_session),
+    storage: ObjectStorageClient = Depends(get_training_object_storage_client),
+) -> FileResponse:
+    job = session.get(TrainingJob, training_job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+    if not job.log_uri:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training log not found")
+    bucket, object_name = _parse_storage_uri(job.log_uri)
+    with NamedTemporaryFile(delete=False, suffix=f"-{training_job_id}.log") as temp_file:
+        temp_path = Path(temp_file.name)
+    storage.get_file(bucket, object_name, temp_path)
+    return FileResponse(
+        temp_path,
+        media_type="text/plain; charset=utf-8",
+        filename=f"{training_job_id}.log",
+        background=BackgroundTask(temp_path.unlink, missing_ok=True),
+    )
+
+
+@router.get("/training-jobs/{training_job_id}/visualizations/{name}")
+def get_training_job_visualization(
+    training_job_id: str,
+    name: str,
+    session: Session = Depends(get_training_job_session),
+    storage: ObjectStorageClient = Depends(get_training_object_storage_client),
+) -> FileResponse:
+    job = session.get(TrainingJob, training_job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+    visualizations = job.metrics.get("visualizations") if isinstance(job.metrics, dict) else None
+    if not isinstance(visualizations, dict):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training visualization not found")
+    uri = visualizations.get(name)
+    if not isinstance(uri, str):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training visualization not found")
+    bucket, object_name = _parse_storage_uri(uri)
+    suffix = Path(name).suffix or ".png"
+    with NamedTemporaryFile(delete=False, suffix=f"-{_safe_name(name) or 'visualization'}") as temp_file:
+        temp_path = Path(temp_file.name)
+    storage.get_file(bucket, object_name, temp_path)
+    return FileResponse(temp_path, media_type=_media_type(suffix), background=BackgroundTask(temp_path.unlink, missing_ok=True))
+
+
+@router.get("/training-jobs/{training_job_id}/artifacts", response_model=TrainingArtifactListResponse)
+def list_training_job_artifacts(
+    training_job_id: str,
+    session: Session = Depends(get_training_job_session),
+    storage: ObjectStorageClient = Depends(get_training_object_storage_client),
+) -> TrainingArtifactListResponse:
+    job = session.get(TrainingJob, training_job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+    artifact_uris = _training_artifact_uris(job, session)
+    items: list[TrainingArtifactResponse] = []
+    for kind in ("weight", "visualization"):
+        for name, uri in artifact_uris[kind].items():
+            bucket, object_name = _parse_storage_uri(uri)
+            items.append(
+                TrainingArtifactResponse(
+                    name=name,
+                    kind=kind,
+                    size_bytes=storage.object_size(bucket, object_name),
+                    download_url=f"/training-jobs/{job.id}/artifacts/{kind}/{name}",
+                )
+            )
+    return TrainingArtifactListResponse(items=items)
+
+
+@router.get("/training-jobs/{training_job_id}/artifacts/{kind}/{name}")
+def download_training_job_artifact(
+    training_job_id: str,
+    kind: str,
+    name: str,
+    session: Session = Depends(get_training_job_session),
+    storage: ObjectStorageClient = Depends(get_training_object_storage_client),
+) -> FileResponse:
+    job = session.get(TrainingJob, training_job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+    if kind not in {"weight", "visualization"}:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found")
+    uri = _training_artifact_uris(job, session)[kind].get(name)
+    if not uri:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found")
+    bucket, object_name = _parse_storage_uri(uri)
+    safe_name = _safe_name(name)
+    with NamedTemporaryFile(delete=False, suffix=f"-{safe_name or 'artifact'}") as temp_file:
+        temp_path = Path(temp_file.name)
+    storage.get_file(bucket, object_name, temp_path)
+    return FileResponse(
+        temp_path,
+        media_type=_media_type(Path(name).suffix),
+        filename=safe_name or "artifact",
+        background=BackgroundTask(temp_path.unlink, missing_ok=True),
+    )
+
+
+def _training_artifact_uris(job: TrainingJob, session: Session) -> dict[str, dict[str, str]]:
+    metrics = job.metrics if isinstance(job.metrics, dict) else {}
+    weights = _string_map(metrics.get("weights"))
+    visualizations = _string_map(metrics.get("visualizations"))
+    if not weights:
+        models = session.scalars(
+            select(TrainedModel)
+            .where(TrainedModel.pipeline_id == job.pipeline_id, TrainedModel.status == "ready")
+            .order_by(TrainedModel.created_at.desc(), TrainedModel.id.desc())
+        ).all()
+        for model in models:
+            _bucket, object_name = _parse_storage_uri(model.artifact_uri)
+            name = _safe_name(Path(object_name).name)
+            if name and name not in weights:
+                weights[name] = model.artifact_uri
+    return {
+        "weight": dict(sorted(weights.items(), key=lambda item: _artifact_sort_key(item[0]))),
+        "visualization": dict(sorted(visualizations.items())),
+    }
+
+
+def _string_map(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        _safe_name(str(name)): uri
+        for name, uri in value.items()
+        if _safe_name(str(name)) and isinstance(uri, str) and uri
+    }
+
+
+def _artifact_sort_key(name: str) -> tuple[int, str]:
+    if name == "best.pt":
+        return 0, name
+    if name == "last.pt":
+        return 1, name
+    return 2, name
+
+
+def _parse_storage_uri(uri: str) -> tuple[str, str]:
+    marker = "://"
+    if marker not in uri:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact is not available")
+    remainder = uri.split(marker, 1)[1]
+    bucket, separator, object_name = remainder.partition("/")
+    if not separator or not bucket or not object_name:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact is not available")
+    return bucket, object_name
+
+
+def _safe_name(name: str) -> str:
+    return "".join(character if character.isalnum() or character in {".", "-", "_"} else "_" for character in name)
+
+
+def _media_type(suffix: str) -> str:
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+    }.get(suffix.lower(), "application/octet-stream")

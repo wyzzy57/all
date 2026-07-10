@@ -27,7 +27,14 @@ def build_train_command(
         f"name={run_name}",
         "exist_ok=True",
     ]
-    for key in ("epochs", "batch", "imgsz", "lr0", "patience", "workers", "device", "seed"):
-        if key in params:
-            argv.append(f"{key}={params[key]}")
+    for key, value in sorted(params.items()):
+        argv.append(f"{key}={_format_arg_value(value)}")
     return YoloTrainCommand(argv=argv)
+
+
+def _format_arg_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if isinstance(value, list):
+        return "[" + ",".join(str(item) for item in value) + "]"
+    return str(value)

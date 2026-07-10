@@ -248,7 +248,8 @@ def _find_dataset_label_project(session: Session, dataset_id: str) -> LabelProje
 def _label_project_response(project: LabelProject, settings: Settings) -> LabelProjectResponse:
     project_url = None
     if project.external_project_id:
-        project_url = f"{settings.label_studio_url.rstrip('/')}/projects/{project.external_project_id}/data"
+        base_url = settings.label_studio_public_url or settings.label_studio_url
+        project_url = f"{base_url.rstrip('/')}/projects/{project.external_project_id}/data"
     response = LabelProjectResponse.model_validate(project)
     response.project_url = project_url
     return response

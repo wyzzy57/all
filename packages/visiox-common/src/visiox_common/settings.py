@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     postgres_dsn: str = "postgresql+psycopg://visiox:visiox@postgres:5432/visiox"
     redis_url: str = "redis://redis:6379/0"
     minio_endpoint: str = "minio:9000"
+    minio_public_url: str | None = None
     minio_access_key: str = "visiox"
     minio_secret_key: str = "visiox123"
     minio_secure: bool = False
@@ -20,8 +21,10 @@ class Settings(BaseSettings):
     max_dataset_zip_uncompressed_bytes: int = 500 * 1024 * 1024
     registry_url: str = "registry:5000"
     label_studio_url: str = "http://label-studio:8080"
+    label_studio_public_url: str | None = None
     label_studio_token: str = ""
     label_studio_sync_stream: str = "stream:label_sync.commands"
+    seed_base_models_on_startup: bool = False
 
 
 @lru_cache

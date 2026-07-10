@@ -3,7 +3,11 @@ import { createRouter, createWebHistory } from "vue-router";
 const router = createRouter({
   history: createWebHistory(),
   routes: [
-    { path: "/", redirect: "/model-space" },
+    { path: "/", redirect: "/workbench" },
+    {
+      path: "/workbench",
+      component: () => import("@/views/workbench/WorkbenchView.vue")
+    },
     {
       path: "/model-space",
       component: () => import("@/views/model-space/ModelSpaceView.vue")
@@ -13,24 +17,16 @@ const router = createRouter({
       component: () => import("@/views/data-preparation/DataPreparationView.vue")
     },
     {
-      path: "/pipelines",
-      component: () => import("@/views/pipelines/PipelinesView.vue")
+      path: "/services",
+      component: () => import("@/views/services/ServicesView.vue")
+    },
+    {
+      path: "/services/:serviceId",
+      component: () => import("@/views/services/ServicesView.vue")
     },
     {
       path: "/tasks",
       component: () => import("@/views/tasks/TasksView.vue")
-    },
-    {
-      path: "/devices",
-      component: () => import("@/views/devices/DevicesView.vue")
-    },
-    {
-      path: "/edge-apps",
-      component: () => import("@/views/edge-apps/EdgeAppsView.vue")
-    },
-    {
-      path: "/deployments",
-      component: () => import("@/views/devices/DeploymentsView.vue")
     }
   ]
 });

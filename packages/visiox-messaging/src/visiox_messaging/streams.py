@@ -4,18 +4,11 @@ from visiox_common.tasks import TaskCommand, TaskType
 
 
 STREAM_BY_TASK_TYPE: dict[TaskType, str] = {
-    TaskType.DOWNLOAD_BASE_MODEL: "stream:training.commands",
     TaskType.VALIDATE_DATASET_FORMAT: "stream:training.commands",
     TaskType.TRAIN_MODEL: "stream:training.commands",
     TaskType.CONVERT_MODEL: "stream:training.commands",
-    TaskType.BUILD_EDGE_APP_PACKAGE: "stream:training.commands",
-    TaskType.DEPLOY_APP: "stream:deployment.commands",
-    TaskType.ROLLBACK_APP: "stream:deployment.commands",
-    TaskType.STOP_APP: "stream:deployment.commands",
     TaskType.SYNC_LABEL_STUDIO_DATA: "stream:label_sync.commands",
     TaskType.IMPORT_LABEL_STUDIO_ANNOTATION: "stream:label_sync.commands",
-    TaskType.CAPTURE_CAMERA_SAMPLE: "stream:camera.commands",
-    TaskType.TEST_CAMERA_CONNECTION: "stream:camera.commands",
 }
 
 

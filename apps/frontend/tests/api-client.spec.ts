@@ -9,6 +9,14 @@ function mockJsonResponse(payload: unknown = {}) {
   } as Response);
 }
 
+function mockErrorResponse(payload: unknown, status = 503) {
+  return Promise.resolve({
+    ok: false,
+    status,
+    text: () => Promise.resolve(JSON.stringify(payload)),
+  } as Response);
+}
+
 describe("api client", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -20,12 +28,13 @@ describe("api client", () => {
     await api.createDataset({ name: "folder-a", task: "detect", class_schema: { names: ["ok", "defect"] } });
     await api.uploadDatasetSample("dataset-1", new File(["image"], "part.png", { type: "image/png" }));
     await api.uploadDatasetBatch("dataset-1", [new File(["label"], "part.txt", { type: "text/plain" })]);
-    await api.downloadBaseModel("base-1");
     await api.analyzeDataset("dataset-1");
+    await api.processDataset("dataset-1", { augment: { horizontalFlip: true }, clean: { blur: true } });
     await api.validateDataset("dataset-1");
     await api.createLabelProject("dataset-1", { external_project_id: "9001" });
     await api.syncLabelProjectSamples("label-project-1");
     await api.importLabelProjectAnnotations("label-project-1");
+    await api.deleteDataset("dataset-1");
     await api.createTrainingJob("pipeline-1", {});
 
     expect(fetchMock).toHaveBeenNthCalledWith(
@@ -53,12 +62,12 @@ describe("api client", () => {
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       4,
-      "/base-models/base-1/download",
+      "/datasets/dataset-1/analyze",
       expect.objectContaining({ method: "POST" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       5,
-      "/datasets/dataset-1/analyze",
+      "/datasets/dataset-1/process",
       expect.objectContaining({ method: "POST" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
@@ -83,8 +92,21 @@ describe("api client", () => {
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       10,
+      "/datasets/dataset-1",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      11,
       "/pipelines/pipeline-1/jobs",
       expect.objectContaining({ method: "POST" }),
     );
+  });
+
+  it("surfaces backend detail messages from failed responses", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      mockErrorResponse({ detail: "Label Studio 服务不可用，请确认服务已启动并可访问" }),
+    );
+
+    await expect(api.createLabelProject("dataset-1")).rejects.toThrow("Label Studio 服务不可用");
   });
 });

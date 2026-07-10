@@ -18,11 +18,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/base-models": apiProxy,
-      "/cameras": apiProxy,
       "/datasets": apiProxy,
-      "/deployments": apiProxy,
-      "/devices": apiProxy,
-      "/edge-apps": apiProxy,
       "/health": apiProxy,
       "/label-projects": apiProxy,
       "/pipelines": apiProxy,

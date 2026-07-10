@@ -91,35 +91,6 @@ def upgrade() -> None:
     op.create_index("ix_datasets_status", "datasets", ["status"])
 
     op.create_table(
-        "devices",
-        id_column(),
-        sa.Column("name", sa.String(length=160), nullable=False),
-        sa.Column("endpoint_url", sa.Text(), nullable=False),
-        sa.Column("status", sa.String(length=40), nullable=False),
-        sa.Column("token_ref", sa.String(length=160), nullable=True),
-        sa.Column("last_heartbeat_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("resource_info", sa.JSON(), nullable=False),
-        created_at_column(),
-        updated_at_column(),
-        pk("devices"),
-        sa.UniqueConstraint("name", name="uq_devices_name"),
-    )
-    op.create_index("ix_devices_status", "devices", ["status"])
-
-    op.create_table(
-        "edge_apps",
-        id_column(),
-        sa.Column("name", sa.String(length=160), nullable=False),
-        sa.Column("description", sa.Text(), nullable=True),
-        sa.Column("status", sa.String(length=40), nullable=False),
-        created_at_column(),
-        updated_at_column(),
-        pk("edge_apps"),
-        sa.UniqueConstraint("name", name="uq_edge_apps_name"),
-    )
-    op.create_index("ix_edge_apps_status", "edge_apps", ["status"])
-
-    op.create_table(
         "base_models",
         id_column(),
         sa.Column("family", sa.String(length=80), nullable=False),
@@ -215,22 +186,6 @@ def upgrade() -> None:
     op.create_index("ix_annotations_validation_status", "annotations", ["validation_status"])
 
     op.create_table(
-        "cameras",
-        id_column(),
-        sa.Column("device_id", sa.String(length=36), nullable=False),
-        sa.Column("name", sa.String(length=160), nullable=False),
-        sa.Column("rtsp_url", sa.Text(), nullable=False),
-        sa.Column("status", sa.String(length=40), nullable=False),
-        sa.Column("last_snapshot_uri", sa.Text(), nullable=True),
-        created_at_column(),
-        updated_at_column(),
-        pk("cameras"),
-        sa.ForeignKeyConstraint(["device_id"], ["devices.id"], name="fk_cameras_device_id_devices"),
-    )
-    op.create_index("ix_cameras_device_id", "cameras", ["device_id"])
-    op.create_index("ix_cameras_status", "cameras", ["status"])
-
-    op.create_table(
         "training_jobs",
         id_column(),
         sa.Column("pipeline_id", sa.String(length=36), nullable=False),
@@ -269,65 +224,15 @@ def upgrade() -> None:
     )
     op.create_index("ix_trained_models_task", "trained_models", ["task"])
     op.create_index("ix_trained_models_status", "trained_models", ["status"])
-    op.create_table(
-        "edge_app_versions",
-        id_column(),
-        sa.Column("edge_app_id", sa.String(length=36), nullable=False),
-        sa.Column("trained_model_id", sa.String(length=36), nullable=True),
-        sa.Column("version", sa.String(length=80), nullable=False),
-        sa.Column("package_uri", sa.Text(), nullable=False),
-        sa.Column("manifest", sa.JSON(), nullable=False),
-        sa.Column("checksum", sa.String(length=128), nullable=True),
-        sa.Column("status", sa.String(length=40), nullable=False),
-        created_at_column(),
-        updated_at_column(),
-        pk("edge_app_versions"),
-        sa.ForeignKeyConstraint(["edge_app_id"], ["edge_apps.id"], name="fk_edge_app_versions_edge_app_id_edge_apps"),
-        sa.ForeignKeyConstraint(["trained_model_id"], ["trained_models.id"], name="fk_edge_app_versions_trained_model_id_trained_models"),
-    )
-    op.create_index("ix_edge_app_versions_edge_app_id", "edge_app_versions", ["edge_app_id"])
-    op.create_index("ix_edge_app_versions_status", "edge_app_versions", ["status"])
-
-    op.create_table(
-        "deployments",
-        id_column(),
-        sa.Column("device_id", sa.String(length=36), nullable=False),
-        sa.Column("edge_app_version_id", sa.String(length=36), nullable=False),
-        sa.Column("task_id", sa.String(length=36), nullable=True),
-        sa.Column("status", sa.String(length=40), nullable=False),
-        sa.Column("active", sa.Boolean(), nullable=False),
-        sa.Column("deployed_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("stopped_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("logs_uri", sa.Text(), nullable=True),
-        created_at_column(),
-        updated_at_column(),
-        pk("deployments"),
-        sa.ForeignKeyConstraint(["device_id"], ["devices.id"], name="fk_deployments_device_id_devices"),
-        sa.ForeignKeyConstraint(
-            ["edge_app_version_id"],
-            ["edge_app_versions.id"],
-            name="fk_deployments_edge_app_version_id_edge_app_versions",
-        ),
-        sa.ForeignKeyConstraint(["task_id"], ["tasks.id"], name="fk_deployments_task_id_tasks"),
-    )
-    op.create_index("ix_deployments_device_id", "deployments", ["device_id"])
-    op.create_index("ix_deployments_status", "deployments", ["status"])
-    op.create_index("ix_deployments_active", "deployments", ["active"])
-
 
 def downgrade() -> None:
-    op.drop_table("deployments")
-    op.drop_table("edge_app_versions")
     op.drop_table("trained_models")
     op.drop_table("training_jobs")
-    op.drop_table("cameras")
     op.drop_table("annotations")
     op.drop_table("training_pipelines")
     op.drop_table("label_projects")
     op.drop_table("dataset_samples")
     op.drop_table("base_models")
-    op.drop_table("edge_apps")
-    op.drop_table("devices")
     op.drop_table("datasets")
     op.drop_table("model_sources")
     op.drop_table("tasks")

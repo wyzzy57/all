@@ -6,7 +6,8 @@
     "scale": "n",
     "filename": "yolo26n.pt",
     "source_path": "yolo26/detect/yolo26n.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-detect-n/yolo26n.pt"
   },
   {
     "id": "yolo26-detect-s",
@@ -15,7 +16,8 @@
     "scale": "s",
     "filename": "yolo26s.pt",
     "source_path": "yolo26/detect/yolo26s.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-detect-s/yolo26s.pt"
   },
   {
     "id": "yolo26-detect-m",
@@ -24,7 +26,8 @@
     "scale": "m",
     "filename": "yolo26m.pt",
     "source_path": "yolo26/detect/yolo26m.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-detect-m/yolo26m.pt"
   },
   {
     "id": "yolo26-detect-l",
@@ -33,7 +36,8 @@
     "scale": "l",
     "filename": "yolo26l.pt",
     "source_path": "yolo26/detect/yolo26l.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-detect-l/yolo26l.pt"
   },
   {
     "id": "yolo26-detect-x",
@@ -42,7 +46,8 @@
     "scale": "x",
     "filename": "yolo26x.pt",
     "source_path": "yolo26/detect/yolo26x.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-detect-x/yolo26x.pt"
   },
   {
     "id": "yolo26-segment-n",
@@ -51,7 +56,8 @@
     "scale": "n",
     "filename": "yolo26n-seg.pt",
     "source_path": "yolo26/segment/yolo26n-seg.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-segment-n/yolo26n-seg.pt"
   },
   {
     "id": "yolo26-segment-s",
@@ -60,7 +66,8 @@
     "scale": "s",
     "filename": "yolo26s-seg.pt",
     "source_path": "yolo26/segment/yolo26s-seg.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-segment-s/yolo26s-seg.pt"
   },
   {
     "id": "yolo26-segment-m",
@@ -69,7 +76,8 @@
     "scale": "m",
     "filename": "yolo26m-seg.pt",
     "source_path": "yolo26/segment/yolo26m-seg.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-segment-m/yolo26m-seg.pt"
   },
   {
     "id": "yolo26-segment-l",
@@ -78,7 +86,8 @@
     "scale": "l",
     "filename": "yolo26l-seg.pt",
     "source_path": "yolo26/segment/yolo26l-seg.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-segment-l/yolo26l-seg.pt"
   },
   {
     "id": "yolo26-segment-x",
@@ -87,7 +96,8 @@
     "scale": "x",
     "filename": "yolo26x-seg.pt",
     "source_path": "yolo26/segment/yolo26x-seg.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-segment-x/yolo26x-seg.pt"
   },
   {
     "id": "yolo26-semantic-n",
@@ -96,7 +106,8 @@
     "scale": "n",
     "filename": "yolo26n-sem.pt",
     "source_path": "yolo26/semantic/yolo26n-sem.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-semantic-n/yolo26n-sem.pt"
   },
   {
     "id": "yolo26-semantic-s",
@@ -105,7 +116,8 @@
     "scale": "s",
     "filename": "yolo26s-sem.pt",
     "source_path": "yolo26/semantic/yolo26s-sem.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-semantic-s/yolo26s-sem.pt"
   },
   {
     "id": "yolo26-semantic-m",
@@ -114,7 +126,8 @@
     "scale": "m",
     "filename": "yolo26m-sem.pt",
     "source_path": "yolo26/semantic/yolo26m-sem.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-semantic-m/yolo26m-sem.pt"
   },
   {
     "id": "yolo26-semantic-l",
@@ -123,7 +136,8 @@
     "scale": "l",
     "filename": "yolo26l-sem.pt",
     "source_path": "yolo26/semantic/yolo26l-sem.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-semantic-l/yolo26l-sem.pt"
   },
   {
     "id": "yolo26-semantic-x",
@@ -132,7 +146,8 @@
     "scale": "x",
     "filename": "yolo26x-sem.pt",
     "source_path": "yolo26/semantic/yolo26x-sem.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-semantic-x/yolo26x-sem.pt"
   },
   {
     "id": "yolo26-pose-n",
@@ -141,7 +156,8 @@
     "scale": "n",
     "filename": "yolo26n-pose.pt",
     "source_path": "yolo26/pose/yolo26n-pose.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-pose-n/yolo26n-pose.pt"
   },
   {
     "id": "yolo26-pose-s",
@@ -150,7 +166,8 @@
     "scale": "s",
     "filename": "yolo26s-pose.pt",
     "source_path": "yolo26/pose/yolo26s-pose.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-pose-s/yolo26s-pose.pt"
   },
   {
     "id": "yolo26-pose-m",
@@ -159,7 +176,8 @@
     "scale": "m",
     "filename": "yolo26m-pose.pt",
     "source_path": "yolo26/pose/yolo26m-pose.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-pose-m/yolo26m-pose.pt"
   },
   {
     "id": "yolo26-pose-l",
@@ -168,7 +186,8 @@
     "scale": "l",
     "filename": "yolo26l-pose.pt",
     "source_path": "yolo26/pose/yolo26l-pose.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-pose-l/yolo26l-pose.pt"
   },
   {
     "id": "yolo26-pose-x",
@@ -177,7 +196,8 @@
     "scale": "x",
     "filename": "yolo26x-pose.pt",
     "source_path": "yolo26/pose/yolo26x-pose.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-pose-x/yolo26x-pose.pt"
   },
   {
     "id": "yolo26-obb-n",
@@ -186,7 +206,8 @@
     "scale": "n",
     "filename": "yolo26n-obb.pt",
     "source_path": "yolo26/obb/yolo26n-obb.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-obb-n/yolo26n-obb.pt"
   },
   {
     "id": "yolo26-obb-s",
@@ -195,7 +216,8 @@
     "scale": "s",
     "filename": "yolo26s-obb.pt",
     "source_path": "yolo26/obb/yolo26s-obb.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-obb-s/yolo26s-obb.pt"
   },
   {
     "id": "yolo26-obb-m",
@@ -204,7 +226,8 @@
     "scale": "m",
     "filename": "yolo26m-obb.pt",
     "source_path": "yolo26/obb/yolo26m-obb.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-obb-m/yolo26m-obb.pt"
   },
   {
     "id": "yolo26-obb-l",
@@ -213,7 +236,8 @@
     "scale": "l",
     "filename": "yolo26l-obb.pt",
     "source_path": "yolo26/obb/yolo26l-obb.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-obb-l/yolo26l-obb.pt"
   },
   {
     "id": "yolo26-obb-x",
@@ -222,7 +246,8 @@
     "scale": "x",
     "filename": "yolo26x-obb.pt",
     "source_path": "yolo26/obb/yolo26x-obb.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-obb-x/yolo26x-obb.pt"
   },
   {
     "id": "yolo26-classify-n",
@@ -231,7 +256,8 @@
     "scale": "n",
     "filename": "yolo26n-cls.pt",
     "source_path": "yolo26/classify/yolo26n-cls.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-classify-n/yolo26n-cls.pt"
   },
   {
     "id": "yolo26-classify-s",
@@ -240,7 +266,8 @@
     "scale": "s",
     "filename": "yolo26s-cls.pt",
     "source_path": "yolo26/classify/yolo26s-cls.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-classify-s/yolo26s-cls.pt"
   },
   {
     "id": "yolo26-classify-m",
@@ -249,7 +276,8 @@
     "scale": "m",
     "filename": "yolo26m-cls.pt",
     "source_path": "yolo26/classify/yolo26m-cls.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-classify-m/yolo26m-cls.pt"
   },
   {
     "id": "yolo26-classify-l",
@@ -258,7 +286,8 @@
     "scale": "l",
     "filename": "yolo26l-cls.pt",
     "source_path": "yolo26/classify/yolo26l-cls.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-classify-l/yolo26l-cls.pt"
   },
   {
     "id": "yolo26-classify-x",
@@ -267,6 +296,7 @@
     "scale": "x",
     "filename": "yolo26x-cls.pt",
     "source_path": "yolo26/classify/yolo26x-cls.pt",
-    "status": "remote_available"
+    "status": "ready",
+    "local_uri": "minio://models/base/yolo26-classify-x/yolo26x-cls.pt"
   }
 ]

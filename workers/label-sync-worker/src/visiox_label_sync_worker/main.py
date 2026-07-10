@@ -3,10 +3,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
+from urllib.parse import quote
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from visiox_common.settings import get_settings
 from visiox_common.tasks import TaskStatus, TaskType
 from visiox_db.models import Annotation, Dataset, DatasetSample, LabelProject, Task
 from visiox_storage.client import ObjectStorageClient
@@ -23,14 +25,9 @@ def sync_label_project_samples(session: Session, client: Any, task_id: str, labe
             .where(DatasetSample.dataset_id == project.dataset_id)
             .order_by(DatasetSample.created_at, DatasetSample.id)
         ).all()
+        annotations_by_sample_id = _annotations_by_sample_id(session, [sample.id for sample in samples])
         label_studio_tasks = [
-            {
-                "data": {
-                    "image": sample.file_uri,
-                    "visiox_dataset_id": project.dataset_id,
-                    "visiox_sample_id": sample.id,
-                }
-            }
+            _label_studio_task(project.dataset_id, sample, annotations_by_sample_id.get(sample.id, []))
             for sample in samples
         ]
         client.import_tasks(project.external_project_id, label_studio_tasks)
@@ -182,3 +179,91 @@ def _cleanup_stored_objects(storage: ObjectStorageClient, stored_objects: list[t
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _annotations_by_sample_id(session: Session, sample_ids: list[str]) -> dict[str, list[Annotation]]:
+    if not sample_ids:
+        return {}
+    rows = session.scalars(select(Annotation).where(Annotation.dataset_sample_id.in_(sample_ids))).all()
+    result: dict[str, list[Annotation]] = {}
+    for annotation in rows:
+        result.setdefault(annotation.dataset_sample_id, []).append(annotation)
+    return result
+
+
+def _label_studio_task(dataset_id: str, sample: DatasetSample, annotations: list[Annotation]) -> dict[str, Any]:
+    task: dict[str, Any] = {
+        "data": {
+            "image": _label_studio_image_uri(sample.file_uri),
+            "visiox_dataset_id": dataset_id,
+            "visiox_sample_id": sample.id,
+        }
+    }
+    results = [
+        label_studio_result
+        for annotation in annotations
+        for internal_result in _internal_annotation_results(annotation)
+        if (label_studio_result := _label_studio_result(internal_result)) is not None
+    ]
+    if results:
+        task["annotations"] = [{"result": results}]
+    return task
+
+
+def _label_studio_image_uri(file_uri: str) -> str:
+    public_url = get_settings().minio_public_url
+    if not public_url or not file_uri.startswith("minio://"):
+        return file_uri
+    bucket_and_name = file_uri.removeprefix("minio://")
+    bucket, object_name = bucket_and_name.split("/", 1)
+    encoded_name = "/".join(quote(part) for part in object_name.split("/"))
+    return f"{public_url.rstrip('/')}/{bucket}/{encoded_name}"
+
+
+def _internal_annotation_results(annotation: Annotation) -> list[dict[str, Any]]:
+    payload = annotation.internal_payload or {}
+    annotations = payload.get("annotations")
+    if not isinstance(annotations, list):
+        return []
+    results = []
+    for item in annotations:
+        if isinstance(item, dict) and isinstance(item.get("results"), list):
+            results.extend(result for result in item["results"] if isinstance(result, dict))
+    return results
+
+
+def _label_studio_result(result: dict[str, Any]) -> dict[str, Any] | None:
+    class_name = result.get("class_name")
+    if not class_name:
+        return None
+    if result.get("shape") == "rectangle":
+        return {
+            "from_name": "label",
+            "to_name": "image",
+            "type": "rectanglelabels",
+            "value": {
+                "x": result.get("x"),
+                "y": result.get("y"),
+                "width": result.get("width"),
+                "height": result.get("height"),
+                "rectanglelabels": [str(class_name)],
+            },
+        }
+    if result.get("shape") == "polygon":
+        return {
+            "from_name": "label",
+            "to_name": "image",
+            "type": "polygonlabels",
+            "value": {
+                "points": result.get("points", []),
+                "polygonlabels": [str(class_name)],
+            },
+        }
+    if result.get("shape") == "classification":
+        return {
+            "from_name": "label",
+            "to_name": "image",
+            "type": "choices",
+            "value": {"choices": [str(class_name)]},
+        }
+    return None

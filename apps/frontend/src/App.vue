@@ -33,29 +33,25 @@
 <script setup lang="ts">
 import {
   Box,
-  Cpu,
   DataAnalysis,
   Files,
-  Monitor,
-  Operation,
-  Van
+  PieChart,
+  Tickets
 } from "@element-plus/icons-vue";
 import { computed } from "vue";
 import { useRoute } from "vue-router";
 
 const route = useRoute();
 const navItems = [
+  { path: "/workbench", label: "工作台", icon: PieChart },
   { path: "/model-space", label: "模型空间", icon: Box },
   { path: "/data-preparation", label: "数据准备", icon: Files },
-  { path: "/pipelines", label: "训练产线", icon: Operation },
-  { path: "/tasks", label: "任务中心", icon: DataAnalysis },
-  { path: "/devices", label: "设备与摄像头", icon: Monitor },
-  { path: "/edge-apps", label: "边缘应用", icon: Cpu },
-  { path: "/deployments", label: "部署记录", icon: Van }
+  { path: "/services", label: "服务列表", icon: Tickets },
+  { path: "/tasks", label: "任务中心", icon: DataAnalysis }
 ];
 
 const currentTitle = computed(() => {
-  const match = navItems.find((item) => item.path === route.path);
+  const match = navItems.find((item) => route.path === item.path || route.path.startsWith(`${item.path}/`));
   return match?.label ?? "工作台";
 });
 </script>
