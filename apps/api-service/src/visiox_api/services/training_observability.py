@@ -308,8 +308,18 @@ class TrainingObservabilityService:
     def _mlflow_client_and_runs(self, job: Any) -> tuple[Any, list[Any]]:
         try:
             client = self._mlflow_client_factory(str(getattr(self.settings, "mlflow_tracking_uri", "")))
+            experiment_ids = [
+                str(experiment.experiment_id)
+                for experiment in client.search_experiments()
+                if getattr(experiment, "lifecycle_stage", None) == "active"
+            ]
+            if not experiment_ids:
+                return client, []
             run_name = self._mlflow_run_name(job)
-            runs = client.search_runs(filter_string=f"tags.mlflow.runName = '{run_name}'")
+            runs = client.search_runs(
+                experiment_ids=experiment_ids,
+                filter_string=f"tags.mlflow.runName = '{run_name}'",
+            )
         except Exception as exc:
             raise ObservabilitySourceError("mlflow", str(exc)) from exc
         return client, list(runs)

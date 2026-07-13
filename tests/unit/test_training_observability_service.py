@@ -16,12 +16,22 @@ from visiox_api.services.training_observability import (
 
 
 class FakeMlflowClient:
-    def __init__(self, histories: dict[str, list[object]] | None = None) -> None:
+    def __init__(
+        self,
+        histories: dict[str, list[object]] | None = None,
+        experiments: list[object] | None = None,
+    ) -> None:
         self.histories = histories or {}
         self.search_calls: list[dict[str, object]] = []
+        self.search_experiments_calls = 0
+        self.experiments = experiments or [SimpleNamespace(experiment_id="1", lifecycle_stage="active")]
 
-    def search_runs(self, *, filter_string: str) -> list[object]:
-        self.search_calls.append({"filter_string": filter_string})
+    def search_experiments(self) -> list[object]:
+        self.search_experiments_calls += 1
+        return self.experiments
+
+    def search_runs(self, *, experiment_ids: list[str], filter_string: str) -> list[object]:
+        self.search_calls.append({"experiment_ids": experiment_ids, "filter_string": filter_string})
         return [SimpleNamespace(info=SimpleNamespace(run_id="run-1"))]
 
     def get_metric_history(self, run_id: str, key: str) -> list[object]:
@@ -122,7 +132,10 @@ def test_scalars_merge_mlflow_history_without_fabricating_missing_series(
     assert [point["value"] for point in result["series"]["train.box_loss"]] == [1.4, 0.9]
     assert result["series"]["metrics.map50"] == []
     assert result["availability"]["mlflow"]["available"] is True
-    assert fake_mlflow_client.search_calls[0]["filter_string"] == "tags.mlflow.runName = 'custom-run'"
+    assert fake_mlflow_client.search_calls[0] == {
+        "experiment_ids": ["1"],
+        "filter_string": "tags.mlflow.runName = 'custom-run'",
+    }
 
 
 def test_mlflow_scalar_query_matches_the_strict_client_signature(
@@ -135,7 +148,45 @@ def test_mlflow_scalar_query_matches_the_strict_client_signature(
     result = service.get_scalars(fake_job, ["train.box_loss"], None, None, 2_000)
 
     assert result["availability"]["mlflow"] == {"available": True, "reason": None}
-    assert client.search_calls == [{"filter_string": "tags.mlflow.runName = 'custom-run'"}]
+    assert client.search_experiments_calls == 1
+    assert client.search_calls == [
+        {"experiment_ids": ["1"], "filter_string": "tags.mlflow.runName = 'custom-run'"}
+    ]
+
+
+def test_mlflow_scalar_query_uses_only_active_experiment_ids(
+    fake_job: SimpleNamespace,
+    test_settings: SimpleNamespace,
+) -> None:
+    client = FakeMlflowClient(
+        experiments=[
+            SimpleNamespace(experiment_id="1", lifecycle_stage="active"),
+            SimpleNamespace(experiment_id="2", lifecycle_stage="deleted"),
+            SimpleNamespace(experiment_id="3", lifecycle_stage="active"),
+        ]
+    )
+    service = TrainingObservabilityService(test_settings, mlflow_client_factory=lambda _: client)
+
+    result = service.get_scalars(fake_job, ["train.box_loss"], None, None, 2_000)
+
+    assert result["availability"]["mlflow"] == {"available": True, "reason": None}
+    assert client.search_calls == [
+        {"experiment_ids": ["1", "3"], "filter_string": "tags.mlflow.runName = 'custom-run'"}
+    ]
+
+
+def test_mlflow_returns_empty_runs_without_calling_search_when_no_active_experiments(
+    fake_job: SimpleNamespace,
+    test_settings: SimpleNamespace,
+) -> None:
+    client = FakeMlflowClient(experiments=[SimpleNamespace(experiment_id="2", lifecycle_stage="deleted")])
+    service = TrainingObservabilityService(test_settings, mlflow_client_factory=lambda _: client)
+
+    result = service.get_scalars(fake_job, ["train.box_loss"], None, None, 2_000)
+
+    assert result["series"] == {"train.box_loss": []}
+    assert result["availability"]["mlflow"] == {"available": True, "reason": None}
+    assert client.search_calls == []
 
 
 def test_mlflow_failure_returns_tensorboard_data_and_reason(
