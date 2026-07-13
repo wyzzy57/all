@@ -382,11 +382,13 @@ class TrainingObservabilityService:
 
         return EventAccumulator(run_path, size_guidance={"histograms": 0})
 
-    @staticmethod
-    def _point_limit(max_points: int | None) -> int:
-        if max_points is None:
-            return _DEFAULT_MAX_POINTS
-        return min(max_points, _DEFAULT_MAX_POINTS)
+    def _point_limit(self, max_points: int | None) -> int:
+        limit = getattr(self.settings, "observability_max_points", _DEFAULT_MAX_POINTS)
+        if max_points is not None:
+            limit = max_points
+        if limit < 1:
+            raise ValueError("max_points must be positive")
+        return limit
 
     @staticmethod
     def _filter_points(

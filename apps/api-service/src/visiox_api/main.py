@@ -14,8 +14,10 @@ from visiox_api.routes.label_projects import router as label_projects_router
 from visiox_api.routes.pipeline_evaluation import router as pipeline_evaluation_router
 from visiox_api.routes.pipeline_inference import router as pipeline_inference_router
 from visiox_api.routes.pipelines import router as pipelines_router
+from visiox_api.routes.services import router as services_router
 from visiox_api.routes.tasks import router as tasks_router
 from visiox_api.routes.trained_models import router as trained_models_router
+from visiox_api.routes.training_observability import router as training_observability_router
 from visiox_api.routes.training_jobs import router as training_jobs_router
 from visiox_api.seed_base_models import seed_yolo26_base_models
 from visiox_api.ws.tasks import router as task_progress_router
@@ -86,7 +88,9 @@ def create_app() -> FastAPI:
     app.include_router(pipelines_router)
     app.include_router(pipeline_evaluation_router)
     app.include_router(pipeline_inference_router)
+    app.include_router(services_router)
     app.include_router(training_jobs_router)
+    app.include_router(training_observability_router)
     app.include_router(trained_models_router)
     app.include_router(task_progress_router)
 

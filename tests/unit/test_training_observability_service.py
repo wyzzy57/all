@@ -110,6 +110,18 @@ def test_downsampling_preserves_first_last_min_and_max() -> None:
     assert len(sampled) <= 6
 
 
+def test_point_limit_uses_settings_default_and_preserves_explicit_maximum(
+    test_settings: SimpleNamespace,
+) -> None:
+    test_settings.observability_max_points = 3_500
+    service = TrainingObservabilityService(test_settings)
+
+    assert service._point_limit(None) == 3_500
+    assert service._point_limit(10_000) == 10_000
+    with pytest.raises(ValueError, match="max_points must be positive"):
+        service._point_limit(0)
+
+
 def test_scalars_merge_mlflow_history_without_fabricating_missing_series(
     fake_job: SimpleNamespace,
     test_settings: SimpleNamespace,
