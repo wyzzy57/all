@@ -222,10 +222,14 @@ def _is_last_training_batch(trainer: Any) -> bool:
 
 
 def capture_gradient_sample(trainer: Any) -> None:
-    epoch = _epoch_number(trainer)
-    if not should_capture_epoch(epoch, int(trainer.epochs), _capture_interval()):
+    epoch_index = getattr(trainer, "epoch", None)
+    total_epochs = getattr(trainer, "epochs", None)
+    if not isinstance(epoch_index, int) or not isinstance(total_epochs, int):
         return
     if not _is_last_training_batch(trainer):
+        return
+    epoch = epoch_index + 1
+    if not should_capture_epoch(epoch, total_epochs, _capture_interval()):
         return
     if getattr(trainer, _GRADIENT_SAMPLE_EPOCH_ATTRIBUTE, None) == epoch:
         return

@@ -219,6 +219,26 @@ def test_pre_zero_bridge_captures_last_batch_before_clear_under_accumulation() -
     assert trainer._visiox_gradient_samples["layer.weight"].numel() == 100_000
 
 
+def test_pre_zero_bridge_skips_startup_clear_before_epoch_exists() -> None:
+    parameter = FakeParameter([1.0], grad=FakeTensor([1.0]))
+    model = FakeModel({"layer.weight": parameter})
+    optimizer = FakeOptimizer(model)
+    trainer = SimpleNamespace(
+        epochs=40,
+        train_loader=[object()],
+        model=model,
+        optimizer=optimizer,
+    )
+    optimizer.trainer = trainer
+    train_entrypoint.install_pre_zero_gradient_capture(trainer)
+
+    optimizer.zero_grad()
+
+    assert optimizer.sample_present_before_clear == [False]
+    assert parameter.grad is None
+    assert not hasattr(trainer, "_visiox_gradient_samples")
+
+
 def test_pre_zero_bridge_rewraps_replacement_optimizer_on_oom_retry() -> None:
     parameter = FakeParameter([1.0], grad=FakeTensor(range(150_003)))
     model = FakeModel({"layer.weight": parameter})
