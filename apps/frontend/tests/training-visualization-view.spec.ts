@@ -1,8 +1,9 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { defineComponent, nextTick } from "vue";
+import { defineComponent, nextTick, onMounted, onUnmounted } from "vue";
 
 import TrainingVisualizationView from "@/views/training-visualization/TrainingVisualizationView.vue";
+import trainingVisualizationViewSource from "@/views/training-visualization/TrainingVisualizationView.vue?raw";
 
 const apiMock = vi.hoisted(() => ({
   getTrainingObservabilityGraph: vi.fn(),
@@ -16,12 +17,21 @@ const apiMock = vi.hoisted(() => ({
 
 vi.mock("@/api/client", () => ({ api: apiMock }));
 
+const chartLifecycle = {
+  mounted: vi.fn(),
+  unmounted: vi.fn(),
+};
+
 const MetricLineChartStub = defineComponent({
   name: "MetricLineChart",
   props: {
     series: { type: Object, required: true },
     unit: String,
     height: [String, Number],
+  },
+  setup() {
+    onMounted(chartLifecycle.mounted);
+    onUnmounted(chartLifecycle.unmounted);
   },
   template: '<div class="metric-line-chart-stub">{{ Object.keys(series).join(",") }}</div>',
 });
@@ -202,6 +212,95 @@ describe("TrainingVisualizationView", () => {
     expect(wrapper.get('[data-testid="resources-panel"]').text()).toContain("system.cpu_percent");
 
     wrapper.unmount();
+  });
+
+  it("mounts the metric chart only after data is visible and keeps that instance through polling", async () => {
+    vi.useFakeTimers();
+    const firstScalars = deferred<{
+      series: Record<string, Array<{ step: number; value: number; timestamp: number }>>;
+      availability: ReturnType<typeof summary>["availability"];
+    }>();
+    apiMock.getTrainingObservabilityScalars
+      .mockReturnValueOnce(firstScalars.promise)
+      .mockResolvedValueOnce({
+        series: { "train.box_loss": [{ step: 2, value: 0.9, timestamp: 110 }] },
+        availability: summary().availability,
+      });
+
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="tab-metrics"]').trigger("click");
+    await nextTick();
+
+    expect(chartLifecycle.mounted).not.toHaveBeenCalled();
+
+    firstScalars.resolve({
+      series: { "train.box_loss": [{ step: 1, value: 1.2, timestamp: 100 }] },
+      availability: summary().availability,
+    });
+    await flushPromises();
+    expect(chartLifecycle.mounted).toHaveBeenCalledTimes(1);
+
+    await wrapper.get('[data-testid="tab-overview"]').trigger("click");
+    await wrapper.get('[data-testid="tab-metrics"]').trigger("click");
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilityScalars).toHaveBeenCalledTimes(2);
+    expect(chartLifecycle.mounted).toHaveBeenCalledTimes(1);
+
+    wrapper.unmount();
+    expect(chartLifecycle.unmounted).toHaveBeenCalledTimes(1);
+  });
+
+  it("mounts the resource chart only after data is visible and keeps that instance through polling", async () => {
+    vi.useFakeTimers();
+    const firstResources = deferred<{
+      series: Record<string, Array<{ step: number; value: number; timestamp: number }>>;
+      availability: ReturnType<typeof summary>["availability"];
+    }>();
+    apiMock.getTrainingObservabilityResources
+      .mockReturnValueOnce(firstResources.promise)
+      .mockResolvedValueOnce({
+        series: { "system.cpu_percent": [{ step: 2, value: 41, timestamp: 110 }] },
+        availability: summary().availability,
+      });
+
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="tab-resources"]').trigger("click");
+    await nextTick();
+
+    expect(chartLifecycle.mounted).not.toHaveBeenCalled();
+
+    firstResources.resolve({
+      series: { "system.cpu_percent": [{ step: 1, value: 36, timestamp: 100 }] },
+      availability: summary().availability,
+    });
+    await flushPromises();
+    expect(chartLifecycle.mounted).toHaveBeenCalledTimes(1);
+
+    await wrapper.get('[data-testid="tab-overview"]').trigger("click");
+    await wrapper.get('[data-testid="tab-resources"]').trigger("click");
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilityResources).toHaveBeenCalledTimes(2);
+    expect(chartLifecycle.mounted).toHaveBeenCalledTimes(1);
+
+    wrapper.unmount();
+    expect(chartLifecycle.unmounted).toHaveBeenCalledTimes(1);
+  });
+
+  it("defines shell-aware collapse and narrow-content overflow constraints", () => {
+    expect(trainingVisualizationViewSource).toContain("container: training-view / inline-size");
+    expect(trainingVisualizationViewSource).toMatch(
+      /@container training-view \(max-width: 760px\)[\s\S]*?\.visualization-layout \{ display: block;/,
+    );
+    expect(trainingVisualizationViewSource).toMatch(
+      /@container training-view \(max-width: 420px\)[\s\S]*?\.source-list \{ grid-template-columns: minmax\(0, 1fr\);/,
+    );
+    expect(trainingVisualizationViewSource).toMatch(/\.refresh-button \{[^}]*white-space: nowrap;/);
   });
 
   it("polls running jobs every five seconds and stops as soon as status is terminal", async () => {

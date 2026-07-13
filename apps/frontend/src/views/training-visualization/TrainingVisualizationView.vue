@@ -134,9 +134,9 @@
                 <div><strong>训练指标</strong><span>Epoch 标量趋势</span></div>
                 <span v-if="metricsUnavailableText" class="source-warning">{{ metricsUnavailableText }}</span>
               </div>
-              <div v-if="metricsLoading && !hasMetricSeries" class="panel-loading">正在加载指标...</div>
-              <el-empty v-else-if="!hasMetricSeries" description="该训练暂无可用指标" />
-              <MetricLineChart v-show="hasMetricSeries" :series="scalarSeries" height="420px" />
+              <div v-if="metricsLoading && !metricsChartMounted" class="panel-loading">正在加载指标...</div>
+              <el-empty v-else-if="!metricsChartMounted" description="该训练暂无可用指标" />
+              <MetricLineChart v-if="metricsChartMounted" :series="scalarSeries" height="420px" />
             </section>
 
             <section
@@ -148,9 +148,9 @@
               <div class="panel-heading">
                 <div><strong>资源监控</strong><span>CPU、内存与显存趋势</span></div>
               </div>
-              <div v-if="resourcesLoading && !hasResourceSeries" class="panel-loading">正在加载资源数据...</div>
-              <el-empty v-else-if="!hasResourceSeries" description="该训练暂无资源记录" />
-              <MetricLineChart v-show="hasResourceSeries" :series="resourceSeries" height="420px" />
+              <div v-if="resourcesLoading && !resourcesChartMounted" class="panel-loading">正在加载资源数据...</div>
+              <el-empty v-else-if="!resourcesChartMounted" description="该训练暂无资源记录" />
+              <MetricLineChart v-if="resourcesChartMounted" :series="resourceSeries" height="420px" />
             </section>
 
             <section v-show="activeTab === 'analysis'" class="dashboard-panel placeholder-panel">
@@ -213,6 +213,8 @@ const metricsLoading = ref(false);
 const resourcesLoading = ref(false);
 const metricsActivated = ref(false);
 const resourcesActivated = ref(false);
+const metricsChartMounted = ref(false);
+const resourcesChartMounted = ref(false);
 let metricsLoadedJobId: string | null = null;
 let resourcesLoadedJobId: string | null = null;
 let generation = 0;
@@ -428,6 +430,7 @@ async function loadScalars(requestGeneration: number, force = false) {
     scalarSeries.value = response.series;
     scalarAvailability.value = response.availability;
     metricsLoadedJobId = job.id;
+    if (activeTab.value === "metrics" && hasPoints(response.series)) metricsChartMounted.value = true;
   } catch (error) {
     if (requestGeneration === generation) {
       ElMessage.error(error instanceof Error ? error.message : "训练指标加载失败");
@@ -448,6 +451,7 @@ async function loadResources(requestGeneration: number, force = false) {
     if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
     resourceSeries.value = response.series;
     resourcesLoadedJobId = job.id;
+    if (activeTab.value === "resources" && hasPoints(response.series)) resourcesChartMounted.value = true;
   } catch (error) {
     if (requestGeneration === generation) {
       ElMessage.error(error instanceof Error ? error.message : "资源数据加载失败");
@@ -497,8 +501,14 @@ async function selectJob(job: TrainingJobRecord) {
 
 async function activateTab(tab: DashboardTab) {
   activeTab.value = tab;
-  if (tab === "metrics") metricsActivated.value = true;
-  if (tab === "resources") resourcesActivated.value = true;
+  if (tab === "metrics") {
+    metricsActivated.value = true;
+    if (hasMetricSeries.value) metricsChartMounted.value = true;
+  }
+  if (tab === "resources") {
+    resourcesActivated.value = true;
+    if (hasResourceSeries.value) resourcesChartMounted.value = true;
+  }
   await loadActiveTabData(generation);
 }
 
@@ -539,13 +549,15 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.training-visualization-view { min-width: 0; color: #1f2937; }
+.training-visualization-view { container: training-view / inline-size; min-width: 0; color: #1f2937; }
+.training-visualization-view, .training-visualization-view * { box-sizing: border-box; }
 .visualization-page-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
+.visualization-page-header > div { min-width: 0; }
 .visualization-page-header h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
-.visualization-page-header p { margin: 5px 0 0; color: #667085; font-size: 14px; }
-.refresh-button { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 14px; border: 1px solid #cfd7e6; border-radius: 4px; background: #fff; color: #344054; cursor: pointer; }
+.visualization-page-header p { margin: 5px 0 0; overflow-wrap: anywhere; color: #667085; font-size: 14px; }
+.refresh-button { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 6px; height: 36px; padding: 0 14px; border: 1px solid #cfd7e6; border-radius: 4px; background: #fff; color: #344054; white-space: nowrap; cursor: pointer; }
 .refresh-button:disabled { cursor: wait; opacity: .55; }
-.visualization-layout { display: grid; grid-template-columns: 288px minmax(0, 1fr); min-height: calc(100vh - 148px); border: 1px solid #dfe5ef; background: #fff; }
+.visualization-layout { display: grid; grid-template-columns: 288px minmax(0, 1fr); width: 100%; max-width: 100%; min-height: calc(100vh - 148px); border: 1px solid #dfe5ef; background: #fff; }
 .run-list-panel { min-width: 0; border-right: 1px solid #dfe5ef; background: #f8fafc; }
 .run-list-heading { display: flex; align-items: center; justify-content: space-between; height: 52px; padding: 0 16px; border-bottom: 1px solid #dfe5ef; }
 .run-list-heading span { color: #667085; font-size: 13px; }
@@ -556,16 +568,17 @@ onBeforeUnmount(() => {
 .run-title { overflow: hidden; color: #172033; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .run-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #667085; font-size: 12px; }
 .run-item code, .selected-run-band code { overflow: hidden; color: #475467; font-family: Consolas, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.visualization-workspace { min-width: 0; padding: 0; }
+.visualization-workspace { width: 100%; max-width: 100%; min-width: 0; padding: 0; }
 .selected-run-band { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, auto) auto; align-items: center; gap: 20px; min-height: 58px; padding: 0 18px; border-bottom: 1px solid #dfe5ef; background: #f8fafc; }
 .selected-run-band > div { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.selected-run-band > div strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .band-label { color: #667085; font-size: 12px; }
 .dashboard-tabs { display: flex; min-width: 0; overflow-x: auto; border-bottom: 1px solid #dfe5ef; background: #fff; }
 .dashboard-tabs button { flex: 0 0 auto; height: 44px; padding: 0 20px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: #667085; cursor: pointer; }
 .dashboard-tabs button:hover { color: #1d4ed8; }
 .dashboard-tabs button.active { border-bottom-color: #2563eb; color: #1d4ed8; font-weight: 600; }
-.dashboard-panels { min-width: 0; }
-.dashboard-panel { min-width: 0; }
+.dashboard-panels { width: 100%; max-width: 100%; min-width: 0; }
+.dashboard-panel { width: 100%; max-width: 100%; min-width: 0; }
 .panel-loading { display: grid; min-height: 180px; place-items: center; color: #667085; }
 .overview-band { border-bottom: 1px solid #e3e8ef; }
 .progress-band { display: grid; grid-template-columns: 180px minmax(260px, 1fr); align-items: center; gap: 24px; padding: 20px 22px; background: #fbfcfe; }
@@ -575,34 +588,35 @@ onBeforeUnmount(() => {
 .status-cell strong { font-size: 18px; }
 .progress-heading { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 8px; }
 .metric-grid { display: grid; }
-.detail-grid { grid-template-columns: repeat(7, minmax(92px, 1fr)); }
+.detail-grid { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 .metric-cell { display: grid; min-width: 0; gap: 7px; padding: 16px 18px; border-right: 1px solid #e3e8ef; }
 .metric-cell:last-child { border-right: 0; }
 .metric-cell strong { overflow-wrap: anywhere; font-size: 15px; font-variant-numeric: tabular-nums; }
 .band-title { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 15px 18px 9px; }
 .band-title span, .panel-heading span { color: #667085; font-size: 12px; }
-.latest-grid { grid-template-columns: repeat(4, minmax(120px, 1fr)); }
+.latest-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .latest-grid .metric-cell strong { font-size: 18px; }
-.source-list { display: grid; grid-template-columns: repeat(4, minmax(145px, 1fr)); }
-.source-item { display: grid; grid-template-columns: 9px auto 1fr; align-items: center; gap: 8px; min-height: 52px; padding: 0 18px; border-right: 1px solid #e3e8ef; }
+.source-list { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.source-item { display: grid; grid-template-columns: 9px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-width: 0; min-height: 52px; padding: 0 18px; border-right: 1px solid #e3e8ef; }
 .source-item:last-child { border-right: 0; }
-.source-item > span:not(.source-dot) { justify-self: end; color: #667085; font-size: 12px; }
+.source-item strong { min-width: 0; overflow-wrap: anywhere; }
+.source-item > span:not(.source-dot) { justify-self: end; color: #667085; font-size: 12px; white-space: nowrap; }
 .source-item small { grid-column: 2 / -1; overflow: hidden; color: #b42318; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .source-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
 .source-dot.available { background: #16a34a; }
 .chart-panel { padding: 0 18px 20px; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 58px; border-bottom: 1px solid #e3e8ef; }
-.panel-heading > div { display: flex; align-items: baseline; gap: 10px; }
+.panel-heading > div { display: flex; min-width: 0; align-items: baseline; gap: 10px; }
 .source-warning { color: #b54708 !important; }
 .placeholder-panel { min-height: 420px; padding-top: 80px; }
-@media (max-width: 1180px) {
+@container training-view (max-width: 900px) {
   .visualization-layout { grid-template-columns: 240px minmax(0, 1fr); }
-  .detail-grid { grid-template-columns: repeat(4, minmax(110px, 1fr)); }
+  .detail-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .detail-grid .metric-cell { border-bottom: 1px solid #e3e8ef; }
-  .source-list { grid-template-columns: repeat(2, minmax(160px, 1fr)); }
+  .source-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .source-item { border-bottom: 1px solid #e3e8ef; }
 }
-@media (max-width: 760px) {
+@container training-view (max-width: 760px) {
   .visualization-page-header { align-items: flex-start; }
   .visualization-layout { display: block; }
   .run-list-panel { max-height: 280px; overflow-y: auto; border-right: 0; border-bottom: 1px solid #dfe5ef; }
@@ -611,5 +625,16 @@ onBeforeUnmount(() => {
   .progress-band { grid-template-columns: 1fr; }
   .detail-grid, .latest-grid, .source-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metric-cell:nth-child(2n), .source-item:nth-child(2n) { border-right: 0; }
+}
+@container training-view (max-width: 420px) {
+  .visualization-page-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; }
+  .visualization-page-header h1 { font-size: 21px; }
+  .selected-run-band > div { flex-wrap: wrap; gap: 4px 8px; }
+  .dashboard-tabs button { padding: 0 14px; }
+  .band-title { flex-wrap: wrap; }
+  .source-list { grid-template-columns: minmax(0, 1fr); }
+  .source-item { min-height: 56px; padding: 9px 14px; border-right: 0; }
+  .chart-panel { padding-right: 10px; padding-left: 10px; }
+  .panel-heading { flex-direction: column; align-items: flex-start; gap: 4px; padding: 10px 0; }
 }
 </style>
