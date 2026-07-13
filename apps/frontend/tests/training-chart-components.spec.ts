@@ -35,7 +35,8 @@ function chartInstance() {
 async function expectChartLifecycle(
   wrapper: VueWrapper,
   updateProps: Record<string, unknown>,
-  preservedOptionKeys: string[]
+  preservedOptionKeys: string[],
+  reactiveSetOptionOptions?: Record<string, unknown>
 ) {
   expect(echartsMocks.init).toHaveBeenCalledTimes(1);
 
@@ -51,7 +52,12 @@ async function expectChartLifecycle(
   wrapper.unmount();
   expect(echartsMocks.dispose).toHaveBeenCalledTimes(1);
 
-  expect(reactiveUpdateCall).toHaveLength(1);
+  if (reactiveSetOptionOptions) {
+    expect(reactiveUpdateCall).toHaveLength(2);
+    expect(reactiveUpdateCall[1]).toEqual(reactiveSetOptionOptions);
+  } else {
+    expect(reactiveUpdateCall).toHaveLength(1);
+  }
   preservedOptionKeys.forEach((key) => {
     expect(reactiveUpdateCall[0]).not.toHaveProperty(key);
   });
@@ -68,14 +74,15 @@ describe("training chart components", () => {
       "train.box_loss": [
         { step: 1, value: 1.4, timestamp: 100 },
         { step: 2, value: 0.9, timestamp: 110 }
-      ]
+      ],
+      "metrics.map50": [{ step: 2, value: 0.81, timestamp: 110 }]
     };
     const wrapper = mount(MetricLineChart, { props: { series, unit: "loss", height: "300px" } });
 
     expect(echartsMocks.setOption).toHaveBeenCalledWith(
       expect.objectContaining({
         xAxis: expect.objectContaining({ type: "value" }),
-        series: [
+        series: expect.arrayContaining([
           expect.objectContaining({
             name: "train.box_loss",
             type: "line",
@@ -84,7 +91,7 @@ describe("training chart components", () => {
               [2, 0.9]
             ]
           })
-        ]
+        ])
       }),
       true
     );
@@ -92,7 +99,9 @@ describe("training chart components", () => {
 
     await expectChartLifecycle(wrapper, {
       series: { "train.box_loss": [{ step: 3, value: 0.7, timestamp: 120 }] }
-    }, ["dataZoom", "legend", "toolbox"]);
+    }, ["dataZoom", "legend", "toolbox"], { replaceMerge: ["series"] });
+    const metricUpdateCall = echartsMocks.setOption.mock.calls[echartsMocks.setOption.mock.calls.length - 1];
+    expect(metricUpdateCall[0].series.map((item: { name: string }) => item.name)).toEqual(["train.box_loss"]);
   });
 
   it("renders histogram DTO buckets on a numeric axis and responds to its lifecycle", async () => {

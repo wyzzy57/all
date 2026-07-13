@@ -57,10 +57,13 @@ function initialOption() {
 }
 
 function updateChart() {
-  chart?.setOption({
-    yAxis: { name: props.unit },
-    series: seriesOption()
-  });
+  chart?.setOption(
+    {
+      yAxis: { name: props.unit },
+      series: seriesOption()
+    },
+    { replaceMerge: ["series"] }
+  );
 }
 
 function resizeChart() {
