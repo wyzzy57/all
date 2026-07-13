@@ -18,7 +18,17 @@ const chartElement = ref<HTMLElement | null>(null);
 const chartHeight = computed(() => (typeof props.height === "number" ? `${props.height}px` : (props.height ?? "420px")));
 let chart: ReturnType<typeof init> | null = null;
 
-function option() {
+function graphData() {
+  return props.nodes.map((node) => ({
+    id: node.id,
+    name: node.label,
+    op: node.op,
+    attributes: node.attributes,
+    value: node.op
+  }));
+}
+
+function initialOption() {
   return {
     animation: false,
     tooltip: {},
@@ -31,32 +41,28 @@ function option() {
         roam: true,
         force: { repulsion: 180, edgeLength: 90 },
         label: { show: true, position: "right" },
-        data: props.nodes.map((node) => ({
-          id: node.id,
-          name: node.label,
-          op: node.op,
-          attributes: node.attributes,
-          value: node.op
-        })),
+        data: graphData(),
         links: props.edges
       }
     ]
   };
 }
 
-function renderChart() {
-  chart?.setOption(option(), true);
+function updateChart() {
+  chart?.setOption({
+    series: [{ type: "graph", data: graphData(), links: props.edges }]
+  });
 }
 
 function resizeChart() {
   chart?.resize();
 }
 
-watch(() => [props.nodes, props.edges], renderChart, { deep: true });
+watch(() => [props.nodes, props.edges], updateChart, { deep: true });
 
 onMounted(() => {
   chart = init(chartElement.value!);
-  renderChart();
+  chart.setOption(initialOption(), true);
   window.addEventListener("resize", resizeChart);
 });
 

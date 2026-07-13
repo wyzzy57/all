@@ -32,18 +32,29 @@ function chartInstance() {
   };
 }
 
-async function expectChartLifecycle(wrapper: VueWrapper, updateProps: Record<string, unknown>) {
+async function expectChartLifecycle(
+  wrapper: VueWrapper,
+  updateProps: Record<string, unknown>,
+  preservedOptionKeys: string[]
+) {
   expect(echartsMocks.init).toHaveBeenCalledTimes(1);
 
+  const resizeCallsBefore = echartsMocks.resize.mock.calls.length;
   window.dispatchEvent(new Event("resize"));
-  expect(echartsMocks.resize).toHaveBeenCalledTimes(1);
+  expect(echartsMocks.resize).toHaveBeenCalledTimes(resizeCallsBefore + 1);
 
   const callsBeforeUpdate = echartsMocks.setOption.mock.calls.length;
   await wrapper.setProps(updateProps);
   expect(echartsMocks.setOption).toHaveBeenCalledTimes(callsBeforeUpdate + 1);
+  const reactiveUpdateCall = echartsMocks.setOption.mock.calls[echartsMocks.setOption.mock.calls.length - 1];
 
   wrapper.unmount();
   expect(echartsMocks.dispose).toHaveBeenCalledTimes(1);
+
+  expect(reactiveUpdateCall).toHaveLength(1);
+  preservedOptionKeys.forEach((key) => {
+    expect(reactiveUpdateCall[0]).not.toHaveProperty(key);
+  });
 }
 
 describe("training chart components", () => {
@@ -81,7 +92,7 @@ describe("training chart components", () => {
 
     await expectChartLifecycle(wrapper, {
       series: { "train.box_loss": [{ step: 3, value: 0.7, timestamp: 120 }] }
-    });
+    }, ["dataZoom", "legend", "toolbox"]);
   });
 
   it("renders histogram DTO buckets on a numeric axis and responds to its lifecycle", async () => {
@@ -116,7 +127,7 @@ describe("training chart components", () => {
 
     await expectChartLifecycle(wrapper, {
       histogram: { ...histogram, step: 9, buckets: [{ lower: 2, upper: 4, count: 3 }] }
-    });
+    }, ["dataZoom", "toolbox"]);
   });
 
   it("renders a force-directed graph DTO and responds to its lifecycle", async () => {
@@ -145,7 +156,12 @@ describe("training chart components", () => {
 
     await expectChartLifecycle(wrapper, {
       nodes: [{ id: "output", label: "Output", op: "Output", attributes: {} }]
-    });
+    }, ["toolbox"]);
+    const lastSetOptionCall = echartsMocks.setOption.mock.calls[echartsMocks.setOption.mock.calls.length - 1];
+    const graphUpdateSeries = lastSetOptionCall[0].series[0];
+    expect(graphUpdateSeries).not.toHaveProperty("layout");
+    expect(graphUpdateSeries).not.toHaveProperty("roam");
+    expect(graphUpdateSeries).not.toHaveProperty("force");
   });
 });
 

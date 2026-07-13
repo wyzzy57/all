@@ -17,7 +17,16 @@ const chartElement = ref<HTMLElement | null>(null);
 const chartHeight = computed(() => (typeof props.height === "number" ? `${props.height}px` : (props.height ?? "320px")));
 let chart: ReturnType<typeof init> | null = null;
 
-function option() {
+function histogramData() {
+  return props.histogram.buckets.map((bucket) => [
+    (bucket.lower + bucket.upper) / 2,
+    bucket.count,
+    bucket.lower,
+    bucket.upper
+  ]);
+}
+
+function initialOption() {
   return {
     animation: false,
     grid: { left: 52, right: 28, top: 38, bottom: 58, containLabel: true },
@@ -31,30 +40,27 @@ function option() {
         name: props.histogram.tag,
         type: "bar",
         encode: { x: 0, y: 1 },
-        data: props.histogram.buckets.map((bucket) => [
-          (bucket.lower + bucket.upper) / 2,
-          bucket.count,
-          bucket.lower,
-          bucket.upper
-        ])
+        data: histogramData()
       }
     ]
   };
 }
 
-function renderChart() {
-  chart?.setOption(option(), true);
+function updateChart() {
+  chart?.setOption({
+    series: [{ name: props.histogram.tag, type: "bar", data: histogramData() }]
+  });
 }
 
 function resizeChart() {
   chart?.resize();
 }
 
-watch(() => props.histogram, renderChart, { deep: true });
+watch(() => props.histogram, updateChart, { deep: true });
 
 onMounted(() => {
   chart = init(chartElement.value!);
-  renderChart();
+  chart.setOption(initialOption(), true);
   window.addEventListener("resize", resizeChart);
 });
 
