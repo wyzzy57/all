@@ -23,6 +23,9 @@ export type DatasetRecord = {
   class_schema?: { names?: unknown[] };
   sample_count: number;
   annotation_count: number;
+  source?: string;
+  created_at?: string;
+  updated_at?: string;
 };
 
 export type DatasetSampleRecord = {
@@ -97,6 +100,91 @@ export type TrainingArtifactRecord = {
   download_url: string;
 };
 
+export type TrainingObservabilitySourceAvailability = {
+  available: boolean;
+  reason: string | null;
+};
+
+export type TrainingObservabilityAvailability = Record<string, TrainingObservabilitySourceAvailability>;
+
+export type TrainingObservabilityScalarPoint = {
+  step: number;
+  value: number;
+  timestamp: number;
+};
+
+export type TrainingObservabilityScalars = {
+  series: Record<string, TrainingObservabilityScalarPoint[]>;
+  availability: TrainingObservabilityAvailability;
+};
+
+export type TrainingObservabilityResources = {
+  series: Record<string, TrainingObservabilityScalarPoint[]>;
+  availability: TrainingObservabilityAvailability;
+};
+
+export type TrainingObservabilityGraphNode = {
+  id: string;
+  label: string;
+  op: string;
+  attributes: Record<string, unknown>;
+};
+
+export type TrainingObservabilityGraphEdge = {
+  source: string;
+  target: string;
+};
+
+export type TrainingObservabilityGraph = {
+  nodes: TrainingObservabilityGraphNode[];
+  edges: TrainingObservabilityGraphEdge[];
+  availability: TrainingObservabilityAvailability;
+};
+
+export type TrainingObservabilityHistogramBucket = {
+  lower: number;
+  upper: number;
+  count: number;
+};
+
+export type TrainingObservabilityHistogram = {
+  kind: "weight" | "gradient";
+  tag: string;
+  step: number;
+  buckets: TrainingObservabilityHistogramBucket[];
+  availability: TrainingObservabilityAvailability;
+};
+
+export type TrainingObservabilitySummary = {
+  job_id: string;
+  pipeline_id: string;
+  pipeline_name: string;
+  status: string;
+  progress: Record<string, unknown>;
+  timing: Record<string, unknown>;
+  environment: Record<string, unknown>;
+  latest_metrics: Record<string, number>;
+  available_scalar_keys: string[];
+  available_histograms: Record<"weight" | "gradient", string[]>;
+  availability: TrainingObservabilityAvailability;
+};
+
+export type TrainingObservabilityRangeParams = {
+  start_step?: number;
+  end_step?: number;
+  max_points?: number;
+};
+
+export type TrainingObservabilityScalarsParams = TrainingObservabilityRangeParams & {
+  keys: string[];
+};
+
+export type TrainingObservabilityHistogramParams = {
+  kind: "weight" | "gradient";
+  tag: string;
+  step: number;
+};
+
 export type TrainedModelRecord = {
   id: string;
   pipeline_id?: string | null;
@@ -130,6 +218,25 @@ export type PipelineEvaluationResponse = {
   score?: number | null;
   metrics: Record<string, unknown>;
   created_at?: string;
+};
+
+export type DeploymentServiceRecord = {
+  id: string;
+  name: string;
+  pipeline_id: string;
+  trained_model_id?: string | null;
+  model_name: string;
+  model_weight: string;
+  environment: string;
+  instance_count: number;
+  instance_name: string;
+  resource_summary: string;
+  status: "running" | "stopped" | "deploying";
+  endpoint: string;
+  calls: number;
+  config: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
 };
 
 export type TaskRecord = {
@@ -266,6 +373,30 @@ export const api = {
     request<TrainingJobRecord>(`/pipelines/${pipelineId}/jobs`, { method: "POST", body: JSON.stringify(payload) }),
   listTrainingJobs: (params: { pipeline_id?: string; status?: string; limit?: number; offset?: number } = {}) =>
     request<ListResponse<TrainingJobRecord>>(`/training-jobs${query(params)}`),
+  getTrainingObservabilitySummary: (trainingJobId: string) =>
+    request<TrainingObservabilitySummary>(`/training-jobs/${trainingJobId}/observability/summary`),
+  getTrainingObservabilityScalars: (trainingJobId: string, params: TrainingObservabilityScalarsParams) =>
+    request<TrainingObservabilityScalars>(
+      `/training-jobs/${trainingJobId}/observability/scalars${query({
+        keys: params.keys.join(","),
+        start_step: params.start_step,
+        end_step: params.end_step,
+        max_points: params.max_points
+      })}`
+    ),
+  getTrainingObservabilityResources: (
+    trainingJobId: string,
+    params: TrainingObservabilityRangeParams = {},
+  ) =>
+    request<TrainingObservabilityResources>(
+      `/training-jobs/${trainingJobId}/observability/resources${query(params)}`
+    ),
+  getTrainingObservabilityGraph: (trainingJobId: string) =>
+    request<TrainingObservabilityGraph>(`/training-jobs/${trainingJobId}/observability/graph`),
+  getTrainingObservabilityHistogram: (trainingJobId: string, params: TrainingObservabilityHistogramParams) =>
+    request<TrainingObservabilityHistogram>(
+      `/training-jobs/${trainingJobId}/observability/histograms${query(params)}`
+    ),
   trainingJobLogUrl: (trainingJobId: string) => `${API_BASE_URL}/training-jobs/${trainingJobId}/log`,
   trainingJobVisualizationUrl: (trainingJobId: string, name: string) =>
     `${API_BASE_URL}/training-jobs/${trainingJobId}/visualizations/${encodeURIComponent(name)}`,
@@ -293,6 +424,27 @@ export const api = {
     }),
   listPipelineEvaluations: (pipelineId: string, params: { limit?: number; offset?: number } = {}) =>
     request<ListResponse<PipelineEvaluationResponse>>(`/pipelines/${pipelineId}/evaluations${query(params)}`),
+  createService: (payload: {
+    name: string;
+    pipeline_id: string;
+    trained_model_id?: string;
+    model_name: string;
+    model_weight: string;
+    environment: string;
+    instance_name: string;
+    resource_summary: string;
+    config?: Record<string, unknown>;
+  }) => request<DeploymentServiceRecord>("/services", { method: "POST", body: JSON.stringify(payload) }),
+  listServices: (params: { status?: string; pipeline_id?: string; limit?: number; offset?: number } = {}) =>
+    request<ListResponse<DeploymentServiceRecord>>(`/services${query(params)}`),
+  updateService: (serviceId: string, payload: { status: "running" | "stopped" }) =>
+    request<DeploymentServiceRecord>(`/services/${serviceId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  deleteService: (serviceId: string) => request<void>(`/services/${serviceId}`, { method: "DELETE" }),
+  predictServiceImage: (serviceId: string, file: File) => {
+    const formData = new FormData();
+    formData.set("file", file, file.name);
+    return request<PipelinePredictResponse>(`/services/${serviceId}/predict/image`, { method: "POST", body: formData });
+  },
   listTasks: (params: { limit?: number; offset?: number } = {}) =>
     request<ListResponse<TaskRecord>>(`/tasks${query(params)}`),
   cancelTask: (id: string) => request<TaskRecord>(`/tasks/${id}/cancel`, { method: "POST" })
