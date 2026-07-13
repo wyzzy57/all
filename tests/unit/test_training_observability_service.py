@@ -8,6 +8,7 @@ from types import ModuleType
 
 import pytest
 
+from visiox_common.settings import Settings
 from visiox_api.services.training_observability import (
     TrainingObservabilityService,
     _downsample_points,
@@ -421,6 +422,23 @@ def test_event_accumulator_cache_is_keyed_by_latest_event_mtime(
     event_file.touch()
     assert service._event_accumulator(fake_job) is not None
     assert len(accumulators) == 0
+
+
+def test_default_settings_keep_job_and_metrics_paths_inside_shared_run_root() -> None:
+    settings = Settings.model_construct()
+    job = SimpleNamespace(
+        id="abc",
+        metrics={"observability": {"tensorboard_run_name": "../../outside"}},
+    )
+
+    run_path = TrainingObservabilityService(settings)._run_path(job)
+
+    assert settings.training_runs_root == Path("/workspace/training-runs")
+    assert settings.observability_max_points == 2_000
+    assert settings.observability_event_cache_size == 32
+    assert settings.observability_live_poll_seconds == 5
+    assert run_path == Path("/workspace/training-runs/runs/job-abc").resolve()
+    assert settings.training_runs_root.resolve() in run_path.parents
 
 
 @pytest.mark.parametrize("job_id", ["../outside", "child/job", "child\\job"])

@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -25,6 +26,14 @@ class Settings(BaseSettings):
     label_studio_token: str = ""
     label_studio_sync_stream: str = "stream:label_sync.commands"
     seed_base_models_on_startup: bool = False
+    mlflow_tracking_uri: str = "http://mlflow:5000"
+    mlflow_public_url: str = "http://127.0.0.1:5001"
+    tensorboard_public_url: str = "http://127.0.0.1:6006"
+    tensorboard_histogram_interval: int = 5
+    training_runs_root: Path = Path("/workspace/training-runs")
+    observability_max_points: int = 2000
+    observability_event_cache_size: int = 32
+    observability_live_poll_seconds: int = 5
 
 
 @lru_cache
