@@ -289,6 +289,55 @@ describe("TrainingVisualizationView", () => {
     wrapper.unmount();
   });
 
+  it("does not mount or fetch a new job gallery while Analysis is inactive", async () => {
+    apiMock.listTrainingJobArtifacts.mockImplementation((jobId: string) => Promise.resolve({
+      items: [
+        {
+          name: `${jobId}.png`,
+          kind: "visualization",
+          size_bytes: 2048,
+          download_url: `/ignored/${jobId}.png`,
+        },
+      ],
+    }));
+    const wrapper = mountView();
+    await flushPromises();
+
+    await wrapper.get('[data-testid="tab-analysis"]').trigger("click");
+    await flushPromises();
+    expect(apiMock.listTrainingJobArtifacts).toHaveBeenCalledTimes(1);
+    expect(apiMock.listTrainingJobArtifacts).toHaveBeenLastCalledWith("job-1");
+    expect(wrapper.get('[data-testid="analysis-panel"]').text()).toContain("job-1.png");
+
+    await wrapper.get('[data-testid="tab-histograms"]').trigger("click");
+    await wrapper.get('[data-testid="job-job-2"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.listTrainingJobArtifacts).toHaveBeenCalledTimes(1);
+    expect(wrapper.find('[data-testid="artifact-preview-job-1.png"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="artifact-preview-job-2.png"]').exists()).toBe(false);
+
+    await wrapper.get('[data-testid="tab-analysis"]').trigger("click");
+    await flushPromises();
+    expect(apiMock.listTrainingJobArtifacts).toHaveBeenCalledTimes(2);
+    expect(apiMock.listTrainingJobArtifacts).toHaveBeenLastCalledWith("job-2");
+    expect(wrapper.get('[data-testid="analysis-panel"]').text()).toContain("job-2.png");
+    expect(wrapper.get('[data-testid="analysis-panel"]').text()).not.toContain("job-1.png");
+
+    await wrapper.get('[data-testid="tab-histograms"]').trigger("click");
+    await wrapper.get('[data-testid="job-job-1"]').trigger("click");
+    await flushPromises();
+    expect(apiMock.listTrainingJobArtifacts).toHaveBeenCalledTimes(2);
+
+    await wrapper.get('[data-testid="tab-analysis"]').trigger("click");
+    await flushPromises();
+    expect(apiMock.listTrainingJobArtifacts).toHaveBeenCalledTimes(2);
+    expect(wrapper.get('[data-testid="analysis-panel"]').text()).toContain("job-1.png");
+    expect(wrapper.get('[data-testid="analysis-panel"]').text()).not.toContain("job-2.png");
+
+    wrapper.unmount();
+  });
+
   it("loads the model graph only after activation and exposes node details", async () => {
     const wrapper = mountView();
     await flushPromises();

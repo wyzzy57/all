@@ -183,7 +183,13 @@
               class="dashboard-panel"
               data-testid="analysis-panel"
             >
-              <ArtifactGallery :key="selectedJob.id" :job-id="selectedJob.id" />
+              <KeepAlive :max="5">
+                <ArtifactGallery
+                  v-if="activeTab === 'analysis'"
+                  :key="selectedJob.id"
+                  :job-id="selectedJob.id"
+                />
+              </KeepAlive>
             </section>
             <section
               v-if="graphActivated"
