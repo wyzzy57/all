@@ -13,8 +13,11 @@ import yaml
 
 
 _MAX_HISTOGRAM_VALUES = 100_000
+_BATCH_INDEX_ATTRIBUTE = "_visiox_batch_index"
+_GRADIENT_SAMPLE_EPOCH_ATTRIBUTE = "_visiox_gradient_sample_epoch"
 _GRADIENT_SAMPLES_ATTRIBUTE = "_visiox_gradient_samples"
 _RESOURCE_SAMPLES_ATTRIBUTE = "_visiox_resource_samples"
+_ZERO_GRAD_WRAPPED_ATTRIBUTE = "_visiox_zero_grad_wrapped"
 
 
 def parse_overrides(arguments: list[str]) -> dict[str, Any]:
@@ -163,7 +166,7 @@ def _collect_resource_metrics(trainer: Any) -> dict[str, float]:
     if callable(utilization):
         try:
             metrics["system.gpu_utilization_percent"] = float(utilization())
-        except (RuntimeError, OSError):
+        except (ImportError, RuntimeError, OSError):
             pass
     for key, method_name in (
         ("system.gpu_memory_used_gb", "memory_allocated"),
@@ -178,14 +181,39 @@ def _collect_resource_metrics(trainer: Any) -> dict[str, float]:
     return metrics
 
 
+def reset_training_batch_index(trainer: Any) -> None:
+    setattr(trainer, _BATCH_INDEX_ATTRIBUTE, -1)
+    setattr(trainer, _GRADIENT_SAMPLE_EPOCH_ATTRIBUTE, None)
+
+
+def install_pre_zero_gradient_capture(trainer: Any) -> None:
+    optimizer = trainer.optimizer
+    if getattr(optimizer, _ZERO_GRAD_WRAPPED_ATTRIBUTE, False):
+        return
+
+    original_zero_grad = optimizer.zero_grad
+
+    def zero_grad_with_capture(*args: Any, **kwargs: Any) -> Any:
+        capture_gradient_sample(trainer)
+        return original_zero_grad(*args, **kwargs)
+
+    optimizer.zero_grad = zero_grad_with_capture
+    setattr(optimizer, _ZERO_GRAD_WRAPPED_ATTRIBUTE, True)
+
+
+def track_training_batch_start(trainer: Any) -> None:
+    batch_index = getattr(trainer, _BATCH_INDEX_ATTRIBUTE, -1)
+    setattr(trainer, _BATCH_INDEX_ATTRIBUTE, int(batch_index) + 1)
+
+
 def _is_last_training_batch(trainer: Any) -> bool:
-    batch_index = getattr(trainer, "batch_i", None)
+    batch_index = getattr(trainer, _BATCH_INDEX_ATTRIBUTE, None)
     if not isinstance(batch_index, int):
         return False
     try:
         batch_count = len(trainer.train_loader)
     except (AttributeError, TypeError):
-        batch_count = getattr(trainer, "nb", None)
+        return False
     return isinstance(batch_count, int) and batch_count > 0 and batch_index == batch_count - 1
 
 
@@ -195,13 +223,17 @@ def capture_gradient_sample(trainer: Any) -> None:
         return
     if not _is_last_training_batch(trainer):
         return
+    if getattr(trainer, _GRADIENT_SAMPLE_EPOCH_ATTRIBUTE, None) == epoch:
+        return
 
     samples: dict[str, Any] = {}
     for name, parameter in trainer.model.named_parameters():
         gradient = getattr(parameter, "grad", None)
         if parameter.requires_grad and gradient is not None:
             samples[name] = _sample_tensor(gradient, copy=True)
-    setattr(trainer, _GRADIENT_SAMPLES_ATTRIBUTE, samples)
+    if samples:
+        setattr(trainer, _GRADIENT_SAMPLES_ATTRIBUTE, samples)
+        setattr(trainer, _GRADIENT_SAMPLE_EPOCH_ATTRIBUTE, epoch)
 
 
 def log_epoch_observability(trainer: Any) -> None:
@@ -226,6 +258,7 @@ def log_epoch_observability(trainer: Any) -> None:
                 writer.add_histogram(f"gradients/{name}", _sample_tensor(values), epoch)
     finally:
         setattr(trainer, _GRADIENT_SAMPLES_ATTRIBUTE, {})
+        setattr(trainer, _GRADIENT_SAMPLE_EPOCH_ATTRIBUTE, None)
         write_progress_snapshot(trainer)
 
 
@@ -238,7 +271,11 @@ def main() -> None:
     task = overrides.pop("task", None)
     overrides.pop("mode", None)
     model = YOLO(model_path, task=task)
+    model.add_callback("on_pretrain_routine_end", install_pre_zero_gradient_capture)
+    model.add_callback("on_train_epoch_start", reset_training_batch_index)
+    model.add_callback("on_train_batch_start", track_training_batch_start)
     model.add_callback("on_before_zero_grad", capture_gradient_sample)
+    model.add_callback("on_train_batch_end", capture_gradient_sample)
     model.add_callback("on_train_epoch_end", log_epoch_observability)
     model.add_callback("on_train_end", write_final_progress_snapshot)
     model.train(**overrides)

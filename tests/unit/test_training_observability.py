@@ -78,6 +78,17 @@ class FakeWriter:
         self.scalars.append((tag, value, step))
 
 
+class FakeOptimizer:
+    def __init__(self, model: FakeModel) -> None:
+        self.model = model
+        self.sample_present_before_clear: list[bool] = []
+
+    def zero_grad(self) -> None:
+        self.sample_present_before_clear.append(hasattr(self.trainer, "_visiox_gradient_samples"))
+        for parameter in self.model.parameters.values():
+            parameter.grad = None
+
+
 def install_tensorboard_writer(monkeypatch: pytest.MonkeyPatch, writer: FakeWriter | None) -> None:
     ultralytics = ModuleType("ultralytics")
     utils = ModuleType("ultralytics.utils")
@@ -153,26 +164,76 @@ def test_write_progress_snapshot_is_atomic_and_contains_training_state(
     assert payload["latest_metrics"] == {"metrics/mAP50(B)": 0.51}
 
 
-def test_capture_gradient_sample_only_copies_last_batch_of_capture_epochs() -> None:
+def test_supported_batch_callbacks_identify_last_batch_without_ultralytics_batch_i() -> None:
     gradient = FakeTensor(range(150_003))
     trainer = SimpleNamespace(
         epoch=4,
         epochs=40,
-        batch_i=1,
         train_loader=[object(), object(), object()],
         model=FakeModel({"layer.weight": FakeParameter([1.0], grad=gradient)}),
     )
 
-    capture_gradient_sample(trainer)
-    assert not hasattr(trainer, "_visiox_gradient_samples")
+    train_entrypoint.reset_training_batch_index(trainer)
+    assert not hasattr(trainer, "batch_i")
+    for _ in range(2):
+        train_entrypoint.track_training_batch_start(trainer)
+        capture_gradient_sample(trainer)
+        assert not hasattr(trainer, "_visiox_gradient_samples")
 
-    trainer.batch_i = 2
+    train_entrypoint.track_training_batch_start(trainer)
     capture_gradient_sample(trainer)
 
     sample = trainer._visiox_gradient_samples["layer.weight"]
     assert sample.detached is True
     assert sample is not gradient
     assert sample.numel() == 100_000
+
+
+def test_pre_zero_bridge_captures_last_batch_before_clear_under_accumulation() -> None:
+    parameter = FakeParameter([1.0], grad=FakeTensor([1.0]))
+    model = FakeModel({"layer.weight": parameter})
+    optimizer = FakeOptimizer(model)
+    trainer = SimpleNamespace(
+        epoch=4,
+        epochs=40,
+        train_loader=[object(), object(), object(), object()],
+        model=model,
+        optimizer=optimizer,
+    )
+    optimizer.trainer = trainer
+
+    train_entrypoint.install_pre_zero_gradient_capture(trainer)
+    train_entrypoint.reset_training_batch_index(trainer)
+    train_entrypoint.track_training_batch_start(trainer)
+    train_entrypoint.track_training_batch_start(trainer)
+    optimizer.zero_grad()
+    assert optimizer.sample_present_before_clear == [False]
+
+    parameter.grad = FakeTensor(range(150_003))
+    train_entrypoint.track_training_batch_start(trainer)
+    train_entrypoint.track_training_batch_start(trainer)
+    optimizer.zero_grad()
+
+    assert optimizer.sample_present_before_clear == [False, True]
+    assert parameter.grad is None
+    assert trainer._visiox_gradient_samples["layer.weight"].numel() == 100_000
+
+
+def test_final_accumulated_batch_captures_at_batch_end_when_no_optimizer_step_occurs() -> None:
+    parameter = FakeParameter([1.0], grad=FakeTensor([1.0]))
+    trainer = SimpleNamespace(
+        epoch=4,
+        epochs=40,
+        train_loader=[object(), object(), object()],
+        model=FakeModel({"layer.weight": parameter}),
+    )
+
+    train_entrypoint.reset_training_batch_index(trainer)
+    for _ in trainer.train_loader:
+        train_entrypoint.track_training_batch_start(trainer)
+    capture_gradient_sample(trainer)
+
+    assert trainer._visiox_gradient_samples["layer.weight"].numel() == 1
 
 
 def test_log_epoch_observability_writes_fixed_resources_and_sampled_histograms(
@@ -258,6 +319,45 @@ def test_log_epoch_observability_adds_available_cuda_resources(
     assert scalar_by_tag["system.gpu_memory_reserved_gb"] == 5.0
 
 
+def test_log_epoch_observability_omits_gpu_utilization_when_nvml_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = FakeWriter()
+    install_tensorboard_writer(monkeypatch, writer)
+    install_fake_psutil(monkeypatch)
+
+    def missing_nvml() -> float:
+        raise ModuleNotFoundError("No module named 'pynvml'")
+
+    torch = ModuleType("torch")
+    torch.cuda = SimpleNamespace(
+        is_available=lambda: True,
+        utilization=missing_nvml,
+        memory_allocated=lambda: 2 * 1024**3,
+        memory_reserved=lambda: 5 * 1024**3,
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    trainer = SimpleNamespace(
+        save_dir=tmp_path,
+        epoch=0,
+        epochs=1,
+        train_time_start=0.0,
+        device="cuda:0",
+        metrics={},
+        model=FakeModel({}),
+        train_loader=[],
+    )
+
+    log_epoch_observability(trainer)
+
+    scalar_by_tag = {tag: value for tag, value, _ in writer.scalars}
+    assert "system.gpu_utilization_percent" not in scalar_by_tag
+    assert scalar_by_tag["system.gpu_memory_used_gb"] == 2.0
+    assert scalar_by_tag["system.gpu_memory_reserved_gb"] == 5.0
+    assert (tmp_path / "visiox-progress.json").exists()
+
+
 def test_main_registers_native_callbacks_and_keeps_native_integrations_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -285,7 +385,11 @@ def test_main_registers_native_callbacks_and_keeps_native_integrations_enabled(
     train_entrypoint.main()
 
     assert callback_names == {
+        "on_pretrain_routine_end": train_entrypoint.install_pre_zero_gradient_capture,
+        "on_train_epoch_start": train_entrypoint.reset_training_batch_index,
+        "on_train_batch_start": train_entrypoint.track_training_batch_start,
         "on_before_zero_grad": capture_gradient_sample,
+        "on_train_batch_end": capture_gradient_sample,
         "on_train_epoch_end": log_epoch_observability,
         "on_train_end": train_entrypoint.write_final_progress_snapshot,
     }
