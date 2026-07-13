@@ -5,10 +5,34 @@
         <h1>可视化训练</h1>
         <p>集中查看训练进度、指标趋势和资源使用情况</p>
       </div>
-      <button class="refresh-button" type="button" :disabled="listLoading" @click="loadRuns">
-        <el-icon><Refresh /></el-icon>
-        刷新
-      </button>
+      <div class="header-actions">
+        <button class="refresh-button" type="button" :disabled="listLoading" @click="loadRuns">
+          <el-icon><Refresh /></el-icon>
+          刷新
+        </button>
+        <div class="advanced-menu-wrap">
+          <button
+            class="icon-button"
+            type="button"
+            data-testid="advanced-menu-toggle"
+            title="高级工具"
+            aria-label="高级工具"
+            :aria-expanded="advancedMenuOpen"
+            @click="advancedMenuOpen = !advancedMenuOpen"
+          >
+            <el-icon><MoreFilled /></el-icon>
+          </button>
+          <div v-if="advancedMenuOpen" class="advanced-menu">
+            <button v-if="mlflowUrl" type="button" data-testid="open-mlflow" @click="openExternalTool(mlflowUrl)">
+              MLflow
+            </button>
+            <button v-if="tensorboardUrl" type="button" data-testid="open-tensorboard" @click="openExternalTool(tensorboardUrl)">
+              TensorBoard
+            </button>
+            <span v-if="!mlflowUrl && !tensorboardUrl">未配置外部工具</span>
+          </div>
+        </div>
+      </div>
     </header>
 
     <div class="visualization-layout">
@@ -153,14 +177,107 @@
               <MetricLineChart v-if="resourcesChartMounted" :series="resourceSeries" height="420px" />
             </section>
 
-            <section v-show="activeTab === 'analysis'" class="dashboard-panel placeholder-panel">
-              <el-empty description="该训练暂无结果分析" />
+            <section
+              v-if="analysisActivated"
+              v-show="activeTab === 'analysis'"
+              class="dashboard-panel"
+              data-testid="analysis-panel"
+            >
+              <ArtifactGallery :key="selectedJob.id" :job-id="selectedJob.id" />
             </section>
-            <section v-show="activeTab === 'graph'" class="dashboard-panel placeholder-panel">
-              <el-empty description="该训练尚未记录计算图" />
+            <section
+              v-if="graphActivated"
+              v-show="activeTab === 'graph'"
+              class="dashboard-panel graph-panel"
+              data-testid="graph-panel"
+            >
+              <div class="panel-heading graph-heading">
+                <div><strong>模型计算图</strong><span>支持缩放与平移</span></div>
+              </div>
+              <div v-if="graphLoading && !graphData" class="panel-loading">正在加载计算图...</div>
+              <el-empty v-else-if="!hasGraph" description="该训练未记录计算图" />
+              <div v-else class="graph-layout">
+                <ModelGraphChart
+                  v-if="graphChartMounted && graphData"
+                  :nodes="graphData.nodes"
+                  :edges="graphData.edges"
+                  height="460px"
+                />
+                <aside class="graph-inspector" data-testid="graph-node-inspector">
+                  <div class="graph-node-list" aria-label="计算图节点">
+                    <button
+                      v-for="node in graphData?.nodes ?? []"
+                      :key="node.id"
+                      type="button"
+                      :class="{ active: selectedGraphNode?.id === node.id }"
+                      :data-testid="`graph-node-${node.id}`"
+                      @click="selectedGraphNode = node"
+                    >
+                      <strong>{{ node.label }}</strong>
+                      <span>{{ node.op }}</span>
+                    </button>
+                  </div>
+                  <div v-if="selectedGraphNode" class="graph-node-detail">
+                    <span>节点</span>
+                    <strong>{{ selectedGraphNode.label }}</strong>
+                    <code>{{ selectedGraphNode.op }}</code>
+                    <dl v-if="selectedGraphAttributes.length">
+                      <template v-for="attribute in selectedGraphAttributes" :key="attribute.key">
+                        <dt>{{ attribute.key }}</dt>
+                        <dd>{{ attribute.value }}</dd>
+                      </template>
+                    </dl>
+                    <span v-else>无属性</span>
+                  </div>
+                </aside>
+              </div>
             </section>
-            <section v-show="activeTab === 'histograms'" class="dashboard-panel placeholder-panel">
-              <el-empty description="该训练尚未记录参数分布" />
+            <section
+              v-if="histogramsActivated"
+              v-show="activeTab === 'histograms'"
+              class="dashboard-panel histogram-panel"
+              data-testid="histograms-panel"
+            >
+              <div class="histogram-toolbar">
+                <div class="segmented-control" aria-label="分布类型">
+                  <button
+                    type="button"
+                    :class="{ active: histogramKind === 'weight' }"
+                    data-testid="histogram-kind-weight"
+                    @click="selectHistogramKind('weight')"
+                  >
+                    权重
+                  </button>
+                  <button
+                    type="button"
+                    :class="{ active: histogramKind === 'gradient' }"
+                    data-testid="histogram-kind-gradient"
+                    @click="selectHistogramKind('gradient')"
+                  >
+                    梯度
+                  </button>
+                </div>
+                <label>
+                  <span>参数</span>
+                  <select v-model="histogramTag" data-testid="histogram-tag" @change="onHistogramSelectionChange">
+                    <option value="">未选择</option>
+                    <option v-for="tag in availableHistogramTags" :key="tag" :value="tag">{{ tag }}</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Epoch</span>
+                  <select v-model.number="histogramStep" data-testid="histogram-step" @change="onHistogramSelectionChange">
+                    <option value="">未选择</option>
+                    <option v-for="step in histogramStepOptions" :key="step" :value="step">Epoch {{ step }}</option>
+                  </select>
+                </label>
+              </div>
+              <div v-if="histogramLoading" class="panel-loading">正在加载分布数据...</div>
+              <el-empty
+                v-else-if="histogramUnavailable"
+                description="该训练未记录梯度分布"
+              />
+              <HistogramChart v-else-if="histogramData" :histogram="histogramData" height="390px" />
             </section>
           </div>
         </template>
@@ -171,7 +288,7 @@
 </template>
 
 <script setup lang="ts">
-import { Refresh } from "@element-plus/icons-vue";
+import { MoreFilled, Refresh } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
@@ -179,17 +296,25 @@ import {
   api,
   type TrainingJobRecord,
   type TrainingObservabilityAvailability,
+  type TrainingObservabilityGraph,
+  type TrainingObservabilityGraphNode,
+  type TrainingObservabilityHistogram,
   type TrainingObservabilityResources,
   type TrainingObservabilityScalars,
   type TrainingObservabilitySummary,
   type TrainingPipelineRecord,
 } from "@/api/client";
+import ArtifactGallery from "@/components/training/ArtifactGallery.vue";
+import HistogramChart from "@/components/training/HistogramChart.vue";
 import MetricLineChart from "@/components/training/MetricLineChart.vue";
+import ModelGraphChart from "@/components/training/ModelGraphChart.vue";
 
 type DashboardTab = "overview" | "metrics" | "resources" | "analysis" | "graph" | "histograms";
 
 const POLL_INTERVAL_MS = 5000;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
+const mlflowUrl = import.meta.env.VITE_MLFLOW_URL as string | undefined;
+const tensorboardUrl = import.meta.env.VITE_TENSORBOARD_URL as string | undefined;
 const tabs: Array<{ id: DashboardTab; label: string }> = [
   { id: "overview", label: "概览" },
   { id: "metrics", label: "指标" },
@@ -211,13 +336,29 @@ const listLoading = ref(false);
 const summaryLoading = ref(false);
 const metricsLoading = ref(false);
 const resourcesLoading = ref(false);
+const graphLoading = ref(false);
+const histogramLoading = ref(false);
 const metricsActivated = ref(false);
 const resourcesActivated = ref(false);
+const analysisActivated = ref(false);
+const graphActivated = ref(false);
+const histogramsActivated = ref(false);
 const metricsChartMounted = ref(false);
 const resourcesChartMounted = ref(false);
+const graphChartMounted = ref(false);
+const graphData = ref<TrainingObservabilityGraph | null>(null);
+const selectedGraphNode = ref<TrainingObservabilityGraphNode | null>(null);
+const histogramKind = ref<"weight" | "gradient">("weight");
+const histogramTag = ref("");
+const histogramStep = ref<number | "">("");
+const histogramData = ref<TrainingObservabilityHistogram | null>(null);
+const histogramRequested = ref(false);
+const advancedMenuOpen = ref(false);
 let metricsLoadedJobId: string | null = null;
 let resourcesLoadedJobId: string | null = null;
+let graphLoadedJobId: string | null = null;
 let generation = 0;
+let histogramRequest = 0;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
 const currentStatus = computed(() => summaryData.value?.status || selectedJob.value?.status || "queued");
@@ -249,6 +390,20 @@ const learningRateLabel = computed(() => formatPlainValue(
 ));
 const hasMetricSeries = computed(() => hasPoints(scalarSeries.value));
 const hasResourceSeries = computed(() => hasPoints(resourceSeries.value));
+const hasGraph = computed(() => Boolean(graphData.value?.nodes.length));
+const selectedGraphAttributes = computed(() => Object.entries(selectedGraphNode.value?.attributes ?? {}).map(([key, value]) => ({
+  key,
+  value: formatAttribute(value),
+})));
+const availableHistogramTags = computed(() => summaryData.value?.available_histograms?.[histogramKind.value] ?? []);
+const histogramStepOptions = computed(() => {
+  const lastStep = Math.max(0, Math.floor(currentEpoch.value || totalEpochs.value));
+  return Array.from({ length: lastStep }, (_, index) => lastStep - index);
+});
+const histogramUnavailable = computed(() => (
+  availableHistogramTags.value.length === 0
+  || (histogramRequested.value && Boolean(histogramData.value) && histogramData.value!.buckets.length === 0)
+));
 const sourceEntries = computed(() => Object.entries(summaryData.value?.availability ?? {}).map(([name, value]) => ({
   name,
   label: sourceLabel(name),
@@ -374,6 +529,18 @@ function formatImageSize(value: unknown) {
   return formatPlainValue(value);
 }
 
+function formatAttribute(value: unknown) {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "-";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function openExternalTool(url: string) {
+  advancedMenuOpen.value = false;
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
 function sourceLabel(name: string) {
   return ({ mlflow: "MLflow", tensorboard: "TensorBoard", progress: "训练进度", artifacts: "训练产物" } as Record<string, string>)[name] || name;
 }
@@ -407,8 +574,18 @@ function resetSelectedData() {
   scalarSeries.value = {};
   resourceSeries.value = {};
   scalarAvailability.value = {};
+  graphData.value = null;
+  selectedGraphNode.value = null;
+  graphChartMounted.value = false;
+  histogramKind.value = "weight";
+  histogramTag.value = "";
+  histogramStep.value = "";
+  histogramData.value = null;
+  histogramRequested.value = false;
+  histogramRequest += 1;
   metricsLoadedJobId = null;
   resourcesLoadedJobId = null;
+  graphLoadedJobId = null;
 }
 
 async function loadScalars(requestGeneration: number, force = false) {
@@ -461,9 +638,70 @@ async function loadResources(requestGeneration: number, force = false) {
   }
 }
 
+async function loadGraph(requestGeneration: number) {
+  const job = selectedJob.value;
+  if (!job || requestGeneration !== generation || graphLoadedJobId === job.id) return;
+
+  graphLoading.value = true;
+  try {
+    const response = await api.getTrainingObservabilityGraph(job.id);
+    if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
+    graphData.value = response;
+    graphLoadedJobId = job.id;
+    selectedGraphNode.value = response.nodes[0] ?? null;
+    if (activeTab.value === "graph" && response.nodes.length > 0) graphChartMounted.value = true;
+  } catch (error) {
+    if (requestGeneration === generation) {
+      ElMessage.error(error instanceof Error ? error.message : "计算图加载失败");
+    }
+  } finally {
+    if (requestGeneration === generation) graphLoading.value = false;
+  }
+}
+
+async function loadHistogram() {
+  const job = selectedJob.value;
+  const kind = histogramKind.value;
+  const tag = histogramTag.value;
+  const step = histogramStep.value;
+  if (!job || !tag || step === "") return;
+
+  const requestGeneration = generation;
+  const requestId = ++histogramRequest;
+  histogramLoading.value = true;
+  histogramRequested.value = true;
+  histogramData.value = null;
+  try {
+    const response = await api.getTrainingObservabilityHistogram(job.id, { kind, tag, step });
+    if (requestGeneration !== generation || requestId !== histogramRequest || selectedJob.value?.id !== job.id) return;
+    histogramData.value = response;
+  } catch (error) {
+    if (requestGeneration === generation && requestId === histogramRequest) {
+      ElMessage.error(error instanceof Error ? error.message : "分布数据加载失败");
+    }
+  } finally {
+    if (requestGeneration === generation && requestId === histogramRequest) histogramLoading.value = false;
+  }
+}
+
+function onHistogramSelectionChange() {
+  histogramData.value = null;
+  histogramRequested.value = false;
+  void loadHistogram();
+}
+
+function selectHistogramKind(kind: "weight" | "gradient") {
+  if (histogramKind.value === kind) return;
+  histogramKind.value = kind;
+  const nextTags = summaryData.value?.available_histograms?.[kind] ?? [];
+  if (!nextTags.includes(histogramTag.value)) histogramTag.value = nextTags[0] ?? "";
+  onHistogramSelectionChange();
+}
+
 async function loadActiveTabData(requestGeneration: number, force = false) {
   if (activeTab.value === "metrics") await loadScalars(requestGeneration, force);
   if (activeTab.value === "resources") await loadResources(requestGeneration, force);
+  if (activeTab.value === "graph") await loadGraph(requestGeneration);
 }
 
 async function loadSummary(requestGeneration: number) {
@@ -509,6 +747,12 @@ async function activateTab(tab: DashboardTab) {
     resourcesActivated.value = true;
     if (hasResourceSeries.value) resourcesChartMounted.value = true;
   }
+  if (tab === "analysis") analysisActivated.value = true;
+  if (tab === "graph") {
+    graphActivated.value = true;
+    if (hasGraph.value) graphChartMounted.value = true;
+  }
+  if (tab === "histograms") histogramsActivated.value = true;
   await loadActiveTabData(generation);
 }
 
@@ -552,11 +796,19 @@ onBeforeUnmount(() => {
 .training-visualization-view { container: training-view / inline-size; min-width: 0; color: #1f2937; }
 .training-visualization-view, .training-visualization-view * { box-sizing: border-box; }
 .visualization-page-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
-.visualization-page-header > div { min-width: 0; }
+.visualization-page-header > div:first-child { min-width: 0; }
 .visualization-page-header h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
 .visualization-page-header p { margin: 5px 0 0; overflow-wrap: anywhere; color: #667085; font-size: 14px; }
+.header-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
 .refresh-button { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 6px; height: 36px; padding: 0 14px; border: 1px solid #cfd7e6; border-radius: 4px; background: #fff; color: #344054; white-space: nowrap; cursor: pointer; }
 .refresh-button:disabled { cursor: wait; opacity: .55; }
+.advanced-menu-wrap { position: relative; }
+.icon-button { display: grid; width: 36px; height: 36px; padding: 0; place-items: center; border: 1px solid #cfd7e6; border-radius: 4px; background: #fff; color: #344054; cursor: pointer; }
+.icon-button:hover { border-color: #2563eb; color: #1d4ed8; }
+.advanced-menu { position: absolute; z-index: 20; top: 42px; right: 0; display: grid; width: 168px; padding: 5px; border: 1px solid #d7deea; border-radius: 6px; box-shadow: 0 10px 24px rgb(15 23 42 / 14%); background: #fff; }
+.advanced-menu button { height: 34px; padding: 0 10px; border: 0; border-radius: 4px; background: transparent; color: #344054; text-align: left; cursor: pointer; }
+.advanced-menu button:hover { background: #eef4ff; color: #1d4ed8; }
+.advanced-menu span { padding: 9px 10px; color: #98a2b3; font-size: 12px; }
 .visualization-layout { display: grid; grid-template-columns: 288px minmax(0, 1fr); width: 100%; max-width: 100%; min-height: calc(100vh - 148px); border: 1px solid #dfe5ef; background: #fff; }
 .run-list-panel { min-width: 0; border-right: 1px solid #dfe5ef; background: #f8fafc; }
 .run-list-heading { display: flex; align-items: center; justify-content: space-between; height: 52px; padding: 0 16px; border-bottom: 1px solid #dfe5ef; }
@@ -608,6 +860,32 @@ onBeforeUnmount(() => {
 .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 58px; border-bottom: 1px solid #e3e8ef; }
 .panel-heading > div { display: flex; min-width: 0; align-items: baseline; gap: 10px; }
 .source-warning { color: #b54708 !important; }
+.graph-panel, .histogram-panel { padding: 0 18px 20px; }
+.graph-heading { margin-bottom: 12px; }
+.graph-layout { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 14px; min-width: 0; }
+.graph-inspector { display: grid; grid-template-rows: minmax(0, 190px) minmax(0, 1fr); min-width: 0; height: 460px; overflow: hidden; border: 1px solid #dfe5ef; background: #fff; }
+.graph-node-list { overflow-y: auto; border-bottom: 1px solid #dfe5ef; background: #f8fafc; }
+.graph-node-list button { display: grid; width: 100%; min-height: 52px; gap: 3px; padding: 9px 12px; border: 0; border-bottom: 1px solid #e3e8ef; background: transparent; text-align: left; cursor: pointer; }
+.graph-node-list button:hover { background: #eef4ff; }
+.graph-node-list button.active { box-shadow: inset 3px 0 #2563eb; background: #eef4ff; }
+.graph-node-list strong, .graph-node-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.graph-node-list span { color: #667085; font-size: 11px; }
+.graph-node-detail { min-width: 0; overflow-y: auto; padding: 14px; }
+.graph-node-detail > span { display: block; color: #667085; font-size: 11px; }
+.graph-node-detail > strong { display: block; margin-top: 4px; overflow-wrap: anywhere; font-size: 15px; }
+.graph-node-detail > code { display: inline-block; margin-top: 7px; color: #1d4ed8; font-size: 12px; }
+.graph-node-detail dl { display: grid; grid-template-columns: minmax(72px, auto) minmax(0, 1fr); margin: 16px 0 0; border-top: 1px solid #e3e8ef; }
+.graph-node-detail dt, .graph-node-detail dd { min-width: 0; margin: 0; padding: 8px 0; border-bottom: 1px solid #e3e8ef; overflow-wrap: anywhere; font-size: 12px; }
+.graph-node-detail dt { padding-right: 10px; color: #667085; }
+.histogram-toolbar { display: flex; align-items: end; gap: 12px; min-height: 68px; padding: 10px 0; border-bottom: 1px solid #e3e8ef; }
+.segmented-control { display: inline-flex; flex: 0 0 auto; height: 36px; padding: 2px; border: 1px solid #cfd7e6; border-radius: 6px; background: #f8fafc; }
+.segmented-control button { min-width: 64px; padding: 0 12px; border: 0; border-radius: 4px; background: transparent; color: #667085; cursor: pointer; }
+.segmented-control button.active { box-shadow: 0 1px 2px rgb(15 23 42 / 10%); background: #fff; color: #1d4ed8; font-weight: 600; }
+.histogram-toolbar label { display: grid; min-width: 0; gap: 5px; }
+.histogram-toolbar label:first-of-type { flex: 1 1 360px; }
+.histogram-toolbar label:last-of-type { flex: 0 0 136px; }
+.histogram-toolbar label span { color: #667085; font-size: 11px; }
+.histogram-toolbar select { width: 100%; height: 36px; min-width: 0; padding: 0 32px 0 10px; border: 1px solid #cfd7e6; border-radius: 4px; background: #fff; color: #344054; }
 .placeholder-panel { min-height: 420px; padding-top: 80px; }
 @container training-view (max-width: 900px) {
   .visualization-layout { grid-template-columns: 240px minmax(0, 1fr); }
@@ -615,6 +893,7 @@ onBeforeUnmount(() => {
   .detail-grid .metric-cell { border-bottom: 1px solid #e3e8ef; }
   .source-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .source-item { border-bottom: 1px solid #e3e8ef; }
+  .graph-layout { grid-template-columns: minmax(0, 1fr) 220px; }
 }
 @container training-view (max-width: 760px) {
   .visualization-page-header { align-items: flex-start; }
@@ -625,6 +904,11 @@ onBeforeUnmount(() => {
   .progress-band { grid-template-columns: 1fr; }
   .detail-grid, .latest-grid, .source-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metric-cell:nth-child(2n), .source-item:nth-child(2n) { border-right: 0; }
+  .graph-layout { grid-template-columns: minmax(0, 1fr); }
+  .graph-inspector { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: 240px; height: 240px; }
+  .graph-node-list { border-right: 1px solid #dfe5ef; border-bottom: 0; }
+  .histogram-toolbar { flex-wrap: wrap; align-items: end; }
+  .histogram-toolbar label:first-of-type { flex-basis: calc(100% - 148px); }
 }
 @container training-view (max-width: 420px) {
   .visualization-page-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; }
@@ -636,5 +920,11 @@ onBeforeUnmount(() => {
   .source-item { min-height: 56px; padding: 9px 14px; border-right: 0; }
   .chart-panel { padding-right: 10px; padding-left: 10px; }
   .panel-heading { flex-direction: column; align-items: flex-start; gap: 4px; padding: 10px 0; }
+  .graph-panel, .histogram-panel { padding-right: 10px; padding-left: 10px; }
+  .graph-inspector { grid-template-columns: minmax(0, 1fr); grid-template-rows: 180px minmax(0, 1fr); height: 420px; }
+  .graph-node-list { border-right: 0; border-bottom: 1px solid #dfe5ef; }
+  .segmented-control { width: 100%; }
+  .segmented-control button { flex: 1 1 50%; }
+  .histogram-toolbar label:first-of-type, .histogram-toolbar label:last-of-type { flex: 1 1 100%; }
 }
 </style>

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { defineComponent, nextTick, onMounted, onUnmounted } from "vue";
 
 import TrainingVisualizationView from "@/views/training-visualization/TrainingVisualizationView.vue";
+import artifactGallerySource from "@/components/training/ArtifactGallery.vue?raw";
 import trainingVisualizationViewSource from "@/views/training-visualization/TrainingVisualizationView.vue?raw";
 
 const apiMock = vi.hoisted(() => ({
@@ -11,8 +12,10 @@ const apiMock = vi.hoisted(() => ({
   getTrainingObservabilityResources: vi.fn(),
   getTrainingObservabilityScalars: vi.fn(),
   getTrainingObservabilitySummary: vi.fn(),
+  listTrainingJobArtifacts: vi.fn(),
   listPipelines: vi.fn(),
   listTrainingJobs: vi.fn(),
+  trainingJobArtifactDownloadUrl: vi.fn(),
 }));
 
 vi.mock("@/api/client", () => ({ api: apiMock }));
@@ -34,6 +37,23 @@ const MetricLineChartStub = defineComponent({
     onUnmounted(chartLifecycle.unmounted);
   },
   template: '<div class="metric-line-chart-stub">{{ Object.keys(series).join(",") }}</div>',
+});
+
+const ModelGraphChartStub = defineComponent({
+  name: "ModelGraphChart",
+  props: {
+    nodes: { type: Array, required: true },
+    edges: { type: Array, required: true },
+  },
+  template: '<div class="model-graph-chart-stub">{{ nodes.map((node) => node.label).join(",") }}</div>',
+});
+
+const HistogramChartStub = defineComponent({
+  name: "HistogramChart",
+  props: {
+    histogram: { type: Object, required: true },
+  },
+  template: '<div class="histogram-chart-stub">{{ histogram.tag }}@{{ histogram.step }}</div>',
 });
 
 const jobs = [
@@ -73,7 +93,10 @@ function summary(overrides: Record<string, unknown> = {}) {
       "metrics/mAP50-95(B)": 0.5234,
     },
     available_scalar_keys: ["train.box_loss", "metrics.map50"],
-    available_histograms: { weight: [], gradient: [] },
+    available_histograms: {
+      weight: ["weights/head.bias", "weights/stem.weight"],
+      gradient: ["gradients/head.bias"],
+    },
     availability: {
       mlflow: { available: false, reason: "offline" },
       tensorboard: { available: true, reason: null },
@@ -88,7 +111,9 @@ function mountView() {
   return mount(TrainingVisualizationView, {
     global: {
       stubs: {
+        HistogramChart: HistogramChartStub,
         MetricLineChart: MetricLineChartStub,
+        ModelGraphChart: ModelGraphChartStub,
         "el-empty": { props: ["description"], template: '<div class="el-empty-stub">{{ description }}</div>' },
         "el-icon": { template: "<span><slot /></span>" },
         "el-progress": { props: ["percentage"], template: '<div class="el-progress-stub">{{ percentage }}%</div>' },
@@ -131,6 +156,32 @@ describe("TrainingVisualizationView", () => {
       series: { "system.cpu_percent": [{ step: 1, value: 36, timestamp: 100 }] },
       availability: summary().availability,
     });
+    apiMock.getTrainingObservabilityGraph.mockResolvedValue({
+      nodes: [
+        { id: "input", label: "Input", op: "Input", attributes: { shape: [1, 3, 640, 640] } },
+        { id: "head", label: "Detection head", op: "Conv2d", attributes: { channels: 80 } },
+      ],
+      edges: [{ source: "input", target: "head" }],
+      availability: summary().availability,
+    });
+    apiMock.getTrainingObservabilityHistogram.mockImplementation(
+      (_jobId: string, params: { kind: "weight" | "gradient"; tag: string; step: number }) => Promise.resolve({
+        ...params,
+        buckets: [{ lower: -1, upper: 1, count: 4 }],
+        availability: summary().availability,
+      }),
+    );
+    apiMock.listTrainingJobArtifacts.mockResolvedValue({
+      items: [
+        { name: "best.pt", kind: "weight", size_bytes: 1024, download_url: "/ignored/best.pt" },
+        { name: "results.png", kind: "visualization", size_bytes: 2048, download_url: "/ignored/results.png" },
+        { name: "confusion_matrix.png", kind: "visualization", size_bytes: 3072, download_url: "/ignored/confusion.png" },
+        { name: "train_batch0.jpg", kind: "visualization", size_bytes: 4096, download_url: "/ignored/batch.jpg" },
+      ],
+    });
+    apiMock.trainingJobArtifactDownloadUrl.mockImplementation(
+      (jobId: string, kind: string, name: string) => `/downloads/${jobId}/${kind}/${name}`,
+    );
   });
 
   afterEach(() => {
@@ -212,6 +263,150 @@ describe("TrainingVisualizationView", () => {
     expect(wrapper.get('[data-testid="resources-panel"]').text()).toContain("system.cpu_percent");
 
     wrapper.unmount();
+  });
+
+  it("loads real artifacts only for analysis and groups previews with API-backed downloads", async () => {
+    const wrapper = mountView();
+    await flushPromises();
+
+    expect(apiMock.listTrainingJobArtifacts).not.toHaveBeenCalled();
+    await wrapper.get('[data-testid="tab-analysis"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.listTrainingJobArtifacts).toHaveBeenCalledTimes(1);
+    expect(apiMock.listTrainingJobArtifacts).toHaveBeenCalledWith("job-1");
+    const panel = wrapper.get('[data-testid="analysis-panel"]');
+    for (const group of ["训练结果", "评估曲线", "混淆矩阵", "训练批次"]) {
+      expect(panel.text()).toContain(group);
+    }
+    expect(panel.get('[data-testid="artifact-preview-results.png"]').attributes("src"))
+      .toBe("/downloads/job-1/visualization/results.png");
+    expect(panel.get('[data-testid="artifact-preview-results.png"]').classes()).toContain("artifact-preview-image");
+    expect(panel.get('[data-testid="artifact-download-best.pt"]').attributes("href"))
+      .toBe("/downloads/job-1/weight/best.pt");
+    expect(apiMock.trainingJobArtifactDownloadUrl).toHaveBeenCalledWith("job-1", "weight", "best.pt");
+
+    wrapper.unmount();
+  });
+
+  it("loads the model graph only after activation and exposes node details", async () => {
+    const wrapper = mountView();
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilityGraph).not.toHaveBeenCalled();
+    await wrapper.get('[data-testid="tab-graph"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilityGraph).toHaveBeenCalledTimes(1);
+    expect(apiMock.getTrainingObservabilityGraph).toHaveBeenCalledWith("job-1");
+    expect(wrapper.get('[data-testid="graph-panel"]').text()).toContain("Input,Detection head");
+
+    await wrapper.get('[data-testid="graph-node-head"]').trigger("click");
+    const inspector = wrapper.get('[data-testid="graph-node-inspector"]');
+    expect(inspector.text()).toContain("Detection head");
+    expect(inspector.text()).toContain("Conv2d");
+    expect(inspector.text()).toContain("channels");
+    expect(inspector.text()).toContain("80");
+
+    await wrapper.get('[data-testid="tab-overview"]').trigger("click");
+    await wrapper.get('[data-testid="tab-graph"]').trigger("click");
+    await flushPromises();
+    expect(apiMock.getTrainingObservabilityGraph).toHaveBeenCalledTimes(1);
+
+    wrapper.unmount();
+  });
+
+  it("shows an honest graph empty state when no nodes were recorded", async () => {
+    apiMock.getTrainingObservabilityGraph.mockResolvedValueOnce({
+      nodes: [],
+      edges: [],
+      availability: summary().availability,
+    });
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="tab-graph"]').trigger("click");
+    await flushPromises();
+
+    expect(wrapper.get('[data-testid="graph-panel"]').text()).toContain("该训练未记录计算图");
+    wrapper.unmount();
+  });
+
+  it("waits for histogram kind, tag, and epoch, then fetches once per completed selection change", async () => {
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="tab-histograms"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilityHistogram).not.toHaveBeenCalled();
+    await wrapper.get('[data-testid="histogram-tag"]').setValue("weights/head.bias");
+    await flushPromises();
+    expect(apiMock.getTrainingObservabilityHistogram).not.toHaveBeenCalled();
+
+    await wrapper.get('[data-testid="histogram-step"]').setValue("4");
+    await flushPromises();
+    expect(apiMock.getTrainingObservabilityHistogram).toHaveBeenCalledTimes(1);
+    expect(apiMock.getTrainingObservabilityHistogram).toHaveBeenLastCalledWith("job-1", {
+      kind: "weight",
+      tag: "weights/head.bias",
+      step: 4,
+    });
+
+    await wrapper.get('[data-testid="histogram-tag"]').setValue("weights/stem.weight");
+    await flushPromises();
+    expect(apiMock.getTrainingObservabilityHistogram).toHaveBeenCalledTimes(2);
+
+    await wrapper.get('[data-testid="histogram-step"]').setValue("3");
+    await flushPromises();
+    expect(apiMock.getTrainingObservabilityHistogram).toHaveBeenCalledTimes(3);
+
+    await wrapper.get('[data-testid="histogram-kind-gradient"]').trigger("click");
+    await flushPromises();
+    expect(apiMock.getTrainingObservabilityHistogram).toHaveBeenCalledTimes(4);
+    expect(apiMock.getTrainingObservabilityHistogram).toHaveBeenLastCalledWith("job-1", {
+      kind: "gradient",
+      tag: "gradients/head.bias",
+      step: 3,
+    });
+    expect(wrapper.get('[data-testid="histograms-panel"]').text()).toContain("gradients/head.bias@3");
+
+    wrapper.unmount();
+  });
+
+  it("shows the honest histogram empty state for a recorded selection with no buckets", async () => {
+    apiMock.getTrainingObservabilityHistogram.mockResolvedValueOnce({
+      kind: "weight",
+      tag: "weights/head.bias",
+      step: 4,
+      buckets: [],
+      availability: summary().availability,
+    });
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="tab-histograms"]').trigger("click");
+    await wrapper.get('[data-testid="histogram-tag"]').setValue("weights/head.bias");
+    await wrapper.get('[data-testid="histogram-step"]').setValue("4");
+    await flushPromises();
+
+    expect(wrapper.get('[data-testid="histograms-panel"]').text()).toContain("该训练未记录梯度分布");
+    wrapper.unmount();
+  });
+
+  it("opens configured advanced tools only after an explicit menu action", async () => {
+    vi.stubEnv("VITE_MLFLOW_URL", "https://mlflow.example.test");
+    vi.stubEnv("VITE_TENSORBOARD_URL", "https://tensorboard.example.test");
+    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+    const wrapper = mountView();
+    await flushPromises();
+
+    expect(openSpy).not.toHaveBeenCalled();
+    await wrapper.get('[data-testid="advanced-menu-toggle"]').trigger("click");
+    await wrapper.get('[data-testid="open-mlflow"]').trigger("click");
+    expect(openSpy).toHaveBeenCalledWith("https://mlflow.example.test", "_blank", "noopener,noreferrer");
+    expect(trainingVisualizationViewSource).not.toMatch(/iframe|5001|6006/);
+
+    wrapper.unmount();
+    openSpy.mockRestore();
+    vi.unstubAllEnvs();
   });
 
   it("mounts the metric chart only after data is visible and keeps that instance through polling", async () => {
@@ -301,6 +496,13 @@ describe("TrainingVisualizationView", () => {
       /@container training-view \(max-width: 420px\)[\s\S]*?\.source-list \{ grid-template-columns: minmax\(0, 1fr\);/,
     );
     expect(trainingVisualizationViewSource).toMatch(/\.refresh-button \{[^}]*white-space: nowrap;/);
+  });
+
+  it("pins contained artifact images inside stable aspect-ratio previews", () => {
+    expect(artifactGallerySource).toMatch(/\.artifact-preview \{[^}]*position: relative;/);
+    expect(artifactGallerySource).toMatch(/\.artifact-preview \{[^}]*aspect-ratio: 16 \/ 10;/);
+    expect(artifactGallerySource).toMatch(/\.artifact-preview-image \{[^}]*position: absolute;/);
+    expect(artifactGallerySource).toMatch(/\.artifact-preview-image \{[^}]*object-fit: contain;/);
   });
 
   it("polls running jobs every five seconds and stops as soon as status is terminal", async () => {
