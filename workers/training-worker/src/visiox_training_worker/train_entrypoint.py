@@ -182,12 +182,15 @@ def _collect_resource_metrics(trainer: Any) -> dict[str, float]:
 
 
 def reset_training_batch_index(trainer: Any) -> None:
+    install_pre_zero_gradient_capture(trainer)
     setattr(trainer, _BATCH_INDEX_ATTRIBUTE, -1)
     setattr(trainer, _GRADIENT_SAMPLE_EPOCH_ATTRIBUTE, None)
 
 
 def install_pre_zero_gradient_capture(trainer: Any) -> None:
-    optimizer = trainer.optimizer
+    optimizer = getattr(trainer, "optimizer", None)
+    if optimizer is None:
+        return
     if getattr(optimizer, _ZERO_GRAD_WRAPPED_ATTRIBUTE, False):
         return
 
@@ -202,6 +205,7 @@ def install_pre_zero_gradient_capture(trainer: Any) -> None:
 
 
 def track_training_batch_start(trainer: Any) -> None:
+    install_pre_zero_gradient_capture(trainer)
     batch_index = getattr(trainer, _BATCH_INDEX_ATTRIBUTE, -1)
     setattr(trainer, _BATCH_INDEX_ATTRIBUTE, int(batch_index) + 1)
 

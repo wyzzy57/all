@@ -219,6 +219,37 @@ def test_pre_zero_bridge_captures_last_batch_before_clear_under_accumulation() -
     assert trainer._visiox_gradient_samples["layer.weight"].numel() == 100_000
 
 
+def test_pre_zero_bridge_rewraps_replacement_optimizer_on_oom_retry() -> None:
+    parameter = FakeParameter([1.0], grad=FakeTensor(range(150_003)))
+    model = FakeModel({"layer.weight": parameter})
+    initial_optimizer = FakeOptimizer(model)
+    trainer = SimpleNamespace(
+        epoch=4,
+        epochs=40,
+        train_loader=[object(), object()],
+        model=model,
+        optimizer=initial_optimizer,
+    )
+    initial_optimizer.trainer = trainer
+    train_entrypoint.install_pre_zero_gradient_capture(trainer)
+
+    replacement_optimizer = FakeOptimizer(model)
+    replacement_optimizer.trainer = trainer
+    trainer.optimizer = replacement_optimizer
+    train_entrypoint.reset_training_batch_index(trainer)
+    assert replacement_optimizer._visiox_zero_grad_wrapped is True
+    wrapped_zero_grad = replacement_optimizer.zero_grad
+    for _ in trainer.train_loader:
+        train_entrypoint.track_training_batch_start(trainer)
+
+    assert replacement_optimizer.zero_grad is wrapped_zero_grad
+    replacement_optimizer.zero_grad()
+
+    assert replacement_optimizer.sample_present_before_clear == [True]
+    assert parameter.grad is None
+    assert trainer._visiox_gradient_samples["layer.weight"].numel() == 100_000
+
+
 def test_final_accumulated_batch_captures_at_batch_end_when_no_optimizer_step_occurs() -> None:
     parameter = FakeParameter([1.0], grad=FakeTensor([1.0]))
     trainer = SimpleNamespace(
