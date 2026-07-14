@@ -12,9 +12,9 @@ using separate native graph and histogram pages.
 VisioX continues to provide native views for training status, scalar metrics,
 resource usage, logs, artifacts, and model outputs.
 
-The native `计算图` and `直方图` tabs are removed. Their chart components,
-frontend state, and VisioX-only graph and histogram API contracts are removed
-when they have no remaining consumers.
+The native `计算图` and `直方图` tabs are removed together with their chart
+components and frontend state. Existing backend observability APIs are outside
+this cleanup and remain unchanged.
 
 The training visualization page keeps its existing top-right advanced-tools
 menu and its existing `TensorBoard` command. No second TensorBoard command is
@@ -56,7 +56,7 @@ shown.
 
 ## Cleanup
 
-Remove only VisioX-native graph and histogram presentation code and APIs. Keep:
+Remove only VisioX-native graph and histogram presentation code. Keep:
 
 - TensorBoard service configuration;
 - event-file mounts and storage;
@@ -72,7 +72,4 @@ TensorBoard page is embedded inside the VisioX content area.
 - Frontend tests confirm that graph and histogram tabs are absent.
 - Frontend tests confirm that the existing top-right `TensorBoard` action remains
   available and opens the configured URL in a new tab.
-- Worker tests confirm TensorBoard graph and histogram summaries are still
-  emitted.
-- A local end-to-end check opens TensorBoard for a completed two-epoch training
-  job and confirms the selected run contains its graph and histogram data.
+- Existing backend and worker tests remain unchanged.
