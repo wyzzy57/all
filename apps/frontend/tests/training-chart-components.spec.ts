@@ -7,9 +7,7 @@ import {
   type TrainingObservabilityHistogram,
   type TrainingObservabilitySummary
 } from "@/api/client";
-import HistogramChart from "@/components/training/HistogramChart.vue";
 import MetricLineChart from "@/components/training/MetricLineChart.vue";
-import ModelGraphChart from "@/components/training/ModelGraphChart.vue";
 
 const echartsMocks = vi.hoisted(() => ({
   dispose: vi.fn(),
@@ -104,93 +102,6 @@ describe("training chart components", () => {
     expect(metricUpdateCall[0].series.map((item: { name: string }) => item.name)).toEqual(["train.box_loss"]);
   });
 
-  it("renders histogram DTO buckets on a numeric axis and responds to its lifecycle", async () => {
-    const histogram = {
-      kind: "weight" as const,
-      tag: "weights/head.bias",
-      step: 8,
-      buckets: [
-        { lower: -1, upper: 0, count: 4 },
-        { lower: 0, upper: 2, count: 7 }
-      ],
-      availability: { tensorboard: { available: true, reason: null } }
-    };
-    const wrapper = mount(HistogramChart, { props: { histogram } });
-
-    expect(echartsMocks.setOption).toHaveBeenCalledWith(
-      expect.objectContaining({
-        xAxis: expect.objectContaining({ type: "value" }),
-        series: [
-          expect.objectContaining({
-            type: "bar",
-            data: [
-              [-0.5, 4, -1, 0],
-              [1, 7, 0, 2]
-            ]
-          })
-        ]
-      }),
-      true
-    );
-    expect(echartsMocks.setOption.mock.calls[0][0].xAxis).not.toHaveProperty("data");
-
-    await expectChartLifecycle(wrapper, {
-      histogram: { ...histogram, step: 9, buckets: [{ lower: 2, upper: 4, count: 3 }] }
-    }, ["dataZoom", "toolbox"]);
-  });
-
-  it("renders a force-directed graph DTO and responds to its lifecycle", async () => {
-    const nodes = [
-      { id: "input", label: "Input", op: "Input", attributes: { shape: [1, 3, 640, 640] } },
-      { id: "conv", label: "Conv2d", op: "Conv", attributes: {} }
-    ];
-    const edges = [{ source: "input", target: "conv" }];
-    const wrapper = mount(ModelGraphChart, { props: { nodes, edges, height: 420 } });
-
-    expect(echartsMocks.setOption).toHaveBeenCalledWith(
-      expect.objectContaining({
-        series: [
-          expect.objectContaining({
-            type: "graph",
-            roam: true,
-            layout: "force",
-            label: { show: true, position: "right" },
-            data: expect.arrayContaining([expect.objectContaining({ id: "input", name: "Input", op: "Input" })]),
-            links: edges
-          })
-        ]
-      }),
-      true
-    );
-    expect(wrapper.get(".training-chart").attributes("style")).toContain("height: 420px");
-
-    await expectChartLifecycle(wrapper, {
-      nodes: [{ id: "output", label: "Output", op: "Output", attributes: {} }]
-    }, ["toolbox"]);
-    const lastSetOptionCall = echartsMocks.setOption.mock.calls[echartsMocks.setOption.mock.calls.length - 1];
-    const graphUpdateSeries = lastSetOptionCall[0].series[0];
-    expect(graphUpdateSeries).not.toHaveProperty("layout");
-    expect(graphUpdateSeries).not.toHaveProperty("roam");
-    expect(graphUpdateSeries).not.toHaveProperty("force");
-  });
-
-  it("hides labels for very large graphs to keep the initial view readable", () => {
-    const nodes = Array.from({ length: 151 }, (_, index) => ({
-      id: `node-${index}`,
-      label: `Node ${index}`,
-      op: "Conv",
-      attributes: {}
-    }));
-    const wrapper = mount(ModelGraphChart, { props: { nodes, edges: [] } });
-
-    expect(echartsMocks.setOption).toHaveBeenCalledWith(
-      expect.objectContaining({
-        series: [expect.objectContaining({ label: { show: false, position: "right" } })]
-      }),
-      true
-    );
-    wrapper.unmount();
-  });
 });
 
 describe("training observability API client", () => {
