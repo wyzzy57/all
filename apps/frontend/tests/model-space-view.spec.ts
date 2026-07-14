@@ -2,6 +2,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import ModelSpaceView from "@/views/model-space/ModelSpaceView.vue";
+import modelSpaceViewSource from "@/views/model-space/ModelSpaceView.vue?raw";
 
 const pushMock = vi.hoisted(() => vi.fn());
 const apiMock = vi.hoisted(() => ({
@@ -23,6 +24,7 @@ const apiMock = vi.hoisted(() => ({
   evaluatePipeline: vi.fn(),
   listPipelineEvaluations: vi.fn(),
   markTrainedModelWeight: vi.fn(),
+  createService: vi.fn(),
 }));
 
 vi.mock("vue-router", () => ({
@@ -161,7 +163,15 @@ describe("ModelSpaceView", () => {
       items: [{ id: "sample-1", dataset_id: "dataset-1", file_uri: "sample-1.jpg", annotation_status: "annotated" }],
     });
     apiMock.datasetSampleContentUrl.mockImplementation((datasetId: string, sampleId: string) => `/datasets/${datasetId}/samples/${sampleId}/content`);
-    apiMock.createPipeline.mockResolvedValue({ id: "pipeline-new" });
+    apiMock.createPipeline.mockResolvedValue({
+      id: "pipeline-new",
+      name: "新建产线",
+      task: "detect",
+      scale: "n",
+      status: "draft",
+      params_template: {},
+      default_environment: {},
+    });
     apiMock.createTrainingJob.mockResolvedValue({ id: "job-1" });
     apiMock.updatePipeline.mockResolvedValue({ id: "pipeline-1" });
     apiMock.deletePipeline.mockResolvedValue(undefined);
@@ -212,9 +222,10 @@ describe("ModelSpaceView", () => {
         status: "ready",
       }),
     );
+    apiMock.createService.mockResolvedValue({ id: "service-1", status: "running" });
   });
 
-  it("opens result files and shows downloadable weights and training visualizations", async () => {
+  it("opens result files and routes the selected job to native training visualization", async () => {
     apiMock.listPipelines.mockResolvedValueOnce({
       items: [
         {
@@ -265,6 +276,14 @@ describe("ModelSpaceView", () => {
     expect(wrapper.text()).toContain("results.png");
     expect(wrapper.text()).toContain("29 MB");
     expect(wrapper.findAll('[data-testid^="download-result-"]')).toHaveLength(3);
+
+    await wrapper.findAll("button").find((button) => button.text() === "可视化训练")?.trigger("click");
+    expect(pushMock).toHaveBeenCalledWith({
+      path: "/training-visualization",
+      query: { job: "job-1" },
+    });
+    expect(wrapper.find("iframe").exists()).toBe(false);
+    expect(modelSpaceViewSource).not.toMatch(/<iframe|127\.0\.0\.1:5001|127\.0\.0\.1:6006/);
   });
 
   it("renders pipeline cards and opens the create pipeline wizard inside model space", async () => {
@@ -284,7 +303,9 @@ describe("ModelSpaceView", () => {
     expect(wrapper.text()).toContain("任务场景");
 
     await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
+    await flushPromises();
 
+    expect(apiMock.createPipeline).toHaveBeenCalledWith({ name: "新建产线", task: "detect", scale: "n" });
     expect(wrapper.text()).toContain("选择产线");
     expect(wrapper.text()).toContain("数据准备");
     expect(wrapper.text()).toContain("参数准备");
@@ -297,6 +318,7 @@ describe("ModelSpaceView", () => {
     await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
     await wrapper.get('[data-testid="create-pipeline"]').trigger("click");
     await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
+    await flushPromises();
     await wrapper.findAll("button").find((button) => button.text() === "下一步")?.trigger("click");
     await flushPromises();
 
@@ -384,6 +406,7 @@ describe("ModelSpaceView", () => {
   });
 
   it("marks a trained weight with a deploy-only name and keeps true evaluation scores", async () => {
+    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
     apiMock.listPipelines.mockResolvedValueOnce({
       items: [
         {
@@ -425,6 +448,17 @@ describe("ModelSpaceView", () => {
           artifact_uri: "memory://models/trained/detect/last.pt",
           metrics: {},
           status: "ready",
+        },
+      ],
+    });
+    apiMock.listTrainingJobs.mockResolvedValueOnce({
+      items: [
+        {
+          id: "job-1",
+          pipeline_id: "pipeline-1",
+          status: "success",
+          metrics: {},
+          created_at: "2026-07-09T10:20:00Z",
         },
       ],
     });
@@ -484,5 +518,19 @@ describe("ModelSpaceView", () => {
 
     await wrapper.findAll("button").find((button) => button.text() === "部署")?.trigger("click");
     expect(wrapper.text()).toContain("数据集A评估最佳");
+
+    expect(wrapper.text()).toContain("服务名称：");
+    expect(wrapper.text()).toContain("选择环境：");
+    await wrapper.findAll("button").find((button) => button.text() === "离线部署")?.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.text()).not.toContain("服务名称：");
+    expect(wrapper.text()).toContain("导出模型文件");
+    await wrapper.findAll("button").find((button) => button.text() === "导出模型文件")?.trigger("click");
+    expect(openSpy).toHaveBeenCalledWith(
+      "/training-jobs/job-1/artifacts/weight/best.pt",
+      "_blank",
+      "noopener,noreferrer",
+    );
   });
 });

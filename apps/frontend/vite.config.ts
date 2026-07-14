@@ -22,6 +22,7 @@ export default defineConfig({
       "/health": apiProxy,
       "/label-projects": apiProxy,
       "/pipelines": apiProxy,
+      "/services": apiProxy,
       "/tasks": apiProxy,
       "/trained-models": apiProxy,
       "/training-jobs": apiProxy,

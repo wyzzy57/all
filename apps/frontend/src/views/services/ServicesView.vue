@@ -140,7 +140,9 @@
           </div>
           <p>支持用户上传测试图像（.jpeg /.jpg /.png /.tiff /.tif /.bmp /.pdf文件格式），文件体积不超过10MB。</p>
           <div class="experience-actions">
-            <button type="button" class="primary-action" @click="runExperience">运行</button>
+            <button type="button" class="primary-action" :disabled="experienceRunning" @click="runExperience">
+              {{ experienceRunning ? "运行中..." : "运行" }}
+            </button>
             <button type="button" class="secondary-action" @click="resetExperience">重置</button>
           </div>
         </aside>
@@ -164,8 +166,11 @@
 
 <script setup lang="ts">
 import { ArrowLeft, CircleCheck, CircleClose, Search, Setting } from "@element-plus/icons-vue";
-import { computed, ref, watch } from "vue";
+import { ElMessage } from "element-plus";
+import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
+
+import { api, type DeploymentServiceRecord, type PipelinePredictResponse } from "@/api/client";
 
 type ServiceStatus = "running" | "stopped" | "deploying";
 type ServiceTab = "basic" | "experience";
@@ -196,16 +201,7 @@ type ServiceRecord = {
 const route = useRoute();
 const router = useRouter();
 
-const services = ref<ServiceRecord[]>([
-  makeService("service-qwen3", "千问3", "qwen3", "2026-05-27 17:14:59", "running", "gpu节点_1_显卡0", 0, "983小时2分钟1秒"),
-  makeService("service-vllm-1", "test_vllm_name1", "test_vllm_name1", "2026-05-21 16:11:47", "deploying", "gpu节点_1_显卡0", 12, "18小时20分钟"),
-  makeService("service-test", "测试", "测试", "2026-05-19 13:59:48", "deploying", "gpu节点_1_显卡0", 2, "23小时10分钟"),
-  makeService("service-vllm", "test_vllm_name", "test_vllm_name", "2026-05-19 13:17:00", "deploying", "gpu节点_1_显卡0", 6, "31小时04分钟"),
-  makeService("service-divise", "test_divise", "huajiao123", "2026-04-24 14:03:30", "stopped", "gpu节点_1_显卡0", 41, "72小时12分钟"),
-  makeService("service-ocr", "原版OCRv5", "原版ocr", "2026-04-22 20:37:36", "stopped", "gpu节点_2_显卡0", 89, "120小时16分钟"),
-  makeService("service-plate", "车牌检测识别", "车牌检测123213", "2026-04-08 11:38:03", "stopped", "gpu节点_1_显卡1", 130, "88小时42分钟"),
-  makeService("service-pepper", "花椒检测在线预测模型", "花椒检测1", "2026-03-31 14:40:12", "stopped", "gpu节点_1_显卡0", 57, "64小时29分钟"),
-]);
+const services = ref<ServiceRecord[]>([]);
 
 const keyword = ref("");
 const sortMode = ref("newest");
@@ -214,8 +210,13 @@ const activeTab = ref<ServiceTab>("basic");
 const detailSubtab = ref<DetailSubtab>("example");
 const selectedExampleId = ref("anime-group");
 const resultMode = ref<ResultMode>("image");
-const hasRun = ref(false);
+const experienceRunning = ref(false);
+const inferenceResult = ref<PipelinePredictResponse | null>(null);
 const uploadedExamples = ref<TestExample[]>([]);
+
+onMounted(() => {
+  void loadServices();
+});
 
 const sampleExamples: TestExample[] = [
   { id: "anime-group", name: "????", image: "/service-examples/anime-group.png", thumb: "/service-examples/anime-group.png" },
@@ -249,20 +250,22 @@ const filteredServices = computed(() => {
 const allTestExamples = computed(() => [...sampleExamples, ...uploadedExamples.value]);
 const selectedExample = computed(() => allTestExamples.value.find((item) => item.id === selectedExampleId.value) ?? sampleExamples[0]);
 
-const resultImage = computed(() => (hasRun.value ? svgResultImage() : selectedExample.value.image));
+const resultImage = computed(() => inferenceResult.value?.result_image ?? selectedExample.value.image);
 const resultJson = computed(() =>
-  JSON.stringify(
-    {
-      service: selectedService.value?.name,
-      image: selectedExample.value.name,
-      detections: [
-        { label: "0", score: 0.68, box: [120, 42, 640, 358] },
-        { label: "1", score: 0.64, box: [620, 262, 690, 344] },
-      ],
-    },
-    null,
-    2,
-  ),
+  inferenceResult.value
+    ? JSON.stringify(inferenceResult.value, null, 2)
+    : JSON.stringify(
+        {
+          service: selectedService.value?.name,
+          image: selectedExample.value.name,
+          detections: [
+            { label: "0", score: 0.68, box: [120, 42, 640, 358] },
+            { label: "1", score: 0.64, box: [620, 262, 690, 344] },
+          ],
+        },
+        null,
+        2,
+      ),
 );
 
 watch(
@@ -271,7 +274,7 @@ watch(
     activeTab.value = "basic";
     detailSubtab.value = "example";
     resultMode.value = "image";
-    hasRun.value = false;
+    inferenceResult.value = null;
   },
 );
 
@@ -284,15 +287,54 @@ function backToList() {
   void router.push("/services");
 }
 
-function toggleService(service: ServiceRecord) {
-  service.status = service.status === "running" ? "stopped" : "running";
+async function toggleService(service: ServiceRecord) {
+  const nextStatus = service.status === "running" ? "stopped" : "running";
+  try {
+    const updated = await api.updateService(service.id, { status: nextStatus });
+    service.status = updated.status;
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "服务状态更新失败");
+  }
 }
 
-function deleteService(service: ServiceRecord) {
+async function deleteService(service: ServiceRecord) {
+  try {
+    await api.deleteService(service.id);
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "服务删除失败");
+    return;
+  }
   services.value = services.value.filter((item) => item.id !== service.id);
   if (selectedService.value?.id === service.id) {
     backToList();
   }
+}
+
+async function loadServices() {
+  try {
+    const response = await api.listServices({ limit: 200, offset: 0 });
+    services.value = response.items.map(serviceFromApi);
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "服务列表加载失败");
+  }
+}
+
+function serviceFromApi(service: DeploymentServiceRecord): ServiceRecord {
+  const pipelineName = typeof service.config.pipeline_name === "string" ? service.config.pipeline_name : service.pipeline_id;
+  const createdAt = service.created_at ? new Date(service.created_at).toLocaleString("zh-CN", { hour12: false }) : "-";
+  return {
+    id: service.id,
+    name: service.name,
+    pipelineName,
+    createdAt,
+    status: service.status,
+    environment: service.resource_summary || service.environment,
+    calls: service.calls,
+    duration: "刚刚创建",
+    endpoint: service.endpoint,
+    exampleCode: `# POST ${service.endpoint}\n# model_weight=${service.model_weight}\n# instance=${service.instance_name}`,
+    logs: `[INFO] ${createdAt} service ${service.name} deployed\n[INFO] environment: ${service.environment}\n[INFO] instance: ${service.instance_name}`,
+  };
 }
 
 function statusText(status: ServiceStatus) {
@@ -301,13 +343,27 @@ function statusText(status: ServiceStatus) {
   return "已终止";
 }
 
-function runExperience() {
-  hasRun.value = true;
-  resultMode.value = "image";
+async function runExperience() {
+  const service = selectedService.value;
+  if (!service) return;
+  experienceRunning.value = true;
+  try {
+    const response = await fetch(selectedExample.value.image);
+    if (!response.ok) throw new Error("测试图片读取失败");
+    const blob = await response.blob();
+    const filename = selectedExample.value.name || "test-image.png";
+    inferenceResult.value = await api.predictServiceImage(service.id, new File([blob], filename, { type: blob.type || "image/png" }));
+    resultMode.value = "image";
+    service.calls += 1;
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "服务推理失败");
+  } finally {
+    experienceRunning.value = false;
+  }
 }
 
 function resetExperience() {
-  hasRun.value = false;
+  inferenceResult.value = null;
   resultMode.value = "image";
   selectedExampleId.value = sampleExamples[0].id;
 }
@@ -326,82 +382,11 @@ function handleExampleUpload(event: Event) {
   };
   uploadedExamples.value = [...uploadedExamples.value, uploadedExample];
   selectedExampleId.value = uploadedExample.id;
-  hasRun.value = false;
+  inferenceResult.value = null;
   resultMode.value = "image";
   input.value = "";
 }
 
-function makeService(
-  id: string,
-  name: string,
-  pipelineName: string,
-  createdAt: string,
-  status: ServiceStatus,
-  environment: string,
-  calls: number,
-  duration: string,
-): ServiceRecord {
-  return {
-    id,
-    name,
-    pipelineName,
-    createdAt,
-    status,
-    environment,
-    calls,
-    duration,
-    endpoint: "http://10.10.30.111:56006",
-    exampleCode: `import requests
-import base64
-import json
-from pathlib import Path
-
-# 读取图片
-image_path = Path(__file__).parent / "app/statics/license_plate_origin/license_plate1.jpg"
-with image_path.open("rb") as f:
-    image_base64 = base64.b64encode(f.read()).decode("utf-8")
-
-url = "http://192.167.6.111:36501/v1/chat/completions"
-headers = {
-    "Content-Type": "application/json",
-    "Authorization": "Bearer EMPTY",
-}
-payload = {"image": image_base64}
-response = requests.post(url, headers=headers, data=json.dumps(payload))
-print(response.json())`,
-    logs: `[INFO] ${createdAt} service ${name} created
-[INFO] runtime environment: ${environment}
-[INFO] endpoint ready: /v1/chat/completions
-[INFO] total calls: ${calls}`,
-  };
-}
-
-function svgImage(background: string, label: string, withBoxes: boolean) {
-  const boxes = withBoxes
-    ? `<rect x="44" y="86" width="328" height="82" fill="none" stroke="#ef4444" stroke-width="3"/>
-       <rect x="248" y="28" width="72" height="24" fill="#ef4444"/><text x="256" y="46" fill="#fff" font-size="18">0 0.68</text>
-       <rect x="312" y="132" width="44" height="44" fill="none" stroke="#22c55e" stroke-width="3"/>
-       <rect x="312" y="112" width="62" height="22" fill="#22c55e"/><text x="318" y="129" fill="#111827" font-size="16">1 0.64</text>`
-    : "";
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(`
-<svg xmlns="http://www.w3.org/2000/svg" width="420" height="236" viewBox="0 0 420 236">
-  <rect width="420" height="236" fill="${background}"/>
-  <rect x="0" y="0" width="420" height="80" fill="#cbd5e1"/>
-  <path d="M0 176 C80 128 142 210 224 162 C304 116 352 178 420 136 L420 236 L0 236 Z" fill="#86efac"/>
-  <rect x="60" y="112" width="300" height="74" rx="8" fill="#65a30d"/>
-  <circle cx="96" cy="152" r="22" fill="#84cc16"/>
-  <circle cx="146" cy="148" r="24" fill="#84cc16"/>
-  <circle cx="198" cy="154" r="23" fill="#84cc16"/>
-  <circle cx="250" cy="150" r="22" fill="#84cc16"/>
-  <circle cx="302" cy="154" r="24" fill="#84cc16"/>
-  <text x="18" y="28" fill="#0f172a" font-size="18" font-family="Arial">${label}</text>
-  ${boxes}
-</svg>`)}`;
-}
-
-function svgResultImage() {
-  return svgImage("#dbeafe", "运行结果", true);
-}
 </script>
 
 <style scoped>

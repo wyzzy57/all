@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import os
 import subprocess
 import time
 from collections.abc import Callable
@@ -45,6 +46,7 @@ class SubprocessTrainingRunner:
         process = subprocess.Popen(
             argv,
             cwd=work_dir,
+            env=_training_environment(argv),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -132,6 +134,14 @@ def _run_dir_from_argv(argv: list[str], work_dir: Path) -> Path:
     if project and name:
         return Path(project) / name
     return work_dir / "runs" / "train"
+
+
+def _training_environment(argv: list[str]) -> dict[str, str]:
+    environment = os.environ.copy()
+    run_name = _arg_value(argv, "name") or "visiox-training"
+    environment.setdefault("MLFLOW_EXPERIMENT_NAME", "Visiox YOLO26")
+    environment["MLFLOW_RUN"] = run_name
+    return environment
 
 
 def _arg_value(argv: list[str], key: str) -> str | None:

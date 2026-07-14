@@ -9,6 +9,7 @@ from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from visiox_db.models import BaseModel, TrainingJob, TrainingPipeline
@@ -27,9 +28,9 @@ router = APIRouter(prefix="/pipelines", tags=["pipelines"])
 class PipelineCreateRequest(PydanticBaseModel):
     name: str
     task: str
-    scale: str
-    base_model_id: str
-    dataset_id: str
+    scale: str = "n"
+    base_model_id: str | None = None
+    dataset_id: str | None = None
     params_template: dict[str, Any] = Field(default_factory=dict)
     default_environment: dict[str, Any] = Field(default_factory=dict)
 
@@ -87,16 +88,19 @@ def create_pipeline(
     response: Response,
     session: Session = Depends(get_pipeline_session),
 ) -> TrainingPipeline:
-    try:
-        validate_training_resources(
-            session,
-            task=request.task,
-            scale=request.scale,
-            base_model_id=request.base_model_id,
-            dataset_id=request.dataset_id,
-        )
-    except TrainingPrecheckError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if (request.base_model_id is None) != (request.dataset_id is None):
+        raise _unprocessable("base_model_id and dataset_id must be provided together")
+    if request.base_model_id and request.dataset_id:
+        try:
+            validate_training_resources(
+                session,
+                task=request.task,
+                scale=request.scale,
+                base_model_id=request.base_model_id,
+                dataset_id=request.dataset_id,
+            )
+        except TrainingPrecheckError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     try:
         params_template = validate_training_params(request.params_template)
         default_environment = validate_training_environment(request.default_environment)
@@ -111,10 +115,14 @@ def create_pipeline(
         dataset_id=request.dataset_id,
         params_template=params_template,
         default_environment=default_environment,
-        status="ready",
+        status="ready" if request.base_model_id and request.dataset_id else "draft",
     )
     session.add(pipeline)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="产线名称已存在，请使用其他名称") from exc
     session.refresh(pipeline)
     response.status_code = status.HTTP_201_CREATED
     return pipeline
@@ -220,7 +228,11 @@ def update_pipeline(
         pipeline.status = "ready"
 
     session.add(pipeline)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="产线名称已存在，请使用其他名称") from exc
     session.refresh(pipeline)
     return pipeline
 

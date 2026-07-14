@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from threading import Lock
 from typing import Any
 import math
 import re
@@ -11,7 +12,17 @@ from visiox_common.settings import Settings
 
 
 _DEFAULT_MAX_POINTS = 2_000
-_MAX_EVENT_ACCUMULATORS = 32
+_RESOURCE_SCALAR_KEYS = frozenset(
+    {
+        "system.cpu_percent",
+        "system.memory_percent",
+        "system.memory_used_gb",
+        "system.gpu_utilization_percent",
+        "system.gpu_memory_used_gb",
+        "system.gpu_memory_reserved_gb",
+        "train.images_per_second",
+    }
+)
 _SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9-]+$")
 
 
@@ -78,9 +89,59 @@ class TrainingObservabilityService:
         self._mlflow_client_factory = mlflow_client_factory or self._default_mlflow_client
         self._event_accumulator_factory = event_accumulator_factory or self._default_event_accumulator
         self._event_accumulators: OrderedDict[tuple[Path, int], Any] = OrderedDict()
+        self._event_accumulator_lock = Lock()
 
     def get_summary(self, job: Any, pipeline: Any, task: Any) -> dict[str, Any]:
-        run_path = self._run_path(job)
+        snapshot: dict[str, Any] = {}
+        try:
+            snapshot = self._progress_snapshot(job)
+            progress_availability = (True, None)
+        except ObservabilitySourceError as exc:
+            progress_availability = (False, exc.message)
+
+        scalar_keys: set[str] = set()
+        latest_metrics: dict[str, float] = {}
+        try:
+            _, runs = self._mlflow_client_and_runs(job)
+            mlflow_availability = (True, None)
+        except ObservabilitySourceError as exc:
+            runs = []
+            mlflow_availability = (False, exc.message)
+        if runs:
+            metrics = getattr(getattr(runs[0], "data", None), "metrics", {})
+            if isinstance(metrics, dict):
+                for name, value in metrics.items():
+                    if isinstance(value, int | float):
+                        latest_metrics[str(name)] = float(value)
+                        scalar_keys.add(_normalize_metric_name(str(name)))
+
+        available_histograms: dict[str, list[str]] = {"weight": [], "gradient": []}
+        try:
+            tags = self._event_accumulator(job).Tags()
+            if not isinstance(tags, dict):
+                raise ObservabilitySourceError("tensorboard", "event tags are invalid")
+            tensorboard_availability = (True, None)
+        except ObservabilitySourceError as exc:
+            tags = {}
+            tensorboard_availability = (False, exc.message)
+        except Exception as exc:
+            tags = {}
+            tensorboard_availability = (False, str(exc))
+        for tag in tags.get("scalars", []):
+            scalar_keys.add(_normalize_metric_name(str(tag)))
+        for tag in tags.get("histograms", []):
+            tag_name = str(tag)
+            if tag_name.startswith("weights/"):
+                available_histograms["weight"].append(tag_name)
+            elif tag_name.startswith("gradients/"):
+                available_histograms["gradient"].append(tag_name)
+
+        snapshot_metrics = snapshot.get("latest_metrics")
+        if isinstance(snapshot_metrics, dict):
+            for name, value in snapshot_metrics.items():
+                if isinstance(value, int | float):
+                    latest_metrics[str(name)] = float(value)
+                    scalar_keys.add(_normalize_metric_name(str(name)))
         return {
             "job_id": str(job.id),
             "status": getattr(job, "status", None),
@@ -93,10 +154,20 @@ class TrainingObservabilityService:
                 "id": getattr(task, "id", None),
                 "status": getattr(task, "status", None),
             },
+            "progress": snapshot.get("progress") if isinstance(snapshot.get("progress"), dict) else {},
+            "timing": snapshot.get("timing") if isinstance(snapshot.get("timing"), dict) else {},
+            "environment": snapshot.get("environment") if isinstance(snapshot.get("environment"), dict) else {},
+            "latest_metrics": latest_metrics,
+            "available_scalar_keys": sorted(
+                key for key in scalar_keys if key and key not in _RESOURCE_SCALAR_KEYS
+            ),
+            "available_histograms": {
+                kind: sorted(set(values)) for kind, values in available_histograms.items()
+            },
             "availability": self._availability(
-                mlflow=self._mlflow_availability(job),
-                tensorboard=self._event_availability(run_path),
-                progress=self._progress_availability(run_path),
+                mlflow=mlflow_availability,
+                tensorboard=tensorboard_availability,
+                progress=progress_availability,
             ),
         }
 
@@ -110,8 +181,6 @@ class TrainingObservabilityService:
     ) -> dict[str, Any]:
         normalized_keys = list(dict.fromkeys(_normalize_metric_name(key) for key in keys))
         series = {key: [] for key in normalized_keys}
-        run_path = self._run_path(job)
-
         mlflow_available = True
         mlflow_reason: str | None = None
         try:
@@ -147,7 +216,7 @@ class TrainingObservabilityService:
             "availability": self._availability(
                 mlflow=(mlflow_available, mlflow_reason),
                 tensorboard=(tensorboard_available, tensorboard_reason),
-                progress=self._progress_availability(run_path),
+                progress=self._progress_availability(job),
             ),
         }
 
@@ -158,7 +227,6 @@ class TrainingObservabilityService:
         end_step: int | None,
         max_points: int | None,
     ) -> dict[str, Any]:
-        run_path = self._run_path(job)
         progress_available = True
         progress_reason: str | None = None
         series: dict[str, list[dict[str, float]]] = {}
@@ -193,13 +261,12 @@ class TrainingObservabilityService:
             "series": series,
             "availability": self._availability(
                 mlflow=self._mlflow_availability(job),
-                tensorboard=self._event_availability(run_path),
+                tensorboard=self._event_availability(job),
                 progress=(progress_available, progress_reason),
             ),
         }
 
     def get_graph(self, job: Any) -> dict[str, Any]:
-        run_path = self._run_path(job)
         tensorboard_available = True
         tensorboard_reason: str | None = None
         nodes: list[dict[str, Any]] = []
@@ -236,12 +303,11 @@ class TrainingObservabilityService:
             "availability": self._availability(
                 mlflow=self._mlflow_availability(job),
                 tensorboard=(tensorboard_available, tensorboard_reason),
-                progress=self._progress_availability(run_path),
+                progress=self._progress_availability(job),
             ),
         }
 
     def get_histogram(self, job: Any, kind: str, tag: str, step: int) -> dict[str, Any]:
-        run_path = self._run_path(job)
         buckets: list[dict[str, float]] = []
         tensorboard_available = True
         tensorboard_reason: str | None = None
@@ -270,7 +336,7 @@ class TrainingObservabilityService:
             "availability": self._availability(
                 mlflow=self._mlflow_availability(job),
                 tensorboard=(tensorboard_available, tensorboard_reason),
-                progress=self._progress_availability(run_path),
+                progress=self._progress_availability(job),
             ),
         }
 
@@ -331,20 +397,22 @@ class TrainingObservabilityService:
             raise ObservabilitySourceError("tensorboard", "event file not found")
         newest_mtime = max(path.stat().st_mtime_ns for path in event_files)
         key = (run_path, newest_mtime)
-        accumulator = self._event_accumulators.get(key)
-        if accumulator is None:
-            try:
-                accumulator = self._event_accumulator_factory(str(run_path))
-                accumulator.Reload()
-            except Exception as exc:
-                raise ObservabilitySourceError("tensorboard", str(exc)) from exc
-            self._event_accumulators[key] = accumulator
-            self._event_accumulators.move_to_end(key)
-            while len(self._event_accumulators) > _MAX_EVENT_ACCUMULATORS:
-                self._event_accumulators.popitem(last=False)
-        else:
-            self._event_accumulators.move_to_end(key)
-        return accumulator
+        with self._event_accumulator_lock:
+            accumulator = self._event_accumulators.get(key)
+            if accumulator is None:
+                try:
+                    accumulator = self._event_accumulator_factory(str(run_path))
+                    accumulator.Reload()
+                except Exception as exc:
+                    raise ObservabilitySourceError("tensorboard", str(exc)) from exc
+                self._event_accumulators[key] = accumulator
+                self._event_accumulators.move_to_end(key)
+                cache_size = max(0, int(getattr(self.settings, "observability_event_cache_size", 32)))
+                while len(self._event_accumulators) > cache_size:
+                    self._event_accumulators.popitem(last=False)
+            else:
+                self._event_accumulators.move_to_end(key)
+            return accumulator
 
     def _progress_snapshot(self, job: Any) -> dict[str, Any]:
         path = self._run_path(job) / "visiox-progress.json"
@@ -442,15 +510,19 @@ class TrainingObservabilityService:
             return encoded.decode("utf-8", errors="replace")
         return str(label)
 
-    def _event_availability(self, run_path: Path) -> tuple[bool, str | None]:
-        if any(run_path.glob("events.out.tfevents.*")):
-            return True, None
-        return False, "event file not found"
+    def _event_availability(self, job: Any) -> tuple[bool, str | None]:
+        try:
+            self._event_accumulator(job)
+        except ObservabilitySourceError as exc:
+            return False, exc.message
+        return True, None
 
-    def _progress_availability(self, run_path: Path) -> tuple[bool, str | None]:
-        if (run_path / "visiox-progress.json").is_file():
-            return True, None
-        return False, "progress snapshot not found"
+    def _progress_availability(self, job: Any) -> tuple[bool, str | None]:
+        try:
+            self._progress_snapshot(job)
+        except ObservabilitySourceError as exc:
+            return False, exc.message
+        return True, None
 
     @staticmethod
     def _availability(

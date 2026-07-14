@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -145,7 +146,18 @@ def run_training_job(
             project_dir=work_dir / "runs",
             run_name=f"job-{job.id}",
         )
-        result = runner.run(command.argv, work_dir, should_cancel=lambda: _task_is_canceled(session, task_id))
+        run_name = f"job-{job.id}"
+        job.metrics = {
+            **(job.metrics or {}),
+            "observability": {
+                "mlflow_run_name": run_name,
+                "tensorboard_run_name": run_name,
+            },
+        }
+        session.add(job)
+        session.commit()
+        instrumented_command = [sys.executable, "-m", "visiox_training_worker.train_entrypoint", *command.argv[2:]]
+        result = runner.run(instrumented_command, work_dir, should_cancel=lambda: _task_is_canceled(session, task_id))
         if _task_is_canceled(session, task_id):
             raise TrainingCanceledError("training canceled")
         if result.exit_code != 0:
@@ -156,7 +168,7 @@ def run_training_job(
         task.stage = "persist_artifacts"
         session.add(task)
         session.commit()
-        metrics = result.metrics or {}
+        metrics = {**(job.metrics or {}), **(result.metrics or {})}
         weight_paths = _training_weight_paths(result)
         weight_uris: dict[str, str] = {}
         trained_model: TrainedModel | None = None

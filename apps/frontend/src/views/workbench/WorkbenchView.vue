@@ -19,7 +19,7 @@
             </div>
           </div>
           <div class="pie-row">
-            <div class="pie-chart" aria-label="数据导入类型占比"></div>
+            <div class="pie-chart" :style="{ background: dataPieBackground }" aria-label="数据导入类型占比"></div>
             <ul class="pie-legend">
               <li v-for="metric in dataMetrics" :key="metric.label">
                 <i :style="{ background: metric.color }"></i>
@@ -41,15 +41,16 @@
         </div>
 
         <div class="dataset-list">
-          <article v-for="dataset in datasets" :key="dataset.name" class="dataset-card">
+          <article v-for="dataset in recentDatasets" :key="dataset.id" class="dataset-card">
             <h3>{{ dataset.name }}</h3>
             <div class="dataset-badges">
-              <span class="success">已完成</span>
-              <span class="imported">导入</span>
-              <span>图像分类</span>
+              <span :class="{ success: dataset.status === 'validated' }">{{ datasetStatusLabel(dataset.status) }}</span>
+              <span class="imported">{{ datasetSourceLabel(dataset.source) }}</span>
+              <span>{{ taskLabel(dataset.task) }}</span>
             </div>
-            <p>{{ dataset.createdAt }} <a href="#">Label Studio</a></p>
+            <p>{{ formatDate(dataset.created_at) }} <button type="button" class="dataset-link" @click="goDataPreparation">Label Studio</button></p>
           </article>
+          <p v-if="!loading && recentDatasets.length === 0" class="empty-state">暂无数据集</p>
         </div>
       </div>
     </section>
@@ -86,12 +87,13 @@
           <button type="button" class="quick-link" @click="goServices">快速访问›</button>
         </div>
         <div class="service-table">
-          <div v-for="service in services" :key="service.name" class="service-row">
+          <div v-for="service in recentServices" :key="service.id" class="service-row">
             <span>{{ service.name }}</span>
-            <time>{{ service.createdAt }}</time>
-            <span v-if="service.pipeline">{{ service.pipeline }}</span>
-            <strong :class="service.status">{{ service.statusText }}</strong>
+            <time>{{ formatDate(service.created_at) }}</time>
+            <span>{{ pipelineName(service.pipeline_id) }}</span>
+            <strong :class="service.status">{{ serviceStatusLabel(service.status) }}</strong>
           </div>
+          <p v-if="!loading && recentServices.length === 0" class="empty-state">暂无已部署服务</p>
         </div>
       </section>
     </div>
@@ -99,50 +101,161 @@
 </template>
 
 <script setup lang="ts">
+import { ElMessage } from "element-plus";
+import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 
+import {
+  api,
+  type DatasetRecord,
+  type DeploymentServiceRecord,
+  type TrainingPipelineRecord,
+} from "@/api/client";
+
 const router = useRouter();
+const loading = ref(true);
+const datasets = ref<DatasetRecord[]>([]);
+const pipelines = ref<TrainingPipelineRecord[]>([]);
+const services = ref<DeploymentServiceRecord[]>([]);
 
-const dataMetrics = [
-  { label: "已标注数据导入", value: 15, color: "#16a34a" },
-  { label: "未标注数据导入", value: 35, color: "#8b35eb" },
-  { label: "视频文件导入", value: 1, color: "#f59e0b" },
-];
+const taskNames: Record<string, string> = {
+  detect: "目标检测",
+  classify: "图像分类",
+  segment: "实例分割",
+  pose: "关键点检测",
+  obb: "旋转框检测",
+  semantic: "语义分割",
+  document: "文档信息抽取",
+  ocr: "OCR",
+  table: "表格识别",
+  llm: "大模型训练",
+};
 
-const dataTags = [
-  { name: "labelstudio导入", count: 23, percent: 23 },
-  { name: "关键点检测", count: 1, percent: 1 },
-  { name: "图像分类", count: 4, percent: 4 },
-  { name: "实例分割", count: 2, percent: 2 },
-  { name: "目标检测", count: 22, percent: 22 },
-];
+const dataMetrics = computed(() => {
+  const isVideo = (dataset: DatasetRecord) => (dataset.source || "").toLowerCase().includes("video");
+  const video = datasets.value.filter(isVideo).length;
+  const annotated = datasets.value.filter((dataset) => dataset.annotation_count > 0 && !isVideo(dataset)).length;
+  const unannotated = datasets.value.length - annotated - video;
+  return [
+    { label: "已标注数据导入", value: annotated, color: "#16a34a" },
+    { label: "未标注数据导入", value: Math.max(0, unannotated), color: "#8b35eb" },
+    { label: "视频文件导入", value: video, color: "#f59e0b" },
+  ];
+});
 
-const datasets = [
-  { name: "xiaoanEval1", createdAt: "2026-06-02 06:37:14" },
-  { name: "xiaoanEval", createdAt: "2026-06-02 06:04:59" },
-  { name: "XiaoanDoor", createdAt: "2026-06-01 02:05:46" },
-];
+const dataPieBackground = computed(() => {
+  const total = dataMetrics.value.reduce((sum, metric) => sum + metric.value, 0);
+  if (total === 0) return "#edf0f5";
+  let cursor = 0;
+  const segments = dataMetrics.value.map((metric) => {
+    const start = cursor;
+    cursor += (metric.value / total) * 100;
+    return `${metric.color} ${start}% ${cursor}%`;
+  });
+  return `conic-gradient(${segments.join(", ")})`;
+});
 
-const modelStatuses = [
-  { label: "运行中止", value: 30, color: "#dc2626" },
-  { label: "运行成功", value: 37, color: "#16a34a" },
-  { label: "配置中", value: 72, color: "#8b35eb" },
-];
+const dataTags = computed(() => {
+  const counts = new Map<string, number>();
+  datasets.value.forEach((dataset) => {
+    const label = taskLabel(dataset.task);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  });
+  const max = Math.max(1, ...counts.values());
+  return [...counts.entries()]
+    .map(([name, count]) => ({ name, count, percent: Math.round((count / max) * 100) }))
+    .sort((left, right) => right.count - left.count)
+    .slice(0, 5);
+});
 
-const pipelineStats = [
-  { name: "PaddleOCR-VL训练", percent: 2 },
-  { name: "偏好对齐", percent: 3 },
-  { name: "图像分类", percent: 7 },
-  { name: "大模型训练", percent: 10 },
-];
+const recentDatasets = computed(() =>
+  [...datasets.value]
+    .sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")))
+    .slice(0, 3),
+);
 
-const services = [
-  { name: "千问3", createdAt: "2026-05-27 17:14:59", pipeline: "", status: "deploying", statusText: "部署中" },
-  { name: "test_vllm_name1", createdAt: "2026-05-21 16:11:47", pipeline: "", status: "deploying", statusText: "部署中" },
-  { name: "测试", createdAt: "2026-05-19 13:59:48", pipeline: "", status: "deploying", statusText: "部署中" },
-  { name: "test_vllm_name", createdAt: "2026-05-19 13:17:00", pipeline: "", status: "deploying", statusText: "部署中" },
-  { name: "test_divise", createdAt: "2026-04-24 14:03:30", pipeline: "huajiao123", status: "stopped", statusText: "已终止" },
-];
+const modelStatuses = computed(() => {
+  const groups = [
+    { label: "运行中止", statuses: ["stopped", "failed", "aborted", "canceled"], color: "#dc2626" },
+    { label: "运行成功", statuses: ["success"], color: "#16a34a" },
+    { label: "训练中", statuses: ["running", "training"], color: "#0ea5e9" },
+    { label: "配置中", statuses: ["draft", "ready", "configuring"], color: "#8b35eb" },
+  ];
+  return groups.map((group) => ({
+    label: group.label,
+    color: group.color,
+    value: pipelines.value.filter((pipeline) => group.statuses.includes(pipeline.status)).length,
+  }));
+});
+
+const pipelineStats = computed(() => {
+  const counts = new Map<string, number>();
+  pipelines.value.forEach((pipeline) => {
+    const label = taskLabel(pipeline.task);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  });
+  const total = Math.max(1, pipelines.value.length);
+  return [...counts.entries()]
+    .map(([name, count]) => ({ name, percent: Math.round((count / total) * 100) }))
+    .sort((left, right) => right.percent - left.percent)
+    .slice(0, 4);
+});
+
+const recentServices = computed(() =>
+  [...services.value].sort((left, right) => right.created_at.localeCompare(left.created_at)).slice(0, 5),
+);
+
+onMounted(async () => {
+  loading.value = true;
+  try {
+    const [datasetResponse, pipelineResponse, serviceResponse] = await Promise.all([
+      api.listDatasets(),
+      api.listPipelines(),
+      api.listServices({ limit: 200, offset: 0 }),
+    ]);
+    datasets.value = datasetResponse.items;
+    pipelines.value = pipelineResponse.items;
+    services.value = serviceResponse.items;
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "工作台数据加载失败");
+  } finally {
+    loading.value = false;
+  }
+});
+
+function taskLabel(task: string) {
+  return taskNames[task] || task || "未知任务";
+}
+
+function datasetStatusLabel(status: string) {
+  if (status === "validated") return "已校验";
+  if (status === "processing") return "处理中";
+  return "待校验";
+}
+
+function datasetSourceLabel(source?: string) {
+  const value = (source || "").toLowerCase();
+  if (value.includes("label")) return "Label Studio";
+  if (value.includes("video")) return "视频导入";
+  return "导入";
+}
+
+function pipelineName(pipelineId: string) {
+  return pipelines.value.find((pipeline) => pipeline.id === pipelineId)?.name || pipelineId;
+}
+
+function serviceStatusLabel(status: string) {
+  if (status === "running") return "运行中";
+  if (status === "deploying") return "部署中";
+  if (status === "failed") return "部署失败";
+  return "已终止";
+}
+
+function formatDate(value?: string) {
+  if (!value) return "-";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
+}
 
 function goDataPreparation() {
   void router.push("/data-preparation");
@@ -357,9 +470,13 @@ function goServices() {
   font-size: 14px;
 }
 
-.dataset-card a {
+.dataset-link {
   margin-left: 8px;
+  border: 0;
+  background: transparent;
   color: #1763ff;
+  cursor: pointer;
+  padding: 0;
   text-decoration: none;
 }
 
@@ -439,6 +556,22 @@ function goServices() {
 .service-row strong.stopped {
   background: #dbeafe;
   color: #1763ff;
+}
+
+.service-row strong.running {
+  background: #dcfce7;
+  color: #16a34a;
+}
+
+.service-row strong.failed {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+.empty-state {
+  margin: 40px 0;
+  color: #98a2b3;
+  text-align: center;
 }
 
 @media (max-width: 1280px) {

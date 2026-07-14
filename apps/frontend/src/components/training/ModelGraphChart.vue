@@ -16,6 +16,7 @@ use([CanvasRenderer, GraphChart, TooltipComponent, LegendComponent, ToolboxCompo
 
 const chartElement = ref<HTMLElement | null>(null);
 const chartHeight = computed(() => (typeof props.height === "number" ? `${props.height}px` : (props.height ?? "420px")));
+const showNodeLabels = computed(() => props.nodes.length <= 150);
 let chart: ReturnType<typeof init> | null = null;
 
 function graphData() {
@@ -40,7 +41,7 @@ function initialOption() {
         layout: "force",
         roam: true,
         force: { repulsion: 180, edgeLength: 90 },
-        label: { show: true, position: "right" },
+        label: { show: showNodeLabels.value, position: "right" },
         data: graphData(),
         links: props.edges
       }
@@ -50,7 +51,7 @@ function initialOption() {
 
 function updateChart() {
   chart?.setOption({
-    series: [{ type: "graph", data: graphData(), links: props.edges }]
+    series: [{ type: "graph", label: { show: showNodeLabels.value }, data: graphData(), links: props.edges }]
   });
 }
 

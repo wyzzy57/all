@@ -154,6 +154,7 @@ describe("training chart components", () => {
             type: "graph",
             roam: true,
             layout: "force",
+            label: { show: true, position: "right" },
             data: expect.arrayContaining([expect.objectContaining({ id: "input", name: "Input", op: "Input" })]),
             links: edges
           })
@@ -171,6 +172,24 @@ describe("training chart components", () => {
     expect(graphUpdateSeries).not.toHaveProperty("layout");
     expect(graphUpdateSeries).not.toHaveProperty("roam");
     expect(graphUpdateSeries).not.toHaveProperty("force");
+  });
+
+  it("hides labels for very large graphs to keep the initial view readable", () => {
+    const nodes = Array.from({ length: 151 }, (_, index) => ({
+      id: `node-${index}`,
+      label: `Node ${index}`,
+      op: "Conv",
+      attributes: {}
+    }));
+    const wrapper = mount(ModelGraphChart, { props: { nodes, edges: [] } });
+
+    expect(echartsMocks.setOption).toHaveBeenCalledWith(
+      expect.objectContaining({
+        series: [expect.objectContaining({ label: { show: false, position: "right" } })]
+      }),
+      true
+    );
+    wrapper.unmount();
   });
 });
 

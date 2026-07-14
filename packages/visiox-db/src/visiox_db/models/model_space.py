@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint, text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from visiox_db.base import Base, IdMixin, TimestampMixin
@@ -97,3 +97,21 @@ class TrainedModel(IdMixin, TimestampMixin, Base):
     artifact_uri: Mapped[str] = mapped_column(Text, nullable=False)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="created", index=True)
+
+
+class DeploymentService(IdMixin, TimestampMixin, Base):
+    __tablename__ = "deployment_services"
+
+    name: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    pipeline_id: Mapped[str] = mapped_column(ForeignKey("training_pipelines.id"), nullable=False, index=True)
+    trained_model_id: Mapped[str | None] = mapped_column(ForeignKey("trained_models.id"))
+    model_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    model_weight: Mapped[str] = mapped_column(String(160), nullable=False)
+    environment: Mapped[str] = mapped_column(String(120), nullable=False)
+    instance_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    instance_name: Mapped[str] = mapped_column(String(160), nullable=False, default="default")
+    resource_summary: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="running", index=True)
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False)
+    calls: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

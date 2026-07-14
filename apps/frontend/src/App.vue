@@ -36,7 +36,8 @@ import {
   DataAnalysis,
   Files,
   PieChart,
-  Tickets
+  Tickets,
+  TrendCharts
 } from "@element-plus/icons-vue";
 import { computed } from "vue";
 import { useRoute } from "vue-router";
@@ -47,6 +48,7 @@ const navItems = [
   { path: "/model-space", label: "模型空间", icon: Box },
   { path: "/data-preparation", label: "数据准备", icon: Files },
   { path: "/services", label: "服务列表", icon: Tickets },
+  { path: "/training-visualization", label: "可视化训练", icon: TrendCharts },
   { path: "/tasks", label: "任务中心", icon: DataAnalysis }
 ];
 

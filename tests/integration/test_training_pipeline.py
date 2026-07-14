@@ -277,6 +277,32 @@ def test_create_pipeline_validates_base_model_dataset_and_lists_filters(client: 
     assert detail.json()["id"] == body["id"]
 
 
+def test_create_pipeline_without_training_resources_persists_draft(client: TestClient):
+    response = client.post(
+        "/pipelines",
+        json={"name": "draft-pipeline", "task": "detect", "scale": "n"},
+    )
+    partial = client.post(
+        "/pipelines",
+        json={"name": "invalid-draft", "task": "detect", "scale": "n", "base_model_id": "base-only"},
+    )
+    duplicate = client.post(
+        "/pipelines",
+        json={"name": "draft-pipeline", "task": "detect", "scale": "n"},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "draft"
+    assert body["base_model_id"] is None
+    assert body["dataset_id"] is None
+    listed = client.get("/pipelines?status=draft")
+    assert any(item["id"] == body["id"] for item in listed.json()["items"])
+    assert partial.status_code == 422
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "产线名称已存在，请使用其他名称"
+
+
 def test_update_and_delete_pipeline_visibility_settings(client: TestClient, session_factory):
     base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
     created = create_pipeline(client, base_model_id, dataset_id)
@@ -596,8 +622,7 @@ def test_worker_runs_training_exports_dataset_and_registers_model(session_factor
     assert result.training_job_id == job_id
     assert result.trained_model_id
     assert len(runner.commands) == 1
-    assert runner.commands[0][0] == "yolo"
-    assert "train" in runner.commands[0]
+    assert runner.commands[0][1:3] == ["-m", "visiox_training_worker.train_entrypoint"]
     assert "optimizer=MuSGD" in runner.commands[0]
     assert "cos_lr=True" in runner.commands[0]
     assert "classes=[0,1]" in runner.commands[0]
@@ -620,6 +645,7 @@ def test_worker_runs_training_exports_dataset_and_registers_model(session_factor
     assert trained_model.name == "best.pt"
     assert job.metrics["mAP50"] == 0.91
     assert job.metrics["precision"] == 0.88
+    assert job.metrics["observability"]["mlflow_run_name"] == f"job-{job_id}"
     assert set(job.metrics["weights"]) == {"best.pt", "last.pt"}
     assert job.log_uri.startswith("memory://training/")
     assert task.status == TaskStatus.SUCCESS.value

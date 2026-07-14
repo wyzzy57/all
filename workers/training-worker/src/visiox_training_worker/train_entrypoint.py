@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
@@ -18,6 +19,9 @@ _GRADIENT_SAMPLE_EPOCH_ATTRIBUTE = "_visiox_gradient_sample_epoch"
 _GRADIENT_SAMPLES_ATTRIBUTE = "_visiox_gradient_samples"
 _RESOURCE_SAMPLES_ATTRIBUTE = "_visiox_resource_samples"
 _ZERO_GRAD_WRAPPED_ATTRIBUTE = "_visiox_zero_grad_wrapped"
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_overrides(arguments: list[str]) -> dict[str, Any]:
@@ -105,8 +109,12 @@ def write_progress_snapshot(trainer: Any) -> Path:
     return path
 
 
-def write_final_progress_snapshot(trainer: Any) -> Path:
-    return write_progress_snapshot(trainer)
+def write_final_progress_snapshot(trainer: Any) -> Path | None:
+    try:
+        return write_progress_snapshot(trainer)
+    except Exception:
+        logger.exception("Training observability final snapshot failed")
+        return None
 
 
 def _write_weight_histograms(trainer: Any, writer: Any, epoch: int) -> None:
@@ -117,13 +125,16 @@ def _write_weight_histograms(trainer: Any, writer: Any, epoch: int) -> None:
 
 
 def log_weight_histograms(trainer: Any) -> None:
-    writer = _tensorboard_writer()
-    if writer is None:
-        return
-    epoch = _epoch_number(trainer)
-    if not should_capture_epoch(epoch, int(trainer.epochs), _capture_interval()):
-        return
-    _write_weight_histograms(trainer, writer, epoch)
+    try:
+        writer = _tensorboard_writer()
+        if writer is None:
+            return
+        epoch = _epoch_number(trainer)
+        if not should_capture_epoch(epoch, int(trainer.epochs), _capture_interval()):
+            return
+        _write_weight_histograms(trainer, writer, epoch)
+    except Exception:
+        logger.exception("Training observability weight histogram capture failed")
 
 
 def _images_per_second(trainer: Any) -> float | None:
@@ -197,7 +208,10 @@ def install_pre_zero_gradient_capture(trainer: Any) -> None:
     original_zero_grad = optimizer.zero_grad
 
     def zero_grad_with_capture(*args: Any, **kwargs: Any) -> Any:
-        capture_gradient_sample(trainer)
+        try:
+            capture_gradient_sample(trainer)
+        except Exception:
+            logger.exception("Training observability pre-zero gradient capture failed")
         return original_zero_grad(*args, **kwargs)
 
     optimizer.zero_grad = zero_grad_with_capture
@@ -222,6 +236,13 @@ def _is_last_training_batch(trainer: Any) -> bool:
 
 
 def capture_gradient_sample(trainer: Any) -> None:
+    try:
+        _capture_gradient_sample(trainer)
+    except Exception:
+        logger.exception("Training observability gradient capture failed")
+
+
+def _capture_gradient_sample(trainer: Any) -> None:
     epoch_index = getattr(trainer, "epoch", None)
     total_epochs = getattr(trainer, "epochs", None)
     if not isinstance(epoch_index, int) or not isinstance(total_epochs, int):
@@ -245,29 +266,59 @@ def capture_gradient_sample(trainer: Any) -> None:
 
 
 def log_epoch_observability(trainer: Any) -> None:
-    epoch = _epoch_number(trainer)
-    resource_metrics = _collect_resource_metrics(trainer)
-    resource_sample = {"step": epoch, "timestamp": time.time(), **resource_metrics}
-    resource_samples = getattr(trainer, _RESOURCE_SAMPLES_ATTRIBUTE, None)
-    if resource_samples is None:
-        resource_samples = []
-        setattr(trainer, _RESOURCE_SAMPLES_ATTRIBUTE, resource_samples)
-    resource_samples.append(resource_sample)
+    try:
+        epoch = _epoch_number(trainer)
+    except Exception:
+        logger.exception("Training observability epoch lookup failed")
+        epoch = None
 
-    writer = _tensorboard_writer()
+    resource_metrics: dict[str, float] = {}
+    if epoch is not None:
+        try:
+            resource_metrics = _collect_resource_metrics(trainer)
+        except Exception:
+            logger.exception("Training observability resource collection failed")
+        try:
+            resource_sample = {"step": epoch, "timestamp": time.time(), **resource_metrics}
+            resource_samples = getattr(trainer, _RESOURCE_SAMPLES_ATTRIBUTE, None)
+            if resource_samples is None:
+                resource_samples = []
+                setattr(trainer, _RESOURCE_SAMPLES_ATTRIBUTE, resource_samples)
+            resource_samples.append(resource_sample)
+        except Exception:
+            logger.exception("Training observability resource sample retention failed")
+
+    try:
+        writer = _tensorboard_writer()
+    except Exception:
+        logger.exception("Training observability TensorBoard writer lookup failed")
+        writer = None
     gradient_samples = getattr(trainer, _GRADIENT_SAMPLES_ATTRIBUTE, {})
     try:
-        if writer is not None:
+        if writer is not None and epoch is not None:
             for tag, value in resource_metrics.items():
-                writer.add_scalar(tag, value, epoch)
-            if should_capture_epoch(epoch, int(trainer.epochs), _capture_interval()):
-                _write_weight_histograms(trainer, writer, epoch)
-            for name, values in gradient_samples.items():
-                writer.add_histogram(f"gradients/{name}", _sample_tensor(values), epoch)
+                try:
+                    writer.add_scalar(tag, value, epoch)
+                except Exception:
+                    logger.exception("Training observability scalar write failed for %s", tag)
+            try:
+                if should_capture_epoch(epoch, int(trainer.epochs), _capture_interval()):
+                    _write_weight_histograms(trainer, writer, epoch)
+            except Exception:
+                logger.exception("Training observability weight histogram write failed")
+            if isinstance(gradient_samples, dict):
+                for name, values in gradient_samples.items():
+                    try:
+                        writer.add_histogram(f"gradients/{name}", _sample_tensor(values), epoch)
+                    except Exception:
+                        logger.exception("Training observability gradient histogram write failed for %s", name)
     finally:
         setattr(trainer, _GRADIENT_SAMPLES_ATTRIBUTE, {})
         setattr(trainer, _GRADIENT_SAMPLE_EPOCH_ATTRIBUTE, None)
-        write_progress_snapshot(trainer)
+        try:
+            write_progress_snapshot(trainer)
+        except Exception:
+            logger.exception("Training observability progress snapshot failed")
 
 
 def main() -> None:

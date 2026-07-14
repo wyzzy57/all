@@ -4,12 +4,11 @@ from collections.abc import Generator
 from datetime import datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from visiox_api.services.training_observability import TrainingObservabilityService
-from visiox_common.settings import get_settings
 from visiox_db.models import Task, TrainingJob, TrainingPipeline
 from visiox_db.session import get_session
 
@@ -93,8 +92,8 @@ def get_training_observability_session() -> Generator[Session]:
     yield from get_session()
 
 
-def get_training_observability_service() -> TrainingObservabilityService:
-    return TrainingObservabilityService(get_settings())
+def get_training_observability_service(request: Request) -> TrainingObservabilityService:
+    return request.app.state.training_observability_service
 
 
 def _get_training_job(session: Session, training_job_id: str) -> TrainingJob:
@@ -149,15 +148,19 @@ def get_training_observability_summary(
     task = session.get(Task, job.task_id) if job.task_id else None
     summary = service.get_summary(job, pipeline, task)
     pipeline_data = summary.get("pipeline") if isinstance(summary.get("pipeline"), dict) else {}
+    summary_timing = summary.get("timing") if isinstance(summary.get("timing"), dict) else {}
+    timing = {**_default_timing(job), **summary_timing}
+    summary_environment = summary.get("environment") if isinstance(summary.get("environment"), dict) else {}
+    summary_metrics = summary.get("latest_metrics") if isinstance(summary.get("latest_metrics"), dict) else {}
     return SummaryResponse(
         job_id=str(summary.get("job_id", job.id)),
         pipeline_id=str(pipeline_data.get("id", job.pipeline_id)),
         pipeline_name=str(pipeline_data.get("name", getattr(pipeline, "name", job.pipeline_id))),
         status=str(summary.get("status", job.status)),
         progress=summary.get("progress") if isinstance(summary.get("progress"), dict) else {},
-        timing=summary.get("timing") if isinstance(summary.get("timing"), dict) else _default_timing(job),
-        environment=summary.get("environment") if isinstance(summary.get("environment"), dict) else _job_environment(task),
-        latest_metrics=summary.get("latest_metrics") if isinstance(summary.get("latest_metrics"), dict) else _latest_metrics(job),
+        timing=timing,
+        environment=summary_environment or _job_environment(task),
+        latest_metrics=summary_metrics or _latest_metrics(job),
         available_scalar_keys=summary.get("available_scalar_keys")
         if isinstance(summary.get("available_scalar_keys"), list)
         else [],

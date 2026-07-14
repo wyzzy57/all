@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from datetime import UTC, datetime
+import json
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,6 +21,7 @@ from visiox_api.routes.training_observability import (
     get_training_observability_session,
 )
 from visiox_common.settings import Settings
+from visiox_api.services.training_observability import TrainingObservabilityService
 from visiox_db.models import Task, TrainingJob, TrainingPipeline
 
 
@@ -81,6 +85,47 @@ class FakeObservabilityService:
         return {"kind": kind, "tag": tag, "step": step, "buckets": [], "availability": self.availability}
 
 
+class RouteMlflowClient:
+    def search_experiments(self) -> list[object]:
+        return [SimpleNamespace(experiment_id="1", lifecycle_stage="active")]
+
+    def search_runs(self, *, experiment_ids: list[str], filter_string: str) -> list[object]:
+        assert experiment_ids == ["1"]
+        assert "job-observability" in filter_string
+        return [
+            SimpleNamespace(
+                info=SimpleNamespace(run_id="run-1"),
+                data=SimpleNamespace(metrics={"train/box_loss": 0.8}),
+            )
+        ]
+
+    def get_metric_history(self, run_id: str, key: str) -> list[object]:
+        assert run_id == "run-1"
+        return [SimpleNamespace(step=2, value=0.8, timestamp=2_000)] if key == "train/box_loss" else []
+
+
+class RouteEventAccumulator:
+    def __init__(self) -> None:
+        self.reload_count = 0
+
+    def Reload(self) -> RouteEventAccumulator:
+        self.reload_count += 1
+        return self
+
+    def Tags(self) -> dict[str, list[str]]:
+        return {
+            "scalars": ["val/box_loss", "system.cpu_percent", "train/images_per_second"],
+            "histograms": ["weights/model.0.conv.weight"],
+        }
+
+    def Scalars(self, tag: str) -> list[object]:
+        assert tag == "val/box_loss"
+        return [SimpleNamespace(step=2, value=0.7, wall_time=2.0)]
+
+    def Graph(self) -> object:
+        return SimpleNamespace(node=[])
+
+
 @pytest.fixture()
 def session_factory(tmp_path):
     database_url = f"sqlite:///{tmp_path / 'visiox-observability.db'}"
@@ -131,6 +176,64 @@ def client(session_factory, monkeypatch: pytest.MonkeyPatch) -> Generator[TestCl
         yield test_client
 
 
+@pytest.fixture()
+def real_service_client(
+    session_factory,
+    seeded_training_job: TrainingJob,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[tuple[TestClient, TrainingObservabilityService, list[RouteEventAccumulator]]]:
+    settings = Settings(
+        _env_file=None,
+        seed_base_models_on_startup=False,
+        training_runs_root=tmp_path,
+        mlflow_tracking_uri=(tmp_path / "mlruns").as_uri(),
+        observability_event_cache_size=2,
+    )
+    (tmp_path / "mlruns").mkdir()
+    run_path = tmp_path / "runs" / f"job-{seeded_training_job.id}"
+    run_path.mkdir(parents=True)
+    (run_path / "events.out.tfevents.1").touch()
+    (run_path / "visiox-progress.json").write_text(
+        json.dumps(
+            {
+                "progress": {"current_epoch": 2, "total_epochs": 10, "percent": 20.0},
+                "timing": {"elapsed_seconds": 12.5, "eta_seconds": 50.0},
+                "environment": {"device": "cpu"},
+                "latest_metrics": {"metrics/mAP50(B)": 0.55},
+                "resources": [
+                    {"step": 2, "timestamp": 2.0, "system.cpu_percent": 35.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    accumulators: list[RouteEventAccumulator] = []
+
+    def create_accumulator(_: str) -> RouteEventAccumulator:
+        accumulator = RouteEventAccumulator()
+        accumulators.append(accumulator)
+        return accumulator
+
+    service = TrainingObservabilityService(
+        settings,
+        mlflow_client_factory=lambda _: RouteMlflowClient(),
+        event_accumulator_factory=create_accumulator,
+    )
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    app = create_app()
+
+    def override_session() -> Generator[Session]:
+        with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_training_observability_session] = override_session
+    app.state.training_observability_service = service
+    with TestClient(app) as test_client:
+        test_client.app.state.training_observability_service = service
+        yield test_client, service, accumulators
+
+
 def test_observability_summary_returns_pipeline_job_and_availability(client, seeded_training_job) -> None:
     response = client.get(f"/training-jobs/{seeded_training_job.id}/observability/summary")
 
@@ -153,6 +256,83 @@ def test_observability_summary_returns_pipeline_job_and_availability(client, see
             "artifacts": {"available": True, "reason": None},
         },
     }
+
+
+def test_real_service_summary_flows_through_route_and_reuses_event_cache_across_requests(
+    real_service_client,
+    seeded_training_job: TrainingJob,
+) -> None:
+    client, _, accumulators = real_service_client
+
+    summary_response = client.get(f"/training-jobs/{seeded_training_job.id}/observability/summary")
+    graph_response = client.get(f"/training-jobs/{seeded_training_job.id}/observability/graph")
+    resources_response = client.get(f"/training-jobs/{seeded_training_job.id}/observability/resources?max_points=10")
+    scalar_response = client.get(
+        f"/training-jobs/{seeded_training_job.id}/observability/scalars?keys=train.box_loss,val.box_loss&max_points=10"
+    )
+
+    assert summary_response.status_code == 200
+    assert summary_response.json()["progress"] == {"current_epoch": 2, "total_epochs": 10, "percent": 20.0}
+    timing = summary_response.json()["timing"]
+    assert timing["started_at"].startswith("2026-07-13T00:00:00")
+    assert timing["elapsed_seconds"] == 12.5
+    assert timing["eta_seconds"] == 50.0
+    assert summary_response.json()["latest_metrics"] == {
+        "train/box_loss": 0.8,
+        "metrics/mAP50(B)": 0.55,
+    }
+    assert summary_response.json()["available_scalar_keys"] == ["metrics.map50", "train.box_loss", "val.box_loss"]
+    assert summary_response.json()["available_histograms"] == {
+        "weight": ["weights/model.0.conv.weight"],
+        "gradient": [],
+    }
+    assert graph_response.status_code == 200
+    assert resources_response.status_code == 200
+    assert resources_response.json()["series"]["system.cpu_percent"] == [
+        {"step": 2.0, "value": 35.0, "timestamp": 2.0},
+    ]
+    assert scalar_response.status_code == 200
+    assert len(accumulators) == 1
+    assert accumulators[0].reload_count == 1
+
+
+def test_application_service_cache_evicts_across_requests_at_configured_size(
+    real_service_client,
+    seeded_training_job: TrainingJob,
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    client, service, accumulators = real_service_client
+    service.settings.observability_event_cache_size = 1
+    second_job_id = "job-observability-2"
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            id="pipeline-observability-2",
+            name="native-observability-2",
+            task="detect",
+            scale="n",
+            status="running",
+        )
+        job = TrainingJob(
+            id=second_job_id,
+            pipeline_id=pipeline.id,
+            status="running",
+            params={},
+            metrics={"observability": {"mlflow_run_name": "job-observability"}},
+        )
+        session.add_all([pipeline, job])
+        session.commit()
+    second_run_path = tmp_path / "runs" / f"job-{second_job_id}"
+    second_run_path.mkdir(parents=True)
+    (second_run_path / "events.out.tfevents.1").touch()
+    (second_run_path / "visiox-progress.json").write_text(json.dumps({"resources": []}), encoding="utf-8")
+
+    assert client.get(f"/training-jobs/{seeded_training_job.id}/observability/summary").status_code == 200
+    assert client.get(f"/training-jobs/{second_job_id}/observability/summary").status_code == 200
+    assert client.get(f"/training-jobs/{seeded_training_job.id}/observability/summary").status_code == 200
+
+    assert len(accumulators) == 3
+    assert len(service._event_accumulators) == 1
 
 
 def test_observability_scalars_validates_max_points(client, seeded_training_job) -> None:

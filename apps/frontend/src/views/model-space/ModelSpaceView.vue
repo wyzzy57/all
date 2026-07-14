@@ -162,6 +162,7 @@
         <nav class="detail-tabs">
           <button :class="{ active: detailTab === 'basic' }" type="button" @click="detailTab = 'basic'">基础信息</button>
           <button :class="{ active: detailTab === 'logs' }" type="button" @click="openDetailTab('logs')">日志详情</button>
+          <button type="button" @click="openTrainingVisualization">可视化训练</button>
           <button :class="{ active: detailTab === 'experience' }" type="button" @click="detailTab = 'experience'">在线体验</button>
           <button :class="{ active: detailTab === 'deploy' }" type="button" @click="detailTab = 'deploy'">部署</button>
           <button
@@ -190,9 +191,9 @@
               </table>
             </div>
             <p><span>数据集：</span><strong>{{ detailDatasetName }}</strong></p>
-            <p>
+            <p class="output-path-line">
               <span>输出路径：</span>
-              <button class="table-link" type="button" data-testid="open-result-files" @click="openResultFiles">
+              <button class="table-link result-files-trigger" type="button" data-testid="open-result-files" @click="openResultFiles">
                 结果文件
               </button>
             </p>
@@ -221,31 +222,76 @@
 
         <section v-else-if="detailTab === 'deploy'" class="detail-panel deploy-detail-panel">
           <div class="detail-subtabs">
-            <button :class="{ active: deployMode === 'online' }" type="button" @click="deployMode = 'online'">在线服务化部署</button>
-            <button :class="{ active: deployMode === 'offline' }" type="button" @click="deployMode = 'offline'">离线部署</button>
+            <button :class="{ active: deployMode === 'online' }" type="button" @click="setDeployMode('online')">在线服务化部署</button>
+            <button :class="{ active: deployMode === 'offline' }" type="button" @click="setDeployMode('offline')">离线部署</button>
           </div>
-          <label class="deploy-field required"><span>服务名称：</span><el-input v-model="deployForm.serviceName" placeholder="请输入" /></label>
+
+          <label v-if="deployMode === 'online'" class="deploy-field">
+            <span class="required-label">服务名称：</span>
+            <el-input v-model="deployForm.serviceName" placeholder="请输入" />
+          </label>
+
           <section class="deploy-section">
             <h3>请选择模型方案</h3>
             <p>请选择各模块对应的模型方案，默认选择官方提供的模型权重，支持用户修改为在产线评估环节标记的模型权重</p>
-            <div class="model-radio-row">
-              <span>* {{ taskLabel(detailPipeline.task) }}模块：</span>
-              <el-radio-group v-model="deployForm.model">
-                <el-radio v-for="model in deployModelOptions" :key="model" :label="model">{{ model }}</el-radio>
-              </el-radio-group>
+
+            <template v-if="deployMode === 'online'">
+              <div class="model-radio-row required-row">
+                <span>{{ taskLabel(detailPipeline.task) }}模块：</span>
+                <el-radio-group v-model="deployForm.model">
+                  <el-radio v-for="model in deployModelOptions" :key="model" :label="model">{{ model }}</el-radio>
+                </el-radio-group>
+              </div>
+              <el-select v-model="deployForm.weight" class="detail-select" placeholder="请选择模型权重">
+                <el-option
+                  v-for="option in deployWeightOptions"
+                  :key="option.value"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
+            </template>
+
+            <div v-else class="offline-model-row required-row">
+              <span>{{ taskLabel(detailPipeline.task) }}：</span>
+              <el-select v-model="deployForm.weight" placeholder="请选择模型权重" data-testid="offline-weight-select">
+                <el-option
+                  v-for="option in detailWeightOptions"
+                  :key="option.value"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
             </div>
-            <el-select v-model="deployForm.weight" class="detail-select">
-              <el-option
-                v-for="option in deployWeightOptions"
-                :key="option.value"
-                :label="option.label"
-                :value="option.value"
-              />
-            </el-select>
           </section>
-          <label class="deploy-field required"><span>选择环境：</span><el-input v-model="deployForm.environment" placeholder="请选择环境" /></label>
-          <p class="env-note"><strong>环境分配</strong><span>请先选择环境</span></p>
-          <el-button type="primary" disabled>开始部署</el-button>
+
+          <template v-if="deployMode === 'online'">
+            <label class="deploy-field">
+              <span class="required-label">选择环境：</span>
+              <el-select v-model="deployForm.environment" placeholder="请选择环境">
+                <el-option
+                  v-for="environment in deploymentEnvironmentOptions"
+                  :key="environment.value"
+                  :label="environment.label"
+                  :value="environment.value"
+                />
+              </el-select>
+            </label>
+            <div class="env-note">
+              <strong>环境分配：</strong>
+              <span>{{ selectedDeploymentEnvironment?.resource || "请先选择环境" }}</span>
+              <template v-if="selectedDeploymentEnvironment">
+                <el-input v-model="deployForm.instanceName" class="instance-name-input" placeholder="请输入实例名称" maxlength="160" />
+                <span>实例名称</span>
+              </template>
+            </div>
+            <el-button class="deploy-action" type="primary" :disabled="!canDeploy" :loading="deploying" @click="startDeployment">
+              开始部署
+            </el-button>
+          </template>
+          <el-button v-else class="deploy-action offline-export-button" type="primary" :disabled="!deployForm.weight" @click="exportOfflineModel">
+            导出模型文件
+          </el-button>
         </section>
 
         <section v-else class="detail-panel evaluate-detail-panel">
@@ -745,7 +791,7 @@
       </div>
 
       <template #footer>
-        <el-button type="primary" data-testid="confirm-create-pipeline" @click="startWizard">
+        <el-button type="primary" :loading="submitting" data-testid="confirm-create-pipeline" @click="startWizard">
           {{ createTab === "zero" ? "创建产线" : "确认创建" }}
         </el-button>
       </template>
@@ -802,6 +848,7 @@ import {
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { useRouter } from "vue-router";
 
 import {
   api,
@@ -875,6 +922,8 @@ type TrainForm = {
   eval_interval: number;
   device: string;
 };
+
+const router = useRouter();
 
 const tabOptions: Array<{ label: string; value: ActiveTab }> = [
   { label: "全部产线", value: "all" },
@@ -1025,6 +1074,7 @@ const publicDialogVisible = ref(false);
 const resultFilesDialogVisible = ref(false);
 const resultFilesLoading = ref(false);
 const resultFiles = ref<TrainingArtifactRecord[]>([]);
+const deploying = ref(false);
 const splitEnabled = ref(true);
 const configMode = ref(false);
 const configText = ref("");
@@ -1070,6 +1120,7 @@ const deployForm = reactive({
   model: "",
   weight: "official",
   environment: "",
+  instanceName: "",
 });
 
 const evaluationForm = reactive({
@@ -1227,6 +1278,23 @@ const detailInferenceModelOptions = computed<WeightOption[]>(() => {
   return [...trainedWeightOptions.value, { label: "官方/基础权重", value: "base" }];
 });
 const inferenceEnvironmentOptions = ["cpu", "0", "gpu-node-1", "gpu-node-2"];
+const deploymentEnvironmentOptions = [
+  { value: "cpu", label: "CPU", resource: "CPU 共享资源" },
+  { value: "gpu-node-1", label: "gpu节点_1", resource: "gpu节点_1 显卡1（3698.5M/12288.0M）" },
+  { value: "gpu-node-2", label: "gpu节点_2", resource: "gpu节点_2 显卡0（8192.0M/24576.0M）" },
+];
+const selectedDeploymentEnvironment = computed(() =>
+  deploymentEnvironmentOptions.find((environment) => environment.value === deployForm.environment),
+);
+const canDeploy = computed(() =>
+  Boolean(
+    deployForm.serviceName.trim() &&
+      deployForm.model &&
+      deployForm.weight &&
+      deployForm.environment &&
+      deployForm.instanceName.trim(),
+  ),
+);
 const detailWeightOptions = computed(() => {
   const options = detailInferenceModelOptions.value.filter((option) => option.value !== "base");
   return options.length > 0 ? options : [{ label: "best.pt", value: "best.pt" }];
@@ -1407,17 +1475,32 @@ async function loadWorkspace(options: { silent?: boolean } = {}) {
 }
 
 function openCreateDialog() {
+  createForm.name = nextPipelineName();
   createDialogVisible.value = true;
   createTab.value = "zero";
+}
+
+function nextPipelineName() {
+  const base = "新建产线";
+  const names = new Set(pipelines.value.map((pipeline) => pipeline.name.trim()));
+  if (!names.has(base)) return base;
+  let suffix = 2;
+  while (names.has(`${base}${suffix}`)) suffix += 1;
+  return `${base}${suffix}`;
 }
 
 function selectScenario(key: string) {
   createForm.scenarioKey = key;
 }
 
-function startWizard() {
+async function startWizard() {
   const scenario = selectedScenario.value;
-  form.name = createForm.name.trim() || "新建产线";
+  const name = createForm.name.trim();
+  if (!name) {
+    ElMessage.warning("请输入产线名称");
+    return;
+  }
+  form.name = name;
   form.task = scenario.task;
   form.scale = "n";
   form.base_model_id = "";
@@ -1426,12 +1509,25 @@ function startWizard() {
   samplesBySplit.value = { train: [], val: [], test: [] };
   activeSampleId.value = "";
   processingTab.value = "train";
-  wizardPipelineId.value = "";
   configParams.value = {};
   ensureWizardDefaults();
-  activeStep.value = 0;
-  createDialogVisible.value = false;
-  viewMode.value = "wizard";
+  submitting.value = true;
+  try {
+    const pipeline = await api.createPipeline({
+      name: form.name,
+      task: form.task,
+      scale: form.scale,
+    });
+    wizardPipelineId.value = pipeline.id;
+    pipelines.value = [pipeline, ...pipelines.value.filter((item) => item.id !== pipeline.id)];
+    activeStep.value = 0;
+    createDialogVisible.value = false;
+    viewMode.value = "wizard";
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, "创建产线失败"));
+  } finally {
+    submitting.value = false;
+  }
 }
 
 async function openExistingPipelineWizard(pipeline: TrainingPipelineRecord) {
@@ -1470,6 +1566,7 @@ function openPipelineDetail(pipeline: TrainingPipelineRecord) {
   deployForm.model = detailModelName.value === "-" ? "" : detailModelName.value;
   deployForm.weight = "official";
   deployForm.environment = "";
+  deployForm.instanceName = "";
   evaluationForm.dataset = "val";
   evaluationForm.customDatasetId = "";
   evaluationForm.weight = "";
@@ -1486,6 +1583,64 @@ function openDetailTab(tab: DetailTab) {
   detailTab.value = tab;
   if (tab === "logs") void loadDetailLog();
   if (tab === "evaluate") void loadEvaluationHistory();
+}
+
+function openTrainingVisualization() {
+  const jobId = detailJob.value?.id;
+  void router.push({
+    path: "/training-visualization",
+    ...(jobId ? { query: { job: jobId } } : {}),
+  });
+}
+
+function setDeployMode(mode: "online" | "offline") {
+  deployMode.value = mode;
+  if (mode === "offline" && (deployForm.weight === "official" || !deployForm.weight)) {
+    deployForm.weight = detailWeightOptions.value[0]?.value ?? "";
+  }
+}
+
+function exportOfflineModel() {
+  const job = detailJob.value;
+  if (!job?.id || !deployForm.weight) {
+    ElMessage.warning("暂无可导出的模型权重");
+    return;
+  }
+  window.open(
+    api.trainingJobArtifactDownloadUrl(job.id, "weight", deployForm.weight),
+    "_blank",
+    "noopener,noreferrer",
+  );
+}
+
+async function startDeployment() {
+  const pipeline = detailPipeline.value;
+  const environment = selectedDeploymentEnvironment.value;
+  if (!pipeline || !environment || !canDeploy.value) {
+    ElMessage.warning("请完整填写部署配置");
+    return;
+  }
+  const selectedWeight = deployWeightOptions.value.find((option) => option.value === deployForm.weight);
+  deploying.value = true;
+  try {
+    await api.createService({
+      name: deployForm.serviceName.trim(),
+      pipeline_id: pipeline.id,
+      ...(selectedWeight?.modelId ? { trained_model_id: selectedWeight.modelId } : {}),
+      model_name: deployForm.model,
+      model_weight: deployForm.weight,
+      environment: deployForm.environment,
+      instance_name: deployForm.instanceName.trim(),
+      resource_summary: environment.resource,
+      config: { task: pipeline.task, pipeline_name: pipeline.name },
+    });
+    ElMessage.success("服务部署成功");
+    await router.push("/services");
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, "服务部署失败"));
+  } finally {
+    deploying.value = false;
+  }
 }
 
 function openEvaluationSubtab(tab: "pipeline" | "history") {
@@ -3257,6 +3412,12 @@ function getErrorMessage(error: unknown, fallback: string) {
   padding: 0;
 }
 
+.result-files-trigger {
+  justify-self: start;
+  width: auto;
+  text-align: left;
+}
+
 .param-table,
 .evaluation-table {
   border-collapse: collapse;
@@ -3342,13 +3503,30 @@ function getErrorMessage(error: unknown, fallback: string) {
   max-width: 100%;
 }
 
-.deploy-field,
+.deploy-field {
+  display: grid;
+  grid-template-columns: 204px minmax(0, 540px);
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0;
+}
+
 .evaluation-form label {
   display: grid;
   grid-template-columns: 120px minmax(0, 540px);
   align-items: center;
   gap: 10px;
   margin: 16px 0;
+}
+
+.deploy-field > span {
+  text-align: right;
+}
+
+.required-label::before,
+.required-row > span::before {
+  content: "* ";
+  color: #f04438;
 }
 
 .deploy-section {
@@ -3376,15 +3554,56 @@ function getErrorMessage(error: unknown, fallback: string) {
   margin: 24px 0 14px 90px;
 }
 
+.model-radio-row > span {
+  min-width: 114px;
+  text-align: right;
+}
+
 .detail-select {
   width: 540px;
   margin-left: 214px;
 }
 
+.offline-model-row {
+  display: grid;
+  grid-template-columns: 128px minmax(0, 560px);
+  align-items: center;
+  gap: 8px;
+  margin: 18px 0 0 48px;
+}
+
+.offline-model-row > span {
+  text-align: right;
+  white-space: nowrap;
+}
+
 .env-note {
   display: flex;
+  align-items: center;
   gap: 16px;
+  margin: 24px 0 42px;
   color: #98a2b3;
+}
+
+.env-note strong {
+  color: #344054;
+}
+
+.instance-name-input {
+  width: 190px;
+  margin-left: 18px;
+}
+
+.env-note :deep(.el-input__inner) {
+  text-align: left;
+}
+
+.deploy-action {
+  margin-left: 0;
+}
+
+.offline-export-button {
+  margin-top: 72px;
 }
 
 .env-note strong {

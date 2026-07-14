@@ -239,6 +239,59 @@ def test_pre_zero_bridge_skips_startup_clear_before_epoch_exists() -> None:
     assert not hasattr(trainer, "_visiox_gradient_samples")
 
 
+def test_pre_zero_bridge_always_calls_original_zero_grad_when_capture_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(train_entrypoint.logger, "disabled", False)
+    parameter = FakeParameter([1.0], grad=FakeTensor([1.0]))
+    model = FakeModel({"layer.weight": parameter})
+    optimizer = FakeOptimizer(model)
+    trainer = SimpleNamespace(model=model, optimizer=optimizer)
+    optimizer.trainer = trainer
+    monkeypatch.setattr(
+        train_entrypoint,
+        "capture_gradient_sample",
+        lambda _: (_ for _ in ()).throw(RuntimeError("tensor copy failed")),
+    )
+    train_entrypoint.install_pre_zero_gradient_capture(trainer)
+
+    optimizer.zero_grad()
+
+    assert optimizer.sample_present_before_clear == [False]
+    assert parameter.grad is None
+    assert "tensor copy failed" in caplog.text
+
+
+def test_gradient_tensor_copy_failure_is_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(train_entrypoint.logger, "disabled", False)
+    class ExplodingCopyTensor(FakeTensor):
+        def detach(self):
+            self.detached = True
+            return self
+
+        def clone(self):
+            raise RuntimeError("copy unavailable")
+
+    gradient = ExplodingCopyTensor([1.0])
+    trainer = SimpleNamespace(
+        epoch=0,
+        epochs=1,
+        train_loader=[object()],
+        model=FakeModel({"layer.weight": FakeParameter([1.0], grad=gradient)}),
+    )
+    train_entrypoint.reset_training_batch_index(trainer)
+    train_entrypoint.track_training_batch_start(trainer)
+
+    capture_gradient_sample(trainer)
+
+    assert not hasattr(trainer, "_visiox_gradient_samples")
+    assert "copy unavailable" in caplog.text
+
+
 def test_pre_zero_bridge_rewraps_replacement_optimizer_on_oom_retry() -> None:
     parameter = FakeParameter([1.0], grad=FakeTensor(range(150_003)))
     model = FakeModel({"layer.weight": parameter})
@@ -407,6 +460,87 @@ def test_log_epoch_observability_omits_gpu_utilization_when_nvml_is_missing(
     assert scalar_by_tag["system.gpu_memory_used_gb"] == 2.0
     assert scalar_by_tag["system.gpu_memory_reserved_gb"] == 5.0
     assert (tmp_path / "visiox-progress.json").exists()
+
+
+def _failure_injection_trainer(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        save_dir=tmp_path,
+        epoch=0,
+        epochs=1,
+        train_time_start=0.0,
+        device="cpu",
+        metrics={},
+        model=FakeModel({"layer.weight": FakeParameter([1.0])}),
+        train_loader=[],
+        _visiox_gradient_samples={"layer.weight": FakeTensor([1.0])},
+    )
+
+
+def test_resource_collection_failure_does_not_abort_epoch_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(train_entrypoint.logger, "disabled", False)
+    install_tensorboard_writer(monkeypatch, None)
+    monkeypatch.setattr(
+        train_entrypoint,
+        "_collect_resource_metrics",
+        lambda _: (_ for _ in ()).throw(RuntimeError("resource reader failed")),
+    )
+    trainer = _failure_injection_trainer(tmp_path)
+
+    log_epoch_observability(trainer)
+
+    assert trainer._visiox_gradient_samples == {}
+    assert (tmp_path / "visiox-progress.json").exists()
+    assert "resource reader failed" in caplog.text
+
+
+def test_tensorboard_writer_failure_does_not_abort_epoch_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(train_entrypoint.logger, "disabled", False)
+    install_fake_psutil(monkeypatch)
+    writer = FakeWriter()
+    monkeypatch.setattr(
+        writer,
+        "add_scalar",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("writer failed")),
+    )
+    install_tensorboard_writer(monkeypatch, writer)
+    trainer = _failure_injection_trainer(tmp_path)
+
+    log_epoch_observability(trainer)
+
+    assert trainer._visiox_gradient_samples == {}
+    assert (tmp_path / "visiox-progress.json").exists()
+    assert "writer failed" in caplog.text
+
+
+def test_snapshot_failure_does_not_abort_epoch_or_final_callbacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(train_entrypoint.logger, "disabled", False)
+    install_fake_psutil(monkeypatch)
+    install_tensorboard_writer(monkeypatch, None)
+    monkeypatch.setattr(
+        train_entrypoint,
+        "write_progress_snapshot",
+        lambda _: (_ for _ in ()).throw(OSError("snapshot read-only")),
+    )
+    trainer = _failure_injection_trainer(tmp_path)
+
+    log_epoch_observability(trainer)
+    result = train_entrypoint.write_final_progress_snapshot(trainer)
+
+    assert result is None
+    assert trainer._visiox_gradient_samples == {}
+    assert "snapshot read-only" in caplog.text
 
 
 def test_main_registers_native_callbacks_and_keeps_native_integrations_enabled(

@@ -158,7 +158,7 @@ services:
       - label-studio
       - start
       - --host
-      - http://127.0.0.1:8080
+      - http://10.10.40.2:8080
       - --username
       - ${LABEL_STUDIO_USERNAME:-admin@example.com}
       - --password

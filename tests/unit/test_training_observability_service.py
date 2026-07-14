@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
+from threading import Barrier
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from types import ModuleType
@@ -21,11 +24,18 @@ class FakeMlflowClient:
         self,
         histories: dict[str, list[object]] | None = None,
         experiments: list[object] | None = None,
+        runs: list[object] | None = None,
     ) -> None:
         self.histories = histories or {}
         self.search_calls: list[dict[str, object]] = []
         self.search_experiments_calls = 0
         self.experiments = experiments or [SimpleNamespace(experiment_id="1", lifecycle_stage="active")]
+        self.runs = runs or [
+            SimpleNamespace(
+                info=SimpleNamespace(run_id="run-1"),
+                data=SimpleNamespace(metrics={}),
+            )
+        ]
 
     def search_experiments(self) -> list[object]:
         self.search_experiments_calls += 1
@@ -33,7 +43,7 @@ class FakeMlflowClient:
 
     def search_runs(self, *, experiment_ids: list[str], filter_string: str) -> list[object]:
         self.search_calls.append({"experiment_ids": experiment_ids, "filter_string": filter_string})
-        return [SimpleNamespace(info=SimpleNamespace(run_id="run-1"))]
+        return self.runs
 
     def get_metric_history(self, run_id: str, key: str) -> list[object]:
         assert run_id == "run-1"
@@ -385,6 +395,114 @@ def test_resources_read_progress_snapshot_and_summary_reports_source_availabilit
     assert summary["status"] == "succeeded"
 
 
+def test_summary_reads_training_tags_without_advertising_dedicated_resource_scalars(
+    fake_job: SimpleNamespace,
+    test_settings: SimpleNamespace,
+) -> None:
+    run_path = test_settings.training_runs_root / "runs" / f"job-{fake_job.id}"
+    run_path.mkdir(parents=True)
+    (run_path / "events.out.tfevents.1").touch()
+    (run_path / "visiox-progress.json").write_text(
+        json.dumps(
+            {
+                "progress": {"current_epoch": 3, "total_epochs": 8, "percent": 37.5},
+                "timing": {"elapsed_seconds": 18.0, "eta_seconds": 30.0},
+                "environment": {"device": "cpu"},
+                "latest_metrics": {"metrics/mAP50(B)": 0.61},
+                "resources": [
+                    {"step": 3, "timestamp": 18.0, "system.cpu_percent": 37.5},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    mlflow_client = FakeMlflowClient(
+        runs=[
+            SimpleNamespace(
+                info=SimpleNamespace(run_id="run-1"),
+                data=SimpleNamespace(metrics={"train/box_loss": 0.82, "metrics/mAP50(B)": 0.59}),
+            )
+        ]
+    )
+    accumulator = FakeEventAccumulator(
+        scalars={
+            "val/box_loss": [],
+            "system.cpu_percent": [],
+            "train/images_per_second": [],
+        },
+        histograms={
+            "weights/model.0.conv.weight": [],
+            "gradients/model.0.conv.weight": [],
+        },
+    )
+    service = TrainingObservabilityService(
+        test_settings,
+        mlflow_client_factory=lambda _: mlflow_client,
+        event_accumulator_factory=lambda _: accumulator,
+    )
+
+    summary = service.get_summary(
+        fake_job,
+        SimpleNamespace(id="pipeline-1", name="pipeline", status="running"),
+        SimpleNamespace(id="task-1", status="RUNNING"),
+    )
+    resources = service.get_resources(fake_job, None, None, 2_000)
+
+    assert summary["progress"] == {"current_epoch": 3, "total_epochs": 8, "percent": 37.5}
+    assert summary["timing"] == {"elapsed_seconds": 18.0, "eta_seconds": 30.0}
+    assert summary["environment"] == {"device": "cpu"}
+    assert summary["latest_metrics"] == {
+        "train/box_loss": 0.82,
+        "metrics/mAP50(B)": 0.61,
+    }
+    assert summary["available_scalar_keys"] == [
+        "metrics.map50",
+        "train.box_loss",
+        "val.box_loss",
+    ]
+    assert resources["series"]["system.cpu_percent"] == [
+        {"step": 3.0, "value": 37.5, "timestamp": 18.0},
+    ]
+    assert summary["available_histograms"] == {
+        "weight": ["weights/model.0.conv.weight"],
+        "gradient": ["gradients/model.0.conv.weight"],
+    }
+    assert summary["availability"]["progress"] == {"available": True, "reason": None}
+    assert summary["availability"]["tensorboard"] == {"available": True, "reason": None}
+
+
+def test_summary_and_data_endpoints_agree_when_progress_and_events_are_corrupt(
+    fake_job: SimpleNamespace,
+    test_settings: SimpleNamespace,
+) -> None:
+    run_path = test_settings.training_runs_root / "runs" / f"job-{fake_job.id}"
+    run_path.mkdir(parents=True)
+    (run_path / "events.out.tfevents.1").write_bytes(b"truncated")
+    (run_path / "visiox-progress.json").write_text("{broken", encoding="utf-8")
+
+    class CorruptEventAccumulator(FakeEventAccumulator):
+        def Reload(self) -> FakeEventAccumulator:
+            raise ValueError("corrupt event stream")
+
+    service = TrainingObservabilityService(
+        test_settings,
+        mlflow_client_factory=lambda _: FakeMlflowClient(),
+        event_accumulator_factory=lambda _: CorruptEventAccumulator(),
+    )
+
+    summary = service.get_summary(fake_job, SimpleNamespace(), SimpleNamespace())
+    resources = service.get_resources(fake_job, None, None, 2_000)
+    graph = service.get_graph(fake_job)
+
+    assert summary["availability"]["progress"]["available"] is False
+    assert resources["availability"]["progress"] == summary["availability"]["progress"]
+    assert summary["availability"]["tensorboard"] == {
+        "available": False,
+        "reason": "corrupt event stream",
+    }
+    assert graph["availability"]["tensorboard"] == summary["availability"]["tensorboard"]
+
+
 def test_summary_and_resources_report_mlflow_probe_failures_without_crashing(
     fake_job: SimpleNamespace,
     test_settings: SimpleNamespace,
@@ -422,6 +540,66 @@ def test_event_accumulator_cache_is_keyed_by_latest_event_mtime(
     event_file.touch()
     assert service._event_accumulator(fake_job) is not None
     assert len(accumulators) == 0
+
+
+def test_event_accumulator_cache_honors_configured_size_and_evicts_lru(
+    test_settings: SimpleNamespace,
+) -> None:
+    test_settings.observability_event_cache_size = 1
+    jobs = [SimpleNamespace(id="job-a"), SimpleNamespace(id="job-b")]
+    for job in jobs:
+        run_path = test_settings.training_runs_root / "runs" / f"job-{job.id}"
+        run_path.mkdir(parents=True)
+        (run_path / "events.out.tfevents.1").touch()
+    created: list[FakeEventAccumulator] = []
+
+    def create_accumulator(_: str) -> FakeEventAccumulator:
+        accumulator = FakeEventAccumulator()
+        created.append(accumulator)
+        return accumulator
+
+    service = TrainingObservabilityService(test_settings, event_accumulator_factory=create_accumulator)
+
+    service._event_accumulator(jobs[0])
+    service._event_accumulator(jobs[1])
+    service._event_accumulator(jobs[0])
+
+    assert len(created) == 3
+    assert len(service._event_accumulators) == 1
+
+
+def test_event_accumulator_size_one_cache_serializes_concurrent_reload_and_publication(
+    test_settings: SimpleNamespace,
+) -> None:
+    test_settings.observability_event_cache_size = 1
+    first_job = SimpleNamespace(id="job-a")
+    concurrent_job = SimpleNamespace(id="job-b")
+    for job in (first_job, concurrent_job):
+        run_path = test_settings.training_runs_root / "runs" / f"job-{job.id}"
+        run_path.mkdir(parents=True)
+        (run_path / "events.out.tfevents.1").touch()
+    created_for: list[str] = []
+
+    def create_accumulator(run_path: str) -> FakeEventAccumulator:
+        created_for.append(run_path)
+        if run_path.endswith("job-job-b"):
+            time.sleep(0.05)
+        return FakeEventAccumulator()
+
+    service = TrainingObservabilityService(test_settings, event_accumulator_factory=create_accumulator)
+    service._event_accumulator(first_job)
+    barrier = Barrier(8)
+
+    def load_concurrently() -> FakeEventAccumulator:
+        barrier.wait(timeout=2)
+        return service._event_accumulator(concurrent_job)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        accumulators = list(executor.map(lambda _: load_concurrently(), range(8)))
+
+    assert len({id(accumulator) for accumulator in accumulators}) == 1
+    assert sum(path.endswith("job-job-b") for path in created_for) == 1
+    assert len(service._event_accumulators) == 1
 
 
 def test_default_settings_keep_job_and_metrics_paths_inside_shared_run_root() -> None:

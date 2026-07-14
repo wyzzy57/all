@@ -17,8 +17,10 @@ const apiMock = vi.hoisted(() => ({
   listTrainingJobs: vi.fn(),
   trainingJobArtifactDownloadUrl: vi.fn(),
 }));
+const routeMock = vi.hoisted(() => ({ query: {} as Record<string, string | undefined> }));
 
 vi.mock("@/api/client", () => ({ api: apiMock }));
+vi.mock("vue-router", () => ({ useRoute: () => routeMock }));
 
 const chartLifecycle = {
   mounted: vi.fn(),
@@ -134,6 +136,7 @@ function deferred<T>() {
 describe("TrainingVisualizationView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    routeMock.query = {};
     apiMock.listPipelines.mockResolvedValue({
       items: [
         { id: "pipeline-1", name: "花椒检测", task: "detect", scale: "l", status: "training" },
@@ -365,6 +368,50 @@ describe("TrainingVisualizationView", () => {
     wrapper.unmount();
   });
 
+  it("retries an empty graph while running and renders it when the next poll finds nodes", async () => {
+    vi.useFakeTimers();
+    apiMock.getTrainingObservabilityGraph
+      .mockResolvedValueOnce({ nodes: [], edges: [], availability: summary().availability })
+      .mockResolvedValueOnce({
+        nodes: [{ id: "head", label: "Detection head", op: "Conv2d", attributes: {} }],
+        edges: [],
+        availability: summary().availability,
+      });
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="tab-graph"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilityGraph).toHaveBeenCalledTimes(1);
+    expect(wrapper.get('[data-testid="graph-panel"]').text()).toContain("该训练未记录计算图");
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilityGraph).toHaveBeenCalledTimes(2);
+    expect(wrapper.get('[data-testid="graph-panel"]').text()).toContain("Detection head");
+    wrapper.unmount();
+  });
+
+  it("caches an empty graph once the job is terminal", async () => {
+    apiMock.getTrainingObservabilitySummary.mockResolvedValueOnce(summary({ status: "succeeded" }));
+    apiMock.getTrainingObservabilityGraph.mockResolvedValueOnce({
+      nodes: [],
+      edges: [],
+      availability: summary().availability,
+    });
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="tab-graph"]').trigger("click");
+    await flushPromises();
+    await wrapper.get('[data-testid="tab-overview"]').trigger("click");
+    await wrapper.get('[data-testid="tab-graph"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilityGraph).toHaveBeenCalledTimes(1);
+    wrapper.unmount();
+  });
+
   it("shows an honest graph empty state when no nodes were recorded", async () => {
     apiMock.getTrainingObservabilityGraph.mockResolvedValueOnce({
       nodes: [],
@@ -436,7 +483,7 @@ describe("TrainingVisualizationView", () => {
     await wrapper.get('[data-testid="histogram-step"]').setValue("4");
     await flushPromises();
 
-    expect(wrapper.get('[data-testid="histograms-panel"]').text()).toContain("该训练未记录梯度分布");
+    expect(wrapper.get('[data-testid="histograms-panel"]').text()).toContain("该训练未记录权重分布");
     wrapper.unmount();
   });
 
@@ -572,6 +619,45 @@ describe("TrainingVisualizationView", () => {
     await flushPromises();
     expect(apiMock.getTrainingObservabilitySummary).toHaveBeenCalledTimes(2);
 
+    wrapper.unmount();
+  });
+
+  it("recovers polling after a transient summary request failure", async () => {
+    vi.useFakeTimers();
+    apiMock.getTrainingObservabilitySummary
+      .mockResolvedValueOnce(summary())
+      .mockRejectedValueOnce(new Error("temporary offline"))
+      .mockResolvedValueOnce(summary({ status: "succeeded" }));
+
+    const wrapper = mountView();
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushPromises();
+    expect(apiMock.getTrainingObservabilitySummary).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushPromises();
+    expect(apiMock.getTrainingObservabilitySummary).toHaveBeenCalledTimes(3);
+
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(apiMock.getTrainingObservabilitySummary).toHaveBeenCalledTimes(3);
+    wrapper.unmount();
+  });
+
+  it("selects the job requested by the native visualization route", async () => {
+    routeMock.query = { job: "job-2" };
+    apiMock.getTrainingObservabilitySummary.mockResolvedValueOnce(summary({
+      job_id: "job-2",
+      pipeline_id: "pipeline-2",
+      pipeline_name: "柑橘检测",
+      status: "succeeded",
+    }));
+
+    const wrapper = mountView();
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilitySummary).toHaveBeenCalledWith("job-2");
+    expect(wrapper.get('[data-testid="job-job-2"]').classes()).toContain("active");
     wrapper.unmount();
   });
 

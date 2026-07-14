@@ -281,7 +281,7 @@
               <div v-if="histogramLoading" class="panel-loading">正在加载分布数据...</div>
               <el-empty
                 v-else-if="histogramUnavailable"
-                description="该训练未记录梯度分布"
+                :description="histogramEmptyDescription"
               />
               <HistogramChart v-else-if="histogramData" :histogram="histogramData" height="390px" />
             </section>
@@ -297,6 +297,7 @@
 import { MoreFilled, Refresh } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { useRoute } from "vue-router";
 
 import {
   api,
@@ -319,6 +320,7 @@ type DashboardTab = "overview" | "metrics" | "resources" | "analysis" | "graph" 
 
 const POLL_INTERVAL_MS = 5000;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
+const route = useRoute();
 const mlflowUrl = import.meta.env.VITE_MLFLOW_URL as string | undefined;
 const tensorboardUrl = import.meta.env.VITE_TENSORBOARD_URL as string | undefined;
 const tabs: Array<{ id: DashboardTab; label: string }> = [
@@ -409,6 +411,9 @@ const histogramStepOptions = computed(() => {
 const histogramUnavailable = computed(() => (
   availableHistogramTags.value.length === 0
   || (histogramRequested.value && Boolean(histogramData.value) && histogramData.value!.buckets.length === 0)
+));
+const histogramEmptyDescription = computed(() => (
+  histogramKind.value === "weight" ? "该训练未记录权重分布" : "该训练未记录梯度分布"
 ));
 const sourceEntries = computed(() => Object.entries(summaryData.value?.availability ?? {}).map(([name, value]) => ({
   name,
@@ -653,7 +658,8 @@ async function loadGraph(requestGeneration: number) {
     const response = await api.getTrainingObservabilityGraph(job.id);
     if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
     graphData.value = response;
-    graphLoadedJobId = job.id;
+    const active = ACTIVE_STATUSES.has(currentStatus.value.toLowerCase());
+    graphLoadedJobId = response.nodes.length > 0 || !active ? job.id : null;
     selectedGraphNode.value = response.nodes[0] ?? null;
     if (activeTab.value === "graph" && response.nodes.length > 0) graphChartMounted.value = true;
   } catch (error) {
@@ -726,8 +732,8 @@ async function loadSummary(requestGeneration: number) {
     await loadActiveTabData(requestGeneration, true);
   } catch (error) {
     if (requestGeneration === generation) {
-      clearPollTimer();
       ElMessage.error(error instanceof Error ? error.message : "训练概览加载失败");
+      schedulePoll(currentStatus.value, requestGeneration);
     }
   } finally {
     if (requestGeneration === generation) summaryLoading.value = false;
@@ -777,7 +783,8 @@ async function loadRuns() {
     jobs.value = [...jobResponse.items].sort((left, right) =>
       String(right.created_at || "").localeCompare(String(left.created_at || "")),
     );
-    const selectedId = selectedJob.value?.id;
+    const routeJobId = Array.isArray(route.query.job) ? route.query.job[0] : route.query.job;
+    const selectedId = typeof routeJobId === "string" && routeJobId ? routeJobId : selectedJob.value?.id;
     selectedJob.value = jobs.value.find((job) => job.id === selectedId) ?? jobs.value[0] ?? null;
     resetSelectedData();
     listLoading.value = false;

@@ -19,6 +19,7 @@ from visiox_api.routes.tasks import router as tasks_router
 from visiox_api.routes.trained_models import router as trained_models_router
 from visiox_api.routes.training_observability import router as training_observability_router
 from visiox_api.routes.training_jobs import router as training_jobs_router
+from visiox_api.services.training_observability import TrainingObservabilityService
 from visiox_api.seed_base_models import seed_yolo26_base_models
 from visiox_api.ws.tasks import router as task_progress_router
 from visiox_db.session import create_session_factory
@@ -57,6 +58,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Visiox API", version="0.1.0", lifespan=lifespan)
+    app.state.training_observability_service = TrainingObservabilityService(get_settings())
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
