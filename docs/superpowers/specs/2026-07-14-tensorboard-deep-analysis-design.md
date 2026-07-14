@@ -16,10 +16,10 @@ The native `计算图` and `直方图` tabs are removed. Their chart components,
 frontend state, and VisioX-only graph and histogram API contracts are removed
 when they have no remaining consumers.
 
-The training visualization page exposes one clearly labeled `打开 TensorBoard`
-command. It opens TensorBoard in a new browser tab and selects the current
-training run. The VisioX page remains open so users can return without losing
-their current job selection.
+The training visualization page keeps its existing top-right advanced-tools
+menu and its existing `TensorBoard` command. No second TensorBoard command is
+added to the tabs or content area. The command opens TensorBoard in a new browser
+tab, and the VisioX page remains open.
 
 ## Data and Service Boundaries
 
@@ -35,23 +35,24 @@ MLflow tracking and VisioX progress telemetry remain unchanged. Removing the
 native graph and histogram views must not remove TensorBoard summary generation
 or event files.
 
-TensorBoard remains a separately managed internal service. VisioX identifies the
-TensorBoard run from persisted training-job observability metadata. The link must
-not guess a run from the pipeline name or from the current list position.
+TensorBoard remains a separately managed internal service. Persisted run-name
+metadata remains available to TensorBoard and future integrations, but the
+existing top-right command continues to open the configured TensorBoard service
+without adding a second run-specific navigation path.
 
 ## Navigation and Security
 
-The frontend obtains a VisioX-owned TensorBoard URL for the selected training
-job. The URL targets the job's run and opens with `target="_blank"` and
-`rel="noopener noreferrer"`.
+The frontend reuses its configured TensorBoard URL and existing explicit menu
+action. The browser opens the URL with an isolated new-window context.
 
 TensorBoard is reached through the VisioX reverse proxy or gateway. Its raw
 service port is not exposed as a customer-facing endpoint. The gateway applies
 the same authenticated user and pipeline-access checks used by the training-job
 page before forwarding the request.
 
-If TensorBoard or the selected run is unavailable, VisioX keeps the current page
-usable and shows a concise failure message instead of opening a blank tab.
+If TensorBoard is not configured, the existing advanced-tools menu keeps its
+current unavailable state. No graph- or histogram-specific fallback panel is
+shown.
 
 ## Cleanup
 
@@ -69,10 +70,8 @@ TensorBoard page is embedded inside the VisioX content area.
 ## Verification
 
 - Frontend tests confirm that graph and histogram tabs are absent.
-- Frontend tests confirm that `打开 TensorBoard` is shown for a selected training
-  job and opens the run-specific URL in a new tab.
-- API tests confirm that users cannot obtain a TensorBoard URL for a training job
-  they cannot access.
+- Frontend tests confirm that the existing top-right `TensorBoard` action remains
+  available and opens the configured URL in a new tab.
 - Worker tests confirm TensorBoard graph and histogram summaries are still
   emitted.
 - A local end-to-end check opens TensorBoard for a completed two-epoch training
