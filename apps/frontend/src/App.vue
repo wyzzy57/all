@@ -17,10 +17,6 @@
     </el-aside>
     <el-container>
       <el-header class="app-header">
-        <div>
-          <div class="page-title">{{ currentTitle }}</div>
-          <div class="page-subtitle">私有化视觉模型平台</div>
-        </div>
         <el-tag type="success" effect="plain">内网部署</el-tag>
       </el-header>
       <el-main class="app-main">
@@ -39,10 +35,7 @@ import {
   Tickets,
   TrendCharts
 } from "@element-plus/icons-vue";
-import { computed } from "vue";
-import { useRoute } from "vue-router";
 
-const route = useRoute();
 const navItems = [
   { path: "/workbench", label: "工作台", icon: PieChart },
   { path: "/model-space", label: "模型空间", icon: Box },
@@ -51,9 +44,4 @@ const navItems = [
   { path: "/training-visualization", label: "可视化训练", icon: TrendCharts },
   { path: "/tasks", label: "任务中心", icon: DataAnalysis }
 ];
-
-const currentTitle = computed(() => {
-  const match = navItems.find((item) => route.path === item.path || route.path.startsWith(`${item.path}/`));
-  return match?.label ?? "工作台";
-});
 </script>
