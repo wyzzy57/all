@@ -31,6 +31,10 @@ const MetricLineChartStub = defineComponent({
     series: { type: Object, required: true },
     unit: String,
     height: [String, Number],
+    axisMin: Number,
+    axisMax: Number,
+    valueFormat: String,
+    smoothing: Number,
   },
   setup() {
     onMounted(chartLifecycle.mounted);
@@ -218,6 +222,26 @@ describe("TrainingVisualizationView", () => {
     wrapper.unmount();
   });
 
+  it("renders TensorBoard-style semantic metric cards and switches to run comparison", async () => {
+    const wrapper = mountView();
+    await flushPromises();
+
+    await wrapper.get('[data-testid="tab-metrics"]').trigger("click");
+    await flushPromises();
+
+    expect(wrapper.findAll('[data-testid^="metric-card-"]').filter((item) => /^metric-card-(box-loss|map50)$/.test(item.attributes("data-testid") ?? ""))).toHaveLength(2);
+    expect(wrapper.text()).toContain("Box Loss");
+    expect(wrapper.text()).toContain("mAP50");
+    expect(wrapper.find('[data-testid="metric-card-precision"]').exists()).toBe(false);
+
+    await wrapper.get('[data-testid="metrics-mode-compare"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="run-comparison"]').exists()).toBe(true);
+    expect(wrapper.get('[data-testid="job-job-1"]').classes()).toContain("active");
+
+    wrapper.unmount();
+  });
+
   it("requests only advertised scalars and keeps TensorBoard-backed series visible", async () => {
     const wrapper = mountView();
     await flushPromises();
@@ -231,7 +255,8 @@ describe("TrainingVisualizationView", () => {
       keys: ["train.box_loss", "metrics.map50"],
       max_points: 1000,
     });
-    expect(wrapper.get('[data-testid="metrics-panel"]').text()).toContain("train.box_loss,metrics.map50");
+    expect(wrapper.get('[data-testid="metrics-panel"]').text()).toContain("Box Loss");
+    expect(wrapper.get('[data-testid="metrics-panel"]').text()).toContain("mAP50");
     expect(wrapper.get('[data-testid="metrics-panel"]').text()).toContain("MLflow 不可用");
 
     wrapper.unmount();

@@ -17,6 +17,10 @@ const echartsMocks = vi.hoisted(() => ({
   use: vi.fn()
 }));
 
+let resizeObserverCallback: ResizeObserverCallback;
+const resizeObserverObserve = vi.fn();
+const resizeObserverDisconnect = vi.fn();
+
 vi.mock("echarts/core", () => ({
   init: echartsMocks.init,
   use: echartsMocks.use
@@ -65,6 +69,14 @@ describe("training chart components", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     echartsMocks.init.mockReturnValue(chartInstance());
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(callback: ResizeObserverCallback) {
+        resizeObserverCallback = callback;
+      }
+      observe = resizeObserverObserve;
+      disconnect = resizeObserverDisconnect;
+      unobserve = vi.fn();
+    });
   });
 
   it("renders metric DTO points and responds to its lifecycle", async () => {
@@ -85,8 +97,8 @@ describe("training chart components", () => {
             name: "train.box_loss",
             type: "line",
             data: [
-              [1, 1.4],
-              [2, 0.9]
+              { value: [1, 1.4], rawValue: 1.4 },
+              { value: [2, 0.9], rawValue: 0.9 }
             ]
           })
         ])
@@ -100,6 +112,68 @@ describe("training chart components", () => {
     }, ["dataZoom", "legend", "toolbox"], { replaceMerge: ["series"] });
     const metricUpdateCall = echartsMocks.setOption.mock.calls[echartsMocks.setOption.mock.calls.length - 1];
     expect(metricUpdateCall[0].series.map((item: { name: string }) => item.name)).toEqual(["train.box_loss"]);
+  });
+
+  it("uses metric axis bounds and preserves raw values while smoothing display data", () => {
+    const wrapper = mount(MetricLineChart, {
+      props: {
+        series: {
+          mAP50: [
+            { step: 1, value: 0.2, timestamp: 100 },
+            { step: 2, value: 0.8, timestamp: 110 },
+          ],
+        },
+        axisMin: 0,
+        axisMax: 1,
+        valueFormat: "ratio",
+        smoothing: 0.5,
+      },
+    });
+
+    expect(echartsMocks.setOption).toHaveBeenCalledWith(
+      expect.objectContaining({
+        yAxis: expect.objectContaining({ min: 0, max: 1 }),
+        series: [expect.objectContaining({
+          data: [
+            expect.objectContaining({ value: [1, 0.2], rawValue: 0.2 }),
+            expect.objectContaining({ value: [2, 0.5], rawValue: 0.8 }),
+          ],
+        })],
+      }),
+      true,
+    );
+
+    wrapper.unmount();
+  });
+
+  it("resizes with its observed chart container and disconnects on unmount", () => {
+    const wrapper = mount(MetricLineChart, {
+      props: { series: { loss: [{ step: 1, value: 1, timestamp: 100 }] } },
+    });
+
+    expect(resizeObserverObserve).toHaveBeenCalledWith(wrapper.get(".training-chart").element);
+    resizeObserverCallback([], {} as ResizeObserver);
+    expect(echartsMocks.resize).toHaveBeenCalledTimes(1);
+
+    wrapper.unmount();
+    expect(resizeObserverDisconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("escapes user-controlled series names in HTML tooltips", () => {
+    const wrapper = mount(MetricLineChart, {
+      props: { series: { '<img src=x onerror="alert(1)">': [{ step: 1, value: 1, timestamp: 100 }] } },
+    });
+    const option = echartsMocks.setOption.mock.calls[0][0];
+    const tooltip = option.tooltip.formatter([{
+      marker: "<span></span>",
+      seriesName: '<img src=x onerror="alert(1)">',
+      data: { rawValue: 1 },
+      value: [1, 1],
+    }]);
+
+    expect(tooltip).not.toContain('<img src=x onerror="alert(1)">');
+    expect(tooltip).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
+    wrapper.unmount();
   });
 
 });

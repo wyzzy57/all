@@ -158,9 +158,51 @@
                 <div><strong>训练指标</strong><span>Epoch 标量趋势</span></div>
                 <span v-if="metricsUnavailableText" class="source-warning">{{ metricsUnavailableText }}</span>
               </div>
-              <div v-if="metricsLoading && !metricsChartMounted" class="panel-loading">正在加载指标...</div>
-              <el-empty v-else-if="!metricsChartMounted" description="该训练暂无可用指标" />
-              <MetricLineChart v-if="metricsChartMounted" :series="scalarSeries" height="420px" />
+              <div class="metrics-toolbar">
+                <div class="metrics-mode-switch" role="tablist" aria-label="指标查看方式">
+                  <button
+                    type="button"
+                    role="tab"
+                    data-testid="metrics-mode-single"
+                    :class="{ active: metricsMode === 'single' }"
+                    :aria-selected="metricsMode === 'single'"
+                    @click="metricsMode = 'single'"
+                  >单次训练</button>
+                  <button
+                    type="button"
+                    role="tab"
+                    data-testid="metrics-mode-compare"
+                    :class="{ active: metricsMode === 'compare' }"
+                    :aria-selected="metricsMode === 'compare'"
+                    @click="metricsMode = 'compare'"
+                  >运行对比</button>
+                </div>
+                <label v-if="metricsMode === 'single'" class="smoothing-control">
+                  <span>平滑</span>
+                  <input v-model.number="metricSmoothing" type="range" min="0" max="0.9" step="0.1" />
+                  <output>{{ metricSmoothing.toFixed(1) }}</output>
+                </label>
+              </div>
+
+              <TrainingRunComparison
+                v-if="metricsMode === 'compare'"
+                :key="selectedJob.id"
+                :jobs="jobs"
+                :pipeline-names="pipelineNameMap"
+                :initial-job-id="selectedJob.id"
+              />
+              <template v-else>
+                <div v-if="metricsLoading && !metricsChartMounted" class="panel-loading">正在加载指标...</div>
+                <el-empty v-else-if="!metricsChartMounted" description="该训练暂无可用指标" />
+                <div v-else class="metric-card-grid">
+                  <TrainingMetricCard
+                    v-for="card in metricCards"
+                    :key="card.id"
+                    :card="card"
+                    :smoothing="metricSmoothing"
+                  />
+                </div>
+              </template>
             </section>
 
             <section
@@ -216,8 +258,12 @@ import {
 } from "@/api/client";
 import ArtifactGallery from "@/components/training/ArtifactGallery.vue";
 import MetricLineChart from "@/components/training/MetricLineChart.vue";
+import TrainingMetricCard from "@/components/training/TrainingMetricCard.vue";
+import TrainingRunComparison from "@/components/training/TrainingRunComparison.vue";
+import { buildMetricCards } from "@/components/training/trainingMetricCatalog";
 
 type DashboardTab = "overview" | "metrics" | "resources" | "analysis";
+type MetricsMode = "single" | "compare";
 
 const POLL_INTERVAL_MS = 5000;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
@@ -239,6 +285,8 @@ const scalarSeries = ref<TrainingObservabilityScalars["series"]>({});
 const resourceSeries = ref<TrainingObservabilityResources["series"]>({});
 const scalarAvailability = ref<TrainingObservabilityAvailability>({});
 const activeTab = ref<DashboardTab>("overview");
+const metricsMode = ref<MetricsMode>("single");
+const metricSmoothing = ref(0);
 const listLoading = ref(false);
 const summaryLoading = ref(false);
 const metricsLoading = ref(false);
@@ -283,6 +331,8 @@ const learningRateLabel = computed(() => formatPlainValue(
 ));
 const hasMetricSeries = computed(() => hasPoints(scalarSeries.value));
 const hasResourceSeries = computed(() => hasPoints(resourceSeries.value));
+const metricCards = computed(() => buildMetricCards(scalarSeries.value));
+const pipelineNameMap = computed(() => Object.fromEntries(pipelines.value.map((pipeline) => [pipeline.id, pipeline.name])));
 const sourceEntries = computed(() => Object.entries(summaryData.value?.availability ?? {}).map(([name, value]) => ({
   name,
   label: sourceLabel(name),
@@ -656,6 +706,15 @@ onBeforeUnmount(() => {
 .chart-panel { padding: 0 18px 20px; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 58px; border-bottom: 1px solid #e3e8ef; }
 .panel-heading > div { display: flex; min-width: 0; align-items: baseline; gap: 10px; }
+.metrics-toolbar { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 20px; }
+.metrics-mode-switch { display: inline-flex; border: 1px solid #d5dce7; border-radius: 4px; overflow: hidden; }
+.metrics-mode-switch button { min-width: 92px; height: 34px; padding: 0 14px; border: 0; border-right: 1px solid #d5dce7; background: #fff; color: #475467; cursor: pointer; }
+.metrics-mode-switch button:last-child { border-right: 0; }
+.metrics-mode-switch button.active { background: #eef4ff; color: #1769ff; font-weight: 600; }
+.smoothing-control { display: flex; align-items: center; gap: 9px; color: #475467; font-size: 12px; }
+.smoothing-control input { width: 120px; accent-color: #1769ff; }
+.smoothing-control output { width: 26px; color: #101828; font-variant-numeric: tabular-nums; }
+.metric-card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .source-warning { color: #b54708 !important; }
 .placeholder-panel { min-height: 420px; padding-top: 80px; }
 @container training-view (max-width: 900px) {
@@ -674,6 +733,7 @@ onBeforeUnmount(() => {
   .progress-band { grid-template-columns: 1fr; }
   .detail-grid, .latest-grid, .source-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metric-cell:nth-child(2n), .source-item:nth-child(2n) { border-right: 0; }
+  .metric-card-grid { grid-template-columns: minmax(0, 1fr); }
 }
 @container training-view (max-width: 420px) {
   .visualization-page-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; }
@@ -685,5 +745,8 @@ onBeforeUnmount(() => {
   .source-item { min-height: 56px; padding: 9px 14px; border-right: 0; }
   .chart-panel { padding-right: 10px; padding-left: 10px; }
   .panel-heading { flex-direction: column; align-items: flex-start; gap: 4px; padding: 10px 0; }
+  .metrics-toolbar { align-items: flex-start; flex-direction: column; gap: 10px; padding: 12px 0; }
+  .smoothing-control { width: 100%; }
+  .smoothing-control input { flex: 1; min-width: 0; }
 }
 </style>
