@@ -26,6 +26,7 @@ import (
 	"github.com/wyzzy57/all/apps/node-agent/internal/protocol"
 	"github.com/wyzzy57/all/apps/node-agent/internal/state"
 	"github.com/wyzzy57/all/apps/node-agent/internal/testsupport"
+	"go.etcd.io/bbolt"
 )
 
 const peerTimeout = 5 * time.Second
@@ -889,6 +890,145 @@ func assertRedactedUnexpectedMessageTypeError(t *testing.T, err error, marker st
 	}
 }
 
+func TestClientRedactsInvalidStoredCertificates(t *testing.T) {
+	const (
+		subjectMarker = "stored-cert-subject-secret-marker"
+		hostMarker    = "stored-cert-host.invalid"
+		secretMarker  = "stored-cert-secret-marker"
+	)
+	expiredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *state.Identity, ed25519.PrivateKey, *testsupport.CA)
+	}{
+		{
+			name: "malformed stored leaf",
+			mutate: func(_ *testing.T, identity *state.Identity, _ ed25519.PrivateKey, _ *testsupport.CA) {
+				identity.CertificatePEM = string(pem.EncodeToMemory(&pem.Block{
+					Type:  "CERTIFICATE",
+					Bytes: []byte("https://" + hostMarker + "/leaf?token=" + secretMarker),
+				}))
+			},
+		},
+		{
+			name: "expired stored leaf",
+			mutate: func(t *testing.T, identity *state.Identity, signer ed25519.PrivateKey, ca *testsupport.CA) {
+				identity.CertificatePEM = ca.SignCSR(
+					t,
+					csrPEMForKey(t, signer, identity.NodeID),
+					identity.NodeID,
+					expiredAt,
+				)
+			},
+		},
+		{
+			name: "malformed stored CA",
+			mutate: func(_ *testing.T, identity *state.Identity, _ ed25519.PrivateKey, _ *testsupport.CA) {
+				identity.CACertificatePEM = string(pem.EncodeToMemory(&pem.Block{
+					Type:  "CERTIFICATE",
+					Bytes: []byte("https://" + hostMarker + "/ca?token=" + secretMarker),
+				}))
+			},
+		},
+		{
+			name: "invalid chain",
+			mutate: func(t *testing.T, identity *state.Identity, signer ed25519.PrivateKey, _ *testsupport.CA) {
+				identity.CertificatePEM = testsupport.NewCA(t).SignCSR(
+					t,
+					csrPEMForKey(t, signer, identity.NodeID),
+					identity.NodeID,
+					time.Now().Add(365*24*time.Hour),
+				)
+			},
+		},
+		{
+			name: "stored expiry mismatch",
+			mutate: func(_ *testing.T, identity *state.Identity, _ ed25519.PrivateKey, _ *testsupport.CA) {
+				identity.CertificateExpiresAt = time.Date(2042, time.January, 2, 3, 4, 5, 0, time.UTC)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "agent.db")
+			seedStore, err := state.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			identity, signer, ca := testsupport.NewStoredIdentity(
+				t,
+				seedStore,
+				subjectMarker,
+				"ws://"+hostMarker+"/agent/v1/connect?token="+secretMarker,
+				time.Now().Add(365*24*time.Hour),
+			)
+			test.mutate(t, &identity, signer, ca)
+			if err := seedStore.Close(); err != nil {
+				t.Fatal(err)
+			}
+			rewriteStoredIdentity(t, path, identity)
+
+			store, err := state.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := store.Close(); err != nil {
+					t.Errorf("close store: %v", err)
+				}
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+			defer cancel()
+			err = New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)).Run(ctx)
+			const want = "invalid stored certificate"
+			if err == nil || err.Error() != want {
+				t.Fatalf("error = %q, want stable stored-certificate rejection %q", err, want)
+			}
+			for _, sensitive := range []string{
+				"x509",
+				subjectMarker,
+				expiredAt.Format(time.RFC3339),
+				"2042-01-02T03:04:05Z",
+				"BEGIN CERTIFICATE",
+				hostMarker,
+				secretMarker,
+			} {
+				if strings.Contains(err.Error(), sensitive) {
+					t.Fatalf("stored-certificate rejection leaked %q: %v", sensitive, err)
+				}
+			}
+		})
+	}
+}
+
+func rewriteStoredIdentity(t *testing.T, path string, identity state.Identity) {
+	t.Helper()
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close raw state database: %v", err)
+		}
+	}()
+	if err := database.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte("identity"))
+		if bucket == nil {
+			return fmt.Errorf("identity bucket is missing")
+		}
+		return bucket.Put([]byte("current"), encoded)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientRejectsInvalidRenewedCertificates(t *testing.T) {
 	const maliciousMarker = "wss://attacker.example/renew?certificate=secret123"
 	tests := []struct {
@@ -1031,7 +1171,7 @@ func TestClientCancellationJoinsReaderGoroutine(t *testing.T) {
 			}
 		}
 		serverReady <- struct{}{}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
 		defer cancel()
 		_, _, _ = conn.Read(ctx)
 		serverClosed <- struct{}{}

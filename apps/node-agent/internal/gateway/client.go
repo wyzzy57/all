@@ -39,6 +39,7 @@ const (
 var (
 	errGatewayServerRejected            = errors.New("Gateway server rejected connection")
 	errGatewayServerRequestedRetry      = errors.New("Gateway server requested retry")
+	errInvalidStoredCertificate         = errors.New("invalid stored certificate")
 	errInvalidRenewedCertificate        = errors.New("invalid renewed certificate")
 	errInvalidHeartbeatInterval         = errors.New("heartbeat interval is outside allowed range")
 	errEventACKAhead                    = errors.New("event ACK is ahead of highest sent sequence")
@@ -163,10 +164,10 @@ func (c *Client) runConnection(ctx context.Context) (bool, error) {
 		time.Now(),
 	)
 	if err != nil {
-		return false, fatal(fmt.Errorf("validate stored identity certificate: %w", err))
+		return false, fatal(errInvalidStoredCertificate)
 	}
 	if !identity.CertificateExpiresAt.Equal(certificate.NotAfter) {
-		return false, fatalErrorf("stored certificate expiry does not match certificate")
+		return false, fatal(errInvalidStoredCertificate)
 	}
 
 	httpClient, transport, err := c.gatewayHTTPClient(identity)
