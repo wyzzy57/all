@@ -613,13 +613,95 @@ func TestClientBackoffResetsAfterApplicationRoundTrip(t *testing.T) {
 	assertNoServerError(t, serverErrors)
 }
 
-func TestClientRejectsProtocolMismatch(t *testing.T) {
-	tests := []protocol.ChallengeMessage{
-		{Envelope: protocol.Envelope{ProtocolVersion: 2, Type: "challenge"}, Nonce: base64.StdEncoding.EncodeToString([]byte("nonce"))},
-		{Envelope: protocol.Envelope{ProtocolVersion: 1, Type: "authenticated"}, Nonce: base64.StdEncoding.EncodeToString([]byte("nonce"))},
+func TestClientRedactsServerControlledProtocolErrors(t *testing.T) {
+	const marker = "https://credential-host.example/connect?access_token=secret123"
+	tests := []struct {
+		name    string
+		payload []byte
+		want    string
+	}{
+		{
+			name: "allowed-format secret-like error code",
+			payload: []byte(`{"protocol_version":1,"type":"error","code":"secret123",` +
+				`"message":"` + marker + `","retryable":false}`),
+			want: "Gateway server rejected connection",
+		},
+		{
+			name: "credential-bearing unknown field",
+			payload: []byte(`{"protocol_version":1,"type":"error","code":"rejected",` +
+				`"message":"rejected","retryable":false,"` + marker + `":true}`),
+			want: "invalid server message",
+		},
 	}
-	for _, challenge := range tests {
-		t.Run(fmt.Sprintf("version_%d_type_%s", challenge.ProtocolVersion, challenge.Type), func(t *testing.T) {
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openGatewayStore(t)
+			serverErrors := make(chan error, 1)
+			var identity state.Identity
+			var signer ed25519.PrivateKey
+			var ca *testsupport.CA
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				defer conn.CloseNow()
+				if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				if err := peerWrite(conn, test.payload); err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				_, _, _ = peerRead(conn)
+			}))
+			defer server.Close()
+			identity, signer, ca = testsupport.NewStoredIdentity(
+				t,
+				store,
+				"node-1",
+				websocketURL(server.URL),
+				time.Now().Add(365*24*time.Hour),
+			)
+
+			ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+			defer cancel()
+			err := New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)).Run(ctx)
+			if err == nil {
+				t.Fatal("expected fatal protocol error")
+			}
+			if err.Error() != test.want {
+				t.Fatalf("error = %q, want stable redacted error %q", err, test.want)
+			}
+			for _, sensitive := range []string{marker, "credential-host.example", "access_token=", "secret123"} {
+				if strings.Contains(err.Error(), sensitive) {
+					t.Fatalf("protocol error leaked %q: %v", sensitive, err)
+				}
+			}
+			assertNoServerError(t, serverErrors)
+		})
+	}
+}
+
+func TestClientRejectsProtocolMismatch(t *testing.T) {
+	tests := []struct {
+		challenge protocol.ChallengeMessage
+		want      string
+	}{
+		{
+			challenge: protocol.ChallengeMessage{Envelope: protocol.Envelope{ProtocolVersion: 2, Type: "challenge"}, Nonce: base64.StdEncoding.EncodeToString([]byte("nonce"))},
+			want:      "unsupported server protocol version",
+		},
+		{
+			challenge: protocol.ChallengeMessage{Envelope: protocol.Envelope{ProtocolVersion: 1, Type: "authenticated"}, Nonce: base64.StdEncoding.EncodeToString([]byte("nonce"))},
+			want:      "unexpected server message type",
+		},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("version_%d_type_%s", test.challenge.ProtocolVersion, test.challenge.Type), func(t *testing.T) {
 			store := openGatewayStore(t)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				conn, err := websocket.Accept(w, r, nil)
@@ -627,7 +709,7 @@ func TestClientRejectsProtocolMismatch(t *testing.T) {
 					return
 				}
 				defer conn.CloseNow()
-				_ = peerWriteJSON(conn, challenge)
+				_ = peerWriteJSON(conn, test.challenge)
 				_, _, _ = peerRead(conn)
 			}))
 			defer server.Close()
@@ -636,8 +718,8 @@ func TestClientRejectsProtocolMismatch(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
 			defer cancel()
 			err := New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)).Run(ctx)
-			if err == nil || (!strings.Contains(err.Error(), "protocol version") && !strings.Contains(err.Error(), "message type")) {
-				t.Fatalf("error = %v, want strict protocol rejection", err)
+			if err == nil || err.Error() != test.want {
+				t.Fatalf("error = %q, want stable protocol rejection %q", err, test.want)
 			}
 		})
 	}
@@ -691,8 +773,14 @@ func TestClientRejectsHeartbeatOutsideBoundsAndOverflow(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
 			defer cancel()
 			err := New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)).Run(ctx)
-			if err == nil || (!strings.Contains(err.Error(), "heartbeat") && !strings.Contains(err.Error(), "decode")) {
-				t.Fatalf("error = %v, want heartbeat rejection", err)
+			if err == nil {
+				t.Fatal("expected heartbeat rejection")
+			}
+			if test.raw != "" && err.Error() != "invalid server message" {
+				t.Fatalf("error = %q, want stable redacted decode error", err)
+			}
+			if test.raw == "" && !strings.Contains(err.Error(), "heartbeat") {
+				t.Fatalf("error = %q, want heartbeat rejection", err)
 			}
 			assertNoServerError(t, serverErrors)
 		})

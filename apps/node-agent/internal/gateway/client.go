@@ -36,6 +36,14 @@ const (
 	certificateRenewalWindow = 30 * 24 * time.Hour
 )
 
+var (
+	errGatewayServerRejected            = errors.New("Gateway server rejected connection")
+	errGatewayServerRequestedRetry      = errors.New("Gateway server requested retry")
+	errInvalidServerMessage             = errors.New("invalid server message")
+	errUnexpectedServerMessageType      = errors.New("unexpected server message type")
+	errUnsupportedServerProtocolVersion = errors.New("unsupported server protocol version")
+)
+
 type Option func(*Client)
 
 type Client struct {
@@ -411,9 +419,9 @@ func (c *Client) runLiveConnection(
 				continue
 			}
 			if result.serverError.Retryable {
-				return stable, fmt.Errorf("Gateway server requested retry for code %q", result.serverError.Code)
+				return stable, errGatewayServerRequestedRetry
 			}
-			return stable, fatalErrorf("Gateway server rejected connection with code %q", result.serverError.Code)
+			return stable, fatal(errGatewayServerRejected)
 		}
 	}
 }
@@ -498,10 +506,10 @@ func publishServerResult(ctx context.Context, results chan<- serverResult, resul
 func decodeServerMessage(raw []byte) (serverResult, error) {
 	var envelope protocol.Envelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return serverResult{}, fmt.Errorf("decode server envelope: %w", err)
+		return serverResult{}, errInvalidServerMessage
 	}
 	if envelope.ProtocolVersion != protocol.ProtocolVersion {
-		return serverResult{}, fmt.Errorf("unsupported server protocol version %d", envelope.ProtocolVersion)
+		return serverResult{}, errUnsupportedServerProtocolVersion
 	}
 	switch envelope.Type {
 	case "events_acked":
@@ -526,7 +534,7 @@ func decodeServerMessage(raw []byte) (serverResult, error) {
 		}
 		return serverResult{serverError: serverError}, nil
 	default:
-		return serverResult{}, fmt.Errorf("unexpected server message type")
+		return serverResult{}, errUnexpectedServerMessageType
 	}
 }
 
@@ -582,28 +590,25 @@ func writeJSONMessage(ctx context.Context, conn *websocket.Conn, message any) er
 	return nil
 }
 
-func decodeStrictMessage(raw []byte, label string, target any) error {
+func decodeStrictMessage(raw []byte, _ string, target any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		return fmt.Errorf("decode %s message: %w", label, err)
+		return errInvalidServerMessage
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return fmt.Errorf("%s message contains multiple JSON values", label)
-		}
-		return fmt.Errorf("decode %s message trailer: %w", label, err)
+		return errInvalidServerMessage
 	}
 	return nil
 }
 
 func requireEnvelope(envelope protocol.Envelope, expectedType string) error {
 	if envelope.ProtocolVersion != protocol.ProtocolVersion {
-		return fmt.Errorf("unsupported server protocol version %d", envelope.ProtocolVersion)
+		return errUnsupportedServerProtocolVersion
 	}
 	if envelope.Type != expectedType {
-		return fmt.Errorf("unexpected server message type")
+		return errUnexpectedServerMessageType
 	}
 	return nil
 }
