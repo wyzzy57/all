@@ -285,7 +285,7 @@ func TestEnsureRequiresExplicitClientAuthUsage(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(protocol.EnrollmentResponse{
 			ProtocolVersion:          protocol.ProtocolVersion,
 			NodeID:                   "node-1",
-			CertificatePEM:           ca.signCSR(t, request.CSRPEM, "node-1", nil),
+			CertificatePEM:           ca.signCSR(t, request.CSRPEM, "node-1", x509.KeyUsageDigitalSignature, nil, false),
 			CACertificatePEM:         ca.pem,
 			GatewayURL:               strings.Replace(server.URL, "http://", "ws://", 1),
 			HeartbeatIntervalSeconds: 15,
@@ -303,6 +303,41 @@ func TestEnsureRequiresExplicitClientAuthUsage(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected a missing client-auth EKU error")
+	}
+	assertStoreEmpty(t, store)
+}
+
+func TestEnsureRejectsCACertificateAsDeviceIdentity(t *testing.T) {
+	ca := newSigningCA(t)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request protocol.EnrollmentRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(protocol.EnrollmentResponse{
+			ProtocolVersion:          protocol.ProtocolVersion,
+			NodeID:                   "node-1",
+			CertificatePEM:           ca.signCSR(t, request.CSRPEM, "node-1", x509.KeyUsageCertSign, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, true),
+			CACertificatePEM:         ca.pem,
+			GatewayURL:               strings.Replace(server.URL, "http://", "ws://", 1),
+			HeartbeatIntervalSeconds: 15,
+		})
+	}))
+	defer server.Close()
+	store := openStore(t)
+
+	_, err := Ensure(
+		context.Background(),
+		testConfig(server.URL, true),
+		protocol.EnrollmentFacts{Architecture: "arm64", PlatformKind: "jetson"},
+		store,
+		server.Client(),
+	)
+	if err == nil {
+		t.Fatal("expected a CA certificate to be rejected as a device identity")
 	}
 	assertStoreEmpty(t, store)
 }
@@ -627,17 +662,21 @@ func (c *signingCA) signCSR(
 	t *testing.T,
 	csrPEM string,
 	nodeID string,
+	keyUsage x509.KeyUsage,
 	extKeyUsage []x509.ExtKeyUsage,
+	isCA bool,
 ) string {
 	t.Helper()
 	csr := parseCSR(t, csrPEM)
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(101),
-		Subject:      pkix.Name{CommonName: nodeID},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  extKeyUsage,
+		SerialNumber:          big.NewInt(101),
+		Subject:               pkix.Name{CommonName: nodeID},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              keyUsage,
+		ExtKeyUsage:           extKeyUsage,
+		BasicConstraintsValid: isCA,
+		IsCA:                  isCA,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, c.certificate, csr.PublicKey, c.privateKey)
 	if err != nil {

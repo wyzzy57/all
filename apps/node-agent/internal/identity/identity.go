@@ -205,6 +205,9 @@ func validateEnrollmentResponse(
 	if certificate.Subject.CommonName != response.NodeID {
 		return nil, fmt.Errorf("device certificate common name does not match node ID")
 	}
+	if certificate.IsCA || certificate.KeyUsage&x509.KeyUsageCertSign != 0 {
+		return nil, fmt.Errorf("device certificate must be an end-entity certificate")
+	}
 	if !hasClientAuthUsage(certificate.ExtKeyUsage) {
 		return nil, fmt.Errorf("device certificate does not explicitly allow client authentication")
 	}
