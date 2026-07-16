@@ -23,6 +23,7 @@ from visiox_api.routes.training_observability import router as training_observab
 from visiox_api.routes.training_jobs import router as training_jobs_router
 from visiox_api.services.training_observability import TrainingObservabilityService
 from visiox_api.seed_base_models import seed_yolo26_base_models
+from visiox_api.ws.agents import router as agent_gateway_router
 from visiox_api.ws.tasks import router as task_progress_router
 from visiox_db.session import create_session_factory
 from visiox_storage.client import MinioObjectStorageClient
@@ -86,6 +87,7 @@ def create_app() -> FastAPI:
 
     app.include_router(tasks_router)
     app.include_router(agent_enrollment_router)
+    app.include_router(agent_gateway_router)
     app.include_router(nodes_router)
     app.include_router(base_models_router)
     app.include_router(datasets_router)

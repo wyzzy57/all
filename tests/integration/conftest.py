@@ -52,8 +52,13 @@ def agent_api_client(
 
     from visiox_api.routes.agent_enrollment import get_agent_enrollment_session
     from visiox_api.routes.nodes import get_node_session
+    from visiox_api.ws.agents import get_agent_gateway_session_factory
+
+    def override_gateway_session_factory() -> sessionmaker[Session]:
+        return agent_session_factory
 
     app.dependency_overrides[get_agent_enrollment_session] = override_session
+    app.dependency_overrides[get_agent_gateway_session_factory] = override_gateway_session_factory
     app.dependency_overrides[get_node_session] = override_session
     app.dependency_overrides[get_settings] = override_settings
 
