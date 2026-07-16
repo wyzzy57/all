@@ -67,8 +67,11 @@ def issue_agent_certificate(
     except Exception:
         raise AgentIdentityError("Certificate request is invalid") from None
 
-    ca_key, ca_certificate = _load_agent_ca(settings)
-    expires_at = current_time + timedelta(days=settings.agent_certificate_ttl_days)
+    ca_key, ca_certificate = _load_agent_ca(settings, now=current_time)
+    expires_at = min(
+        current_time + timedelta(days=settings.agent_certificate_ttl_days),
+        ca_certificate.not_valid_after_utc,
+    )
     try:
         certificate = (
             x509.CertificateBuilder()
@@ -101,9 +104,10 @@ def verify_agent_signature(
     settings: Settings,
     now: datetime | None = None,
 ) -> VerifiedAgentIdentity:
+    current_time = _as_utc(now)
     try:
         certificate = x509.load_pem_x509_certificate(certificate_pem.encode())
-        _, ca_certificate = _load_agent_ca(settings)
+        _, ca_certificate = _load_agent_ca(settings, now=current_time)
         ca_public_key = ca_certificate.public_key()
         if not isinstance(ca_public_key, ed25519.Ed25519PublicKey):
             raise ValueError
@@ -111,7 +115,6 @@ def verify_agent_signature(
             raise ValueError
         ca_public_key.verify(certificate.signature, certificate.tbs_certificate_bytes)
 
-        current_time = _as_utc(now)
         if current_time < certificate.not_valid_before_utc or current_time > certificate.not_valid_after_utc:
             raise ValueError
 
@@ -170,7 +173,10 @@ def _generate_agent_ca(settings: Settings) -> None:
     settings.agent_ca_cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
 
 
-def _load_agent_ca(settings: Settings) -> tuple[ed25519.Ed25519PrivateKey, x509.Certificate]:
+def _load_agent_ca(
+    settings: Settings,
+    now: datetime | None = None,
+) -> tuple[ed25519.Ed25519PrivateKey, x509.Certificate]:
     try:
         private_key = serialization.load_pem_private_key(
             settings.agent_ca_key_path.read_bytes(),
@@ -190,8 +196,8 @@ def _load_agent_ca(settings: Settings) -> tuple[ed25519.Ed25519PrivateKey, x509.
         public_key.verify(certificate.signature, certificate.tbs_certificate_bytes)
         if _public_key_bytes(private_key.public_key()) != _public_key_bytes(public_key):
             raise ValueError
-        now = datetime.now(UTC)
-        if now < certificate.not_valid_before_utc or now > certificate.not_valid_after_utc:
+        current_time = _as_utc(now)
+        if current_time < certificate.not_valid_before_utc or current_time > certificate.not_valid_after_utc:
             raise ValueError
     except Exception:
         raise AgentIdentityError("Agent CA material is invalid") from None

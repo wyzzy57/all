@@ -104,6 +104,49 @@ def test_ca_issues_node_certificate_and_verifies_nonce(tmp_path: Path) -> None:
     assert hash_enrollment_token("secret") == hashlib.sha256(b"secret").hexdigest()
 
 
+def test_verify_agent_signature_validates_ca_at_caller_supplied_time(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    ensure_agent_ca(settings)
+    key = ed25519.Ed25519PrivateKey.generate()
+    _, ca_certificate = _load_ca(settings)
+    verification_time = ca_certificate.not_valid_after_utc + timedelta(seconds=1)
+    certificate_pem = _certificate(settings, key, now=verification_time)
+
+    with pytest.raises(AgentIdentityError, match="^Agent identity verification failed$"):
+        verify_agent_signature(
+            certificate_pem,
+            b"nonce",
+            key.sign(b"nonce"),
+            settings,
+            now=verification_time,
+        )
+
+
+def test_issue_agent_certificate_validates_ca_at_caller_supplied_time(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    ensure_agent_ca(settings)
+    _, csr_pem = _csr()
+    _, ca_certificate = _load_ca(settings)
+    issuance_time = ca_certificate.not_valid_after_utc + timedelta(seconds=1)
+
+    with pytest.raises(AgentIdentityError, match="^Agent CA material is invalid$"):
+        issue_agent_certificate(csr_pem, "node-123", settings, now=issuance_time)
+
+
+def test_issued_certificate_never_outlives_ca(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    ensure_agent_ca(settings)
+    _, csr_pem = _csr()
+    _, ca_certificate = _load_ca(settings)
+    issuance_time = ca_certificate.not_valid_after_utc - timedelta(days=1)
+
+    issued = issue_agent_certificate(csr_pem, "node-123", settings, now=issuance_time)
+
+    certificate = x509.load_pem_x509_certificate(issued.certificate_pem.encode())
+    assert certificate.not_valid_after_utc == ca_certificate.not_valid_after_utc
+    assert issued.expires_at == ca_certificate.not_valid_after_utc
+
+
 def test_ensure_agent_ca_rejects_missing_material_when_generation_is_disabled(tmp_path: Path) -> None:
     settings = _settings(tmp_path, agent_auto_generate_ca=False)
 
