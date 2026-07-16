@@ -1,7 +1,9 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Self
+from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,6 +36,37 @@ class Settings(BaseSettings):
     observability_max_points: int = 2000
     observability_event_cache_size: int = 32
     observability_live_poll_seconds: int = 5
+    agent_ca_cert_path: Path = Path("/var/lib/visiox/pki/ca.crt")
+    agent_ca_key_path: Path = Path("/var/lib/visiox/pki/ca.key")
+    agent_auto_generate_ca: bool = False
+    agent_certificate_ttl_days: int = 365
+    agent_enrollment_token_ttl_minutes: int = 15
+    agent_public_ws_url: str = "ws://127.0.0.1:8000/agent/v1/connect"
+    agent_gateway_enabled: bool = False
+    agent_heartbeat_interval_seconds: int = 15
+    agent_offline_after_seconds: int = 45
+    agent_certificate_renew_before_days: int = 30
+    agent_max_ws_message_bytes: int = 1024 * 1024
+
+    @model_validator(mode="after")
+    def validate_agent_public_ws_url(self) -> Self:
+        if self.environment.lower() != "local" and "agent_public_ws_url" not in self.model_fields_set:
+            self.agent_public_ws_url = self.agent_public_ws_url.replace("ws://", "wss://", 1)
+
+        parsed = urlsplit(self.agent_public_ws_url)
+        required_schemes = {"ws", "wss"} if self.environment.lower() == "local" else {"wss"}
+        if (
+            parsed.scheme.lower() not in required_schemes
+            or not parsed.hostname
+            or parsed.path != "/agent/v1/connect"
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "agent_public_ws_url must use the environment-appropriate WebSocket scheme "
+                "and path /agent/v1/connect"
+            )
+        return self
 
 
 @lru_cache
