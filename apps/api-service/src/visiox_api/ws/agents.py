@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import secrets
 from datetime import UTC, datetime
@@ -79,8 +80,11 @@ async def agent_gateway(
     )
     try:
         raw_auth = await _receive_text_frame(websocket, settings)
-        auth = _parse_authentication(raw_auth)
+        auth, signature = _parse_authentication(raw_auth)
     except WebSocketDisconnect:
+        return
+    except AgentAuthenticationRejected:
+        await websocket.close(code=4403, reason="agent identity rejected")
         return
     except InvalidAgentMessage:
         await _send_error(websocket, "invalid_message", "Message rejected")
@@ -91,7 +95,7 @@ async def agent_gateway(
         verified = verify_agent_signature(
             auth.certificate_pem,
             nonce,
-            base64.b64decode(auth.signature, validate=True),
+            signature,
             settings,
         )
         if verified.node_id != auth.node_id:
@@ -187,12 +191,21 @@ async def _receive_text_frame(websocket: WebSocket, settings: Settings) -> str:
     return raw_message
 
 
-def _parse_authentication(raw_message: str) -> AuthenticateMessage:
-    _load_json_object(raw_message)
+def _parse_authentication(raw_message: str) -> tuple[AuthenticateMessage, bytes]:
+    payload = _load_json_object(raw_message)
+    raw_signature = payload.get("signature")
+    if isinstance(raw_signature, str):
+        try:
+            signature = base64.b64decode(raw_signature, validate=True)
+        except ValueError:
+            raise AgentAuthenticationRejected from None
+    else:
+        signature = b""
     try:
-        return AuthenticateMessage.model_validate_json(raw_message)
+        auth = AuthenticateMessage.model_validate_json(raw_message)
     except ValidationError:
         raise InvalidAgentMessage from None
+    return auth, signature
 
 
 def _parse_agent_message(
@@ -297,9 +310,20 @@ def _same_event(stored: NodeEvent, received: Any) -> bool:
         stored.event_type == received.event_type
         and stored.command_id == received.command_id
         and stored.stage == received.stage
-        and stored.payload == received.payload
+        and _canonical_json_digest(stored.payload)
+        == _canonical_json_digest(received.payload)
         and _as_utc(stored.occurred_at) == _as_utc(received.occurred_at)
     )
+
+
+def _canonical_json_digest(value: object) -> bytes:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).digest()
 
 
 def _renew_agent_certificate(

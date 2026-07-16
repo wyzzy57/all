@@ -214,6 +214,30 @@ def test_agent_gateway_rejects_wrong_signature_opaquely(
     assert rejected.value.reason == "agent identity rejected"
 
 
+def test_agent_gateway_rejects_malformed_signature_base64_opaquely(
+    agent_api_client: TestClient,
+    enrolled_agent,
+) -> None:
+    node_id, certificate_pem, _ = enrolled_agent
+    with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
+        challenge = websocket.receive_json()
+        assert challenge["type"] == "challenge"
+        websocket.send_json(
+            {
+                "protocol_version": 1,
+                "type": "authenticate",
+                "node_id": node_id,
+                "certificate_pem": certificate_pem,
+                "signature": "not-valid-base64!",
+            }
+        )
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            websocket.receive_json()
+
+    assert rejected.value.code == 4403
+    assert rejected.value.reason == "agent identity rejected"
+
+
 def test_agent_gateway_rejects_certificate_node_mismatch_opaquely(
     agent_api_client: TestClient,
     enrolled_agent,
@@ -266,6 +290,30 @@ def test_agent_gateway_event_replays_are_idempotent_and_conflicts_are_rejected(
         stored = session.scalar(select(NodeEvent).where(NodeEvent.node_id == node_id))
         assert stored is not None
         assert stored.payload == {"boot_id": "boot-a"}
+
+
+def test_agent_gateway_event_replay_preserves_json_value_types(
+    agent_api_client: TestClient,
+    agent_session_factory: sessionmaker[Session],
+    enrolled_agent,
+) -> None:
+    node_id, certificate_pem, private_key = enrolled_agent
+    original_event = _event(1, payload={"enabled": True})
+    with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
+        _authenticate(websocket, node_id, certificate_pem, private_key)
+        websocket.send_json(_event_batch(original_event))
+        assert websocket.receive_json()["through_sequence"] == 1
+
+        websocket.send_json(_event_batch(original_event))
+        assert websocket.receive_json()["through_sequence"] == 1
+
+        websocket.send_json(_event_batch(_event(1, payload={"enabled": 1})))
+        assert websocket.receive_json() == EVENT_CONFLICT
+
+    with agent_session_factory() as session:
+        stored = session.scalar(select(NodeEvent).where(NodeEvent.node_id == node_id))
+        assert stored is not None
+        assert stored.payload == {"enabled": True}
 
 
 @pytest.mark.parametrize(
