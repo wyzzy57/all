@@ -7,10 +7,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from visiox_common.settings import get_settings
+from visiox_api.routes.agent_enrollment import router as agent_enrollment_router
 from visiox_api.routes.base_models import router as base_models_router
 from visiox_api.routes.dataset_samples import router as dataset_samples_router
 from visiox_api.routes.datasets import router as datasets_router
 from visiox_api.routes.label_projects import router as label_projects_router
+from visiox_api.routes.nodes import router as nodes_router
 from visiox_api.routes.pipeline_evaluation import router as pipeline_evaluation_router
 from visiox_api.routes.pipeline_inference import router as pipeline_inference_router
 from visiox_api.routes.pipelines import router as pipelines_router
@@ -83,6 +85,8 @@ def create_app() -> FastAPI:
         }
 
     app.include_router(tasks_router)
+    app.include_router(agent_enrollment_router)
+    app.include_router(nodes_router)
     app.include_router(base_models_router)
     app.include_router(datasets_router)
     app.include_router(dataset_samples_router)
