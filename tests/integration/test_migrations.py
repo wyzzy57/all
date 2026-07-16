@@ -21,6 +21,14 @@ EXPECTED_TABLES = {
     "label_projects",
 }
 
+EXPECTED_TABLES |= {
+    "resource_pools",
+    "compute_nodes",
+    "agent_enrollment_tokens",
+    "node_commands",
+    "node_events",
+}
+
 REMOVED_TABLES = {
     "devices",
     "cameras",
