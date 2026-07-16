@@ -97,7 +97,7 @@ func (c *Client) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		authenticated, err := c.runConnection(ctx)
+		stable, err := c.runConnection(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -109,14 +109,14 @@ func (c *Client) Run(ctx context.Context) error {
 			attempt = 0
 			continue
 		}
-		if authenticated {
+		if stable {
 			attempt = 0
 		}
 		delay := c.backoff(attempt)
 		if delay < 0 {
 			delay = 0
 		}
-		if !authenticated && attempt < math.MaxInt {
+		if attempt < math.MaxInt {
 			attempt++
 		}
 		timer := time.NewTimer(delay)
@@ -174,32 +174,34 @@ func (c *Client) runConnection(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	authenticated := true
-
 	if !identity.CertificateExpiresAt.After(time.Now().Add(certificateRenewalWindow)) {
 		renewed, err := renewCertificate(ctx, conn, identity, signer)
 		if err != nil {
-			return authenticated, err
+			return false, err
 		}
 		if err := c.store.UpdateCertificate(renewed.pem, renewed.certificate.NotAfter); err != nil {
-			return authenticated, fatal(fmt.Errorf("persist renewed certificate: %w", err))
+			return false, fatal(fmt.Errorf("persist renewed certificate: %w", err))
 		}
 		identity.CertificatePEM = renewed.pem
 		identity.CertificateExpiresAt = renewed.certificate.NotAfter
 	}
 
-	return authenticated, c.runLiveConnection(ctx, conn, time.Duration(heartbeatSeconds)*time.Second)
+	return c.runLiveConnection(ctx, conn, time.Duration(heartbeatSeconds)*time.Second)
 }
 
 func (c *Client) gatewayHTTPClient(identity state.Identity) (*http.Client, *http.Transport, error) {
 	parsed, err := url.Parse(identity.GatewayURL)
-	if err != nil || parsed.Host == "" || parsed.User != nil {
+	if err != nil {
+		return nil, nil, fmt.Errorf("stored Gateway URL is invalid")
+	}
+	hostname := parsed.Hostname()
+	if parsed.Host == "" || hostname == "" || parsed.User != nil {
 		return nil, nil, fmt.Errorf("stored Gateway URL is invalid")
 	}
 	switch strings.ToLower(parsed.Scheme) {
 	case "wss":
 	case "ws":
-		if !c.cfg.AllowInsecureLocal {
+		if !c.cfg.AllowInsecureLocal || !isLocalDevelopmentGatewayHost(hostname) {
 			return nil, nil, fmt.Errorf("stored Gateway URL requires insecure local mode")
 		}
 	default:
@@ -230,6 +232,15 @@ func (c *Client) gatewayHTTPClient(identity state.Identity) (*http.Client, *http
 		},
 	}
 	return client, transport, nil
+}
+
+func isLocalDevelopmentGatewayHost(hostname string) bool {
+	switch strings.ToLower(hostname) {
+	case "localhost", "127.0.0.1", "api-service", "host.docker.internal":
+		return true
+	default:
+		return false
+	}
 }
 
 func authenticate(
@@ -332,6 +343,9 @@ func renewCertificate(
 	if err != nil {
 		return renewedCertificate{}, fatal(fmt.Errorf("validate renewed certificate: %w", err))
 	}
+	if !certificate.NotAfter.After(identity.CertificateExpiresAt) {
+		return renewedCertificate{}, fatalErrorf("renewed certificate expiry must advance")
+	}
 	return renewedCertificate{pem: renewed.CertificatePEM, certificate: certificate}, nil
 }
 
@@ -339,7 +353,7 @@ func (c *Client) runLiveConnection(
 	ctx context.Context,
 	conn *websocket.Conn,
 	heartbeatInterval time.Duration,
-) error {
+) (bool, error) {
 	readerCtx, cancelReader := context.WithCancel(ctx)
 	readerResults := make(chan serverResult, 1)
 	readerDone := make(chan struct{})
@@ -350,15 +364,16 @@ func (c *Client) runLiveConnection(
 		<-readerDone
 	}()
 
+	stable := false
 	highestSent := uint64(0)
 	if err := writeJSONMessage(ctx, conn, c.inventory); err != nil {
-		return err
+		return stable, err
 	}
 	if err := writeHeartbeat(ctx, conn); err != nil {
-		return err
+		return stable, err
 	}
 	if err := c.writePendingEvents(ctx, conn, &highestSent); err != nil {
-		return err
+		return stable, err
 	}
 
 	ticker := time.NewTicker(heartbeatInterval)
@@ -366,35 +381,39 @@ func (c *Client) runLiveConnection(
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return stable, ctx.Err()
 		case <-ticker.C:
 			if err := writeHeartbeat(ctx, conn); err != nil {
-				return err
+				return stable, err
 			}
 			if err := c.writePendingEvents(ctx, conn, &highestSent); err != nil {
-				return err
+				return stable, err
 			}
+			stable = true
 		case result := <-readerResults:
 			if result.err != nil {
-				return result.err
+				return stable, result.err
 			}
 			if result.ack != nil {
 				if result.ack.ThroughSequence > highestSent {
-					return fatalErrorf(
+					return stable, fatalErrorf(
 						"ACK sequence %d is ahead of highest sent sequence %d",
 						result.ack.ThroughSequence,
 						highestSent,
 					)
 				}
 				if err := c.store.AckEvents(result.ack.ThroughSequence); err != nil {
-					return fatal(fmt.Errorf("persist event ACK: %w", err))
+					return stable, fatal(fmt.Errorf("persist event ACK: %w", err))
+				}
+				if result.ack.ThroughSequence > 0 {
+					stable = true
 				}
 				continue
 			}
 			if result.serverError.Retryable {
-				return fmt.Errorf("Gateway server requested retry for code %q", result.serverError.Code)
+				return stable, fmt.Errorf("Gateway server requested retry for code %q", result.serverError.Code)
 			}
-			return fatalErrorf("Gateway server rejected connection with code %q", result.serverError.Code)
+			return stable, fatalErrorf("Gateway server rejected connection with code %q", result.serverError.Code)
 		}
 	}
 }

@@ -238,6 +238,95 @@ func TestClientRenewsCertificateBeforeExpiry(t *testing.T) {
 	assertNoServerError(t, serverErrors)
 }
 
+func TestClientRejectsRenewalWithoutExpiryAdvance(t *testing.T) {
+	tests := []struct {
+		name        string
+		expiryDelta time.Duration
+	}{
+		{name: "equal expiry"},
+		{name: "earlier expiry", expiryDelta: -time.Hour},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openGatewayStore(t)
+			serverErrors := make(chan error, 1)
+			var (
+				identity            state.Identity
+				signer              ed25519.PrivateKey
+				ca                  *testsupport.CA
+				returnedCertificate string
+			)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				defer conn.CloseNow()
+				if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				var renewal protocol.CertificateRenewalRequest
+				if err := peerReadJSON(conn, &renewal); err != nil || renewal.Type != "certificate_renewal_request" {
+					reportServerError(serverErrors, fmt.Errorf("read renewal request: %v", err))
+					return
+				}
+				if err := peerWriteJSON(conn, protocol.CertificateRenewedMessage{
+					Envelope:       testEnvelope("certificate_renewed"),
+					CertificatePEM: returnedCertificate,
+				}); err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				_, _, _ = peerRead(conn)
+			}))
+			defer server.Close()
+
+			identity, signer, ca = testsupport.NewStoredIdentity(
+				t,
+				store,
+				"node-1",
+				websocketURL(server.URL),
+				time.Now().Add(29*24*time.Hour),
+			)
+			returnedCertificate = ca.SignCSR(
+				t,
+				csrPEMForKey(t, signer, identity.NodeID),
+				identity.NodeID,
+				identity.CertificateExpiresAt.Add(test.expiryDelta),
+			)
+
+			ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+			defer cancel()
+			client := New(testGatewayConfig(), store, testInventory(), WithBackoff(func(int) time.Duration {
+				cancel()
+				return 0
+			}))
+			err := client.Run(ctx)
+			if err == nil || !strings.Contains(err.Error(), "advance") {
+				t.Errorf("error = %v, want expiry-advance rejection", err)
+			}
+
+			current, found, loadErr := store.Identity()
+			if loadErr != nil || !found {
+				t.Fatalf("load identity after rejected renewal: found=%v err=%v", found, loadErr)
+			}
+			if current.NodeID != identity.NodeID ||
+				current.PrivateKeyPEM != identity.PrivateKeyPEM ||
+				current.CertificatePEM != identity.CertificatePEM ||
+				current.CACertificatePEM != identity.CACertificatePEM ||
+				!current.CertificateExpiresAt.Equal(identity.CertificateExpiresAt) ||
+				current.GatewayURL != identity.GatewayURL ||
+				current.HeartbeatIntervalSeconds != identity.HeartbeatIntervalSeconds {
+				t.Fatal("rejected renewal modified the stored identity")
+			}
+			assertNoServerError(t, serverErrors)
+		})
+	}
+}
+
 func TestClientDoesNotRenewCertificateOutsideWindow(t *testing.T) {
 	store := openGatewayStore(t)
 	serverReady := make(chan struct{}, 1)
@@ -384,6 +473,143 @@ func TestClientReconnectsAndReplaysUnackedEvents(t *testing.T) {
 	if err := waitClient(t, runDone); err != nil {
 		t.Fatalf("Run returned an error after cancellation: %v", err)
 	}
+	assertNoServerError(t, serverErrors)
+}
+
+func TestClientBackoffAdvancesAfterAuthenticatedDisconnects(t *testing.T) {
+	store := openGatewayStore(t)
+	serverErrors := make(chan error, 1)
+	var (
+		authentications atomic.Int32
+		identity        state.Identity
+		signer          ed25519.PrivateKey
+		ca              *testsupport.CA
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		authentications.Add(1)
+	}))
+	defer server.Close()
+	identity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-1",
+		websocketURL(server.URL),
+		time.Now().Add(365*24*time.Hour),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	defer cancel()
+	var attempts []int
+	client := New(testGatewayConfig(), store, testInventory(), WithBackoff(func(attempt int) time.Duration {
+		attempts = append(attempts, attempt)
+		if len(attempts) == 4 {
+			cancel()
+		}
+		return 0
+	}))
+	if err := client.Run(ctx); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	wantAttempts := []int{0, 1, 2, 3}
+	if fmt.Sprint(attempts) != fmt.Sprint(wantAttempts) {
+		t.Fatalf("backoff attempts = %v, want %v", attempts, wantAttempts)
+	}
+	if got := authentications.Load(); got != int32(len(wantAttempts)) {
+		t.Fatalf("authentications = %d, want %d", got, len(wantAttempts))
+	}
+	assertNoServerError(t, serverErrors)
+}
+
+func TestClientBackoffResetsAfterApplicationRoundTrip(t *testing.T) {
+	store := openGatewayStore(t)
+	serverErrors := make(chan error, 1)
+	var (
+		connections atomic.Int32
+		identity    state.Identity
+		signer      ed25519.PrivateKey
+		ca          *testsupport.CA
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		connectionNumber := connections.Add(1)
+		if connectionNumber < 3 {
+			return
+		}
+		if connectionNumber != 3 {
+			reportServerError(serverErrors, fmt.Errorf("unexpected connection %d", connectionNumber))
+			return
+		}
+		if _, err := readEventBatchFrame(conn); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := peerWriteJSON(conn, protocol.EventsAckMessage{
+			Envelope:        testEnvelope("events_acked"),
+			ThroughSequence: 1,
+		}); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := peerWriteJSON(conn, protocol.ErrorMessage{
+			Envelope:  testEnvelope("error"),
+			Code:      "retry_test",
+			Message:   "retry after acknowledged connection",
+			Retryable: true,
+		}); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		_, _, _ = peerRead(conn)
+	}))
+	defer server.Close()
+	identity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-1",
+		websocketURL(server.URL),
+		time.Now().Add(365*24*time.Hour),
+	)
+	if _, err := store.AppendEvent("agent_started", map[string]any{"ok": true}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	defer cancel()
+	var attempts []int
+	client := New(testGatewayConfig(), store, testInventory(), WithBackoff(func(attempt int) time.Duration {
+		attempts = append(attempts, attempt)
+		if len(attempts) == 3 {
+			cancel()
+		}
+		return 0
+	}))
+	if err := client.Run(ctx); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	wantAttempts := []int{0, 1, 0}
+	if fmt.Sprint(attempts) != fmt.Sprint(wantAttempts) {
+		t.Fatalf("backoff attempts = %v, want %v", attempts, wantAttempts)
+	}
+	waitPendingEvents(t, store, 0)
 	assertNoServerError(t, serverErrors)
 }
 
@@ -695,6 +921,56 @@ func TestAppendEnrolledCAKeepsSystemRoots(t *testing.T) {
 	}
 	if len(combined.Subjects()) != 2 {
 		t.Fatalf("combined roots contain %d subjects, want 2", len(combined.Subjects()))
+	}
+}
+
+func TestGatewayHTTPClientRestrictsPlaintextToExplicitLocalHosts(t *testing.T) {
+	ca := testsupport.NewCA(t)
+	tests := []struct {
+		name          string
+		gatewayURL    string
+		allowInsecure bool
+		wantError     bool
+	}{
+		{name: "localhost", gatewayURL: "ws://localhost:8080/agent/v1/connect", allowInsecure: true},
+		{name: "IPv4 loopback", gatewayURL: "ws://127.0.0.1/agent/v1/connect", allowInsecure: true},
+		{name: "Compose service", gatewayURL: "ws://api-service/agent/v1/connect", allowInsecure: true},
+		{name: "Docker host", gatewayURL: "ws://host.docker.internal/agent/v1/connect", allowInsecure: true},
+		{name: "case insensitive host", gatewayURL: "ws://LOCALHOST/agent/v1/connect", allowInsecure: true},
+		{name: "insecure mode disabled", gatewayURL: "ws://localhost/agent/v1/connect", wantError: true},
+		{name: "remote hostname", gatewayURL: "ws://gateway.example/agent/v1/connect", allowInsecure: true, wantError: true},
+		{name: "public IP", gatewayURL: "ws://203.0.113.10/agent/v1/connect", allowInsecure: true, wantError: true},
+		{name: "private IPv4", gatewayURL: "ws://192.168.1.10/agent/v1/connect", allowInsecure: true, wantError: true},
+		{name: "alternate loopback IPv4", gatewayURL: "ws://127.0.0.2/agent/v1/connect", allowInsecure: true, wantError: true},
+		{name: "IPv6 loopback", gatewayURL: "ws://[::1]/agent/v1/connect", allowInsecure: true, wantError: true},
+		{name: "userinfo", gatewayURL: "ws://user@localhost/agent/v1/connect", allowInsecure: true, wantError: true},
+		{name: "empty hostname", gatewayURL: "ws:///agent/v1/connect", allowInsecure: true, wantError: true},
+		{name: "malformed URL", gatewayURL: "ws://[::1/agent/v1/connect", allowInsecure: true, wantError: true},
+		{name: "secure remote hostname", gatewayURL: "wss://gateway.example/agent/v1/connect"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := New(config.Config{AllowInsecureLocal: test.allowInsecure}, nil, protocol.InventoryMessage{})
+			httpClient, transport, err := client.gatewayHTTPClient(state.Identity{
+				GatewayURL:       test.gatewayURL,
+				CACertificatePEM: ca.PEM(),
+			})
+			if test.wantError {
+				if err == nil {
+					transport.CloseIdleConnections()
+					t.Fatalf("gatewayHTTPClient(%q) succeeded, want rejection", test.gatewayURL)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("gatewayHTTPClient(%q): %v", test.gatewayURL, err)
+			}
+			if httpClient == nil || transport == nil {
+				t.Fatal("gatewayHTTPClient returned nil client or transport")
+			}
+			transport.CloseIdleConnections()
+		})
 	}
 }
 
