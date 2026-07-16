@@ -1,4 +1,5 @@
 import base64
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -204,24 +205,72 @@ def test_enrollment_assigns_compatible_default_pool(
         assert pool.name == pool_name
 
 
-def test_inventory_mismatch_marks_node_incompatible_without_pool_reassignment(
+@pytest.mark.parametrize(
+    ("architecture", "platform_kind", "valid_architecture"),
+    [
+        ("amd64", "jetson", "arm64"),
+        ("arm64", "x86_nvidia", "amd64"),
+    ],
+)
+def test_enrollment_rejects_incompatible_pool_pair_without_consuming_token(
+    agent_api_client,
+    architecture: str,
+    platform_kind: str,
+    valid_architecture: str,
+) -> None:
+    token = _create_token(agent_api_client, f"invalid-{platform_kind}")
+    payload = _enrollment_payload(token, f"invalid-{platform_kind}")
+    payload.update({"architecture": architecture, "platform_kind": platform_kind})
+
+    rejected = agent_api_client.post("/agent/v1/enroll", json=payload)
+    payload["architecture"] = valid_architecture
+    accepted = agent_api_client.post("/agent/v1/enroll", json=payload)
+
+    assert rejected.status_code == 409
+    assert accepted.status_code == 201
+
+
+@pytest.mark.parametrize(
+    (
+        "enrollment_architecture",
+        "enrollment_platform",
+        "inventory_architecture",
+        "inventory_platform",
+    ),
+    [
+        ("arm64", "jetson", "amd64", "jetson"),
+        ("amd64", "x86_nvidia", "arm64", "x86_nvidia"),
+    ],
+)
+def test_inventory_incompatible_pool_pair_preserves_enrollment_pool(
     agent_api_client,
     agent_session_factory: sessionmaker[Session],
+    enrollment_architecture: str,
+    enrollment_platform: str,
+    inventory_architecture: str,
+    inventory_platform: str,
 ) -> None:
     from visiox_api.schemas.agent_protocol import InventoryMessage
     from visiox_api.services.node_registry import NodeRegistryService
 
-    enrolled = _enroll(agent_api_client)
+    token = _create_token(agent_api_client, f"inventory-{enrollment_platform}")
+    payload = _enrollment_payload(token, f"inventory-{enrollment_platform}")
+    payload.update(
+        {"architecture": enrollment_architecture, "platform_kind": enrollment_platform}
+    )
+    enrolled = agent_api_client.post("/agent/v1/enroll", json=payload)
+    assert enrolled.status_code == 201
     node_id = enrolled.json()["node_id"]
     settings = agent_api_client.app.dependency_overrides[get_settings]()
     with agent_session_factory() as session:
         node = session.get(ComputeNode, node_id)
         original_pool_id = node.resource_pool_id  # type: ignore[union-attr]
+        node_name = node.name  # type: ignore[union-attr]
         inventory = InventoryMessage(
             protocol_version=1,
             type="inventory",
-            architecture="amd64",
-            platform_kind="x86_nvidia",
+            architecture=inventory_architecture,
+            platform_kind=inventory_platform,
             capabilities={"gpu": "RTX"},
             resources={"vram_bytes": 1},
             fingerprint={"machine": "redacted"},
@@ -233,7 +282,55 @@ def test_inventory_mismatch_marks_node_incompatible_without_pool_reassignment(
         assert updated.status == "incompatible"
         assert updated.resource_pool_id == original_pool_id
         assert "compatibility_error" in updated.fingerprint
-        assert "edge-01" not in updated.fingerprint["compatibility_error"]
+        assert node_name not in updated.fingerprint["compatibility_error"]
+
+
+def test_enrollment_recovers_when_concurrent_pool_creation_wins(
+    agent_api_client,
+    agent_session_factory: sessionmaker[Session],
+    monkeypatch,
+) -> None:
+    from visiox_api.schemas.agent_protocol import EnrollmentRequest
+    from visiox_api.services.node_registry import NodeRegistryService
+
+    token = _create_token(agent_api_client, "pool-race")
+    request = EnrollmentRequest.model_validate(_enrollment_payload(token, "pool-race"))
+    settings = agent_api_client.app.dependency_overrides[get_settings]()
+    with agent_session_factory() as session:
+        winning_pool = ResourcePool(
+            name="jetson-default",
+            kind="jetson",
+            selector={"architecture": "arm64", "platform_kind": "jetson"},
+            compatibility_policy={"architecture": "arm64", "platform_kind": "jetson"},
+            enabled=True,
+        )
+        session.add(winning_pool)
+        session.commit()
+        original_scalar = session.scalar
+        hid_winning_pool = False
+
+        def scalar_with_stale_first_pool_read(statement, *args, **kwargs):
+            nonlocal hid_winning_pool
+            selects_pool = any(
+                description.get("entity") is ResourcePool
+                for description in statement.column_descriptions
+            )
+            if selects_pool and not hid_winning_pool:
+                hid_winning_pool = True
+                return None
+            return original_scalar(statement, *args, **kwargs)
+
+        monkeypatch.setattr(session, "scalar", scalar_with_stale_first_pool_read)
+
+        result = NodeRegistryService(session, settings).enroll(request)
+
+        assert hid_winning_pool
+        assert result.node.resource_pool_id == winning_pool.id
+        stored_token = session.scalar(
+            select(AgentEnrollmentToken).where(AgentEnrollmentToken.node_id == result.node.id)
+        )
+        assert stored_token is not None
+        assert stored_token.used_at is not None
 
 
 @pytest.mark.parametrize("status", ["incompatible", "draining", "disabled"])
@@ -269,6 +366,69 @@ def test_protocol_messages_reject_unknown_fields_and_unsupported_versions() -> N
         HeartbeatMessage(protocol_version=2, type="heartbeat", occurred_at=datetime.now(UTC))
 
 
+@pytest.mark.parametrize(
+    ("model_name", "payload"),
+    [
+        (
+            "AuthenticateMessage",
+            {
+                "protocol_version": 1,
+                "type": "authenticate",
+                "node_id": "node-1",
+                "certificate_pem": "x" * 100,
+                "signature": base64.b64encode(b"signature").decode(),
+            },
+        ),
+        (
+            "InventoryMessage",
+            {
+                "protocol_version": 1,
+                "type": "inventory",
+                "architecture": "arm64",
+                "platform_kind": "jetson",
+                "capabilities": {},
+                "resources": {},
+                "fingerprint": {},
+                "agent_version": "0.1.0",
+            },
+        ),
+        (
+            "HeartbeatMessage",
+            {
+                "protocol_version": 1,
+                "type": "heartbeat",
+                "occurred_at": datetime.now(UTC),
+            },
+        ),
+        (
+            "EventBatchMessage",
+            {"protocol_version": 1, "type": "event_batch", "events": []},
+        ),
+        (
+            "CertificateRenewalRequest",
+            {
+                "protocol_version": 1,
+                "type": "certificate_renewal_request",
+                "csr_pem": "x" * 100,
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("missing_field", ["protocol_version", "type"])
+def test_inbound_messages_require_explicit_wire_discriminators(
+    model_name: str,
+    payload: dict[str, object],
+    missing_field: str,
+) -> None:
+    from visiox_api.schemas import agent_protocol
+
+    missing_payload = dict(payload)
+    missing_payload.pop(missing_field)
+
+    with pytest.raises(ValidationError):
+        getattr(agent_protocol, model_name).model_validate(missing_payload)
+
+
 def test_protocol_messages_enforce_base64_utc_batch_and_json_size_bounds() -> None:
     from visiox_api.schemas.agent_protocol import (
         ChallengeMessage,
@@ -293,19 +453,6 @@ def test_protocol_messages_enforce_base64_utc_batch_and_json_size_bounds() -> No
             ],
         )
     with pytest.raises(ValidationError):
-        EventBatchMessage(
-            protocol_version=1,
-            type="event_batch",
-            events=[
-                {
-                    "sequence": 1,
-                    "event_type": "progress",
-                    "payload": {"blob": "x" * (1024 * 1024)},
-                    "occurred_at": datetime.now(UTC),
-                }
-            ],
-        )
-    with pytest.raises(ValidationError):
         InventoryMessage(
             protocol_version=1,
             type="inventory",
@@ -315,4 +462,42 @@ def test_protocol_messages_enforce_base64_utc_batch_and_json_size_bounds() -> No
             resources={},
             fingerprint={},
             agent_version="0.1.0",
+        )
+
+
+def test_raw_message_size_uses_received_utf8_bytes_before_json_parsing() -> None:
+    from visiox_api.schemas.agent_protocol import MAX_MESSAGE_BYTES, validate_raw_message_size
+
+    payload = {
+        "protocol_version": 1,
+        "type": "heartbeat",
+        "occurred_at": "2026-07-16T00:00:00Z",
+    }
+    normalized = json.dumps(payload, separators=(",", ":"))
+    raw_message = normalized + (" " * (MAX_MESSAGE_BYTES - len(normalized.encode("utf-8")) + 1))
+    assert json.loads(raw_message) == payload
+
+    validate_raw_message_size(raw_message[:-1])
+
+    with pytest.raises(ValueError, match="message exceeds 1 MiB"):
+        validate_raw_message_size(raw_message)
+
+
+def test_pem_limit_uses_utf8_bytes_instead_of_character_count() -> None:
+    from visiox_api.schemas.agent_protocol import CertificateRenewalRequest, MAX_PEM_BYTES
+
+    multibyte_pem = "\u754c" * ((MAX_PEM_BYTES // len("\u754c".encode("utf-8"))) + 1)
+    assert len(multibyte_pem) < MAX_PEM_BYTES
+    assert len(multibyte_pem.encode("utf-8")) > MAX_PEM_BYTES
+
+    CertificateRenewalRequest(
+        protocol_version=1,
+        type="certificate_renewal_request",
+        csr_pem="x" * MAX_PEM_BYTES,
+    )
+    with pytest.raises(ValidationError, match="PEM exceeds 16 KiB"):
+        CertificateRenewalRequest(
+            protocol_version=1,
+            type="certificate_renewal_request",
+            csr_pem=multibyte_pem,
         )

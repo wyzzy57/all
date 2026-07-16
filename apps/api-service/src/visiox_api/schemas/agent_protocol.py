@@ -1,15 +1,22 @@
 import base64
 import json
 from datetime import datetime, timedelta
-from typing import Any, Literal, Self
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_INVENTORY_SECTION_BYTES = 64 * 1024
 MAX_PEM_BYTES = 16 * 1024
 MAX_EVENT_BATCH_SIZE = 100
+
+
+def validate_raw_message_size(message: str | bytes) -> None:
+    """Validate Task 4 inbound text/bytes before JSON parsing."""
+    size = len(message.encode("utf-8")) if isinstance(message, str) else len(message)
+    if size > MAX_MESSAGE_BYTES:
+        raise ValueError("message exceeds 1 MiB")
 
 
 def _serialized_json_size(value: object) -> int:
@@ -32,6 +39,12 @@ def _validate_base64(value: str) -> str:
     return value
 
 
+def _validate_pem_size(value: str) -> str:
+    if len(value.encode("utf-8")) > MAX_PEM_BYTES:
+        raise ValueError("PEM exceeds 16 KiB")
+    return value
+
+
 def _validate_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() != timedelta(0):
         raise ValueError("timestamp must be UTC RFC3339")
@@ -41,12 +54,6 @@ def _validate_utc(value: datetime) -> datetime:
 class ProtocolModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    @model_validator(mode="after")
-    def validate_message_size(self) -> Self:
-        if len(self.model_dump_json().encode()) > MAX_MESSAGE_BYTES:
-            raise ValueError("message exceeds 1 MiB")
-        return self
-
 
 class EnrollmentRequest(ProtocolModel):
     protocol_version: Literal[1]
@@ -55,16 +62,22 @@ class EnrollmentRequest(ProtocolModel):
     architecture: Literal["amd64", "arm64"]
     platform_kind: Literal["jetson", "x86_nvidia"]
     agent_version: str = Field(min_length=1, max_length=40)
-    csr_pem: str = Field(min_length=100, max_length=MAX_PEM_BYTES)
+    csr_pem: str = Field(min_length=100)
+
+    _csr_fits = field_validator("csr_pem")(_validate_pem_size)
 
 
 class EnrollmentResponse(ProtocolModel):
     protocol_version: Literal[1] = 1
     node_id: str
-    certificate_pem: str = Field(min_length=100, max_length=MAX_PEM_BYTES)
-    ca_certificate_pem: str = Field(min_length=100, max_length=MAX_PEM_BYTES)
+    certificate_pem: str = Field(min_length=100)
+    ca_certificate_pem: str = Field(min_length=100)
     gateway_url: str
     heartbeat_interval_seconds: int = Field(gt=0)
+
+    _certificates_fit = field_validator("certificate_pem", "ca_certificate_pem")(
+        _validate_pem_size
+    )
 
 
 class ChallengeMessage(ProtocolModel):
@@ -76,13 +89,14 @@ class ChallengeMessage(ProtocolModel):
 
 
 class AuthenticateMessage(ProtocolModel):
-    protocol_version: Literal[1] = 1
-    type: Literal["authenticate"] = "authenticate"
+    protocol_version: Literal[1]
+    type: Literal["authenticate"]
     node_id: str = Field(min_length=1, max_length=36)
-    certificate_pem: str = Field(min_length=100, max_length=MAX_PEM_BYTES)
+    certificate_pem: str = Field(min_length=100)
     signature: str = Field(min_length=1, max_length=MAX_PEM_BYTES)
 
     _signature_is_base64 = field_validator("signature")(_validate_base64)
+    _certificate_fits = field_validator("certificate_pem")(_validate_pem_size)
 
 
 class AuthenticatedMessage(ProtocolModel):
@@ -92,8 +106,8 @@ class AuthenticatedMessage(ProtocolModel):
 
 
 class InventoryMessage(ProtocolModel):
-    protocol_version: Literal[1] = 1
-    type: Literal["inventory"] = "inventory"
+    protocol_version: Literal[1]
+    type: Literal["inventory"]
     architecture: Literal["amd64", "arm64"]
     platform_kind: Literal["jetson", "x86_nvidia"]
     capabilities: dict[str, Any]
@@ -105,8 +119,8 @@ class InventoryMessage(ProtocolModel):
 
 
 class HeartbeatMessage(ProtocolModel):
-    protocol_version: Literal[1] = 1
-    type: Literal["heartbeat"] = "heartbeat"
+    protocol_version: Literal[1]
+    type: Literal["heartbeat"]
     occurred_at: datetime
 
     _occurred_at_is_utc = field_validator("occurred_at")(_validate_utc)
@@ -124,8 +138,8 @@ class AgentEvent(ProtocolModel):
 
 
 class EventBatchMessage(ProtocolModel):
-    protocol_version: Literal[1] = 1
-    type: Literal["event_batch"] = "event_batch"
+    protocol_version: Literal[1]
+    type: Literal["event_batch"]
     events: list[AgentEvent] = Field(max_length=MAX_EVENT_BATCH_SIZE)
 
 
@@ -136,15 +150,19 @@ class EventsAckMessage(ProtocolModel):
 
 
 class CertificateRenewalRequest(ProtocolModel):
-    protocol_version: Literal[1] = 1
-    type: Literal["certificate_renewal_request"] = "certificate_renewal_request"
-    csr_pem: str = Field(min_length=100, max_length=MAX_PEM_BYTES)
+    protocol_version: Literal[1]
+    type: Literal["certificate_renewal_request"]
+    csr_pem: str = Field(min_length=100)
+
+    _csr_fits = field_validator("csr_pem")(_validate_pem_size)
 
 
 class CertificateRenewedMessage(ProtocolModel):
     protocol_version: Literal[1] = 1
     type: Literal["certificate_renewed"] = "certificate_renewed"
-    certificate_pem: str = Field(min_length=100, max_length=MAX_PEM_BYTES)
+    certificate_pem: str = Field(min_length=100)
+
+    _certificate_fits = field_validator("certificate_pem")(_validate_pem_size)
 
 
 class ErrorMessage(ProtocolModel):

@@ -40,8 +40,8 @@ class EnrollmentResult:
 
 
 _DEFAULT_POOLS = {
-    "jetson": ("jetson-default", "arm64"),
-    "x86_nvidia": ("x86-nvidia-default", "amd64"),
+    ("arm64", "jetson"): "jetson-default",
+    ("amd64", "x86_nvidia"): "x86-nvidia-default",
 }
 
 
@@ -92,7 +92,10 @@ class NodeRegistryService:
             if self.session.scalar(select(ComputeNode.id).where(ComputeNode.name == request.node_name)):
                 raise EnrollmentRejected("Enrollment rejected")
 
-            pool = self._get_or_create_default_pool(request.platform_kind)
+            pool = self._get_or_create_default_pool(
+                request.architecture,
+                request.platform_kind,
+            )
             node = ComputeNode(
                 name=request.node_name,
                 resource_pool_id=pool.id,
@@ -148,13 +151,20 @@ class NodeRegistryService:
                 node.architecture == inventory.architecture
                 and node.platform_kind == inventory.platform_kind
             )
+            has_compatible_pool = (
+                inventory.architecture,
+                inventory.platform_kind,
+            ) in _DEFAULT_POOLS
             fingerprint = dict(inventory.fingerprint)
-            if not matches_enrollment:
+            if not matches_enrollment or not has_compatible_pool:
                 fingerprint["compatibility_error"] = "reported inventory does not match enrollment declaration"
                 node.status = "incompatible"
             else:
                 fingerprint.pop("compatibility_error", None)
-                pool = self._get_or_create_default_pool(inventory.platform_kind)
+                pool = self._get_or_create_default_pool(
+                    inventory.architecture,
+                    inventory.platform_kind,
+                )
                 node.resource_pool_id = pool.id
                 if node.status not in {"draining", "disabled"}:
                     node.status = "online"
@@ -186,8 +196,14 @@ class NodeRegistryService:
             raise NodeNotFound(node_id)
         return node
 
-    def _get_or_create_default_pool(self, platform_kind: str) -> ResourcePool:
-        pool_name, architecture = _DEFAULT_POOLS[platform_kind]
+    def _get_or_create_default_pool(
+        self,
+        architecture: str,
+        platform_kind: str,
+    ) -> ResourcePool:
+        pool_name = _DEFAULT_POOLS.get((architecture, platform_kind))
+        if pool_name is None:
+            raise EnrollmentRejected("Enrollment rejected")
         pool = self.session.scalar(select(ResourcePool).where(ResourcePool.name == pool_name))
         if pool is not None:
             return pool
@@ -198,8 +214,17 @@ class NodeRegistryService:
             compatibility_policy={"architecture": architecture, "platform_kind": platform_kind},
             enabled=True,
         )
-        self.session.add(pool)
-        self.session.flush()
+        try:
+            with self.session.begin_nested():
+                self.session.add(pool)
+                self.session.flush()
+        except IntegrityError:
+            winning_pool = self.session.scalar(
+                select(ResourcePool).where(ResourcePool.name == pool_name)
+            )
+            if winning_pool is None:
+                raise
+            return winning_pool
         return pool
 
 
