@@ -387,94 +387,173 @@ func TestClientDoesNotRenewCertificateOutsideWindow(t *testing.T) {
 }
 
 func TestClientReconnectsAndReplaysUnackedEvents(t *testing.T) {
-	store := openGatewayStore(t)
-	observedBatches := make(chan []byte, 2)
-	serverErrors := make(chan error, 1)
-	ackSent := make(chan struct{}, 1)
-	allowAck := make(chan struct{})
-	releaseSecond := make(chan struct{})
-	var authentications atomic.Int32
-	var (
-		storedIdentity state.Identity
-		signer         ed25519.PrivateKey
-		ca             *testsupport.CA
-	)
+	tests := []struct {
+		name             string
+		mismatchObserved bool
+	}{
+		{name: "replays byte-for-byte"},
+		{name: "mismatch cleanup returns", mismatchObserved: true},
+	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		connectionNumber := authentications.Add(1)
-		conn, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			reportServerError(serverErrors, err)
-			return
-		}
-		defer conn.CloseNow()
-		if err := authenticatePeer(conn, storedIdentity, signer, ca, 5); err != nil {
-			reportServerError(serverErrors, err)
-			return
-		}
-		batch, err := readEventBatchFrame(conn)
-		if err != nil {
-			reportServerError(serverErrors, err)
-			return
-		}
-		observedBatches <- append([]byte(nil), batch...)
-		if connectionNumber == 1 {
-			_ = conn.Close(websocket.StatusInternalError, "retry")
-			return
-		}
-		if connectionNumber != 2 {
-			reportServerError(serverErrors, fmt.Errorf("unexpected connection %d", connectionNumber))
-			return
-		}
-		<-allowAck
-		if err := peerWriteJSON(conn, protocol.EventsAckMessage{
-			Envelope:        testEnvelope("events_acked"),
-			ThroughSequence: 1,
-		}); err != nil {
-			reportServerError(serverErrors, err)
-			return
-		}
-		ackSent <- struct{}{}
-		<-releaseSecond
-	}))
-	defer server.Close()
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openGatewayStore(t)
+			handlerCtx, cancelHandlers := context.WithCancel(context.Background())
+			observedBatches := make(chan []byte, 2)
+			handlerDone := make(chan struct{}, 2)
+			serverErrors := make(chan error, 1)
+			ackSent := make(chan struct{}, 1)
+			allowAck := make(chan struct{})
+			releaseSecond := make(chan struct{})
+			var authentications atomic.Int32
+			var (
+				storedIdentity state.Identity
+				signer         ed25519.PrivateKey
+				ca             *testsupport.CA
+			)
 
-	storedIdentity, signer, ca = testsupport.NewStoredIdentity(
-		t,
-		store,
-		"node-1",
-		websocketURL(server.URL),
-		time.Now().Add(365*24*time.Hour),
-	)
-	if _, err := store.AppendEvent("agent_started", map[string]any{"ok": true}); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
-	runDone := runClient(ctx, New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer func() {
+					select {
+					case handlerDone <- struct{}{}:
+					default:
+					}
+				}()
+				connectionNumber := authentications.Add(1)
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				defer conn.CloseNow()
+				if err := authenticatePeer(conn, storedIdentity, signer, ca, 5); err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				batch, err := readEventBatchFrame(conn)
+				if err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				observed := append([]byte(nil), batch...)
+				if test.mismatchObserved && connectionNumber == 2 {
+					observed = append(observed, '\n')
+				}
+				select {
+				case observedBatches <- observed:
+				case <-handlerCtx.Done():
+					return
+				case <-r.Context().Done():
+					return
+				case <-time.After(peerTimeout):
+					reportServerError(serverErrors, fmt.Errorf("timed out publishing observed event batch"))
+					return
+				}
+				if connectionNumber == 1 {
+					_ = conn.Close(websocket.StatusInternalError, "retry")
+					return
+				}
+				if connectionNumber != 2 {
+					reportServerError(serverErrors, fmt.Errorf("unexpected connection %d", connectionNumber))
+					return
+				}
+				select {
+				case <-allowAck:
+				case <-handlerCtx.Done():
+					return
+				case <-r.Context().Done():
+					return
+				case <-time.After(peerTimeout):
+					reportServerError(serverErrors, fmt.Errorf("timed out waiting to send event ACK"))
+					return
+				}
+				if err := peerWriteJSON(conn, protocol.EventsAckMessage{
+					Envelope:        testEnvelope("events_acked"),
+					ThroughSequence: 1,
+				}); err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				select {
+				case ackSent <- struct{}{}:
+				case <-handlerCtx.Done():
+					return
+				case <-r.Context().Done():
+					return
+				case <-time.After(peerTimeout):
+					reportServerError(serverErrors, fmt.Errorf("timed out publishing event ACK"))
+					return
+				}
+				select {
+				case <-releaseSecond:
+				case <-handlerCtx.Done():
+					return
+				case <-r.Context().Done():
+					return
+				case <-time.After(peerTimeout):
+					reportServerError(serverErrors, fmt.Errorf("timed out releasing replay connection"))
+					return
+				}
+			}))
+			defer server.Close()
+			defer cancelHandlers()
 
-	first := waitBatch(t, ctx, observedBatches, serverErrors)
-	waitPendingEvents(t, store, 1)
-	second := waitBatch(t, ctx, observedBatches, serverErrors)
-	if !bytes.Equal(first, second) {
-		cancel()
-		close(releaseSecond)
-		t.Fatalf("replayed event batch changed\nfirst:  %s\nsecond: %s", first, second)
+			storedIdentity, signer, ca = testsupport.NewStoredIdentity(
+				t,
+				store,
+				"node-1",
+				websocketURL(server.URL),
+				time.Now().Add(365*24*time.Hour),
+			)
+			if _, err := store.AppendEvent("agent_started", map[string]any{"ok": true}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+			defer cancel()
+			runDone := runClient(ctx, New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)))
+
+			first := waitBatch(t, ctx, observedBatches, serverErrors)
+			waitPendingEvents(t, store, 1)
+			second := waitBatch(t, ctx, observedBatches, serverErrors)
+			if !bytes.Equal(first, second) {
+				cancel()
+				cancelHandlers()
+				if test.mismatchObserved {
+					cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), peerTimeout)
+					defer cancelCleanup()
+					for range 2 {
+						select {
+						case <-handlerDone:
+						case <-cleanupCtx.Done():
+							t.Fatal("replay mismatch cleanup did not stop every server handler")
+						case <-time.After(peerTimeout):
+							t.Fatal("timed out waiting for replay mismatch cleanup")
+						}
+					}
+					return
+				}
+				t.Fatalf("replayed event batch changed\nfirst:  %s\nsecond: %s", first, second)
+			}
+			if test.mismatchObserved {
+				t.Fatal("replay mismatch was not exercised")
+			}
+			waitPendingEvents(t, store, 1)
+			close(allowAck)
+			waitSignalOrError(t, ctx, ackSent, serverErrors, "event ACK")
+			waitPendingEvents(t, store, 0)
+			if got := authentications.Load(); got != 2 {
+				cancel()
+				cancelHandlers()
+				t.Fatalf("authentications = %d, want 2", got)
+			}
+			cancel()
+			close(releaseSecond)
+			if err := waitClient(t, runDone); err != nil {
+				t.Fatalf("Run returned an error after cancellation: %v", err)
+			}
+			assertNoServerError(t, serverErrors)
+		})
 	}
-	waitPendingEvents(t, store, 1)
-	close(allowAck)
-	waitSignalOrError(t, ctx, ackSent, serverErrors, "event ACK")
-	waitPendingEvents(t, store, 0)
-	if got := authentications.Load(); got != 2 {
-		cancel()
-		close(releaseSecond)
-		t.Fatalf("authentications = %d, want 2", got)
-	}
-	cancel()
-	close(releaseSecond)
-	if err := waitClient(t, runDone); err != nil {
-		t.Fatalf("Run returned an error after cancellation: %v", err)
-	}
-	assertNoServerError(t, serverErrors)
 }
 
 func TestClientBackoffAdvancesAfterAuthenticatedDisconnects(t *testing.T) {
@@ -1216,6 +1295,28 @@ func TestAppendEnrolledCAKeepsSystemRoots(t *testing.T) {
 	}
 	if len(combined.Subjects()) != 2 {
 		t.Fatalf("combined roots contain %d subjects, want 2", len(combined.Subjects()))
+	}
+}
+
+func TestGatewayHTTPClientRedactsInvalidStoredCA(t *testing.T) {
+	const marker = "stored-ca-rollover-secret"
+	client := New(config.Config{}, nil, protocol.InventoryMessage{})
+	_, transport, err := client.gatewayHTTPClient(state.Identity{
+		GatewayURL: "wss://gateway.example/agent/v1/connect",
+		CACertificatePEM: string(pem.EncodeToMemory(&pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: []byte(marker),
+		})),
+	})
+	if transport != nil {
+		transport.CloseIdleConnections()
+	}
+	const want = "invalid stored certificate"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %q, want exact stored-certificate rejection %q", err, want)
+	}
+	if strings.Contains(err.Error(), marker) || strings.Contains(err.Error(), "x509") {
+		t.Fatalf("stored CA rejection leaked parse diagnostics: %v", err)
 	}
 }
 

@@ -226,7 +226,7 @@ func (c *Client) gatewayHTTPClient(identity state.Identity) (*http.Client, *http
 	}
 	combinedRoots, err := appendEnrolledCA(systemRoots, identity.CACertificatePEM)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errInvalidStoredCertificate
 	}
 	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
