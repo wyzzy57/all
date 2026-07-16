@@ -88,9 +88,11 @@ func (s *Store) Identity() (Identity, bool, error) {
 }
 
 func (s *Store) SaveIdentity(identity Identity) error {
-	if err := validateCertificateMatchesPrivateKey(identity.PrivateKeyPEM, identity.CertificatePEM); err != nil {
+	certificate, err := validateCertificate(identity.PrivateKeyPEM, identity.CertificatePEM, identity.CACertificatePEM)
+	if err != nil {
 		return err
 	}
+	identity.CertificateExpiresAt = certificate.NotAfter
 	encoded, err := json.Marshal(identity)
 	if err != nil {
 		return fmt.Errorf("encode identity: %w", err)
@@ -100,7 +102,7 @@ func (s *Store) SaveIdentity(identity Identity) error {
 	})
 }
 
-func (s *Store) UpdateCertificate(certificatePEM string, expiresAt time.Time) error {
+func (s *Store) UpdateCertificate(certificatePEM string, _ time.Time) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(identityBucket)
 		stored := bucket.Get(currentIdentityKey)
@@ -111,11 +113,12 @@ func (s *Store) UpdateCertificate(certificatePEM string, expiresAt time.Time) er
 		if err := json.Unmarshal(stored, &identity); err != nil {
 			return fmt.Errorf("decode identity: %w", err)
 		}
-		if err := validateCertificateMatchesPrivateKey(identity.PrivateKeyPEM, certificatePEM); err != nil {
+		certificate, err := validateCertificate(identity.PrivateKeyPEM, certificatePEM, identity.CACertificatePEM)
+		if err != nil {
 			return err
 		}
 		identity.CertificatePEM = certificatePEM
-		identity.CertificateExpiresAt = expiresAt
+		identity.CertificateExpiresAt = certificate.NotAfter
 		encoded, err := json.Marshal(identity)
 		if err != nil {
 			return fmt.Errorf("encode identity: %w", err)
@@ -222,40 +225,51 @@ func (s *Store) AckEvents(throughSequence uint64) error {
 	})
 }
 
-func validateCertificateMatchesPrivateKey(privateKeyPEM, certificatePEM string) error {
+func validateCertificate(privateKeyPEM, certificatePEM, caCertificatePEM string) (*x509.Certificate, error) {
 	privateBlock, _ := pem.Decode([]byte(privateKeyPEM))
 	if privateBlock == nil {
-		return fmt.Errorf("private key is not valid PEM")
+		return nil, fmt.Errorf("private key is not valid PEM")
 	}
 	privateKey, err := x509.ParsePKCS8PrivateKey(privateBlock.Bytes)
 	if err != nil {
-		return fmt.Errorf("parse PKCS#8 private key: %w", err)
+		return nil, fmt.Errorf("parse PKCS#8 private key: %w", err)
 	}
 	signer, ok := privateKey.(crypto.Signer)
 	if !ok {
-		return fmt.Errorf("private key does not expose a public key")
+		return nil, fmt.Errorf("private key does not expose a public key")
 	}
 
 	certificateBlock, _ := pem.Decode([]byte(certificatePEM))
 	if certificateBlock == nil {
-		return fmt.Errorf("certificate is not valid PEM")
+		return nil, fmt.Errorf("certificate is not valid PEM")
 	}
 	certificate, err := x509.ParseCertificate(certificateBlock.Bytes)
 	if err != nil {
-		return fmt.Errorf("parse certificate: %w", err)
+		return nil, fmt.Errorf("parse certificate: %w", err)
 	}
 	privatePublicKey, err := x509.MarshalPKIXPublicKey(signer.Public())
 	if err != nil {
-		return fmt.Errorf("marshal private-key public key: %w", err)
+		return nil, fmt.Errorf("marshal private-key public key: %w", err)
 	}
 	certificatePublicKey, err := x509.MarshalPKIXPublicKey(certificate.PublicKey)
 	if err != nil {
-		return fmt.Errorf("marshal certificate public key: %w", err)
+		return nil, fmt.Errorf("marshal certificate public key: %w", err)
 	}
 	if !bytes.Equal(privatePublicKey, certificatePublicKey) {
-		return fmt.Errorf("certificate public key does not match private key")
+		return nil, fmt.Errorf("certificate public key does not match private key")
 	}
-	return nil
+
+	roots := x509.NewCertPool()
+	if ok := roots.AppendCertsFromPEM([]byte(caCertificatePEM)); !ok {
+		return nil, fmt.Errorf("CA certificate is not valid PEM")
+	}
+	if _, err := certificate.Verify(x509.VerifyOptions{
+		Roots:     roots,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return nil, fmt.Errorf("verify client certificate: %w", err)
+	}
+	return certificate, nil
 }
 
 func sequenceKey(sequence uint64) []byte {
