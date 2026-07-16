@@ -39,6 +39,9 @@ const (
 var (
 	errGatewayServerRejected            = errors.New("Gateway server rejected connection")
 	errGatewayServerRequestedRetry      = errors.New("Gateway server requested retry")
+	errInvalidRenewedCertificate        = errors.New("invalid renewed certificate")
+	errInvalidHeartbeatInterval         = errors.New("heartbeat interval is outside allowed range")
+	errEventACKAhead                    = errors.New("event ACK is ahead of highest sent sequence")
 	errInvalidServerMessage             = errors.New("invalid server message")
 	errUnexpectedServerMessageType      = errors.New("unexpected server message type")
 	errUnsupportedServerProtocolVersion = errors.New("unsupported server protocol version")
@@ -295,12 +298,7 @@ func authenticate(
 	}
 	if authenticated.HeartbeatIntervalSeconds < minimumHeartbeatSeconds ||
 		authenticated.HeartbeatIntervalSeconds > maximumHeartbeatSeconds {
-		return 0, fatalErrorf(
-			"heartbeat interval %d is outside %d-%d seconds",
-			authenticated.HeartbeatIntervalSeconds,
-			minimumHeartbeatSeconds,
-			maximumHeartbeatSeconds,
-		)
+		return 0, fatal(errInvalidHeartbeatInterval)
 	}
 	return authenticated.HeartbeatIntervalSeconds, nil
 }
@@ -349,10 +347,10 @@ func renewCertificate(
 		time.Now(),
 	)
 	if err != nil {
-		return renewedCertificate{}, fatal(fmt.Errorf("validate renewed certificate: %w", err))
+		return renewedCertificate{}, fatal(errInvalidRenewedCertificate)
 	}
 	if !certificate.NotAfter.After(identity.CertificateExpiresAt) {
-		return renewedCertificate{}, fatalErrorf("renewed certificate expiry must advance")
+		return renewedCertificate{}, fatal(errInvalidRenewedCertificate)
 	}
 	return renewedCertificate{pem: renewed.CertificatePEM, certificate: certificate}, nil
 }
@@ -404,11 +402,7 @@ func (c *Client) runLiveConnection(
 			}
 			if result.ack != nil {
 				if result.ack.ThroughSequence > highestSent {
-					return stable, fatalErrorf(
-						"ACK sequence %d is ahead of highest sent sequence %d",
-						result.ack.ThroughSequence,
-						highestSent,
-					)
+					return stable, fatal(errEventACKAhead)
 				}
 				if err := c.store.AckEvents(result.ack.ThroughSequence); err != nil {
 					return stable, fatal(fmt.Errorf("persist event ACK: %w", err))

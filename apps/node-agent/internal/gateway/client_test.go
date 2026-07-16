@@ -305,8 +305,8 @@ func TestClientRejectsRenewalWithoutExpiryAdvance(t *testing.T) {
 				return 0
 			}))
 			err := client.Run(ctx)
-			if err == nil || !strings.Contains(err.Error(), "advance") {
-				t.Errorf("error = %v, want expiry-advance rejection", err)
+			if err == nil || err.Error() != "invalid renewed certificate" {
+				t.Errorf("error = %q, want stable certificate rejection %q", err, "invalid renewed certificate")
 			}
 
 			current, found, loadErr := store.Identity()
@@ -727,13 +727,16 @@ func TestClientRejectsProtocolMismatch(t *testing.T) {
 
 func TestClientRejectsHeartbeatOutsideBoundsAndOverflow(t *testing.T) {
 	tests := []struct {
-		name      string
-		heartbeat int
-		raw       string
+		name            string
+		heartbeat       int
+		raw             string
+		want            string
+		controlledValue string
 	}{
-		{name: "below minimum", heartbeat: 4},
-		{name: "above maximum", heartbeat: 301},
-		{name: "numeric overflow", raw: `{"protocol_version":1,"type":"authenticated","heartbeat_interval_seconds":9223372036854775808}`},
+		{name: "below minimum", heartbeat: 4, want: "heartbeat interval is outside allowed range", controlledValue: "4"},
+		{name: "above maximum", heartbeat: 301, want: "heartbeat interval is outside allowed range", controlledValue: "301"},
+		{name: "malicious negative value", heartbeat: -1000000007, want: "heartbeat interval is outside allowed range", controlledValue: "-1000000007"},
+		{name: "numeric overflow", raw: `{"protocol_version":1,"type":"authenticated","heartbeat_interval_seconds":9223372036854775808}`, want: "invalid server message", controlledValue: "9223372036854775808"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -773,14 +776,11 @@ func TestClientRejectsHeartbeatOutsideBoundsAndOverflow(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
 			defer cancel()
 			err := New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)).Run(ctx)
-			if err == nil {
-				t.Fatal("expected heartbeat rejection")
+			if err == nil || err.Error() != test.want {
+				t.Fatalf("error = %q, want stable heartbeat rejection %q", err, test.want)
 			}
-			if test.raw != "" && err.Error() != "invalid server message" {
-				t.Fatalf("error = %q, want stable redacted decode error", err)
-			}
-			if test.raw == "" && !strings.Contains(err.Error(), "heartbeat") {
-				t.Fatalf("error = %q, want heartbeat rejection", err)
+			if strings.Contains(err.Error(), test.controlledValue) {
+				t.Fatalf("heartbeat rejection leaked server value %q: %v", test.controlledValue, err)
 			}
 			assertNoServerError(t, serverErrors)
 		})
@@ -788,49 +788,59 @@ func TestClientRejectsHeartbeatOutsideBoundsAndOverflow(t *testing.T) {
 }
 
 func TestClientRejectsAckAheadOfHighestSent(t *testing.T) {
-	store := openGatewayStore(t)
-	serverErrors := make(chan error, 1)
-	var identity state.Identity
-	var signer ed25519.PrivateKey
-	var ca *testsupport.CA
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			reportServerError(serverErrors, err)
-			return
-		}
-		defer conn.CloseNow()
-		if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
-			reportServerError(serverErrors, err)
-			return
-		}
-		if _, err := readEventBatchFrame(conn); err != nil {
-			reportServerError(serverErrors, err)
-			return
-		}
-		if err := peerWriteJSON(conn, protocol.EventsAckMessage{
-			Envelope:        testEnvelope("events_acked"),
-			ThroughSequence: 2,
-		}); err != nil {
-			reportServerError(serverErrors, err)
-			return
-		}
-		_, _, _ = peerRead(conn)
-	}))
-	defer server.Close()
-	identity, signer, ca = testsupport.NewStoredIdentity(t, store, "node-1", websocketURL(server.URL), time.Now().Add(365*24*time.Hour))
-	if _, err := store.AppendEvent("agent_started", map[string]any{}); err != nil {
-		t.Fatal(err)
-	}
+	for _, throughSequence := range []uint64{2, ^uint64(0)} {
+		t.Run(fmt.Sprintf("through sequence %d", throughSequence), func(t *testing.T) {
+			store := openGatewayStore(t)
+			serverErrors := make(chan error, 1)
+			var identity state.Identity
+			var signer ed25519.PrivateKey
+			var ca *testsupport.CA
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				defer conn.CloseNow()
+				if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				if _, err := readEventBatchFrame(conn); err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				if err := peerWriteJSON(conn, protocol.EventsAckMessage{
+					Envelope:        testEnvelope("events_acked"),
+					ThroughSequence: throughSequence,
+				}); err != nil {
+					reportServerError(serverErrors, err)
+					return
+				}
+				_, _, _ = peerRead(conn)
+			}))
+			defer server.Close()
+			identity, signer, ca = testsupport.NewStoredIdentity(t, store, "node-1", websocketURL(server.URL), time.Now().Add(365*24*time.Hour))
+			if _, err := store.AppendEvent("agent_started", map[string]any{}); err != nil {
+				t.Fatal(err)
+			}
 
-	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
-	defer cancel()
-	err := New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)).Run(ctx)
-	if err == nil || !strings.Contains(err.Error(), "ahead of highest sent") {
-		t.Fatalf("error = %v, want ACK-ahead rejection", err)
+			ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+			defer cancel()
+			err := New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)).Run(ctx)
+			const want = "event ACK is ahead of highest sent sequence"
+			if err == nil || err.Error() != want {
+				t.Fatalf("error = %q, want stable ACK-ahead rejection %q", err, want)
+			}
+			for _, controlledValue := range []string{fmt.Sprint(throughSequence), "1"} {
+				if strings.Contains(err.Error(), controlledValue) {
+					t.Fatalf("ACK-ahead rejection leaked sequence value %q: %v", controlledValue, err)
+				}
+			}
+			waitPendingEvents(t, store, 1)
+			assertNoServerError(t, serverErrors)
+		})
 	}
-	waitPendingEvents(t, store, 1)
-	assertNoServerError(t, serverErrors)
 }
 
 func TestDecodeServerMessageRejectsUnsafeErrorCode(t *testing.T) {
@@ -880,14 +890,14 @@ func assertRedactedUnexpectedMessageTypeError(t *testing.T, err error, marker st
 }
 
 func TestClientRejectsInvalidRenewedCertificates(t *testing.T) {
+	const maliciousMarker = "wss://attacker.example/renew?certificate=secret123"
 	tests := []struct {
 		name        string
-		want        string
+		sensitive   []string
 		certificate func(*testing.T, ed25519.PrivateKey, *testsupport.CA) string
 	}{
 		{
 			name: "private key mismatch",
-			want: "public key",
 			certificate: func(t *testing.T, _ ed25519.PrivateKey, ca *testsupport.CA) string {
 				_, otherKey, err := ed25519.GenerateKey(rand.Reader)
 				if err != nil {
@@ -898,23 +908,40 @@ func TestClientRejectsInvalidRenewedCertificates(t *testing.T) {
 		},
 		{
 			name: "untrusted chain",
-			want: "certificate chain",
 			certificate: func(t *testing.T, signer ed25519.PrivateKey, _ *testsupport.CA) string {
 				return testsupport.NewCA(t).SignCSR(t, csrPEMForKey(t, signer, "node-1"), "node-1", time.Now().Add(365*24*time.Hour))
 			},
 		},
 		{
 			name: "CA instead of end entity",
-			want: "end-entity",
 			certificate: func(t *testing.T, signer ed25519.PrivateKey, _ *testsupport.CA) string {
 				return selfSignedCertificate(t, signer, true, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 			},
 		},
 		{
 			name: "missing client auth",
-			want: "client authentication",
 			certificate: func(t *testing.T, signer ed25519.PrivateKey, _ *testsupport.CA) string {
 				return selfSignedCertificate(t, signer, false, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
+			},
+		},
+		{
+			name:      "malicious subject",
+			sensitive: []string{maliciousMarker, "attacker.example", "certificate=", "secret123"},
+			certificate: func(t *testing.T, signer ed25519.PrivateKey, ca *testsupport.CA) string {
+				return ca.SignCSR(t, csrPEMForKey(t, signer, maliciousMarker), maliciousMarker, time.Now().Add(365*24*time.Hour))
+			},
+		},
+		{
+			name:      "malformed x509 with PEM content",
+			sensitive: []string{maliciousMarker, "attacker.example", "certificate=", "secret123", "x509:"},
+			certificate: func(*testing.T, ed25519.PrivateKey, *testsupport.CA) string {
+				return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte(maliciousMarker)}))
+			},
+		},
+		{
+			name: "expired certificate",
+			certificate: func(t *testing.T, signer ed25519.PrivateKey, ca *testsupport.CA) string {
+				return ca.SignCSR(t, csrPEMForKey(t, signer, "node-1"), "node-1", time.Now().Add(-time.Hour))
 			},
 		},
 	}
@@ -960,8 +987,14 @@ func TestClientRejectsInvalidRenewedCertificates(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
 			defer cancel()
 			err := New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)).Run(ctx)
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("error = %v, want %q", err, test.want)
+			const want = "invalid renewed certificate"
+			if err == nil || err.Error() != want {
+				t.Fatalf("error = %q, want stable certificate rejection %q", err, want)
+			}
+			for _, sensitive := range test.sensitive {
+				if strings.Contains(err.Error(), sensitive) {
+					t.Fatalf("certificate rejection leaked %q: %v", sensitive, err)
+				}
 			}
 			current, found, loadErr := store.Identity()
 			if loadErr != nil || !found || current.CertificatePEM != originalCertificate {
