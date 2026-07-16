@@ -307,6 +307,110 @@ func TestEnsureRequiresExplicitClientAuthUsage(t *testing.T) {
 	assertStoreEmpty(t, store)
 }
 
+func TestEnsureRejectsLeafSignedByExtraUnrelatedCA(t *testing.T) {
+	trustedCA := testsupport.NewCA(t)
+	attackerCA := testsupport.NewCA(t)
+	server := enrollmentServer(t, func(request protocol.EnrollmentRequest, response *protocol.EnrollmentResponse) {
+		response.CertificatePEM = attackerCA.SignCSR(t, request.CSRPEM, response.NodeID, time.Now().Add(24*time.Hour))
+		response.CACertificatePEM = trustedCA.PEM() + attackerCA.PEM()
+	}, trustedCA)
+	defer server.Close()
+	store := openStore(t)
+
+	_, err := Ensure(
+		context.Background(),
+		testConfig(server.URL, true),
+		protocol.EnrollmentFacts{Architecture: "arm64", PlatformKind: "jetson"},
+		store,
+		server.Client(),
+	)
+	if err == nil {
+		t.Fatal("expected a leaf signed by an extra unrelated CA to be rejected")
+	}
+	assertStoreEmpty(t, store)
+}
+
+func TestParseCACertificatesRejectsInvalidRootBundles(t *testing.T) {
+	now := time.Now()
+	validCA := testsupport.NewCA(t)
+	otherCA := testsupport.NewCA(t)
+	issuer := newSigningCA(t)
+	tests := []struct {
+		name string
+		pem  string
+	}{
+		{name: "duplicate certificate", pem: validCA.PEM() + validCA.PEM()},
+		{name: "extra unrelated certificate", pem: validCA.PEM() + otherCA.PEM()},
+		{
+			name: "non CA certificate",
+			pem: selfSignedCertificatePEM(t, x509.Certificate{
+				SerialNumber:          big.NewInt(200),
+				Subject:               pkix.Name{CommonName: "Not a CA"},
+				NotBefore:             now.Add(-time.Hour),
+				NotAfter:              now.Add(time.Hour),
+				KeyUsage:              x509.KeyUsageDigitalSignature,
+				BasicConstraintsValid: true,
+			}),
+		},
+		{
+			name: "missing key cert sign usage",
+			pem: selfSignedCertificatePEM(t, x509.Certificate{
+				SerialNumber:          big.NewInt(201),
+				Subject:               pkix.Name{CommonName: "Wrong Key Usage CA"},
+				NotBefore:             now.Add(-time.Hour),
+				NotAfter:              now.Add(time.Hour),
+				KeyUsage:              x509.KeyUsageCRLSign,
+				BasicConstraintsValid: true,
+				IsCA:                  true,
+			}),
+		},
+		{
+			name: "expired CA",
+			pem: selfSignedCertificatePEM(t, x509.Certificate{
+				SerialNumber:          big.NewInt(202),
+				Subject:               pkix.Name{CommonName: "Expired CA"},
+				NotBefore:             now.Add(-2 * time.Hour),
+				NotAfter:              now.Add(-time.Hour),
+				KeyUsage:              x509.KeyUsageCertSign,
+				BasicConstraintsValid: true,
+				IsCA:                  true,
+			}),
+		},
+		{
+			name: "not yet valid CA",
+			pem: selfSignedCertificatePEM(t, x509.Certificate{
+				SerialNumber:          big.NewInt(203),
+				Subject:               pkix.Name{CommonName: "Future CA"},
+				NotBefore:             now.Add(time.Hour),
+				NotAfter:              now.Add(2 * time.Hour),
+				KeyUsage:              x509.KeyUsageCertSign,
+				BasicConstraintsValid: true,
+				IsCA:                  true,
+			}),
+		},
+		{
+			name: "not self signed",
+			pem: signedCertificatePEM(t, x509.Certificate{
+				SerialNumber:          big.NewInt(204),
+				Subject:               pkix.Name{CommonName: "Intermediate CA"},
+				NotBefore:             now.Add(-time.Hour),
+				NotAfter:              now.Add(time.Hour),
+				KeyUsage:              x509.KeyUsageCertSign,
+				BasicConstraintsValid: true,
+				IsCA:                  true,
+			}, issuer.certificate, issuer.privateKey),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parseCACertificates(test.pem); err == nil {
+				t.Fatal("expected invalid CA root bundle to be rejected")
+			}
+		})
+	}
+}
+
 func TestEnsureRejectsInsecureGatewayWhenNotAllowed(t *testing.T) {
 	ca := testsupport.NewCA(t)
 	server := enrollmentServer(t, nil, ca)
@@ -324,6 +428,44 @@ func TestEnsureRejectsInsecureGatewayWhenNotAllowed(t *testing.T) {
 		t.Fatal("expected ws gateway URL to be rejected")
 	}
 	assertStoreEmpty(t, store)
+}
+
+func TestValidateGatewayURLLocality(t *testing.T) {
+	tests := []struct {
+		name    string
+		rawURL  string
+		allowed bool
+	}{
+		{name: "secure remote host", rawURL: "wss://gateway.example:443/agent/v1/connect", allowed: true},
+		{name: "secure mixed case host", rawURL: "WSS://Gateway.Example.:443/agent/v1/connect", allowed: true},
+		{name: "localhost", rawURL: "ws://localhost:8080/agent/v1/connect", allowed: true},
+		{name: "normalized localhost", rawURL: "ws://LOCALHOST.:8080/agent/v1/connect", allowed: true},
+		{name: "loopback IPv4", rawURL: "ws://127.0.0.1:8080/agent/v1/connect", allowed: true},
+		{name: "compose service", rawURL: "ws://api-service:8000/agent/v1/connect", allowed: true},
+		{name: "docker host", rawURL: "ws://HOST.DOCKER.INTERNAL.:8000/agent/v1/connect", allowed: true},
+		{name: "remote host", rawURL: "ws://gateway.example:443/agent/v1/connect"},
+		{name: "remote private address", rawURL: "ws://192.168.1.10:443/agent/v1/connect"},
+		{name: "empty insecure hostname", rawURL: "ws://:443/agent/v1/connect"},
+		{name: "empty secure hostname", rawURL: "wss://:443/agent/v1/connect"},
+		{name: "insecure userinfo", rawURL: "ws://user@localhost:443/agent/v1/connect"},
+		{name: "secure userinfo", rawURL: "wss://user@gateway.example:443/agent/v1/connect"},
+		{name: "malformed authority", rawURL: "ws://localhost:bad/agent/v1/connect"},
+		{name: "dangling insecure port delimiter", rawURL: "ws://localhost:/agent/v1/connect"},
+		{name: "dangling secure port delimiter", rawURL: "wss://gateway.example:/agent/v1/connect"},
+		{name: "unterminated IPv6 authority", rawURL: "wss://[::1/agent/v1/connect"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateGatewayURL(test.rawURL, true)
+			if test.allowed && err != nil {
+				t.Fatalf("expected gateway URL to be allowed: %v", err)
+			}
+			if !test.allowed && err == nil {
+				t.Fatal("expected gateway URL to be rejected")
+			}
+		})
+	}
 }
 
 func enrollmentServer(
@@ -453,6 +595,32 @@ func newSigningCA(t *testing.T) *signingCA {
 		privateKey:  privateKey,
 		pem:         string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
 	}
+}
+
+func selfSignedCertificatePEM(t *testing.T, template x509.Certificate) string {
+	t.Helper()
+	return signedCertificatePEM(t, template, &template, nil)
+}
+
+func signedCertificatePEM(
+	t *testing.T,
+	template x509.Certificate,
+	parent *x509.Certificate,
+	parentKey ed25519.PrivateKey,
+) string {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parentKey == nil {
+		parentKey = privateKey
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, parent, publicKey, parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }
 
 func (c *signingCA) signCSR(

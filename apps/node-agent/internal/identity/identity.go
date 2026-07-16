@@ -198,7 +198,7 @@ func validateEnrollmentResponse(
 	if err != nil {
 		return nil, err
 	}
-	caCertificates, err := parseCACertificates(response.CACertificatePEM)
+	caCertificate, err := parseCACertificates(response.CACertificatePEM)
 	if err != nil {
 		return nil, err
 	}
@@ -214,9 +214,7 @@ func validateEnrollmentResponse(
 	}
 
 	roots := x509.NewCertPool()
-	for _, caCertificate := range caCertificates {
-		roots.AddCert(caCertificate)
-	}
+	roots.AddCert(caCertificate)
 	if _, err := certificate.Verify(x509.VerifyOptions{
 		Roots:     roots,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
@@ -241,28 +239,29 @@ func parseSingleCertificate(certificatePEM, label string) (*x509.Certificate, er
 	return certificate, nil
 }
 
-func parseCACertificates(certificatePEM string) ([]*x509.Certificate, error) {
-	remaining := []byte(certificatePEM)
-	var certificates []*x509.Certificate
-	for len(strings.TrimSpace(string(remaining))) != 0 {
-		block, rest := pem.Decode(remaining)
-		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
-			return nil, fmt.Errorf("CA certificate is not valid certificate PEM")
-		}
-		certificate, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("parse CA certificate: %w", err)
-		}
-		if !certificate.BasicConstraintsValid || !certificate.IsCA || certificate.KeyUsage&x509.KeyUsageCertSign == 0 {
-			return nil, fmt.Errorf("CA certificate does not permit certificate signing")
-		}
-		certificates = append(certificates, certificate)
-		remaining = rest
+func parseCACertificates(certificatePEM string) (*x509.Certificate, error) {
+	block, rest := pem.Decode([]byte(certificatePEM))
+	if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+		return nil, fmt.Errorf("CA certificate is not valid certificate PEM")
 	}
-	if len(certificates) == 0 {
-		return nil, fmt.Errorf("CA certificate is missing")
+	if len(strings.TrimSpace(string(rest))) != 0 {
+		return nil, fmt.Errorf("CA certificate PEM must contain exactly one certificate")
 	}
-	return certificates, nil
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse CA certificate: %w", err)
+	}
+	if !certificate.BasicConstraintsValid || !certificate.IsCA || certificate.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return nil, fmt.Errorf("CA certificate does not permit certificate signing")
+	}
+	now := time.Now()
+	if now.Before(certificate.NotBefore) || now.After(certificate.NotAfter) {
+		return nil, fmt.Errorf("CA certificate is not currently valid")
+	}
+	if !bytes.Equal(certificate.RawIssuer, certificate.RawSubject) || certificate.CheckSignatureFrom(certificate) != nil {
+		return nil, fmt.Errorf("CA certificate is not self-signed")
+	}
+	return certificate, nil
 }
 
 func hasClientAuthUsage(usages []x509.ExtKeyUsage) bool {
@@ -276,16 +275,29 @@ func hasClientAuthUsage(usages []x509.ExtKeyUsage) bool {
 
 func validateGatewayURL(rawURL string, allowInsecureLocal bool) error {
 	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Host == "" || parsed.User != nil {
+	if err != nil || parsed.Host == "" || parsed.User != nil || strings.HasSuffix(parsed.Host, ":") {
+		return fmt.Errorf("gateway URL must be an absolute WebSocket URL")
+	}
+	hostname := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if hostname == "" {
 		return fmt.Errorf("gateway URL must be an absolute WebSocket URL")
 	}
 	switch strings.ToLower(parsed.Scheme) {
 	case "wss":
 		return nil
 	case "ws":
-		if allowInsecureLocal {
+		if allowInsecureLocal && isDevelopmentLocalHostname(hostname) {
 			return nil
 		}
 	}
 	return fmt.Errorf("gateway URL must use wss unless insecure local development is enabled")
+}
+
+func isDevelopmentLocalHostname(hostname string) bool {
+	switch hostname {
+	case "localhost", "127.0.0.1", "api-service", "host.docker.internal":
+		return true
+	default:
+		return false
+	}
 }
