@@ -526,7 +526,7 @@ func decodeServerMessage(raw []byte) (serverResult, error) {
 		}
 		return serverResult{serverError: serverError}, nil
 	default:
-		return serverResult{}, fmt.Errorf("unexpected server message type %q", envelope.Type)
+		return serverResult{}, fmt.Errorf("unexpected server message type")
 	}
 }
 
@@ -603,7 +603,7 @@ func requireEnvelope(envelope protocol.Envelope, expectedType string) error {
 		return fmt.Errorf("unsupported server protocol version %d", envelope.ProtocolVersion)
 	}
 	if envelope.Type != expectedType {
-		return fmt.Errorf("unexpected server message type %q, want %q", envelope.Type, expectedType)
+		return fmt.Errorf("unexpected server message type")
 	}
 	return nil
 }

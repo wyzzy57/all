@@ -757,6 +757,40 @@ func TestDecodeServerMessageRejectsUnsafeErrorCode(t *testing.T) {
 	}
 }
 
+func TestDecodeServerMessageRedactsUnexpectedType(t *testing.T) {
+	marker := "wss://host/path?token=secret"
+	raw := []byte(fmt.Sprintf(`{"protocol_version":1,"type":%q}`, marker))
+
+	_, err := decodeServerMessage(raw)
+	assertRedactedUnexpectedMessageTypeError(t, err, marker)
+}
+
+func TestRequireEnvelopeRedactsUnexpectedType(t *testing.T) {
+	marker := "wss://host/path?token=secret"
+	err := requireEnvelope(protocol.Envelope{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Type:            marker,
+	}, "authenticated")
+
+	assertRedactedUnexpectedMessageTypeError(t, err, marker)
+}
+
+func assertRedactedUnexpectedMessageTypeError(t *testing.T, err error, marker string) {
+	t.Helper()
+	const want = "unexpected server message type"
+	if err == nil {
+		t.Fatal("expected unexpected-message rejection")
+	}
+	if err.Error() != want {
+		t.Fatalf("error = %q, want stable redacted error %q", err, want)
+	}
+	for _, sensitive := range []string{marker, "host", "token=", "secret"} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("protocol error leaked %q: %v", sensitive, err)
+		}
+	}
+}
+
 func TestClientRejectsInvalidRenewedCertificates(t *testing.T) {
 	tests := []struct {
 		name        string
