@@ -27,6 +27,12 @@ container runtime or deploy models.
 Production is not ready until a TLS-terminating reverse proxy enforces and
 verifies this policy. Do not rely on a management-network allowlist alone, and
 do not forward a missing or untrusted operator certificate to `api-service`.
+`api-service` must have a private proxy-only listener or network, with a
+network policy or firewall that permits its backend port only from the reverse
+proxy. Do not publish or route that backend listener to operator, edge, or
+public networks. The local Compose `8000` publication in
+`infra/compose/docker-compose.yml` is development-only and must not be exposed
+in production.
 Configure the proxy to require a client certificate trusted by the platform's
 operator CA for these exact method/path combinations:
 
@@ -43,14 +49,33 @@ enrollment. Make the proxy return `401` or `403` for missing or untrusted
 operator certificates, and make that result happen before proxying to the
 application.
 
-On a trusted operator host, use local certificate/key file variables. The
-commands below never print the key material or enrollment token:
+From a release-check host on an untrusted or edge network, outside the
+proxy-only backend network, use local operator certificate/key file variables.
+Set `VISIOX_DIRECT_BACKEND_URL` to a routable private backend listener address
+that would be reachable if isolation were absent; do not use an unresolvable
+name. The direct check must fail with curl exit `7` (connection denied) or `28`
+(timeout). The commands below never print key material or an enrollment token:
 
 ```bash
+# BEGIN operator mTLS and backend isolation verification
 export VISIOX_API_URL='https://visiox-control.example.internal'
+export VISIOX_DIRECT_BACKEND_URL='http://api-service.production.internal:8000'
 export VISIOX_OPERATOR_CERT_FILE='/secure/operator-client.crt'
 export VISIOX_OPERATOR_KEY_FILE='/secure/operator-client.key'
 export VISIOX_MTLS_CHECK_NODE_ID='00000000-0000-0000-0000-000000000000'
+
+assert_direct_backend_denied() {
+  if direct_output="$(curl --silent --show-error --connect-timeout 5 --max-time 10 --output /dev/null --write-out '%{http_code}' "$VISIOX_DIRECT_BACKEND_URL/health" 2>&1)"; then
+    printf 'Expected direct backend connection denial or timeout, got: %s\n' "$direct_output" >&2
+    exit 1
+  else
+    curl_status=$?
+  fi
+  case "$curl_status" in
+    7|28) printf 'Direct backend access denied with curl exit %s\n' "$curl_status" ;;
+    *) printf 'Expected direct backend connection denial or timeout (curl exit 7 or 28), got exit %s\n' "$curl_status" >&2; exit 1 ;;
+  esac
+}
 
 assert_proxy_denies() {
   method=$1
@@ -62,6 +87,7 @@ assert_proxy_denies() {
   esac
 }
 
+assert_direct_backend_denied
 assert_proxy_denies POST "$VISIOX_API_URL/agent/v1/enrollment-tokens"
 assert_proxy_denies GET "$VISIOX_API_URL/nodes"
 assert_proxy_denies POST "$VISIOX_API_URL/nodes/$VISIOX_MTLS_CHECK_NODE_ID/drain"
@@ -70,12 +96,14 @@ curl --fail --silent --show-error \
   --cert "$VISIOX_OPERATOR_CERT_FILE" \
   --key "$VISIOX_OPERATOR_KEY_FILE" \
   "$VISIOX_API_URL/nodes" | jq '{total, items: [.items[] | {id, name, status}]}'
+# END operator mTLS and backend isolation verification
 ```
 
-The three unauthenticated requests must each report `401` or `403`, and the
+The direct backend request must fail with a connection denial or timeout, the
+three unauthenticated proxy requests must each report `401` or `403`, and the
 certificate-authenticated `GET /nodes` request must succeed. Keep the proxy
-policy and this negative/positive verification as a release prerequisite; M1
-is not production-ready without both.
+policy, backend isolation, and this negative/positive verification as a release
+prerequisite; M1 is not production-ready without all three.
 
 ## 1. Configure the Production Control Plane
 
@@ -176,13 +204,15 @@ recover_cleanup() {
   status=$?
   rollback_failed=0
   trap - EXIT HUP INT TERM
-  if [ "$status" -ne 0 ] && [ "$live_replaced" -eq 1 ]; then
-    if [ "$api_stopped" -eq 1 ]; then
-      docker compose -f "$compose_file" stop api-service || rollback_failed=1
-    fi
-    if ! restore_live_ca; then
-      rollback_failed=1
-      printf '%s\n' 'CA recovery rollback could not restore every prior file.' >&2
+  if [ "$status" -ne 0 ]; then
+    if [ "$live_replaced" -eq 1 ]; then
+      if [ "$api_stopped" -eq 1 ]; then
+        docker compose -f "$compose_file" stop api-service || rollback_failed=1
+      fi
+      if ! restore_live_ca; then
+        rollback_failed=1
+        printf '%s\n' 'CA recovery rollback could not restore every prior file.' >&2
+      fi
     fi
     if [ "$api_stopped" -eq 1 ]; then
       docker compose -f "$compose_file" up -d --no-deps api-service || rollback_failed=1
@@ -241,8 +271,9 @@ The offline backup is first copied into a root-only temporary directory and
 validated there. Only then does the procedure stop `api-service`, retain any
 existing live files as rollback copies, and replace each live file with an
 atomic `mv` from a same-filesystem replacement directory. The exit trap restores
-the previous files and attempts to restart the service if replacement, startup,
-or health validation fails. The validation requires a parseable matching
+the previous files only after replacement begins, and always attempts to
+restart a service it stopped if recovery fails before, during, or after
+replacement. The validation requires a parseable matching
 Ed25519 key and certificate, a self-signed CA certificate valid now, and CA
 constraints; it does not reveal private-key contents. If there is no valid
 backup, do not attempt to preserve the existing device identities: schedule a

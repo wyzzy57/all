@@ -16,7 +16,7 @@ test -r "$runbook"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update >/dev/null
-apt-get install --yes --no-install-recommends openssl passwd >/dev/null
+apt-get install --yes --no-install-recommends jq openssl passwd >/dev/null
 
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT HUP INT TERM
@@ -29,6 +29,7 @@ docker_log="$workdir/docker.log"
 curl_log="$workdir/curl.log"
 real_usermod=$(command -v usermod)
 real_mv=$(command -v mv)
+real_install=$(command -v install)
 
 cat > "$testbin/systemctl" <<'SYSTEMCTL'
 #!/bin/sh
@@ -66,12 +67,82 @@ DOCKER
 cat > "$testbin/curl" <<'CURL'
 #!/bin/sh
 set -eu
+if [ "${VISIOX_TEST_MTLS_VERIFICATION:-0}" = 1 ]; then
+    method=GET
+    cert=0
+    key=0
+    url=
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --request)
+                method=$2
+                shift 2
+                ;;
+            --cert)
+                cert=1
+                shift 2
+                ;;
+            --key)
+                key=1
+                shift 2
+                ;;
+            --output|--write-out|--connect-timeout|--max-time)
+                shift 2
+                ;;
+            --silent|--show-error|--fail)
+                shift
+                ;;
+            *)
+                url=$1
+                shift
+                ;;
+        esac
+    done
+    printf '%s|%s|cert=%s|key=%s\n' "$method" "$url" "$cert" "$key" >> "$VISIOX_TEST_CURL_LOG"
+    case "$url" in
+        "$VISIOX_DIRECT_BACKEND_URL"/health)
+            printf '%s\n' 'curl: (7) Failed to connect to backend' >&2
+            exit 7
+            ;;
+        "$VISIOX_API_URL"/*)
+            if [ "$cert" = 1 ] && [ "$key" = 1 ]; then
+                printf '%s\n' '{"total":0,"items":[]}'
+            else
+                printf '%s' 401
+            fi
+            exit 0
+            ;;
+        *)
+            printf '%s\n' "unexpected curl URL: $url" >&2
+            exit 2
+            ;;
+    esac
+fi
 printf '%s\n' "$*" >> "$VISIOX_TEST_CURL_LOG"
 if [ "${VISIOX_TEST_FAIL_HEALTH:-0}" = 1 ]; then
     exit 22
 fi
 printf '%s\n' '{"status":"ok"}'
 CURL
+
+cat > "$testbin/install" <<'INSTALL'
+#!/bin/sh
+set -eu
+destination=
+for argument in "$@"; do
+    destination=$argument
+done
+case "$destination" in
+    "${VISIOX_PKI_DIR:-}"/.ca-replacement.*/ca.crt)
+        if [ "${VISIOX_TEST_FAIL_PRE_REPLACEMENT:-0}" = 1 ] && \
+            [ ! -e "$VISIOX_TEST_STATE/pre-replacement-failed" ]; then
+            : > "$VISIOX_TEST_STATE/pre-replacement-failed"
+            exit 1
+        fi
+        ;;
+esac
+exec "$VISIOX_TEST_REAL_INSTALL" "$@"
+INSTALL
 
 cat > "$testbin/mv" <<'MV'
 #!/bin/sh
@@ -89,18 +160,35 @@ fi
 exec "$VISIOX_TEST_REAL_MV" "$@"
 MV
 
-chmod 0755 "$testbin/systemctl" "$testbin/usermod" "$testbin/sudo" "$testbin/docker" "$testbin/curl" "$testbin/mv"
+chmod 0755 "$testbin/systemctl" "$testbin/usermod" "$testbin/sudo" "$testbin/docker" "$testbin/curl" "$testbin/install" "$testbin/mv"
 
 export PATH="$testbin:$PATH"
 export VISIOX_TEST_SYSTEMCTL_LOG="$systemctl_log"
 export VISIOX_TEST_USERMOD_LOG="$usermod_log"
 export VISIOX_TEST_REAL_USERMOD="$real_usermod"
 export VISIOX_TEST_REAL_MV="$real_mv"
+export VISIOX_TEST_REAL_INSTALL="$real_install"
 export VISIOX_TEST_DOCKER_LOG="$docker_log"
 export VISIOX_TEST_CURL_LOG="$curl_log"
 
 sha256_file() {
     sha256sum "$1" | awk '{print $1}'
+}
+
+assert_output_excludes_private_key() {
+    key_file=$1
+    output_file=$2
+    if grep -F -f "$key_file" "$output_file" >/dev/null; then
+        printf '%s\n' 'private-key-output=unexpected' >&2
+        exit 1
+    fi
+}
+
+assert_api_restart_attempted() {
+    if ! grep -Fqx 'compose -f /tmp/compose.yml up -d --no-deps api-service' "$docker_log"; then
+        printf '%s\n' 'api-restart-attempted=missing' >&2
+        exit 1
+    fi
 }
 
 assert_installed_metadata() {
@@ -181,6 +269,7 @@ run_documented_recovery() {
         VISIOX_API_URL='https://visiox-control.example.invalid' \
         VISIOX_COMPOSE_FILE='/tmp/compose.yml' \
         VISIOX_TEST_STATE="$state_dir" \
+        VISIOX_TEST_FAIL_PRE_REPLACEMENT="${VISIOX_TEST_FAIL_PRE_REPLACEMENT:-0}" \
         VISIOX_TEST_FAIL_REPLACEMENT="${VISIOX_TEST_FAIL_REPLACEMENT:-0}" \
         VISIOX_TEST_FAIL_STARTUP="${VISIOX_TEST_FAIL_STARTUP:-0}" \
         VISIOX_TEST_FAIL_HEALTH="${VISIOX_TEST_FAIL_HEALTH:-0}" \
@@ -213,6 +302,7 @@ run_recovery_tests() {
     assert_live_ca_matches "$success_offline" "$success_live"
     test "$(stat -c '%a' "$success_live/ca.key")" = 600
     test "$(stat -c '%a' "$success_live/ca.crt")" = 644
+    assert_output_excludes_private_key "$success_offline/ca.key" "$recovery_root/success.out"
     grep -F 'stop api-service' "$docker_log" >/dev/null
     grep -F 'up -d --no-deps api-service' "$docker_log" >/dev/null
     grep -F 'logs --tail=100 api-service' "$docker_log" >/dev/null
@@ -233,11 +323,24 @@ run_recovery_tests() {
     test "$(sha256_file "$mismatch_live/ca.key")" = "$old_mismatch_key"
     test "$(sha256_file "$mismatch_live/ca.crt")" = "$old_mismatch_cert"
     test ! -s "$docker_log"
-    if grep -F -f "$mismatch_offline/ca.key" "$recovery_root/mismatch.out" >/dev/null; then
-        printf '%s\n' 'private-key-output=unexpected' >&2
-        exit 1
-    fi
+    assert_output_excludes_private_key "$mismatch_offline/ca.key" "$recovery_root/mismatch.out"
     printf '%s\n' 'invalid-staged-mismatch-preserves-live-ca=passed'
+
+    pre_replacement_live="$recovery_root/pre-replacement-live"
+    pre_replacement_offline="$recovery_root/pre-replacement-offline"
+    pre_replacement_state="$recovery_root/pre-replacement-state"
+    make_ca "$pre_replacement_live"
+    make_ca "$pre_replacement_offline"
+    mkdir -p "$pre_replacement_state"
+    old_pre_replacement_key=$(sha256_file "$pre_replacement_live/ca.key")
+    old_pre_replacement_cert=$(sha256_file "$pre_replacement_live/ca.crt")
+    VISIOX_TEST_FAIL_PRE_REPLACEMENT=1 VISIOX_TEST_FAIL_REPLACEMENT=0 VISIOX_TEST_FAIL_STARTUP=0 VISIOX_TEST_FAIL_HEALTH=0 \
+        run_documented_recovery "$pre_replacement_live" "$pre_replacement_offline" "$pre_replacement_state" "$recovery_root/pre-replacement.out"
+    test "$recovery_status" -ne 0
+    test "$(sha256_file "$pre_replacement_live/ca.key")" = "$old_pre_replacement_key"
+    test "$(sha256_file "$pre_replacement_live/ca.crt")" = "$old_pre_replacement_cert"
+    assert_api_restart_attempted
+    printf '%s\n' 'pre-replacement-failure-preserves-live-ca-and-restarts-api=passed'
 
     replacement_live="$recovery_root/replacement-live"
     replacement_offline="$recovery_root/replacement-offline"
@@ -285,21 +388,46 @@ run_recovery_tests() {
     printf '%s\n' 'health-failure-restores-live-ca=passed'
 }
 
+extract_documented_mtls_verification() {
+    mtls_script="$workdir/documented-mtls-verification.sh"
+    start_marker='# BEGIN operator mTLS and backend isolation verification'
+    end_marker='# END operator mTLS and backend isolation verification'
+    start_count=$(grep -Fxc "$start_marker" "$runbook" || true)
+    end_count=$(grep -Fxc "$end_marker" "$runbook" || true)
+    if [ "$start_count" != 1 ] || [ "$end_count" != 1 ]; then
+        printf '%s\n' 'documented-mtls-verification-block=missing' >&2
+        exit 1
+    fi
+    sed -n "/^$start_marker$/,/^$end_marker$/p" "$runbook" | sed '1d;$d' > "$mtls_script"
+    if [ ! -s "$mtls_script" ]; then
+        printf '%s\n' 'documented-mtls-verification-block=empty' >&2
+        exit 1
+    fi
+}
+
+assert_mtls_curl_event() {
+    if ! grep -Fqx "$1" "$curl_log"; then
+        printf '%s\n' 'documented-mtls-curl-event=missing' >&2
+        exit 1
+    fi
+}
+
 run_documentation_checks() {
-    for required in \
-        'POST /agent/v1/enrollment-tokens' \
-        'GET /nodes' \
-        'POST /nodes/{id}/drain' \
-        'POST /agent/v1/enroll' \
-        'WSS /agent/v1/connect' \
-        'VISIOX_OPERATOR_CERT_FILE' \
-        'VISIOX_OPERATOR_KEY_FILE' \
-        'Production is not ready'; do
-        grep -F "$required" "$runbook" >/dev/null
-    done
-    grep -F -- '--cert "$VISIOX_OPERATOR_CERT_FILE"' "$runbook" >/dev/null
-    grep -F -- '--key "$VISIOX_OPERATOR_KEY_FILE"' "$runbook" >/dev/null
-    grep -E '401[|/]403' "$runbook" >/dev/null
+    extract_documented_mtls_verification
+    : > "$curl_log"
+    set +e
+    VISIOX_TEST_MTLS_VERIFICATION=1 sh "$mtls_script" > "$workdir/mtls-verification.out" 2>&1
+    mtls_status=$?
+    set -e
+    if [ "$mtls_status" -ne 0 ]; then
+        printf '%s\n' 'documented-mtls-verification=failed' >&2
+        exit 1
+    fi
+    assert_mtls_curl_event 'POST|https://visiox-control.example.internal/agent/v1/enrollment-tokens|cert=0|key=0'
+    assert_mtls_curl_event 'GET|https://visiox-control.example.internal/nodes|cert=0|key=0'
+    assert_mtls_curl_event 'POST|https://visiox-control.example.internal/nodes/00000000-0000-0000-0000-000000000000/drain|cert=0|key=0'
+    assert_mtls_curl_event 'GET|http://api-service.production.internal:8000/health|cert=0|key=0'
+    assert_mtls_curl_event 'GET|https://visiox-control.example.internal/nodes|cert=1|key=1'
     printf '%s\n' 'operator-mtls-documentation=passed'
 }
 
