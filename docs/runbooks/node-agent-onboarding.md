@@ -51,6 +51,8 @@ application.
 
 From a release-check host on an untrusted or edge network, outside the
 proxy-only backend network, use local operator certificate/key file variables.
+Run the following block in Bash; its pipefail setting prevents a successful
+JSON formatter from masking an authorized curl failure.
 Set `VISIOX_DIRECT_BACKEND_URL` to a routable private backend listener address
 that would be reachable if isolation were absent; do not use an unresolvable
 name. The direct check must fail with curl exit `7` (connection denied) or `28`
@@ -58,6 +60,7 @@ name. The direct check must fail with curl exit `7` (connection denied) or `28`
 
 ```bash
 # BEGIN operator mTLS and backend isolation verification
+set -euo pipefail
 export VISIOX_API_URL='https://visiox-control.example.internal'
 export VISIOX_DIRECT_BACKEND_URL='http://api-service.production.internal:8000'
 export VISIOX_OPERATOR_CERT_FILE='/secure/operator-client.crt'
@@ -92,10 +95,13 @@ assert_proxy_denies POST "$VISIOX_API_URL/agent/v1/enrollment-tokens"
 assert_proxy_denies GET "$VISIOX_API_URL/nodes"
 assert_proxy_denies POST "$VISIOX_API_URL/nodes/$VISIOX_MTLS_CHECK_NODE_ID/drain"
 
-curl --fail --silent --show-error \
+if ! curl --fail --silent --show-error \
   --cert "$VISIOX_OPERATOR_CERT_FILE" \
   --key "$VISIOX_OPERATOR_KEY_FILE" \
-  "$VISIOX_API_URL/nodes" | jq '{total, items: [.items[] | {id, name, status}]}'
+  "$VISIOX_API_URL/nodes" | jq '{total, items: [.items[] | {id, name, status}]}'; then
+  printf '%s\n' 'Authorized operator mTLS verification failed.' >&2
+  exit 1
+fi
 # END operator mTLS and backend isolation verification
 ```
 
@@ -119,7 +125,14 @@ sudo openssl req -x509 -new -key /srv/visiox/pki/ca.key -out /srv/visiox/pki/ca.
 sudo chmod 0600 /srv/visiox/pki/ca.key
 sudo chmod 0644 /srv/visiox/pki/ca.crt
 sudo openssl x509 -in /srv/visiox/pki/ca.crt -noout -subject -issuer -dates -text
+sudo openssl x509 -in /srv/visiox/pki/ca.crt -noout -fingerprint -sha256
 ```
+
+When the offline CA backup is created, record the colon-delimited SHA-256
+fingerprint of the **public** `ca.crt` in secure inventory alongside the backup
+location and recovery authorization. This inventory value is the durable
+same-CA identity: do not derive it from an untrusted backup or from the live
+host during recovery.
 
 The production deployment must set these values for `api-service` and bind
 mount `/srv/visiox/pki:/var/lib/visiox/pki:ro`:
@@ -158,13 +171,16 @@ export VISIOX_PKI_DIR='/srv/visiox/pki'
 export VISIOX_OFFLINE_CA_BACKUP_DIR='/mnt/offline-backups/visiox-agent-ca'
 export VISIOX_API_URL='https://visiox-control.example.internal'
 export VISIOX_COMPOSE_FILE='infra/compose/docker-compose.yml'
+# Replace with the public-cert SHA-256 fingerprint stored in secure inventory.
+export VISIOX_EXPECTED_CA_SHA256_FINGERPRINT='AA:BB:...'
 
-sudo bash -seu -- "$VISIOX_PKI_DIR" "$VISIOX_OFFLINE_CA_BACKUP_DIR" "$VISIOX_API_URL" "$VISIOX_COMPOSE_FILE" <<'RECOVER_AGENT_CA'
+sudo bash -seu -- "$VISIOX_PKI_DIR" "$VISIOX_OFFLINE_CA_BACKUP_DIR" "$VISIOX_API_URL" "$VISIOX_COMPOSE_FILE" "$VISIOX_EXPECTED_CA_SHA256_FINGERPRINT" <<'RECOVER_AGENT_CA'
 set -o pipefail
 pki_dir=$1
 offline_backup_dir=$2
 api_url=$3
 compose_file=$4
+expected_ca_fingerprint=$5
 stage_dir=
 replacement_dir=
 rollback_dir=
@@ -183,6 +199,49 @@ validate_ca_pair() {
   test "$(openssl pkey -in "$key" -pubout -outform DER | sha256sum)" = "$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum)"
   openssl x509 -in "$cert" -noout -text | grep -A1 'Basic Constraints' | grep -F 'CA:TRUE' >/dev/null
   openssl verify -x509_strict -check_ss_sig -CAfile "$cert" "$cert"
+}
+
+normalize_ca_fingerprint() {
+  value=$(printf '%s' "$1" | tr -d ':')
+  case "$value" in
+    ''|*[!0-9A-Fa-f]*) return 1 ;;
+  esac
+  [ "$(printf '%s' "$value" | wc -c)" -eq 64 ] || return 1
+  printf '%s\n' "$value" | tr '[:lower:]' '[:upper:]'
+}
+
+certificate_sha256_fingerprint() {
+  raw_fingerprint=$(openssl x509 -in "$1" -noout -fingerprint -sha256 | awk -F= 'NF == 2 { print $2 }')
+  normalize_ca_fingerprint "$raw_fingerprint"
+}
+
+verify_same_ca_identity() {
+  if ! staged_ca_fingerprint=$(certificate_sha256_fingerprint "$stage_dir/ca.crt"); then
+    printf '%s\n' 'Could not determine the staged CA certificate SHA-256 fingerprint.' >&2
+    exit 1
+  fi
+  if ! expected_ca_fingerprint=$(normalize_ca_fingerprint "$expected_ca_fingerprint"); then
+    if [ -r "$pki_dir/ca.crt" ]; then
+      printf '%s\n' 'The secure-inventory expected CA fingerprint is missing or malformed; do not continue with same-CA recovery.' >&2
+    else
+      printf '%s\n' 'No trustworthy expected CA fingerprint and no readable live ca.crt; do not continue with same-CA recovery. Use replacement CA maintenance and node re-enrollment.' >&2
+    fi
+    exit 1
+  fi
+  if [ "$staged_ca_fingerprint" != "$expected_ca_fingerprint" ]; then
+    printf '%s\n' 'The staged CA certificate does not match the secure-inventory expected CA fingerprint.' >&2
+    exit 1
+  fi
+  if [ -r "$pki_dir/ca.crt" ]; then
+    if ! live_ca_fingerprint=$(certificate_sha256_fingerprint "$pki_dir/ca.crt"); then
+      printf '%s\n' 'Could not determine the readable live CA certificate SHA-256 fingerprint.' >&2
+      exit 1
+    fi
+    if [ "$staged_ca_fingerprint" != "$live_ca_fingerprint" ]; then
+      printf '%s\n' 'The staged CA certificate does not match the readable live ca.crt.' >&2
+      exit 1
+    fi
+  fi
 }
 
 restore_live_ca() {
@@ -236,6 +295,7 @@ chmod 0700 "$stage_dir"
 install -o root -g root -m 0600 "$offline_backup_dir/ca.key" "$stage_dir/ca.key"
 install -o root -g root -m 0644 "$offline_backup_dir/ca.crt" "$stage_dir/ca.crt"
 validate_ca_pair "$stage_dir/ca.key" "$stage_dir/ca.crt"
+verify_same_ca_identity
 
 install -d -o root -g root -m 0700 "$pki_dir"
 docker compose -f "$compose_file" stop api-service
@@ -268,17 +328,24 @@ RECOVER_AGENT_CA
 ```
 
 The offline backup is first copied into a root-only temporary directory and
-validated there. Only then does the procedure stop `api-service`, retain any
-existing live files as rollback copies, and replace each live file with an
-atomic `mv` from a same-filesystem replacement directory. The exit trap restores
-the previous files only after replacement begins, and always attempts to
-restart a service it stopped if recovery fails before, during, or after
-replacement. The validation requires a parseable matching
-Ed25519 key and certificate, a self-signed CA certificate valid now, and CA
-constraints; it does not reveal private-key contents. If there is no valid
-backup, do not attempt to preserve the existing device identities: schedule a
-maintenance window, create and deploy a replacement CA using the production
-provisioning steps above, then re-enroll every node with new one-time tokens.
+validated there. Before it changes the live PKI directory, stops `api-service`, or
+replaces files, the procedure requires the secure-inventory fingerprint to
+match the staged public certificate and, when readable, requires the staged
+certificate to match live `ca.crt` too. A readable live certificate is a
+corroborating check, not a replacement for the secure-inventory identity. Only
+then does the procedure stop `api-service`, retain any existing live files as
+rollback copies, and replace each live file with an atomic `mv` from a
+same-filesystem replacement directory. The exit trap restores the previous
+files only after replacement begins, and always attempts to restart a service
+it stopped if recovery fails before, during, or after replacement. The
+validation requires a parseable matching Ed25519 key and certificate, a
+self-signed CA certificate valid now, and CA constraints; it does not reveal
+private-key contents. If the secure-inventory identity is unavailable, the
+staged CA differs from it, or no trustworthy identity exists with no readable
+live certificate, do not attempt to preserve existing device identities:
+schedule a maintenance window, create and deploy a replacement CA using the
+production provisioning steps above, then re-enroll every node with new
+one-time tokens.
 
 ## 2. Build and Transfer the Correct Binary
 
@@ -369,6 +436,34 @@ EOF
 )
 sudo systemctl status visiox-node-agent --no-pager
 sudo journalctl -u visiox-node-agent -n 200 --no-pager
+```
+
+The supported installer invocation above is the primary procedure. The
+following audited expansion is a review and emergency-manual-install reference
+that mirrors install.sh exactly. Do not run it after the supported installer:
+use it only instead of that invocation, with the same transferred files still
+present at the fixed /tmp paths. The status and journal commands above remain
+the required post-install checks.
+
+```bash
+# BEGIN audited node-agent installer expansion
+if ! getent group visiox-agent >/dev/null 2>&1; then
+  sudo groupadd --system visiox-agent
+fi
+if ! id visiox-agent >/dev/null 2>&1; then
+  sudo useradd --system --home-dir /var/lib/visiox-agent --shell /usr/sbin/nologin \
+    --gid visiox-agent --no-create-home visiox-agent
+elif [ "$(id -g visiox-agent)" != "$(getent group visiox-agent | cut -d: -f3)" ]; then
+  sudo usermod --gid visiox-agent visiox-agent
+fi
+sudo install -d -o visiox-agent -g visiox-agent -m 0750 /var/lib/visiox-agent
+sudo install -d -o root -g visiox-agent -m 0750 /etc/visiox-agent
+sudo install -o root -g visiox-agent -m 0640 /tmp/visiox-node-agent.env /etc/visiox-agent/agent.env
+sudo install -o root -g root -m 0755 /tmp/visiox-node-agent /usr/local/bin/visiox-node-agent
+sudo install -o root -g root -m 0644 /tmp/visiox-node-agent.service /etc/systemd/system/visiox-node-agent.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now visiox-node-agent
+# END audited node-agent installer expansion
 ```
 
 The service runs as `visiox-agent`, has a read-only system filesystem, and may
