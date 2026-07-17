@@ -115,26 +115,48 @@ On the build host, produce both supported architectures:
 Get-Item dist\visiox-node-agent-linux-amd64, dist\visiox-node-agent-linux-arm64
 ```
 
-Transfer exactly one binary and the packaged unit file to the target. For
-example, use the `arm64` binary for a Jetson and the `amd64` binary for an x86
-NVIDIA host:
+On the build host, select the binary from the target's reported architecture,
+then transfer the selected binary, installer, and unit to the fixed paths used
+in the installation step. `x86_64`/`amd64` selects the `amd64` binary; a
+Jetson reports `aarch64`/`arm64` and selects the `arm64` binary.
 
 ```bash
-scp dist/visiox-node-agent-linux-arm64 ops@edge-jetson-01:/tmp/visiox-node-agent-linux-arm64
-scp apps/node-agent/packaging/systemd/visiox-node-agent.service ops@edge-jetson-01:/tmp/visiox-node-agent.service
+EDGE_HOST='ops@edge-01'
+VISIOX_AGENT_ARCH="$(ssh "$EDGE_HOST" 'case "$(uname -m)" in
+  x86_64|amd64) printf "%s\n" amd64 ;;
+  aarch64|arm64) printf "%s\n" arm64 ;;
+  *) printf "Unsupported edge architecture: %s\n" "$(uname -m)" >&2; exit 1 ;;
+esac')"
+
+case "$VISIOX_AGENT_ARCH" in
+  amd64|arm64) ;;
+  *) printf 'Could not determine a supported edge architecture.\n' >&2; exit 1 ;;
+esac
+
+scp "dist/visiox-node-agent-linux-$VISIOX_AGENT_ARCH" "$EDGE_HOST:/tmp/visiox-node-agent"
+scp apps/node-agent/packaging/install.sh "$EDGE_HOST:/tmp/visiox-node-agent-install.sh"
+scp apps/node-agent/packaging/systemd/visiox-node-agent.service "$EDGE_HOST:/tmp/visiox-node-agent.service"
 ```
 
 ## 3. Create a One-Time Enrollment Token
 
 Run this on a trusted control-plane operator host. It prints only the token's
-ID, name, and expiry; transfer the value held in `ENROLLMENT_TOKEN` to the node
-through an approved secret channel, then clear it from the operator shell.
+ID, name, and expiry; it does not print the token value.
 
 ```bash
 export VISIOX_API_URL='https://visiox-control.example.internal'
 TOKEN_RESPONSE="$(curl --fail --silent --show-error --request POST "$VISIOX_API_URL/agent/v1/enrollment-tokens" --header 'Content-Type: application/json' --data '{"name":"edge-jetson-01"}')"
 ENROLLMENT_TOKEN="$(printf '%s' "$TOKEN_RESPONSE" | jq -er '.token')"
 printf '%s\n' "$TOKEN_RESPONSE" | jq '{id, name, expires_at}'
+```
+
+Securely transfer the value held in `ENROLLMENT_TOKEN` to the edge operator
+through an approved secret channel, then enter it at the non-echoing prompt in
+step 4. Do not paste the token into shell history, source control, tickets, or
+logs. After that handoff is complete, run this separate cleanup command on the
+same operator host:
+
+```bash
 unset ENROLLMENT_TOKEN
 unset TOKEN_RESPONSE
 ```
@@ -145,43 +167,26 @@ expires or is unavailable, create a new token instead.
 
 ## 4. Install and Start the Agent
 
-On the target node, place the transferred files in the current directory and
-run the following commands. The explicit group creation precedes the required
-service account command.
+On the target node, use the transferred absolute paths. The packaged installer
+idempotently creates or reuses the `visiox-agent` group and binds the
+`visiox-agent` system user to it as its primary group; do not pre-create the
+account separately.
 
 ```bash
-sudo groupadd --system visiox-agent
-sudo useradd --system --home-dir /var/lib/visiox-agent --shell /usr/sbin/nologin visiox-agent
-sudo install -d -o root -g visiox-agent -m 0750 /etc/visiox-agent
-sudo install -d -o visiox-agent -g visiox-agent -m 0750 /var/lib/visiox-agent
-sudo install -m 0755 visiox-node-agent-linux-arm64 /usr/local/bin/visiox-node-agent
-sudo install -m 0644 visiox-node-agent.service /etc/systemd/system/visiox-node-agent.service
-```
-
-If the system account was already installed, confirm it instead of rerunning
-the creation commands:
-
-```bash
-getent group visiox-agent
-id visiox-agent
-```
-
-Enter the one-time secret without echoing it, then create the service
-environment file. Substitute the real HTTPS platform URL and a unique node
-name; do not place a `ws://` URL or `host.docker.internal` in this file.
-
-```bash
-read -rsp 'Enrollment token: ' VISIOX_AGENT_ENROLLMENT_TOKEN; echo
-sudo install -o root -g visiox-agent -m 0640 /dev/stdin /etc/visiox-agent/agent.env <<EOF
+(
+  umask 077
+  trap 'rm -f /tmp/visiox-node-agent.env' EXIT HUP INT TERM
+  read -rsp 'Enrollment token: ' VISIOX_AGENT_ENROLLMENT_TOKEN; echo
+  cat > /tmp/visiox-node-agent.env <<EOF
 VISIOX_AGENT_PLATFORM_URL=https://visiox-control.example.internal
 VISIOX_AGENT_NODE_NAME=edge-jetson-01
 VISIOX_AGENT_ENROLLMENT_TOKEN=$VISIOX_AGENT_ENROLLMENT_TOKEN
 VISIOX_AGENT_STATE_DIR=/var/lib/visiox-agent
 VISIOX_AGENT_VERSION=0.1.0
 EOF
-unset VISIOX_AGENT_ENROLLMENT_TOKEN
-sudo systemctl daemon-reload
-sudo systemctl enable --now visiox-node-agent
+  unset VISIOX_AGENT_ENROLLMENT_TOKEN
+  sudo sh /tmp/visiox-node-agent-install.sh /tmp/visiox-node-agent.env /tmp/visiox-node-agent /tmp/visiox-node-agent.service
+)
 sudo systemctl status visiox-node-agent --no-pager
 sudo journalctl -u visiox-node-agent -n 200 --no-pager
 ```
