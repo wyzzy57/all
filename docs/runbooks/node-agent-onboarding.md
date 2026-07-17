@@ -89,6 +89,7 @@ export VISIOX_API_URL='https://visiox-control.example.internal'
 TOKEN_RESPONSE="$(curl --fail --silent --show-error --request POST "$VISIOX_API_URL/agent/v1/enrollment-tokens" --header 'Content-Type: application/json' --data '{"name":"edge-jetson-01"}')"
 ENROLLMENT_TOKEN="$(printf '%s' "$TOKEN_RESPONSE" | jq -er '.token')"
 printf '%s\n' "$TOKEN_RESPONSE" | jq '{id, name, expires_at}'
+unset ENROLLMENT_TOKEN
 unset TOKEN_RESPONSE
 ```
 
