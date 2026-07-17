@@ -164,6 +164,85 @@ Before enrolling any node, verify the public HTTPS endpoint and its WSS
 reverse-proxy route from the edge network. Do not set
 `VISIOX_AGENT_ALLOW_INSECURE_LOCAL=true` outside explicit local development.
 
+### Deploy the Management-plane mTLS Proxy
+
+Use `infra/compose/docker-compose.production-mtls.yml` with the base Compose
+file for every production lifecycle command. The overlay adds the
+`management-proxy` TLS listener, removes every inherited host-port publication,
+and keeps `api-service` off the public network. Only the proxy's TLS port is
+published. The proxy requests client certificates at TLS negotiation, requires
+a certificate trusted by the operator CA for the documented management
+method/path pairs, keeps enrollment and the Agent WebSocket public, and denies
+all other paths by default.
+
+Provision these files from the platform PKI or secret manager on the
+control-plane host. `server.crt` must contain the server certificate and any
+required intermediate chain. Do not copy any private key, operator certificate,
+or CA private key into the repository, an image, a ticket, or a shell log.
+The proxy needs only the public operator CA certificate; each operator keeps
+their own client certificate and key in approved local secret storage.
+
+```bash
+sudo install -d -o root -g root -m 0750 /srv/visiox/management-tls
+sudo install -d -o root -g root -m 0750 /srv/visiox/operator-ca
+sudo install -o root -g root -m 0644 "$VISIOX_ISSUED_SERVER_CERT" /srv/visiox/management-tls/server.crt
+sudo install -o root -g root -m 0600 "$VISIOX_ISSUED_SERVER_KEY" /srv/visiox/management-tls/server.key
+sudo install -o root -g root -m 0644 "$VISIOX_OPERATOR_CA_CERT" /srv/visiox/operator-ca/operator-ca.crt
+
+export VISIOX_MANAGEMENT_TLS_CERT_PATH='/srv/visiox/management-tls/server.crt'
+export VISIOX_MANAGEMENT_TLS_KEY_PATH='/srv/visiox/management-tls/server.key'
+export VISIOX_MANAGEMENT_OPERATOR_CA_PATH='/srv/visiox/operator-ca/operator-ca.crt'
+export VISIOX_MANAGEMENT_PROXY_PORT='8443'
+export VISIOX_AGENT_PUBLIC_WS_URL='wss://visiox-control.example.internal/agent/v1/connect'
+```
+
+Run the following commands from the repository root after setting the Agent CA
+variables above. The `config` check must report only `management-proxy` as a
+published service and no `api-service` port before anything is started.
+
+```bash
+set -euo pipefail
+compose_args=(
+  -f infra/compose/docker-compose.yml
+  -f infra/compose/docker-compose.production-mtls.yml
+)
+
+docker compose "${compose_args[@]}" config --format json |
+  jq -e '([.services | to_entries[] | select((.value.ports // []) | length > 0) | .key] == ["management-proxy"]) and ((.services["api-service"].ports // []) | length == 0)'
+docker compose "${compose_args[@]}" up -d --wait
+docker compose "${compose_args[@]}" ps
+```
+
+After startup, run the operator mTLS and direct-backend isolation verification
+block in the Security Boundaries section from an untrusted or edge network.
+It is the release check for the five protected routes, public enrollment, and
+backend reachability. Confirm the public WSS endpoint with a real Agent before
+enrolling production nodes.
+
+Check certificate freshness before a planned rotation without printing private
+key material:
+
+```bash
+openssl x509 -in "$VISIOX_MANAGEMENT_TLS_CERT_PATH" -noout -checkend 2592000
+test "$(openssl pkey -in "$VISIOX_MANAGEMENT_TLS_KEY_PATH" -pubout -outform DER | sha256sum)" = "$(openssl x509 -in "$VISIOX_MANAGEMENT_TLS_CERT_PATH" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum)"
+```
+
+Keep the file names stable during renewal. Because the overlay bind-mounts the
+individual certificate files, an atomic host-side file replacement is picked up
+by recreating the proxy rather than by relying on an in-container reload:
+
+```bash
+docker compose "${compose_args[@]}" up -d --force-recreate --no-deps management-proxy
+docker compose "${compose_args[@]}" exec -T management-proxy nginx -t
+```
+
+When certificate contents are updated in place, `nginx -t` followed by
+`nginx -s reload` is acceptable. For an operator CA rotation, temporarily use
+a CA bundle that trusts both the old and new operator issuers, recreate the
+proxy, distribute new operator credentials, then remove the retired issuer
+only after the migration window closes. Re-run the release check after every
+certificate, CA, proxy, or Compose change.
+
 ### Recover Lost or Damaged Agent CA Material
 
 Use this procedure only to restore the same CA from the offline backup created
@@ -175,17 +254,17 @@ offline-backup directory; never print, copy to a ticket, or otherwise expose
 ```bash
 export VISIOX_PKI_DIR='/srv/visiox/pki'
 export VISIOX_OFFLINE_CA_BACKUP_DIR='/mnt/offline-backups/visiox-agent-ca'
-export VISIOX_API_URL='https://visiox-control.example.internal'
-export VISIOX_COMPOSE_FILE='infra/compose/docker-compose.yml'
+export VISIOX_COMPOSE_BASE_FILE='infra/compose/docker-compose.yml'
+export VISIOX_COMPOSE_PRODUCTION_OVERLAY='infra/compose/docker-compose.production-mtls.yml'
 # Replace with the public-cert SHA-256 fingerprint stored in secure inventory.
 export VISIOX_EXPECTED_CA_SHA256_FINGERPRINT='AA:BB:...'
 
-sudo bash -seu -- "$VISIOX_PKI_DIR" "$VISIOX_OFFLINE_CA_BACKUP_DIR" "$VISIOX_API_URL" "$VISIOX_COMPOSE_FILE" "$VISIOX_EXPECTED_CA_SHA256_FINGERPRINT" <<'RECOVER_AGENT_CA'
+sudo bash -seu -- "$VISIOX_PKI_DIR" "$VISIOX_OFFLINE_CA_BACKUP_DIR" "$VISIOX_COMPOSE_BASE_FILE" "$VISIOX_COMPOSE_PRODUCTION_OVERLAY" "$VISIOX_EXPECTED_CA_SHA256_FINGERPRINT" <<'RECOVER_AGENT_CA'
 set -o pipefail
 pki_dir=$1
 offline_backup_dir=$2
-api_url=$3
-compose_file=$4
+compose_base_file=$3
+compose_production_overlay=$4
 expected_ca_fingerprint=$5
 stage_dir=
 replacement_dir=
@@ -219,6 +298,10 @@ normalize_ca_fingerprint() {
 certificate_sha256_fingerprint() {
   raw_fingerprint=$(openssl x509 -in "$1" -noout -fingerprint -sha256 | awk -F= 'NF == 2 { print $2 }')
   normalize_ca_fingerprint "$raw_fingerprint"
+}
+
+compose_api() {
+  docker compose -f "$compose_base_file" -f "$compose_production_overlay" "$@"
 }
 
 verify_same_ca_identity() {
@@ -272,7 +355,7 @@ recover_cleanup() {
   if [ "$status" -ne 0 ]; then
     if [ "$live_replaced" -eq 1 ]; then
       if [ "$api_stop_attempted" -eq 1 ]; then
-        docker compose -f "$compose_file" stop api-service || rollback_failed=1
+        compose_api stop api-service || rollback_failed=1
       fi
       if ! restore_live_ca; then
         rollback_failed=1
@@ -280,7 +363,7 @@ recover_cleanup() {
       fi
     fi
     if [ "$api_stop_attempted" -eq 1 ]; then
-      docker compose -f "$compose_file" up -d --no-deps api-service || rollback_failed=1
+      compose_api up -d --no-deps api-service || rollback_failed=1
     fi
   fi
   [ -z "$stage_dir" ] || rm -rf -- "$stage_dir" || rollback_failed=1
@@ -305,7 +388,7 @@ verify_same_ca_identity
 
 install -d -o root -g root -m 0700 "$pki_dir"
 api_stop_attempted=1
-docker compose -f "$compose_file" stop api-service
+compose_api stop api-service
 
 # Keep rollback files and replacement files on the live filesystem for atomic mv.
 rollback_dir=$(mktemp -d "$pki_dir/.ca-rollback.XXXXXX")
@@ -326,9 +409,9 @@ live_replaced=1
 mv -f -- "$replacement_dir/ca.key" "$pki_dir/ca.key"
 mv -f -- "$replacement_dir/ca.crt" "$pki_dir/ca.crt"
 
-docker compose -f "$compose_file" up -d --no-deps api-service
-docker compose -f "$compose_file" logs --tail=100 api-service
-curl --fail --silent --show-error "$api_url/health"
+compose_api up -d --no-deps api-service
+compose_api logs --tail=100 api-service
+compose_api exec -T api-service python -c "from urllib.request import urlopen; response = urlopen('http://127.0.0.1:8000/health', timeout=10); response.read(); raise SystemExit(response.status != 200)"
 live_replaced=0
 RECOVER_AGENT_CA
 ```

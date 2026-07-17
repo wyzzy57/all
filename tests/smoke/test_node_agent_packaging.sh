@@ -67,6 +67,11 @@ case " $* " in
             exit 1
         fi
         ;;
+    *" exec -T api-service python -c "*)
+        if [ "${VISIOX_TEST_FAIL_HEALTH:-0}" = 1 ]; then
+            exit 22
+        fi
+        ;;
 esac
 DOCKER
 
@@ -195,7 +200,7 @@ assert_output_excludes_private_key() {
 
 assert_api_restart_attempted() {
     expected_attempts=$1
-    restart_attempts=$(grep -Fxc 'compose -f /tmp/compose.yml up -d --no-deps api-service' "$docker_log" || true)
+    restart_attempts=$(grep -Fxc 'compose -f /tmp/compose.yml -f /tmp/compose-production-mtls.yml up -d --no-deps api-service' "$docker_log" || true)
     if [ "$restart_attempts" -lt "$expected_attempts" ]; then
         printf '%s\n' 'api-restart-attempted=missing' >&2
         exit 1
@@ -332,8 +337,8 @@ run_documented_recovery() {
     set +e
     VISIOX_PKI_DIR="$pki_dir" \
         VISIOX_OFFLINE_CA_BACKUP_DIR="$offline_backup_dir" \
-        VISIOX_API_URL='https://visiox-control.example.invalid' \
-        VISIOX_COMPOSE_FILE='/tmp/compose.yml' \
+        VISIOX_COMPOSE_BASE_FILE='/tmp/compose.yml' \
+        VISIOX_COMPOSE_PRODUCTION_OVERLAY='/tmp/compose-production-mtls.yml' \
         VISIOX_EXPECTED_CA_SHA256_FINGERPRINT="$expected_ca_fingerprint" \
         VISIOX_TEST_STATE="$state_dir" \
         VISIOX_TEST_FAIL_STOP="${VISIOX_TEST_FAIL_STOP:-0}" \
@@ -375,6 +380,12 @@ run_recovery_tests() {
     grep -F 'stop api-service' "$docker_log" >/dev/null
     grep -F 'up -d --no-deps api-service' "$docker_log" >/dev/null
     grep -F 'logs --tail=100 api-service' "$docker_log" >/dev/null
+    grep -F -- '-f /tmp/compose.yml -f /tmp/compose-production-mtls.yml stop api-service' "$docker_log" >/dev/null
+    if grep -F 'https://visiox-control.example.invalid/health' "$curl_log" >/dev/null; then
+        printf '%s\n' 'recovery-public-health-check=unexpected' >&2
+        exit 1
+    fi
+    grep -F 'exec -T api-service python -c' "$docker_log" >/dev/null
     printf '%s\n' 'same-ca-recovery-successful-replacement=passed'
 
     stop_failure_live="$recovery_root/stop-failure-live"

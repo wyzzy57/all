@@ -1,0 +1,95 @@
+services:
+  api-service:
+    ports: !reset []
+    environment:
+      VISIOX_AGENT_PUBLIC_WS_URL: "${VISIOX_AGENT_PUBLIC_WS_URL:?VISIOX_AGENT_PUBLIC_WS_URL must be set to the public wss URL}"
+    networks:
+      api-dependencies:
+      management-backend:
+
+  label-sync-worker:
+    networks:
+      application-internal:
+
+  training-worker:
+    networks:
+      application-internal:
+
+  mlflow:
+    ports: !reset []
+    networks:
+      application-internal:
+      api-dependencies:
+
+  tensorboard:
+    ports: !reset []
+    networks:
+      application-internal:
+
+  postgres:
+    ports: !reset []
+    networks:
+      application-internal:
+      api-dependencies:
+
+  redis:
+    ports: !reset []
+    networks:
+      application-internal:
+      api-dependencies:
+
+  minio:
+    ports: !reset []
+    networks:
+      application-internal:
+      api-dependencies:
+
+  registry:
+    ports: !reset []
+    networks:
+      application-internal:
+      api-dependencies:
+
+  label-studio:
+    ports: !reset []
+    networks:
+      application-internal:
+      api-dependencies:
+
+  management-proxy:
+    image: nginx:stable-alpine
+    depends_on:
+      api-service:
+        condition: service_started
+    restart: unless-stopped
+    ports:
+      - "${VISIOX_MANAGEMENT_PROXY_PORT:-8443}:8443"
+    volumes:
+      - type: bind
+        source: ../proxy/nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+      - type: bind
+        source: "${VISIOX_MANAGEMENT_TLS_CERT_PATH:?VISIOX_MANAGEMENT_TLS_CERT_PATH is required}"
+        target: /etc/nginx/tls/server.crt
+        read_only: true
+      - type: bind
+        source: "${VISIOX_MANAGEMENT_TLS_KEY_PATH:?VISIOX_MANAGEMENT_TLS_KEY_PATH is required}"
+        target: /etc/nginx/tls/server.key
+        read_only: true
+      - type: bind
+        source: "${VISIOX_MANAGEMENT_OPERATOR_CA_PATH:?VISIOX_MANAGEMENT_OPERATOR_CA_PATH is required}"
+        target: /etc/nginx/mtls/operator-ca.crt
+        read_only: true
+    networks:
+      management-public:
+      management-backend:
+
+networks:
+  application-internal:
+    internal: true
+  api-dependencies:
+    internal: true
+  management-backend:
+    internal: true
+  management-public:

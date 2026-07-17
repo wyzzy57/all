@@ -1,0 +1,39 @@
+services:
+  api-service:
+    image: python:3.12-alpine
+    command: ["python", "/app/backend.py"]
+    volumes:
+      - type: bind
+        source: ./backend.py
+        target: /app/backend.py
+        read_only: true
+    networks:
+      - control-plane
+
+  management-proxy:
+    image: nginx:stable-alpine
+    depends_on:
+      - api-service
+    ports:
+      - "127.0.0.1::8443"
+    volumes:
+      - type: bind
+        source: ../../../infra/proxy/nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+      - type: bind
+        source: ${VISIOX_MTLS_TEST_CERT_DIR}
+        target: /etc/nginx/tls
+        read_only: true
+      - type: bind
+        source: ${VISIOX_MTLS_TEST_CERT_DIR}
+        target: /etc/nginx/mtls
+        read_only: true
+    networks:
+      - public
+      - control-plane
+
+networks:
+  public:
+  control-plane:
+    internal: true
