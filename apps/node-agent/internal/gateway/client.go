@@ -44,6 +44,7 @@ var (
 	errGatewayAuthenticationRejected    = errors.New("Gateway authentication was rejected")
 	errInvalidStoredCertificate         = errors.New("invalid stored certificate")
 	errInvalidRenewedCertificate        = errors.New("invalid renewed certificate")
+	errRenewalRecoveryRequired          = errors.New("expired pending renewal requires node re-enrollment")
 	errInvalidHeartbeatInterval         = errors.New("heartbeat interval is outside allowed range")
 	errEventACKAhead                    = errors.New("event ACK is ahead of highest sent sequence")
 	errInvalidServerMessage             = errors.New("invalid server message")
@@ -155,29 +156,79 @@ func (c *Client) runConnection(ctx context.Context) (bool, error) {
 	if identity.NodeID == "" {
 		return false, fatalErrorf("stored identity node ID is empty")
 	}
+	signer, err := parseStoredPrivateKey(identity.PrivateKeyPEM)
+	if err != nil {
+		return false, fatal(err)
+	}
 	pending, pendingFound, err := c.store.PendingRenewal()
 	if err != nil {
 		return false, fatalErrorf("load pending renewal: %v", err)
 	}
+	now := time.Now()
+	expiredPendingCandidate := pendingFound && pending.CertificatePEM != "" && !pending.CertificateExpiresAt.After(now)
+	if expiredPendingCandidate {
+		if err := c.store.ClearPendingRenewal(); err != nil {
+			return false, fatal(fmt.Errorf("clear expired pending renewal: %w", err))
+		}
+		pending = state.PendingRenewal{}
+		pendingFound = false
+	}
+
+	activeValid := validStoredCredential(identity, signer, now)
+	candidateIdentity := identity
+	candidateValid := false
 	if pendingFound && pending.CertificatePEM != "" {
+		candidateIdentity.CertificatePEM = pending.CertificatePEM
+		candidateIdentity.CertificateExpiresAt = pending.CertificateExpiresAt
+		if validStoredCredential(candidateIdentity, signer, now) != nil {
+			return false, fatal(errInvalidRenewedCertificate)
+		}
+		candidateValid = true
+	}
+
+	if activeValid == nil {
+		if !candidateValid {
+			return c.runAuthenticatedConnection(ctx, identity, pending, pendingFound, false)
+		}
 		stable, err := c.runAuthenticatedConnection(ctx, identity, pending, true, false)
 		if !errors.Is(err, errGatewayAuthenticationRejected) {
 			return stable, err
 		}
-		candidateIdentity := identity
-		candidateIdentity.CertificatePEM = pending.CertificatePEM
-		candidateIdentity.CertificateExpiresAt = pending.CertificateExpiresAt
 		stable, err = c.runAuthenticatedConnection(ctx, candidateIdentity, pending, true, true)
 		if errors.Is(err, errGatewayAuthenticationRejected) {
 			return stable, fatal(err)
 		}
 		return stable, err
 	}
-	stable, err := c.runAuthenticatedConnection(ctx, identity, pending, pendingFound, false)
-	if errors.Is(err, errGatewayAuthenticationRejected) {
-		return stable, fatal(err)
+	if candidateValid {
+		stable, err := c.runAuthenticatedConnection(ctx, candidateIdentity, pending, true, true)
+		if errors.Is(err, errGatewayAuthenticationRejected) {
+			return stable, fatal(err)
+		}
+		return stable, err
 	}
-	return stable, err
+	if expiredPendingCandidate {
+		return false, fatal(errRenewalRecoveryRequired)
+	}
+	return false, fatal(errInvalidStoredCertificate)
+}
+
+func validStoredCredential(
+	identity state.Identity,
+	signer ed25519.PrivateKey,
+	now time.Time,
+) error {
+	certificate, err := validateDeviceCertificate(
+		identity.CertificatePEM,
+		identity.CACertificatePEM,
+		identity.NodeID,
+		signer.Public().(ed25519.PublicKey),
+		now,
+	)
+	if err != nil || !identity.CertificateExpiresAt.Equal(certificate.NotAfter) {
+		return errInvalidStoredCertificate
+	}
+	return nil
 }
 
 func (c *Client) runAuthenticatedConnection(

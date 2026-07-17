@@ -170,6 +170,10 @@ func TestClientRenewsCertificateBeforeExpiry(t *testing.T) {
 			reportServerError(serverErrors, fmt.Errorf("unexpected renewal request: %#v", request))
 			return
 		}
+		if strings.Contains(request.CSRPEM, "PRIVATE KEY") {
+			reportServerError(serverErrors, fmt.Errorf("renewal request transported private key material"))
+			return
+		}
 		csr, err := parsePeerCSR(request.CSRPEM)
 		if err != nil {
 			reportServerError(serverErrors, err)
@@ -1478,6 +1482,386 @@ func assertRedactedUnexpectedMessageTypeError(t *testing.T, err error, marker st
 	}
 }
 
+func TestClientPromotesPendingCandidateAfterCurrentCertificateExpiresWithoutFallbackLoop(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		identity          state.Identity
+		candidateIdentity state.Identity
+		signer            ed25519.PrivateKey
+		ca                *testsupport.CA
+		candidatePEM      string
+		connections       atomic.Int32
+	)
+	serverReady := make(chan struct{}, 1)
+	serverErrors := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if connections.Add(1) != 1 {
+			reportServerError(serverErrors, fmt.Errorf("unexpected fallback connection %d", connections.Load()))
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, candidateIdentity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := expectLiveInventory(conn); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		serverReady <- struct{}{}
+		_, _, _ = peerRead(conn)
+	}))
+	defer server.Close()
+
+	identity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-1",
+		websocketURL(server.URL),
+		time.Now().UTC().Add(time.Hour),
+	)
+	pending := state.PendingRenewal{
+		RequestID: "renewal-expired-current-001",
+		CSRPEM:    csrPEMForKey(t, signer, identity.NodeID),
+	}
+	if err := store.SavePendingRenewal(pending); err != nil {
+		t.Fatal(err)
+	}
+	candidatePEM = ca.SignCSR(
+		t,
+		pending.CSRPEM,
+		identity.NodeID,
+		time.Now().UTC().Add(365*24*time.Hour),
+	)
+	candidate, err := parsePeerCertificate(candidatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRenewalCandidate(
+		pending.RequestID,
+		candidatePEM,
+		testCertificateFingerprint(candidate),
+	); err != nil {
+		t.Fatal(err)
+	}
+	expiredCurrentPEM := ca.SignCSR(
+		t,
+		csrPEMForKey(t, signer, identity.NodeID),
+		identity.NodeID,
+		time.Now().UTC().Add(-time.Hour),
+	)
+	expiredCurrent, err := parsePeerCertificate(expiredCurrentPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity.CertificatePEM = expiredCurrentPEM
+	identity.CertificateExpiresAt = expiredCurrent.NotAfter
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rewriteStoredIdentity(t, path, identity)
+	candidateIdentity = identity
+	candidateIdentity.CertificatePEM = candidatePEM
+	candidateIdentity.CertificateExpiresAt = candidate.NotAfter
+
+	reopened, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := reopened.Close(); closeErr != nil {
+			t.Errorf("close reopened store: %v", closeErr)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	defer cancel()
+	runDone := runClient(ctx, New(testGatewayConfig(), reopened, testInventory(), WithBackoff(zeroBackoff)))
+	select {
+	case <-serverReady:
+	case err := <-runDone:
+		t.Fatalf("Run returned before pending-candidate authentication: %v", err)
+	case err := <-serverErrors:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for pending-candidate authentication")
+	}
+	assertPromotedRenewal(t, reopened, candidatePEM)
+	if connections.Load() != 1 {
+		t.Fatalf("connections = %d, want one pending-candidate authentication", connections.Load())
+	}
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	assertNoServerError(t, serverErrors)
+}
+
+func TestClientClearsExpiredPendingCandidateAndReissues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverReady := make(chan struct{}, 1)
+	serverErrors := make(chan error, 1)
+	var (
+		identity       state.Identity
+		signer         ed25519.PrivateKey
+		ca             *testsupport.CA
+		expiredPending state.PendingRenewal
+		reissuedPEM    string
+		connections    atomic.Int32
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if connections.Add(1) != 1 {
+			reportServerError(serverErrors, fmt.Errorf("unexpected renewal connection %d", connections.Load()))
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		var request protocol.CertificateRenewalRequest
+		if err := peerReadJSON(conn, &request); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if request.Envelope != testEnvelope("certificate_renewal_request") ||
+			request.RenewalRequestID == "" || request.RenewalRequestID == expiredPending.RequestID {
+			reportServerError(serverErrors, fmt.Errorf("expired candidate was not reissued: %#v", request))
+			return
+		}
+		reissuedPEM = ca.SignCSR(
+			t,
+			request.CSRPEM,
+			identity.NodeID,
+			time.Now().UTC().Add(365*24*time.Hour),
+		)
+		reissuedCertificate, err := parsePeerCertificate(reissuedPEM)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		fingerprint := testCertificateFingerprint(reissuedCertificate)
+		if err := peerWriteJSON(conn, protocol.CertificateRenewalCandidateMessage{
+			Envelope:                     testEnvelope("certificate_renewal_candidate"),
+			RenewalRequestID:             request.RenewalRequestID,
+			CertificatePEM:               reissuedPEM,
+			CertificateFingerprintSHA256: fingerprint,
+		}); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := expectRenewalAcknowledgement(
+			conn,
+			state.PendingRenewal{RequestID: request.RenewalRequestID},
+			fingerprint,
+		); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := peerWriteJSON(conn, protocol.CertificateRenewalActivatedMessage{
+			Envelope:                     testEnvelope("certificate_renewal_activated"),
+			RenewalRequestID:             request.RenewalRequestID,
+			CertificateFingerprintSHA256: fingerprint,
+		}); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := expectLiveInventory(conn); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		serverReady <- struct{}{}
+		_, _, _ = peerRead(conn)
+	}))
+	defer server.Close()
+
+	identity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-1",
+		websocketURL(server.URL),
+		time.Now().UTC().Add(29*24*time.Hour),
+	)
+	expiredPending = state.PendingRenewal{
+		RequestID: "renewal-expired-candidate-001",
+		CSRPEM:    csrPEMForKey(t, signer, identity.NodeID),
+	}
+	if err := store.SavePendingRenewal(expiredPending); err != nil {
+		t.Fatal(err)
+	}
+	persistedCertificatePEM := ca.SignCSR(
+		t,
+		expiredPending.CSRPEM,
+		identity.NodeID,
+		time.Now().UTC().Add(365*24*time.Hour),
+	)
+	persistedCertificate, err := parsePeerCertificate(persistedCertificatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRenewalCandidate(
+		expiredPending.RequestID,
+		persistedCertificatePEM,
+		testCertificateFingerprint(persistedCertificate),
+	); err != nil {
+		t.Fatal(err)
+	}
+	expiredCertificatePEM := ca.SignCSR(
+		t,
+		expiredPending.CSRPEM,
+		identity.NodeID,
+		time.Now().UTC().Add(-time.Hour),
+	)
+	expiredCertificate, err := parsePeerCertificate(expiredCertificatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredPending.CertificatePEM = expiredCertificatePEM
+	expiredPending.CertificateFingerprintSHA256 = testCertificateFingerprint(expiredCertificate)
+	expiredPending.CertificateExpiresAt = expiredCertificate.NotAfter
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rewriteStoredPendingRenewal(t, path, expiredPending)
+	store, err = state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("close store: %v", closeErr)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	runDone := runClient(ctx, New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)))
+	waitSignalOrError(t, ctx, serverReady, serverErrors, "expired pending candidate recovery")
+	assertPromotedRenewal(t, store, reissuedPEM)
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	if connections.Load() != 1 {
+		t.Fatalf("connections = %d, want 1", connections.Load())
+	}
+	assertNoServerError(t, serverErrors)
+}
+
+func TestClientClearsExpiredPendingCandidateAndStopsForReEnrollment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, signer, ca := testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-1",
+		"ws://gateway.invalid/agent/v1/connect",
+		time.Now().UTC().Add(time.Hour),
+	)
+	pending := state.PendingRenewal{
+		RequestID: "renewal-expired-reenroll-001",
+		CSRPEM:    csrPEMForKey(t, signer, identity.NodeID),
+	}
+	if err := store.SavePendingRenewal(pending); err != nil {
+		t.Fatal(err)
+	}
+	persistedCandidatePEM := ca.SignCSR(
+		t,
+		pending.CSRPEM,
+		identity.NodeID,
+		time.Now().UTC().Add(365*24*time.Hour),
+	)
+	persistedCandidate, err := parsePeerCertificate(persistedCandidatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRenewalCandidate(
+		pending.RequestID,
+		persistedCandidatePEM,
+		testCertificateFingerprint(persistedCandidate),
+	); err != nil {
+		t.Fatal(err)
+	}
+	expiredCurrentPEM := ca.SignCSR(
+		t,
+		csrPEMForKey(t, signer, identity.NodeID),
+		identity.NodeID,
+		time.Now().UTC().Add(-time.Hour),
+	)
+	expiredCurrent, err := parsePeerCertificate(expiredCurrentPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity.CertificatePEM = expiredCurrentPEM
+	identity.CertificateExpiresAt = expiredCurrent.NotAfter
+	expiredPendingPEM := ca.SignCSR(
+		t,
+		pending.CSRPEM,
+		identity.NodeID,
+		time.Now().UTC().Add(-time.Hour),
+	)
+	expiredPendingCertificate, err := parsePeerCertificate(expiredPendingPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending.CertificatePEM = expiredPendingPEM
+	pending.CertificateFingerprintSHA256 = testCertificateFingerprint(expiredPendingCertificate)
+	pending.CertificateExpiresAt = expiredPendingCertificate.NotAfter
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rewriteStoredIdentity(t, path, identity)
+	rewriteStoredPendingRenewal(t, path, pending)
+
+	reopened, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := reopened.Close(); closeErr != nil {
+			t.Errorf("close reopened store: %v", closeErr)
+		}
+	}()
+	var backoffCalls atomic.Int32
+	err = New(
+		testGatewayConfig(),
+		reopened,
+		testInventory(),
+		WithBackoff(func(int) time.Duration {
+			backoffCalls.Add(1)
+			return 0
+		}),
+	).Run(context.Background())
+	if err != errRenewalRecoveryRequired {
+		t.Fatalf("Run error = %v, want %v", err, errRenewalRecoveryRequired)
+	}
+	if backoffCalls.Load() != 0 {
+		t.Fatalf("backoff calls = %d, want 0", backoffCalls.Load())
+	}
+	if _, found, err := reopened.PendingRenewal(); err != nil || found {
+		t.Fatalf("expired pending renewal remained after recovery stop: found=%v err=%v", found, err)
+	}
+}
+
 func TestClientRedactsInvalidStoredCertificates(t *testing.T) {
 	const (
 		subjectMarker = "stored-cert-subject-secret-marker"
@@ -1612,6 +1996,32 @@ func rewriteStoredIdentity(t *testing.T, path string, identity state.Identity) {
 			return fmt.Errorf("identity bucket is missing")
 		}
 		return bucket.Put([]byte("current"), encoded)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func rewriteStoredPendingRenewal(t *testing.T, path string, pending state.PendingRenewal) {
+	t.Helper()
+	encoded, err := json.Marshal(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close raw state database: %v", err)
+		}
+	}()
+	if err := database.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte("identity"))
+		if bucket == nil {
+			return fmt.Errorf("identity bucket is missing")
+		}
+		return bucket.Put([]byte("pending_renewal"), encoded)
 	}); err != nil {
 		t.Fatal(err)
 	}

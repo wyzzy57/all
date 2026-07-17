@@ -180,6 +180,12 @@ func (s *Store) PendingRenewal() (PendingRenewal, bool, error) {
 	return pending, found, err
 }
 
+func (s *Store) ClearPendingRenewal() error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(identityBucket).Delete(pendingRenewalKey)
+	})
+}
+
 func (s *Store) SavePendingRenewal(pending PendingRenewal) error {
 	if strings.TrimSpace(pending.RequestID) == "" || strings.TrimSpace(pending.CSRPEM) == "" {
 		return fmt.Errorf("pending renewal request is incomplete")

@@ -40,6 +40,8 @@ operator CA for these exact method/path combinations:
 
 - `POST /agent/v1/enrollment-tokens`
 - `GET /nodes`
+- `GET /nodes/{id}`
+- `GET /resource-pools`
 - `POST /nodes/{id}/drain`
 
 Apply the same boundary to any additional operator or admin route added later.
@@ -95,6 +97,8 @@ assert_proxy_denies() {
 assert_direct_backend_denied
 assert_proxy_denies POST "$VISIOX_API_URL/agent/v1/enrollment-tokens"
 assert_proxy_denies GET "$VISIOX_API_URL/nodes"
+assert_proxy_denies GET "$VISIOX_API_URL/nodes/$VISIOX_MTLS_CHECK_NODE_ID"
+assert_proxy_denies GET "$VISIOX_API_URL/resource-pools"
 assert_proxy_denies POST "$VISIOX_API_URL/nodes/$VISIOX_MTLS_CHECK_NODE_ID/drain"
 
 if ! curl --fail --silent --show-error \
@@ -108,7 +112,7 @@ fi
 ```
 
 The direct backend request must fail with a connection denial or timeout, the
-three unauthenticated proxy requests must each report `401` or `403`, and the
+five unauthenticated proxy requests must each report `401` or `403`, and the
 certificate-authenticated `GET /nodes` request must succeed. Keep the proxy
 policy, backend isolation, and this negative/positive verification as a release
 prerequisite; M1 is not production-ready without all three.
@@ -510,8 +514,11 @@ remains valid. The Agent durably stores the candidate before it acknowledges
 readiness; only then does the control plane activate it and reject the old
 certificate. If a candidate, acknowledgement, or activation response is lost,
 the Agent retains the old and pending certificates across restart and recovers
-on reconnect without moving the private key. Do not edit Agent state files to
-force this sequence.
+on reconnect without moving the private key. After a long outage, a still-valid
+pending candidate is promoted on reconnect; if both the current and pending
+certificates expire, the Agent clears the stale candidate and stops for planned
+node re-enrollment rather than retrying indefinitely. Do not edit Agent state
+files to force this sequence.
 
 M1 rotates device certificates under the same CA but does not provide
 zero-downtime CA rotation. Replacing the CA requires a maintenance window and

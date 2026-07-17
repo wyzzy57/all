@@ -574,6 +574,8 @@ run_documentation_checks() {
     fi
     assert_mtls_curl_event 'POST|https://visiox-control.example.internal/agent/v1/enrollment-tokens|cert=0|key=0'
     assert_mtls_curl_event 'GET|https://visiox-control.example.internal/nodes|cert=0|key=0'
+    assert_mtls_curl_event 'GET|https://visiox-control.example.internal/nodes/00000000-0000-0000-0000-000000000000|cert=0|key=0'
+    assert_mtls_curl_event 'GET|https://visiox-control.example.internal/resource-pools|cert=0|key=0'
     assert_mtls_curl_event 'POST|https://visiox-control.example.internal/nodes/00000000-0000-0000-0000-000000000000/drain|cert=0|key=0'
     assert_mtls_curl_event 'GET|http://api-service.production.internal:8000/health|cert=0|key=0'
     assert_mtls_curl_event 'GET|https://visiox-control.example.internal/nodes|cert=1|key=1'

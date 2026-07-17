@@ -6,12 +6,15 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"go.etcd.io/bbolt"
 )
 
 func TestStoreSpoolsAndAcknowledgesEvents(t *testing.T) {
@@ -225,6 +228,86 @@ func TestStoreRetainsPendingRenewalAcrossRestartUntilPromotion(t *testing.T) {
 	}
 	if _, found, err := reopened.PendingRenewal(); err != nil || found {
 		t.Fatalf("pending renewal remained after promotion: found=%v err=%v", found, err)
+	}
+}
+
+func TestStoreClearsExpiredPendingRenewalAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeExpiry := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	identity, privateKey, ca := newTestIdentity(t, "node-1", activeExpiry)
+	if err := store.SaveIdentity(identity); err != nil {
+		t.Fatal(err)
+	}
+	pending := PendingRenewal{
+		RequestID: "renewal-expired-restart-001",
+		CSRPEM:    csrPEMForPrivateKey(t, privateKey, identity.NodeID),
+	}
+	if err := store.SavePendingRenewal(pending); err != nil {
+		t.Fatal(err)
+	}
+	persistedCandidatePEM := ca.signCertificate(
+		t,
+		privateKey.Public(),
+		identity.NodeID,
+		activeExpiry.Add(time.Hour),
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	)
+	persistedCandidate, err := parseCertificate(persistedCandidatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRenewalCandidate(
+		pending.RequestID,
+		persistedCandidatePEM,
+		certificateFingerprint(persistedCandidate),
+	); err != nil {
+		t.Fatal(err)
+	}
+	expiredCandidatePEM := ca.signCertificate(
+		t,
+		privateKey.Public(),
+		identity.NodeID,
+		time.Now().UTC().Add(-time.Hour),
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	)
+	expiredCandidate, err := parseCertificate(expiredCandidatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending.CertificatePEM = expiredCandidatePEM
+	pending.CertificateFingerprintSHA256 = certificateFingerprint(expiredCandidate)
+	pending.CertificateExpiresAt = expiredCandidate.NotAfter
+	encodedPending, err := json.Marshal(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(identityBucket).Put(pendingRenewalKey, encodedPending)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.ClearPendingRenewal(); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := reopened.PendingRenewal(); err != nil || found {
+		t.Fatalf("expired pending renewal remained after cleanup: found=%v err=%v", found, err)
+	}
+	storedIdentity, found, err := reopened.Identity()
+	if err != nil || !found || storedIdentity.CertificatePEM != identity.CertificatePEM {
+		t.Fatalf("pending cleanup changed active identity: found=%v identity=%#v err=%v", found, storedIdentity, err)
 	}
 }
 

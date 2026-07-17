@@ -29,6 +29,7 @@ class VerifiedAgentIdentity:
     node_id: str
     serial_number: str
     fingerprint_sha256: str
+    public_key_bytes: bytes
 
 
 def hash_enrollment_token(raw_token: str) -> str:
@@ -38,6 +39,14 @@ def hash_enrollment_token(raw_token: str) -> str:
 def csr_fingerprint_sha256(csr_pem: str) -> str:
     csr = _load_valid_csr(csr_pem)
     return hashlib.sha256(csr.public_bytes(serialization.Encoding.DER)).hexdigest()
+
+
+def csr_public_key_bytes(csr_pem: str) -> bytes:
+    csr = _load_valid_csr(csr_pem)
+    public_key = csr.public_key()
+    if not isinstance(public_key, ed25519.Ed25519PublicKey):
+        raise AgentIdentityError("Certificate request is invalid")
+    return _public_key_bytes(public_key)
 
 
 def ensure_agent_ca(settings: Settings) -> None:
@@ -102,6 +111,15 @@ def issue_agent_certificate(
     )
 
 
+def verify_agent_certificate(
+    certificate_pem: str,
+    settings: Settings,
+    now: datetime | None = None,
+) -> VerifiedAgentIdentity:
+    identity, _ = _verify_agent_certificate(certificate_pem, settings, now)
+    return identity
+
+
 def verify_agent_signature(
     certificate_pem: str,
     nonce: bytes,
@@ -109,6 +127,20 @@ def verify_agent_signature(
     settings: Settings,
     now: datetime | None = None,
 ) -> VerifiedAgentIdentity:
+    try:
+        identity, agent_public_key = _verify_agent_certificate(certificate_pem, settings, now)
+        agent_public_key.verify(signature, nonce)
+    except Exception:
+        raise AgentIdentityError("Agent identity verification failed") from None
+
+    return identity
+
+
+def _verify_agent_certificate(
+    certificate_pem: str,
+    settings: Settings,
+    now: datetime | None,
+) -> tuple[VerifiedAgentIdentity, ed25519.Ed25519PublicKey]:
     current_time = _as_utc(now)
     try:
         certificate = x509.load_pem_x509_certificate(certificate_pem.encode())
@@ -119,32 +151,31 @@ def verify_agent_signature(
         if certificate.issuer != ca_certificate.subject:
             raise ValueError
         ca_public_key.verify(certificate.signature, certificate.tbs_certificate_bytes)
-
         if current_time < certificate.not_valid_before_utc or current_time > certificate.not_valid_after_utc:
             raise ValueError
-
         basic_constraints = certificate.extensions.get_extension_for_class(x509.BasicConstraints).value
         if basic_constraints.ca:
             raise ValueError
         extended_key_usage = certificate.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
         if ExtendedKeyUsageOID.CLIENT_AUTH not in extended_key_usage:
             raise ValueError
-
         common_names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
         if len(common_names) != 1 or not common_names[0].value.strip():
             raise ValueError
-
         agent_public_key = certificate.public_key()
         if not isinstance(agent_public_key, ed25519.Ed25519PublicKey):
             raise ValueError
-        agent_public_key.verify(signature, nonce)
     except Exception:
         raise AgentIdentityError("Agent identity verification failed") from None
 
-    return VerifiedAgentIdentity(
-        node_id=common_names[0].value,
-        serial_number=str(certificate.serial_number),
-        fingerprint_sha256=certificate.fingerprint(hashes.SHA256()).hex(),
+    return (
+        VerifiedAgentIdentity(
+            node_id=common_names[0].value,
+            serial_number=str(certificate.serial_number),
+            fingerprint_sha256=certificate.fingerprint(hashes.SHA256()).hex(),
+            public_key_bytes=_public_key_bytes(agent_public_key),
+        ),
+        agent_public_key,
     )
 
 

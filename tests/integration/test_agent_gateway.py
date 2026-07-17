@@ -5,7 +5,7 @@ from time import sleep
 
 import pytest
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi.testclient import TestClient
@@ -596,6 +596,307 @@ def test_agent_gateway_recovers_when_activation_confirmation_is_lost(
 
     with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
         _authenticate(websocket, node_id, candidate["certificate_pem"], private_key)
+
+
+def test_agent_gateway_rejects_different_renewal_key_without_state_change(
+    agent_api_client: TestClient,
+    agent_session_factory: sessionmaker[Session],
+    enrolled_agent,
+) -> None:
+    node_id, certificate_pem, private_key = enrolled_agent
+    original_identity = _stored_certificate_identity(agent_session_factory, node_id)
+    _, different_key_csr = new_agent_csr(node_id)
+
+    with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
+        _authenticate(websocket, node_id, certificate_pem, private_key)
+        websocket.send_json(
+            {
+                "protocol_version": 1,
+                "type": "certificate_renewal_request",
+                "renewal_request_id": "renewal-other-key-001",
+                "csr_pem": different_key_csr,
+            }
+        )
+        assert websocket.receive_json() == INVALID_CERTIFICATE_REQUEST
+
+    assert _stored_certificate_identity(agent_session_factory, node_id) == original_identity
+    with agent_session_factory() as session:
+        node = session.get(ComputeNode, node_id)
+        assert node is not None
+        assert node.pending_certificate_pem is None
+        assert node.pending_certificate_fingerprint is None
+        assert node.pending_renewal_request_id is None
+
+
+def test_agent_gateway_replays_pending_candidate_for_fresh_same_key_csr(
+    agent_api_client: TestClient,
+    agent_session_factory: sessionmaker[Session],
+    enrolled_agent,
+) -> None:
+    node_id, certificate_pem, private_key = enrolled_agent
+    first_request_id = "renewal-fresh-csr-001"
+    second_request_id = "renewal-fresh-csr-002"
+    first_csr = _csr_for_key(private_key, node_id)
+    fresh_csr = _csr_for_key(private_key, "fresh-csr-encoding")
+    assert fresh_csr != first_csr
+    first_request = {
+        "protocol_version": 1,
+        "type": "certificate_renewal_request",
+        "renewal_request_id": first_request_id,
+        "csr_pem": first_csr,
+    }
+    assert "PRIVATE KEY" not in json.dumps(first_request)
+
+    with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
+        _authenticate(websocket, node_id, certificate_pem, private_key)
+        websocket.send_json(first_request)
+        candidate = websocket.receive_json()
+
+    assert candidate["type"] == "certificate_renewal_candidate"
+    assert "private" not in json.dumps(candidate).lower()
+
+    with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
+        _authenticate(websocket, node_id, certificate_pem, private_key)
+        websocket.send_json(
+            {
+                "protocol_version": 1,
+                "type": "certificate_renewal_request",
+                "renewal_request_id": second_request_id,
+                "csr_pem": fresh_csr,
+            }
+        )
+        replayed = websocket.receive_json()
+        assert replayed["renewal_request_id"] == second_request_id
+        assert replayed["certificate_pem"] == candidate["certificate_pem"]
+        assert (
+            replayed["certificate_fingerprint_sha256"]
+            == candidate["certificate_fingerprint_sha256"]
+        )
+        websocket.send_json(
+            {
+                "protocol_version": 1,
+                "type": "certificate_renewal_ack",
+                "renewal_request_id": second_request_id,
+                "certificate_fingerprint_sha256": replayed["certificate_fingerprint_sha256"],
+            }
+        )
+        assert websocket.receive_json()["type"] == "certificate_renewal_activated"
+
+    with agent_session_factory() as session:
+        node = session.get(ComputeNode, node_id)
+        assert node is not None
+        assert node.certificate_fingerprint == candidate["certificate_fingerprint_sha256"]
+        assert node.pending_certificate_pem is None
+
+
+def test_agent_gateway_reissues_expired_pending_candidate(
+    agent_api_client: TestClient,
+    agent_session_factory: sessionmaker[Session],
+    enrolled_agent,
+) -> None:
+    node_id, certificate_pem, private_key = enrolled_agent
+    first_csr = _csr_for_key(private_key, node_id)
+
+    with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
+        _authenticate(websocket, node_id, certificate_pem, private_key)
+        websocket.send_json(
+            {
+                "protocol_version": 1,
+                "type": "certificate_renewal_request",
+                "renewal_request_id": "renewal-expired-pending-001",
+                "csr_pem": first_csr,
+            }
+        )
+        expired_candidate = websocket.receive_json()
+
+    with agent_session_factory() as session:
+        node = session.get(ComputeNode, node_id)
+        assert node is not None
+        node.pending_certificate_expires_at = datetime.now(UTC) - timedelta(minutes=1)
+        session.commit()
+
+    with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
+        _authenticate(websocket, node_id, certificate_pem, private_key)
+        websocket.send_json(
+            {
+                "protocol_version": 1,
+                "type": "certificate_renewal_request",
+                "renewal_request_id": "renewal-expired-pending-002",
+                "csr_pem": _csr_for_key(private_key, "reissued-pending"),
+            }
+        )
+        reissued_candidate = websocket.receive_json()
+
+    assert reissued_candidate["type"] == "certificate_renewal_candidate"
+    assert (
+        reissued_candidate["certificate_fingerprint_sha256"]
+        != expired_candidate["certificate_fingerprint_sha256"]
+    )
+    with agent_session_factory() as session:
+        node = session.get(ComputeNode, node_id)
+        assert node is not None
+        assert node.pending_renewal_request_id == "renewal-expired-pending-002"
+        assert node.pending_certificate_expires_at is not None
+        pending_expires_at = node.pending_certificate_expires_at
+        if pending_expires_at.tzinfo is None:
+            pending_expires_at = pending_expires_at.replace(tzinfo=UTC)
+        assert pending_expires_at > datetime.now(UTC)
+
+
+def test_agent_gateway_promotes_pending_candidate_after_active_certificate_expires(
+    agent_api_client: TestClient,
+    agent_session_factory: sessionmaker[Session],
+    enrolled_agent,
+) -> None:
+    node_id, certificate_pem, private_key = enrolled_agent
+    with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
+        _authenticate(websocket, node_id, certificate_pem, private_key)
+        websocket.send_json(
+            {
+                "protocol_version": 1,
+                "type": "certificate_renewal_request",
+                "renewal_request_id": "renewal-expired-active-001",
+                "csr_pem": _csr_for_key(private_key, node_id),
+            }
+        )
+        candidate = websocket.receive_json()
+
+    expired_certificate_pem = _expired_certificate(agent_api_client, node_id, private_key)
+    expired_certificate = x509.load_pem_x509_certificate(expired_certificate_pem.encode())
+    with agent_session_factory() as session:
+        node = session.get(ComputeNode, node_id)
+        assert node is not None
+        node.certificate_serial = str(expired_certificate.serial_number)
+        node.certificate_fingerprint = expired_certificate.fingerprint(hashes.SHA256()).hex()
+        node.certificate_expires_at = expired_certificate.not_valid_after_utc
+        session.commit()
+
+    with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
+        _authenticate(websocket, node_id, candidate["certificate_pem"], private_key)
+
+    with agent_session_factory() as session:
+        node = session.get(ComputeNode, node_id)
+        assert node is not None
+        assert node.certificate_fingerprint == candidate["certificate_fingerprint_sha256"]
+        assert node.pending_certificate_pem is None
+        assert node.pending_renewal_request_id is None
+
+    with agent_api_client.websocket_connect("/agent/v1/connect") as websocket:
+        _send_authentication(websocket, node_id, expired_certificate_pem, private_key)
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            websocket.receive_json()
+    assert rejected.value.code == 4403
+
+
+def test_agent_gateway_rejects_stale_concurrent_sessions_after_renewal_activation(
+    agent_api_client: TestClient,
+    agent_session_factory: sessionmaker[Session],
+    enrolled_agent,
+) -> None:
+    node_id, certificate_pem, private_key = enrolled_agent
+    with (
+        agent_api_client.websocket_connect("/agent/v1/connect") as acknowledging,
+        agent_api_client.websocket_connect("/agent/v1/connect") as stale_heartbeat,
+        agent_api_client.websocket_connect("/agent/v1/connect") as stale_inventory,
+        agent_api_client.websocket_connect("/agent/v1/connect") as stale_events,
+    ):
+        _authenticate(acknowledging, node_id, certificate_pem, private_key)
+        _authenticate(stale_heartbeat, node_id, certificate_pem, private_key)
+        _authenticate(stale_inventory, node_id, certificate_pem, private_key)
+        _authenticate(stale_events, node_id, certificate_pem, private_key)
+
+        acknowledging.send_json(
+            {
+                "protocol_version": 1,
+                "type": "certificate_renewal_request",
+                "renewal_request_id": "renewal-stale-session-001",
+                "csr_pem": _csr_for_key(private_key, node_id),
+            }
+        )
+        candidate = acknowledging.receive_json()
+        acknowledging.send_json(
+            {
+                "protocol_version": 1,
+                "type": "certificate_renewal_ack",
+                "renewal_request_id": candidate["renewal_request_id"],
+                "certificate_fingerprint_sha256": candidate["certificate_fingerprint_sha256"],
+            }
+        )
+        assert acknowledging.receive_json()["type"] == "certificate_renewal_activated"
+
+        acknowledging.send_json(
+            {
+                "protocol_version": 1,
+                "type": "inventory",
+                "architecture": "arm64",
+                "platform_kind": "jetson",
+                "capabilities": {"source": "acknowledging"},
+                "resources": {"source": "acknowledging"},
+                "fingerprint": {"source": "acknowledging"},
+                "agent_version": "0.1.0-test",
+            }
+        )
+        acknowledging.send_json(
+            {
+                "protocol_version": 1,
+                "type": "heartbeat",
+                "occurred_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        acknowledging.send_json(_event_batch(_event(1, payload={"source": "acknowledging"})))
+        assert acknowledging.receive_json()["through_sequence"] == 1
+
+        with agent_session_factory() as session:
+            node = session.get(ComputeNode, node_id)
+            assert node is not None
+            expected_last_seen_at = node.last_seen_at
+            expected_resources = dict(node.resources)
+            expected_events = session.scalar(
+                select(func.count()).select_from(NodeEvent).where(NodeEvent.node_id == node_id)
+            )
+
+        stale_heartbeat.send_json(
+            {
+                "protocol_version": 1,
+                "type": "heartbeat",
+                "occurred_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        stale_heartbeat.send_json(_event_batch(_event(2, payload={"source": "stale-heartbeat"})))
+        with pytest.raises(WebSocketDisconnect) as heartbeat_rejected:
+            stale_heartbeat.receive_json()
+        assert heartbeat_rejected.value.code == 4403
+
+        stale_inventory.send_json(
+            {
+                "protocol_version": 1,
+                "type": "inventory",
+                "architecture": "arm64",
+                "platform_kind": "jetson",
+                "capabilities": {"source": "stale"},
+                "resources": {"source": "stale"},
+                "fingerprint": {"source": "stale"},
+                "agent_version": "0.1.0-stale",
+            }
+        )
+        stale_inventory.send_json(_event_batch(_event(3, payload={"source": "stale-inventory"})))
+        with pytest.raises(WebSocketDisconnect) as inventory_rejected:
+            stale_inventory.receive_json()
+        assert inventory_rejected.value.code == 4403
+
+        stale_events.send_json(_event_batch(_event(4, payload={"source": "stale-events"})))
+        with pytest.raises(WebSocketDisconnect) as events_rejected:
+            stale_events.receive_json()
+        assert events_rejected.value.code == 4403
+
+    with agent_session_factory() as session:
+        node = session.get(ComputeNode, node_id)
+        assert node is not None
+        assert node.last_seen_at == expected_last_seen_at
+        assert node.resources == expected_resources
+        assert session.scalar(
+            select(func.count()).select_from(NodeEvent).where(NodeEvent.node_id == node_id)
+        ) == expected_events
 
 
 def test_agent_gateway_rejects_malformed_renewal_without_metadata_change(

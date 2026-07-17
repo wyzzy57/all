@@ -31,7 +31,9 @@ from visiox_api.services.agent_identity import (
     AgentIdentityError,
     VerifiedAgentIdentity,
     csr_fingerprint_sha256,
+    csr_public_key_bytes,
     issue_agent_certificate,
+    verify_agent_certificate,
     verify_agent_signature,
 )
 from visiox_api.services.node_registry import NodeNotFound, NodeRegistryService
@@ -115,7 +117,7 @@ async def agent_gateway(
         if verified.node_id != auth.node_id:
             raise AgentAuthenticationRejected
         with session_factory() as session:
-            _authenticate_registered_node(session, verified)
+            verified = _authenticate_registered_node(session, verified, settings)
     except (AgentIdentityError, AgentAuthenticationRejected):
         await websocket.close(code=4403, reason="agent identity rejected")
         return
@@ -147,17 +149,17 @@ async def _receive_agent_messages(
         try:
             if isinstance(message, InventoryMessage):
                 with session_factory() as session:
+                    _require_current_session_credential(session, identity)
                     NodeRegistryService(session, settings).apply_inventory(
                         identity.node_id, message
                     )
             elif isinstance(message, HeartbeatMessage):
                 with session_factory() as session:
+                    _require_current_session_credential(session, identity)
                     NodeRegistryService(session, settings).mark_seen(identity.node_id)
             elif isinstance(message, EventBatchMessage):
                 with session_factory() as session:
-                    through_sequence = _persist_event_batch(
-                        session, identity.node_id, message
-                    )
+                    through_sequence = _persist_event_batch(session, identity, message)
                 await websocket.send_json(
                     EventsAckMessage(through_sequence=through_sequence).model_dump(mode="json")
                 )
@@ -173,11 +175,13 @@ async def _receive_agent_messages(
                 )
             elif isinstance(message, CertificateRenewalAckMessage):
                 with session_factory() as session:
-                    fingerprint = _activate_agent_certificate_renewal(session, identity, message)
+                    identity = _activate_agent_certificate_renewal(
+                        session, identity, message, settings
+                    )
                 await websocket.send_json(
                     CertificateRenewalActivatedMessage(
                         renewal_request_id=message.renewal_request_id,
-                        certificate_fingerprint_sha256=fingerprint,
+                        certificate_fingerprint_sha256=identity.fingerprint_sha256,
                     ).model_dump(mode="json")
                 )
         except EventSequenceConflict:
@@ -259,27 +263,125 @@ def _load_json_object(raw_message: str) -> dict[str, Any]:
 def _authenticate_registered_node(
     session: Session,
     identity: VerifiedAgentIdentity,
-) -> None:
-    node = session.get(ComputeNode, identity.node_id)
-    if (
-        node is None
-        or node.certificate_serial != identity.serial_number
-        or node.certificate_fingerprint != identity.fingerprint_sha256
-    ):
+    settings: Settings,
+) -> VerifiedAgentIdentity:
+    try:
+        node = session.scalar(
+            select(ComputeNode).where(ComputeNode.id == identity.node_id).with_for_update()
+        )
+        if node is None:
+            raise AgentAuthenticationRejected
+        if _matches_active_credential(node, identity):
+            return identity
+
+        candidate = _pending_candidate_identity(node, settings)
+        if candidate is None:
+            if _has_pending_renewal(node):
+                _clear_pending_renewal(node)
+                session.commit()
+            raise AgentAuthenticationRejected
+        if (
+            candidate.serial_number != identity.serial_number
+            or candidate.fingerprint_sha256 != identity.fingerprint_sha256
+        ):
+            raise AgentAuthenticationRejected
+
+        _promote_pending_renewal(node, candidate)
+        session.commit()
+        return candidate
+    except Exception:
+        session.rollback()
+        raise
+
+
+def _require_current_session_credential(
+    session: Session,
+    identity: VerifiedAgentIdentity,
+) -> ComputeNode:
+    node = session.scalar(
+        select(ComputeNode).where(ComputeNode.id == identity.node_id).with_for_update()
+    )
+    if node is None or not _matches_active_credential(node, identity):
         raise AgentAuthenticationRejected
+    return node
+
+
+def _matches_active_credential(node: ComputeNode, identity: VerifiedAgentIdentity) -> bool:
+    return (
+        node.certificate_serial == identity.serial_number
+        and node.certificate_fingerprint == identity.fingerprint_sha256
+    )
+
+
+def _pending_candidate_identity(
+    node: ComputeNode,
+    settings: Settings,
+) -> VerifiedAgentIdentity | None:
+    expires_at = _as_utc(node.pending_certificate_expires_at)
+    if (
+        node.pending_certificate_serial is None
+        or node.pending_certificate_fingerprint is None
+        or node.pending_certificate_pem is None
+        or expires_at is None
+        or expires_at <= datetime.now(UTC)
+    ):
+        return None
+    try:
+        candidate = verify_agent_certificate(node.pending_certificate_pem, settings)
+    except AgentIdentityError:
+        return None
+    if (
+        candidate.node_id != node.id
+        or candidate.serial_number != node.pending_certificate_serial
+        or candidate.fingerprint_sha256 != node.pending_certificate_fingerprint
+    ):
+        return None
+    return candidate
+
+
+def _has_pending_renewal(node: ComputeNode) -> bool:
+    return any(
+        value is not None
+        for value in (
+            node.pending_certificate_serial,
+            node.pending_certificate_fingerprint,
+            node.pending_certificate_expires_at,
+            node.pending_certificate_pem,
+            node.pending_renewal_request_id,
+            node.pending_renewal_csr_fingerprint,
+        )
+    )
+
+
+def _clear_pending_renewal(node: ComputeNode) -> None:
+    node.pending_certificate_serial = None
+    node.pending_certificate_fingerprint = None
+    node.pending_certificate_expires_at = None
+    node.pending_certificate_pem = None
+    node.pending_renewal_request_id = None
+    node.pending_renewal_csr_fingerprint = None
+
+
+def _promote_pending_renewal(
+    node: ComputeNode,
+    candidate: VerifiedAgentIdentity,
+) -> None:
+    if node.pending_certificate_expires_at is None:
+        raise CertificateRenewalRejected
+    node.certificate_serial = candidate.serial_number
+    node.certificate_fingerprint = candidate.fingerprint_sha256
+    node.certificate_expires_at = node.pending_certificate_expires_at
+    _clear_pending_renewal(node)
 
 
 def _persist_event_batch(
     session: Session,
-    node_id: str,
+    identity: VerifiedAgentIdentity,
     batch: EventBatchMessage,
 ) -> int:
     try:
-        node = session.scalar(
-            select(ComputeNode).where(ComputeNode.id == node_id).with_for_update()
-        )
-        if node is None:
-            raise NodeNotFound(node_id)
+        node = _require_current_session_credential(session, identity)
+        node_id = node.id
 
         sequences = {event.sequence for event in batch.events}
         stored_by_sequence = {
@@ -358,30 +460,28 @@ def _stage_agent_certificate_renewal(
     settings: Settings,
 ) -> RenewalCandidate:
     try:
-        node = session.scalar(
-            select(ComputeNode)
-            .where(ComputeNode.id == identity.node_id)
-            .with_for_update()
-        )
-        if (
-            node is None
-            or node.certificate_serial != identity.serial_number
-            or node.certificate_fingerprint != identity.fingerprint_sha256
-        ):
-            raise AgentAuthenticationRejected
+        csr_public_key = csr_public_key_bytes(request.csr_pem)
         csr_fingerprint = csr_fingerprint_sha256(request.csr_pem)
-        if node.pending_renewal_request_id is not None:
+        node = _require_current_session_credential(session, identity)
+        if csr_public_key != identity.public_key_bytes:
+            raise CertificateRenewalRejected
+
+        candidate = _pending_candidate_identity(node, settings)
+        if candidate is not None and candidate.public_key_bytes == identity.public_key_bytes:
             if (
-                node.pending_renewal_request_id != request.renewal_request_id
-                or node.pending_renewal_csr_fingerprint != csr_fingerprint
-                or node.pending_certificate_pem is None
+                node.pending_certificate_pem is None
                 or node.pending_certificate_fingerprint is None
             ):
                 raise CertificateRenewalRejected
+            node.pending_renewal_request_id = request.renewal_request_id
+            node.pending_renewal_csr_fingerprint = csr_fingerprint
+            session.commit()
             return RenewalCandidate(
                 certificate_pem=node.pending_certificate_pem,
                 fingerprint_sha256=node.pending_certificate_fingerprint,
             )
+        if _has_pending_renewal(node):
+            _clear_pending_renewal(node)
 
         renewed = issue_agent_certificate(request.csr_pem, identity.node_id, settings)
         node.pending_certificate_serial = renewed.serial_number
@@ -404,37 +504,24 @@ def _activate_agent_certificate_renewal(
     session: Session,
     identity: VerifiedAgentIdentity,
     acknowledgement: CertificateRenewalAckMessage,
-) -> str:
+    settings: Settings,
+) -> VerifiedAgentIdentity:
     try:
-        node = session.scalar(
-            select(ComputeNode)
-            .where(ComputeNode.id == identity.node_id)
-            .with_for_update()
-        )
-        if (
-            node is None
-            or node.certificate_serial != identity.serial_number
-            or node.certificate_fingerprint != identity.fingerprint_sha256
-        ):
-            raise AgentAuthenticationRejected
+        node = _require_current_session_credential(session, identity)
+        candidate = _pending_candidate_identity(node, settings)
         if (
             node.pending_renewal_request_id != acknowledgement.renewal_request_id
             or node.pending_certificate_fingerprint != acknowledgement.certificate_fingerprint_sha256
-            or node.pending_certificate_serial is None
-            or node.pending_certificate_expires_at is None
+            or candidate is None
+            or candidate.public_key_bytes != identity.public_key_bytes
         ):
+            if candidate is None and _has_pending_renewal(node):
+                _clear_pending_renewal(node)
+                session.commit()
             raise CertificateRenewalRejected
-        node.certificate_serial = node.pending_certificate_serial
-        node.certificate_fingerprint = node.pending_certificate_fingerprint
-        node.certificate_expires_at = node.pending_certificate_expires_at
-        node.pending_certificate_serial = None
-        node.pending_certificate_fingerprint = None
-        node.pending_certificate_expires_at = None
-        node.pending_certificate_pem = None
-        node.pending_renewal_request_id = None
-        node.pending_renewal_csr_fingerprint = None
+        _promote_pending_renewal(node, candidate)
         session.commit()
-        return acknowledgement.certificate_fingerprint_sha256
+        return candidate
     except Exception:
         session.rollback()
         raise
