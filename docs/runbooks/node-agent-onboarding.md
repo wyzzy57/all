@@ -81,7 +81,7 @@ sudo chmod 0600 "$VISIOX_PKI_DIR/ca.key"
 sudo chmod 0644 "$VISIOX_PKI_DIR/ca.crt"
 
 # Validate the pair without displaying private-key material.
-sudo bash -ceu '
+sudo bash -seu -- "$VISIOX_PKI_DIR/ca.key" "$VISIOX_PKI_DIR/ca.crt" <<'VALIDATE_AGENT_CA'
 set -o pipefail
 key="$1"
 cert="$2"
@@ -91,7 +91,7 @@ test "$(openssl x509 -in "$cert" -noout -text | sed -n 's/ *Public Key Algorithm
 test "$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 | sed 's/^subject=//')" = "$(openssl x509 -in "$cert" -noout -issuer -nameopt RFC2253 | sed 's/^issuer=//')"
 test "$(openssl pkey -in "$key" -pubout -outform DER | sha256sum)" = "$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum)"
 openssl verify -x509_strict -check_ss_sig -CAfile "$cert" "$cert"
-' bash "$VISIOX_PKI_DIR/ca.key" "$VISIOX_PKI_DIR/ca.crt"
+VALIDATE_AGENT_CA
 
 docker compose -f infra/compose/docker-compose.yml up -d --no-deps api-service
 docker compose -f infra/compose/docker-compose.yml logs --tail=100 api-service
