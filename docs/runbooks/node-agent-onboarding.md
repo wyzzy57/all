@@ -60,6 +60,52 @@ Before enrolling any node, verify the public HTTPS endpoint and its WSS
 reverse-proxy route from the edge network. Do not set
 `VISIOX_AGENT_ALLOW_INSECURE_LOCAL=true` outside explicit local development.
 
+### Recover Lost or Damaged Agent CA Material
+
+Use this procedure only to restore the same CA from the offline backup created
+under the platform key-management policy. Replace
+`/mnt/offline-backups/visiox-agent-ca` with the mounted or securely attached
+offline-backup directory; never print, copy to a ticket, or otherwise expose
+`ca.key`. Run these commands on the production Compose control-plane host.
+
+```bash
+export VISIOX_PKI_DIR='/srv/visiox/pki'
+export VISIOX_OFFLINE_CA_BACKUP_DIR='/mnt/offline-backups/visiox-agent-ca'
+export VISIOX_API_URL='https://visiox-control.example.internal'
+
+docker compose -f infra/compose/docker-compose.yml stop api-service
+sudo install -d -o root -g root -m 0700 "$VISIOX_PKI_DIR"
+sudo install -o root -g root -m 0600 "$VISIOX_OFFLINE_CA_BACKUP_DIR/ca.key" "$VISIOX_PKI_DIR/ca.key"
+sudo install -o root -g root -m 0644 "$VISIOX_OFFLINE_CA_BACKUP_DIR/ca.crt" "$VISIOX_PKI_DIR/ca.crt"
+sudo chmod 0600 "$VISIOX_PKI_DIR/ca.key"
+sudo chmod 0644 "$VISIOX_PKI_DIR/ca.crt"
+
+# Validate the pair without displaying private-key material.
+sudo bash -ceu '
+set -o pipefail
+key="$1"
+cert="$2"
+openssl pkey -in "$key" -pubout -out /dev/null
+openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -out /dev/null
+test "$(openssl x509 -in "$cert" -noout -text | sed -n 's/ *Public Key Algorithm: //p' | head -n 1)" = 'ED25519'
+test "$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 | sed 's/^subject=//')" = "$(openssl x509 -in "$cert" -noout -issuer -nameopt RFC2253 | sed 's/^issuer=//')"
+test "$(openssl pkey -in "$key" -pubout -outform DER | sha256sum)" = "$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum)"
+openssl verify -x509_strict -check_ss_sig -CAfile "$cert" "$cert"
+' bash "$VISIOX_PKI_DIR/ca.key" "$VISIOX_PKI_DIR/ca.crt"
+
+docker compose -f infra/compose/docker-compose.yml up -d --no-deps api-service
+docker compose -f infra/compose/docker-compose.yml logs --tail=100 api-service
+curl --fail --silent --show-error "$VISIOX_API_URL/health"
+```
+
+The `stop`/`up` sequence restarts `api-service` after the restored read-only
+mount is validated. The validation requires a parseable matching Ed25519 key
+and certificate, a self-signed CA certificate valid now, and CA extensions;
+it does not reveal private-key contents. If there is no valid backup, do not
+attempt to preserve the existing device identities: schedule a maintenance
+window, create and deploy a replacement CA using the production provisioning
+steps above, then re-enroll every node with new one-time tokens.
+
 ## 2. Build and Transfer the Correct Binary
 
 On the build host, produce both supported architectures:
