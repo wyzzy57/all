@@ -19,6 +19,9 @@ import (
 	"github.com/wyzzy57/all/apps/node-agent/internal/state"
 )
 
+// testInventoryFixtureBuild is set only by the smoke image linker flags.
+var testInventoryFixtureBuild = "false"
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -80,6 +83,9 @@ type inventoryProbe func(context.Context) (protocol.InventoryMessage, error)
 func inventoryForAgent(ctx context.Context, cfg config.Config, probe inventoryProbe) (protocol.InventoryMessage, error) {
 	fixture := strings.TrimSpace(os.Getenv("VISIOX_AGENT_TEST_INVENTORY_JSON"))
 	if fixture != "" {
+		if testInventoryFixtureBuild != "true" {
+			return protocol.InventoryMessage{}, fmt.Errorf("VISIOX_AGENT_TEST_INVENTORY_JSON is disabled in this build")
+		}
 		if !strings.HasSuffix(cfg.AgentVersion, "-test") {
 			return protocol.InventoryMessage{}, fmt.Errorf("VISIOX_AGENT_TEST_INVENTORY_JSON is only allowed for test agent versions")
 		}

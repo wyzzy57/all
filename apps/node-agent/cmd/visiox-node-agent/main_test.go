@@ -9,7 +9,8 @@ import (
 	"github.com/wyzzy57/all/apps/node-agent/internal/protocol"
 )
 
-func TestInventoryForAgentUsesFixtureOnlyForTestVersion(t *testing.T) {
+func TestInventoryForAgentUsesFixtureForSmokeBuildWithTestVersion(t *testing.T) {
+	setTestInventoryFixtureBuild(t, "true")
 	t.Setenv("VISIOX_AGENT_TEST_INVENTORY_JSON", `{"protocol_version":1,"type":"inventory","architecture":"amd64","platform_kind":"x86_nvidia","capabilities":{"nvidia_gpu":true},"resources":{"cpu_logical_cores":8},"fingerprint":{"platform_kind":"x86_nvidia"},"agent_version":"fixture"}`)
 
 	called := false
@@ -27,7 +28,24 @@ func TestInventoryForAgentUsesFixtureOnlyForTestVersion(t *testing.T) {
 	}
 }
 
-func TestInventoryForAgentRejectsFixtureForProductionVersion(t *testing.T) {
+func TestInventoryForAgentRejectsFixtureForReleaseBuild(t *testing.T) {
+	if testInventoryFixtureBuild != "false" {
+		t.Fatalf("release test must use the default disabled build gate, got %q", testInventoryFixtureBuild)
+	}
+	t.Setenv("VISIOX_AGENT_TEST_INVENTORY_BUILD", "true")
+	t.Setenv("VISIOX_AGENT_TEST_INVENTORY_JSON", `{"protocol_version":1,"type":"inventory","architecture":"amd64","platform_kind":"x86_nvidia"}`)
+
+	_, err := inventoryForAgent(context.Background(), config.Config{AgentVersion: "0.1.0-test"}, func(context.Context) (protocol.InventoryMessage, error) {
+		t.Fatal("hardware probe must not run when a release build rejects the fixture")
+		return protocol.InventoryMessage{}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "disabled in this build") {
+		t.Fatalf("expected release build rejection, got %v", err)
+	}
+}
+
+func TestInventoryForAgentRejectsFixtureWithoutTestVersionForSmokeBuild(t *testing.T) {
+	setTestInventoryFixtureBuild(t, "true")
 	t.Setenv("VISIOX_AGENT_TEST_INVENTORY_JSON", `{"protocol_version":1,"type":"inventory","architecture":"amd64","platform_kind":"x86_nvidia"}`)
 
 	called := false
@@ -65,6 +83,7 @@ func TestInventoryForAgentProbesHardwareWithoutFixture(t *testing.T) {
 }
 
 func TestInventoryForAgentRejectsMalformedFixture(t *testing.T) {
+	setTestInventoryFixtureBuild(t, "true")
 	t.Setenv("VISIOX_AGENT_TEST_INVENTORY_JSON", "not-json")
 
 	_, err := inventoryForAgent(context.Background(), config.Config{AgentVersion: "0.1.0-test"}, func(context.Context) (protocol.InventoryMessage, error) {
@@ -77,6 +96,7 @@ func TestInventoryForAgentRejectsMalformedFixture(t *testing.T) {
 }
 
 func TestInventoryForAgentRequiresInventoryEnvelope(t *testing.T) {
+	setTestInventoryFixtureBuild(t, "true")
 	t.Setenv("VISIOX_AGENT_TEST_INVENTORY_JSON", `{"protocol_version":1,"type":"heartbeat","architecture":"amd64","platform_kind":"x86_nvidia"}`)
 
 	_, err := inventoryForAgent(context.Background(), config.Config{AgentVersion: "0.1.0-test"}, func(context.Context) (protocol.InventoryMessage, error) {
@@ -89,6 +109,7 @@ func TestInventoryForAgentRequiresInventoryEnvelope(t *testing.T) {
 }
 
 func TestInventoryForAgentRequiresVersionToEndWithTest(t *testing.T) {
+	setTestInventoryFixtureBuild(t, "true")
 	t.Setenv("VISIOX_AGENT_TEST_INVENTORY_JSON", `{}`)
 
 	_, err := inventoryForAgent(context.Background(), config.Config{AgentVersion: "0.1.0-test-build"}, func(context.Context) (protocol.InventoryMessage, error) {
@@ -101,6 +122,7 @@ func TestInventoryForAgentRequiresVersionToEndWithTest(t *testing.T) {
 }
 
 func TestInventoryForAgentDoesNotTreatEmptyVersionAsTest(t *testing.T) {
+	setTestInventoryFixtureBuild(t, "true")
 	t.Setenv("VISIOX_AGENT_TEST_INVENTORY_JSON", `{}`)
 
 	_, err := inventoryForAgent(context.Background(), config.Config{}, func(context.Context) (protocol.InventoryMessage, error) {
@@ -110,4 +132,13 @@ func TestInventoryForAgentDoesNotTreatEmptyVersionAsTest(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "only allowed for test agent versions") {
 		t.Fatalf("expected empty-version rejection, got %v", err)
 	}
+}
+
+func setTestInventoryFixtureBuild(t *testing.T, value string) {
+	t.Helper()
+	previous := testInventoryFixtureBuild
+	testInventoryFixtureBuild = value
+	t.Cleanup(func() {
+		testInventoryFixtureBuild = previous
+	})
 }

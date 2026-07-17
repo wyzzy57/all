@@ -7,6 +7,33 @@ $dockerfile = Join-Path $repoRoot "apps/node-agent/Dockerfile"
 $dist = Join-Path $repoRoot "dist"
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) "visiox-node-agent-build-$PID"
 
+function Invoke-NodeAgentGoGate {
+    $gateScript = @'
+set -eu
+apk add --no-cache gcc musl-dev >/dev/null
+find . -type f -name '*.go' -exec gofmt -l {} + > /tmp/unformatted-go-files
+if [ -s /tmp/unformatted-go-files ]; then
+    printf '%s\n' 'Go files need gofmt:'
+    cat /tmp/unformatted-go-files
+    exit 1
+fi
+CGO_ENABLED=1 go test -race ./...
+go vet ./...
+'@
+    $arguments = @(
+        "run", "--rm",
+        "--volume", "${repoRoot}:/src",
+        "--workdir", "/src/apps/node-agent",
+        "golang:1.26.5-alpine", "sh", "-ec", $gateScript
+    )
+    & docker @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Pinned Go gate failed"
+    }
+}
+
+Invoke-NodeAgentGoGate
+
 New-Item -ItemType Directory -Force $dist | Out-Null
 New-Item -ItemType Directory -Force $temporaryRoot | Out-Null
 
@@ -20,6 +47,7 @@ try {
             "--target", "builder",
             "--build-arg", "TARGETOS=linux",
             "--build-arg", "TARGETARCH=$architecture",
+            "--build-arg", "TEST_INVENTORY_FIXTURE_BUILD=false",
             "--output", "type=local,dest=$output",
             $repoRoot
         )
