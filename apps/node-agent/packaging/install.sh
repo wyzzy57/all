@@ -20,6 +20,8 @@ fi
 if ! id visiox-agent >/dev/null 2>&1; then
     useradd --system --home-dir /var/lib/visiox-agent --shell /usr/sbin/nologin \
         --gid visiox-agent --no-create-home visiox-agent
+elif [ "$(id -g visiox-agent)" != "$(getent group visiox-agent | cut -d: -f3)" ]; then
+    usermod --gid visiox-agent visiox-agent
 fi
 
 install -d -o visiox-agent -g visiox-agent -m 0750 /var/lib/visiox-agent

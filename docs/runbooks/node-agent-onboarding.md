@@ -17,8 +17,65 @@ container runtime or deploy models.
   a CSR and returns a device certificate plus the CA certificate, never a
   private key. The private key, certificate, and durable event spool remain in
   `/var/lib/visiox-agent/agent.db` with mode `0600`.
-- Restrict the enrollment-token endpoint to the trusted management network.
-  Anyone who can create a token can authorize a new device during its lifetime.
+- M1 does not add application authentication to the management endpoints.
+  Production must enforce the operator mTLS boundary below before exposing
+  those routes. Anyone who can create a token can authorize a new device during
+  its lifetime.
+
+### Mandatory Production Operator mTLS Boundary
+
+Production is not ready until a TLS-terminating reverse proxy enforces and
+verifies this policy. Do not rely on a management-network allowlist alone, and
+do not forward a missing or untrusted operator certificate to `api-service`.
+Configure the proxy to require a client certificate trusted by the platform's
+operator CA for these exact method/path combinations:
+
+- `POST /agent/v1/enrollment-tokens`
+- `GET /nodes`
+- `POST /nodes/{id}/drain`
+
+Apply the same boundary to any additional operator or admin route added later.
+The proxy must keep `POST /agent/v1/enroll` reachable under its existing
+one-time enrollment-token protocol and `WSS /agent/v1/connect` reachable under
+its existing device-authentication protocol. In particular, do not apply a
+path-only mTLS rule to all of `/agent/v1`, because that would block agent
+enrollment. Make the proxy return `401` or `403` for missing or untrusted
+operator certificates, and make that result happen before proxying to the
+application.
+
+On a trusted operator host, use local certificate/key file variables. The
+commands below never print the key material or enrollment token:
+
+```bash
+export VISIOX_API_URL='https://visiox-control.example.internal'
+export VISIOX_OPERATOR_CERT_FILE='/secure/operator-client.crt'
+export VISIOX_OPERATOR_KEY_FILE='/secure/operator-client.key'
+export VISIOX_MTLS_CHECK_NODE_ID='00000000-0000-0000-0000-000000000000'
+
+assert_proxy_denies() {
+  method=$1
+  url=$2
+  status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --request "$method" "$url")"
+  case "$status" in
+    401|403) printf '%s %s denied with HTTP %s\n' "$method" "$url" "$status" ;;
+    *) printf 'Expected proxy mTLS denial (401/403) for %s %s, got HTTP %s\n' "$method" "$url" "$status" >&2; exit 1 ;;
+  esac
+}
+
+assert_proxy_denies POST "$VISIOX_API_URL/agent/v1/enrollment-tokens"
+assert_proxy_denies GET "$VISIOX_API_URL/nodes"
+assert_proxy_denies POST "$VISIOX_API_URL/nodes/$VISIOX_MTLS_CHECK_NODE_ID/drain"
+
+curl --fail --silent --show-error \
+  --cert "$VISIOX_OPERATOR_CERT_FILE" \
+  --key "$VISIOX_OPERATOR_KEY_FILE" \
+  "$VISIOX_API_URL/nodes" | jq '{total, items: [.items[] | {id, name, status}]}'
+```
+
+The three unauthenticated requests must each report `401` or `403`, and the
+certificate-authenticated `GET /nodes` request must succeed. Keep the proxy
+policy and this negative/positive verification as a release prerequisite; M1
+is not production-ready without both.
 
 ## 1. Configure the Production Control Plane
 
@@ -72,39 +129,125 @@ offline-backup directory; never print, copy to a ticket, or otherwise expose
 export VISIOX_PKI_DIR='/srv/visiox/pki'
 export VISIOX_OFFLINE_CA_BACKUP_DIR='/mnt/offline-backups/visiox-agent-ca'
 export VISIOX_API_URL='https://visiox-control.example.internal'
+export VISIOX_COMPOSE_FILE='infra/compose/docker-compose.yml'
 
-docker compose -f infra/compose/docker-compose.yml stop api-service
-sudo install -d -o root -g root -m 0700 "$VISIOX_PKI_DIR"
-sudo install -o root -g root -m 0600 "$VISIOX_OFFLINE_CA_BACKUP_DIR/ca.key" "$VISIOX_PKI_DIR/ca.key"
-sudo install -o root -g root -m 0644 "$VISIOX_OFFLINE_CA_BACKUP_DIR/ca.crt" "$VISIOX_PKI_DIR/ca.crt"
-sudo chmod 0600 "$VISIOX_PKI_DIR/ca.key"
-sudo chmod 0644 "$VISIOX_PKI_DIR/ca.crt"
-
-# Validate the pair without displaying private-key material.
-sudo bash -seu -- "$VISIOX_PKI_DIR/ca.key" "$VISIOX_PKI_DIR/ca.crt" <<'VALIDATE_AGENT_CA'
+sudo bash -seu -- "$VISIOX_PKI_DIR" "$VISIOX_OFFLINE_CA_BACKUP_DIR" "$VISIOX_API_URL" "$VISIOX_COMPOSE_FILE" <<'RECOVER_AGENT_CA'
 set -o pipefail
-key="$1"
-cert="$2"
-openssl pkey -in "$key" -pubout -out /dev/null
-openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -out /dev/null
-test "$(openssl x509 -in "$cert" -noout -text | sed -n 's/ *Public Key Algorithm: //p' | head -n 1)" = 'ED25519'
-test "$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 | sed 's/^subject=//')" = "$(openssl x509 -in "$cert" -noout -issuer -nameopt RFC2253 | sed 's/^issuer=//')"
-test "$(openssl pkey -in "$key" -pubout -outform DER | sha256sum)" = "$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum)"
-openssl verify -x509_strict -check_ss_sig -CAfile "$cert" "$cert"
-VALIDATE_AGENT_CA
+pki_dir=$1
+offline_backup_dir=$2
+api_url=$3
+compose_file=$4
+stage_dir=
+replacement_dir=
+rollback_dir=
+api_stopped=0
+live_replaced=0
+had_live_key=0
+had_live_cert=0
 
-docker compose -f infra/compose/docker-compose.yml up -d --no-deps api-service
-docker compose -f infra/compose/docker-compose.yml logs --tail=100 api-service
-curl --fail --silent --show-error "$VISIOX_API_URL/health"
+validate_ca_pair() {
+  key=$1
+  cert=$2
+  openssl pkey -in "$key" -pubout -out /dev/null
+  openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -out /dev/null
+  test "$(openssl x509 -in "$cert" -noout -text | sed -n 's/ *Public Key Algorithm: //p' | head -n 1)" = 'ED25519'
+  test "$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 | sed 's/^subject=//')" = "$(openssl x509 -in "$cert" -noout -issuer -nameopt RFC2253 | sed 's/^issuer=//')"
+  test "$(openssl pkey -in "$key" -pubout -outform DER | sha256sum)" = "$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum)"
+  openssl x509 -in "$cert" -noout -text | grep -A1 'Basic Constraints' | grep -F 'CA:TRUE' >/dev/null
+  openssl verify -x509_strict -check_ss_sig -CAfile "$cert" "$cert"
+}
+
+restore_live_ca() {
+  restore_failed=0
+  if [ "$had_live_key" -eq 1 ]; then
+    mv -f -- "$rollback_dir/ca.key" "$pki_dir/ca.key" || restore_failed=1
+  else
+    rm -f -- "$pki_dir/ca.key" || restore_failed=1
+  fi
+  if [ "$had_live_cert" -eq 1 ]; then
+    mv -f -- "$rollback_dir/ca.crt" "$pki_dir/ca.crt" || restore_failed=1
+  else
+    rm -f -- "$pki_dir/ca.crt" || restore_failed=1
+  fi
+  return "$restore_failed"
+}
+
+recover_cleanup() {
+  status=$?
+  rollback_failed=0
+  trap - EXIT HUP INT TERM
+  if [ "$status" -ne 0 ] && [ "$live_replaced" -eq 1 ]; then
+    if [ "$api_stopped" -eq 1 ]; then
+      docker compose -f "$compose_file" stop api-service || rollback_failed=1
+    fi
+    if ! restore_live_ca; then
+      rollback_failed=1
+      printf '%s\n' 'CA recovery rollback could not restore every prior file.' >&2
+    fi
+    if [ "$api_stopped" -eq 1 ]; then
+      docker compose -f "$compose_file" up -d --no-deps api-service || rollback_failed=1
+    fi
+  fi
+  [ -z "$stage_dir" ] || rm -rf -- "$stage_dir" || rollback_failed=1
+  [ -z "$replacement_dir" ] || rm -rf -- "$replacement_dir" || rollback_failed=1
+  [ -z "$rollback_dir" ] || rm -rf -- "$rollback_dir" || rollback_failed=1
+  if [ "$rollback_failed" -ne 0 ]; then
+    printf '%s\n' 'CA recovery cleanup or rollback failed; keep the control plane in maintenance and investigate.' >&2
+    [ "$status" -ne 0 ] || status=1
+  fi
+  exit "$status"
+}
+
+trap recover_cleanup EXIT HUP INT TERM
+
+# Stage and validate the offline backup before touching the live CA or service.
+stage_dir=$(mktemp -d /run/visiox-agent-ca-recovery.XXXXXX)
+chmod 0700 "$stage_dir"
+install -o root -g root -m 0600 "$offline_backup_dir/ca.key" "$stage_dir/ca.key"
+install -o root -g root -m 0644 "$offline_backup_dir/ca.crt" "$stage_dir/ca.crt"
+validate_ca_pair "$stage_dir/ca.key" "$stage_dir/ca.crt"
+
+install -d -o root -g root -m 0700 "$pki_dir"
+docker compose -f "$compose_file" stop api-service
+api_stopped=1
+
+# Keep rollback files and replacement files on the live filesystem for atomic mv.
+rollback_dir=$(mktemp -d "$pki_dir/.ca-rollback.XXXXXX")
+replacement_dir=$(mktemp -d "$pki_dir/.ca-replacement.XXXXXX")
+chmod 0700 "$rollback_dir" "$replacement_dir"
+if [ -e "$pki_dir/ca.key" ]; then
+  cp -p -- "$pki_dir/ca.key" "$rollback_dir/ca.key"
+  had_live_key=1
+fi
+if [ -e "$pki_dir/ca.crt" ]; then
+  cp -p -- "$pki_dir/ca.crt" "$rollback_dir/ca.crt"
+  had_live_cert=1
+fi
+install -o root -g root -m 0600 "$stage_dir/ca.key" "$replacement_dir/ca.key"
+install -o root -g root -m 0644 "$stage_dir/ca.crt" "$replacement_dir/ca.crt"
+
+live_replaced=1
+mv -f -- "$replacement_dir/ca.key" "$pki_dir/ca.key"
+mv -f -- "$replacement_dir/ca.crt" "$pki_dir/ca.crt"
+
+docker compose -f "$compose_file" up -d --no-deps api-service
+docker compose -f "$compose_file" logs --tail=100 api-service
+curl --fail --silent --show-error "$api_url/health"
+live_replaced=0
+RECOVER_AGENT_CA
 ```
 
-The `stop`/`up` sequence restarts `api-service` after the restored read-only
-mount is validated. The validation requires a parseable matching Ed25519 key
-and certificate, a self-signed CA certificate valid now, and CA extensions;
-it does not reveal private-key contents. If there is no valid backup, do not
-attempt to preserve the existing device identities: schedule a maintenance
-window, create and deploy a replacement CA using the production provisioning
-steps above, then re-enroll every node with new one-time tokens.
+The offline backup is first copied into a root-only temporary directory and
+validated there. Only then does the procedure stop `api-service`, retain any
+existing live files as rollback copies, and replace each live file with an
+atomic `mv` from a same-filesystem replacement directory. The exit trap restores
+the previous files and attempts to restart the service if replacement, startup,
+or health validation fails. The validation requires a parseable matching
+Ed25519 key and certificate, a self-signed CA certificate valid now, and CA
+constraints; it does not reveal private-key contents. If there is no valid
+backup, do not attempt to preserve the existing device identities: schedule a
+maintenance window, create and deploy a replacement CA using the production
+provisioning steps above, then re-enroll every node with new one-time tokens.
 
 ## 2. Build and Transfer the Correct Binary
 
@@ -140,12 +283,18 @@ scp apps/node-agent/packaging/systemd/visiox-node-agent.service "$EDGE_HOST:/tmp
 
 ## 3. Create a One-Time Enrollment Token
 
-Run this on a trusted control-plane operator host. It prints only the token's
-ID, name, and expiry; it does not print the token value.
+Run this on a trusted control-plane operator host with the mTLS file variables
+from the production boundary already set. It prints only the token's ID, name,
+and expiry; it does not print the token value.
 
 ```bash
 export VISIOX_API_URL='https://visiox-control.example.internal'
-TOKEN_RESPONSE="$(curl --fail --silent --show-error --request POST "$VISIOX_API_URL/agent/v1/enrollment-tokens" --header 'Content-Type: application/json' --data '{"name":"edge-jetson-01"}')"
+TOKEN_RESPONSE="$(curl --fail --silent --show-error \
+  --cert "$VISIOX_OPERATOR_CERT_FILE" \
+  --key "$VISIOX_OPERATOR_KEY_FILE" \
+  --request POST "$VISIOX_API_URL/agent/v1/enrollment-tokens" \
+  --header 'Content-Type: application/json' \
+  --data '{"name":"edge-jetson-01"}')"
 ENROLLMENT_TOKEN="$(printf '%s' "$TOKEN_RESPONSE" | jq -er '.token')"
 printf '%s\n' "$TOKEN_RESPONSE" | jq '{id, name, expires_at}'
 ```
@@ -202,7 +351,10 @@ After the Agent reports online, find the dynamically created node. A real node
 appears in `GET /nodes`; no seed data is required.
 
 ```bash
-curl --fail --silent --show-error "$VISIOX_API_URL/nodes" | jq -er '.items[] | select(.name == "edge-jetson-01") | {id, name, status, architecture, platform_kind, last_seen_at}'
+curl --fail --silent --show-error \
+  --cert "$VISIOX_OPERATOR_CERT_FILE" \
+  --key "$VISIOX_OPERATOR_KEY_FILE" \
+  "$VISIOX_API_URL/nodes" | jq -er '.items[] | select(.name == "edge-jetson-01") | {id, name, status, architecture, platform_kind, last_seen_at}'
 ```
 
 Once this reports `"status": "online"`, remove the consumed bootstrap token
@@ -236,7 +388,10 @@ configuration:
 sudo systemctl status visiox-node-agent --no-pager
 sudo journalctl -u visiox-node-agent -n 200 --no-pager
 curl --fail --silent --show-error "$VISIOX_API_URL/health"
-curl --fail --silent --show-error "$VISIOX_API_URL/nodes" | jq '.items[] | {id, name, status, last_seen_at, certificate_expires_at}'
+curl --fail --silent --show-error \
+  --cert "$VISIOX_OPERATOR_CERT_FILE" \
+  --key "$VISIOX_OPERATOR_KEY_FILE" \
+  "$VISIOX_API_URL/nodes" | jq '.items[] | {id, name, status, last_seen_at, certificate_expires_at}'
 ```
 
 ## 7. Drain Before Maintenance or Removal
@@ -247,7 +402,10 @@ device. It also remains draining when a heartbeat arrives.
 
 ```bash
 export NODE_ID='replace-with-node-id'
-curl --fail --silent --show-error --request POST "$VISIOX_API_URL/nodes/$NODE_ID/drain" | jq '{id, name, status, last_seen_at}'
+curl --fail --silent --show-error \
+  --cert "$VISIOX_OPERATOR_CERT_FILE" \
+  --key "$VISIOX_OPERATOR_KEY_FILE" \
+  --request POST "$VISIOX_API_URL/nodes/$NODE_ID/drain" | jq '{id, name, status, last_seen_at}'
 sudo systemctl stop visiox-node-agent
 ```
 
