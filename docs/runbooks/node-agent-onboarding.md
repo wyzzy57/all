@@ -184,7 +184,7 @@ expected_ca_fingerprint=$5
 stage_dir=
 replacement_dir=
 rollback_dir=
-api_stopped=0
+api_stop_attempted=0
 live_replaced=0
 had_live_key=0
 had_live_cert=0
@@ -265,7 +265,7 @@ recover_cleanup() {
   trap - EXIT HUP INT TERM
   if [ "$status" -ne 0 ]; then
     if [ "$live_replaced" -eq 1 ]; then
-      if [ "$api_stopped" -eq 1 ]; then
+      if [ "$api_stop_attempted" -eq 1 ]; then
         docker compose -f "$compose_file" stop api-service || rollback_failed=1
       fi
       if ! restore_live_ca; then
@@ -273,7 +273,7 @@ recover_cleanup() {
         printf '%s\n' 'CA recovery rollback could not restore every prior file.' >&2
       fi
     fi
-    if [ "$api_stopped" -eq 1 ]; then
+    if [ "$api_stop_attempted" -eq 1 ]; then
       docker compose -f "$compose_file" up -d --no-deps api-service || rollback_failed=1
     fi
   fi
@@ -298,8 +298,8 @@ validate_ca_pair "$stage_dir/ca.key" "$stage_dir/ca.crt"
 verify_same_ca_identity
 
 install -d -o root -g root -m 0700 "$pki_dir"
+api_stop_attempted=1
 docker compose -f "$compose_file" stop api-service
-api_stopped=1
 
 # Keep rollback files and replacement files on the live filesystem for atomic mv.
 rollback_dir=$(mktemp -d "$pki_dir/.ca-rollback.XXXXXX")
@@ -336,8 +336,8 @@ corroborating check, not a replacement for the secure-inventory identity. Only
 then does the procedure stop `api-service`, retain any existing live files as
 rollback copies, and replace each live file with an atomic `mv` from a
 same-filesystem replacement directory. The exit trap restores the previous
-files only after replacement begins, and always attempts to restart a service
-it stopped if recovery fails before, during, or after replacement. The
+files only after replacement begins, and always attempts to restart the service
+after a stop attempt if recovery fails before, during, or after replacement. The
 validation requires a parseable matching Ed25519 key and certificate, a
 self-signed CA certificate valid now, and CA constraints; it does not reveal
 private-key contents. If the secure-inventory identity is unavailable, the

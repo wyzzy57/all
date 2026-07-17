@@ -55,6 +55,12 @@ cat > "$testbin/docker" <<'DOCKER'
 set -eu
 printf '%s\n' "$*" >> "$VISIOX_TEST_DOCKER_LOG"
 case " $* " in
+    *" stop api-service "*)
+        if [ "${VISIOX_TEST_FAIL_STOP:-0}" = 1 ] && [ ! -e "$VISIOX_TEST_STATE/stop-failed" ]; then
+            : > "$VISIOX_TEST_STATE/stop-failed"
+            exit 1
+        fi
+        ;;
     *" up -d --no-deps api-service "*)
         if [ "${VISIOX_TEST_FAIL_STARTUP:-0}" = 1 ] && [ ! -e "$VISIOX_TEST_STATE/startup-failed" ]; then
             : > "$VISIOX_TEST_STATE/startup-failed"
@@ -330,6 +336,7 @@ run_documented_recovery() {
         VISIOX_COMPOSE_FILE='/tmp/compose.yml' \
         VISIOX_EXPECTED_CA_SHA256_FINGERPRINT="$expected_ca_fingerprint" \
         VISIOX_TEST_STATE="$state_dir" \
+        VISIOX_TEST_FAIL_STOP="${VISIOX_TEST_FAIL_STOP:-0}" \
         VISIOX_TEST_FAIL_PRE_REPLACEMENT="${VISIOX_TEST_FAIL_PRE_REPLACEMENT:-0}" \
         VISIOX_TEST_FAIL_REPLACEMENT="${VISIOX_TEST_FAIL_REPLACEMENT:-0}" \
         VISIOX_TEST_FAIL_STARTUP="${VISIOX_TEST_FAIL_STARTUP:-0}" \
@@ -369,6 +376,24 @@ run_recovery_tests() {
     grep -F 'up -d --no-deps api-service' "$docker_log" >/dev/null
     grep -F 'logs --tail=100 api-service' "$docker_log" >/dev/null
     printf '%s\n' 'same-ca-recovery-successful-replacement=passed'
+
+    stop_failure_live="$recovery_root/stop-failure-live"
+    stop_failure_offline="$recovery_root/stop-failure-offline"
+    stop_failure_state="$recovery_root/stop-failure-state"
+    make_ca "$stop_failure_live"
+    copy_ca "$stop_failure_live" "$stop_failure_offline"
+    mkdir -p "$stop_failure_state"
+    old_stop_failure_key=$(sha256_file "$stop_failure_live/ca.key")
+    old_stop_failure_cert=$(sha256_file "$stop_failure_live/ca.crt")
+    stop_failure_expected=$(ca_certificate_sha256_fingerprint "$stop_failure_live/ca.crt")
+    VISIOX_TEST_FAIL_STOP=1 VISIOX_TEST_FAIL_PRE_REPLACEMENT=0 VISIOX_TEST_FAIL_REPLACEMENT=0 VISIOX_TEST_FAIL_STARTUP=0 VISIOX_TEST_FAIL_HEALTH=0 \
+        run_documented_recovery "$stop_failure_live" "$stop_failure_offline" "$stop_failure_state" "$recovery_root/stop-failure.out" "$stop_failure_expected"
+    test "$recovery_status" -ne 0
+    test "$(sha256_file "$stop_failure_live/ca.key")" = "$old_stop_failure_key"
+    test "$(sha256_file "$stop_failure_live/ca.crt")" = "$old_stop_failure_cert"
+    assert_api_restart_attempted 1
+    assert_output_excludes_private_key "$stop_failure_offline/ca.key" "$recovery_root/stop-failure.out"
+    printf '%s\n' 'stop-failure-preserves-live-ca-and-restarts-api=passed'
 
     wrong_valid_live="$recovery_root/wrong-valid-live"
     wrong_valid_offline="$recovery_root/wrong-valid-offline"

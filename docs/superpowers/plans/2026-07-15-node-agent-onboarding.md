@@ -1277,16 +1277,29 @@ git commit -m "feat: package node agent onboarding"
 
 - [ ] **Step 1: Write the runbook with exact operator commands**
 
-The runbook must include:
+The runbook must include the supported installer invocation and this audited
+manual-install expansion, which mirrors `install.sh` exactly and uses the
+transferred fixed `/tmp` paths:
 
 ```bash
-sudo useradd --system --home-dir /var/lib/visiox-agent --shell /usr/sbin/nologin visiox-agent
-sudo install -d -o root -g visiox-agent -m 0750 /etc/visiox-agent
+# BEGIN audited node-agent installer expansion
+if ! getent group visiox-agent >/dev/null 2>&1; then
+  sudo groupadd --system visiox-agent
+fi
+if ! id visiox-agent >/dev/null 2>&1; then
+  sudo useradd --system --home-dir /var/lib/visiox-agent --shell /usr/sbin/nologin \
+    --gid visiox-agent --no-create-home visiox-agent
+elif [ "$(id -g visiox-agent)" != "$(getent group visiox-agent | cut -d: -f3)" ]; then
+  sudo usermod --gid visiox-agent visiox-agent
+fi
 sudo install -d -o visiox-agent -g visiox-agent -m 0750 /var/lib/visiox-agent
-sudo install -m 0755 visiox-node-agent-linux-arm64 /usr/local/bin/visiox-node-agent
-sudo install -m 0644 visiox-node-agent.service /etc/systemd/system/visiox-node-agent.service
+sudo install -d -o root -g visiox-agent -m 0750 /etc/visiox-agent
+sudo install -o root -g visiox-agent -m 0640 /tmp/visiox-node-agent.env /etc/visiox-agent/agent.env
+sudo install -o root -g root -m 0755 /tmp/visiox-node-agent /usr/local/bin/visiox-node-agent
+sudo install -o root -g root -m 0644 /tmp/visiox-node-agent.service /etc/systemd/system/visiox-node-agent.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now visiox-node-agent
+# END audited node-agent installer expansion
 sudo systemctl status visiox-node-agent --no-pager
 sudo journalctl -u visiox-node-agent -n 200 --no-pager
 ```
