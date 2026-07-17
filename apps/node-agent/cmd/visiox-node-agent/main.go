@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/wyzzy57/all/apps/node-agent/internal/config"
@@ -50,7 +52,9 @@ func run(ctx context.Context) (runErr error) {
 		}
 	}()
 
-	detected, err := inventory.Probe(ctx, inventory.ExecRunner{}, inventory.OSFileSystem{})
+	detected, err := inventoryForAgent(ctx, cfg, func(ctx context.Context) (protocol.InventoryMessage, error) {
+		return inventory.Probe(ctx, inventory.ExecRunner{}, inventory.OSFileSystem{})
+	})
 	if err != nil {
 		return fmt.Errorf("probe hardware inventory: %w", err)
 	}
@@ -69,4 +73,30 @@ func run(ctx context.Context) (runErr error) {
 		return fmt.Errorf("run Gateway client: %w", err)
 	}
 	return nil
+}
+
+type inventoryProbe func(context.Context) (protocol.InventoryMessage, error)
+
+func inventoryForAgent(ctx context.Context, cfg config.Config, probe inventoryProbe) (protocol.InventoryMessage, error) {
+	fixture := strings.TrimSpace(os.Getenv("VISIOX_AGENT_TEST_INVENTORY_JSON"))
+	if fixture != "" {
+		if !strings.HasSuffix(cfg.AgentVersion, "-test") {
+			return protocol.InventoryMessage{}, fmt.Errorf("VISIOX_AGENT_TEST_INVENTORY_JSON is only allowed for test agent versions")
+		}
+		var detected protocol.InventoryMessage
+		if err := json.Unmarshal([]byte(fixture), &detected); err != nil {
+			return protocol.InventoryMessage{}, fmt.Errorf("decode test inventory fixture: %w", err)
+		}
+		if detected.ProtocolVersion != protocol.ProtocolVersion {
+			return protocol.InventoryMessage{}, fmt.Errorf("inventory fixture uses unsupported protocol version %d", detected.ProtocolVersion)
+		}
+		if detected.Type != "inventory" {
+			return protocol.InventoryMessage{}, fmt.Errorf("inventory fixture must use protocol type inventory")
+		}
+		return detected, nil
+	}
+	if probe == nil {
+		return protocol.InventoryMessage{}, fmt.Errorf("hardware inventory probe must not be nil")
+	}
+	return probe(ctx)
 }

@@ -82,7 +82,7 @@ func validatePlatformURL(rawURL string, allowInsecureLocal bool) error {
 
 func isLocalDevelopmentHost(host string) bool {
 	switch strings.ToLower(host) {
-	case "localhost", "127.0.0.1", "api-service":
+	case "localhost", "127.0.0.1", "api-service", "host.docker.internal":
 		return true
 	default:
 		return false

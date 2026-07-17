@@ -22,6 +22,7 @@ from visiox_api.routes.trained_models import router as trained_models_router
 from visiox_api.routes.training_observability import router as training_observability_router
 from visiox_api.routes.training_jobs import router as training_jobs_router
 from visiox_api.services.training_observability import TrainingObservabilityService
+from visiox_api.services.agent_identity import ensure_agent_ca
 from visiox_api.seed_base_models import seed_yolo26_base_models
 from visiox_api.ws.agents import router as agent_gateway_router
 from visiox_api.ws.tasks import router as task_progress_router
@@ -37,6 +38,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from redis import asyncio as redis
 
     settings = get_settings()
+    if settings.agent_gateway_enabled:
+        ensure_agent_ca(settings)
     app.state.redis = redis.from_url(settings.redis_url, decode_responses=True)
     app.state.object_storage = MinioObjectStorageClient(
         endpoint=settings.minio_endpoint,

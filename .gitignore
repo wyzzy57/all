@@ -9,3 +9,7 @@ __pycache__/
 .tmp/
 *.egg-info/
 .env
+/dist/
+/.local/visiox-agent/
+agent.db
+*.agent-ca.key

@@ -156,6 +156,10 @@ def _generate_agent_ca(settings: Settings) -> None:
         .not_valid_before(now - timedelta(minutes=1))
         .not_valid_after(now + timedelta(days=3650))
         .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(x509.KeyUsage(key_cert_sign=True, crl_sign=True, digital_signature=False,
+                                     content_commitment=False, key_encipherment=False,
+                                     data_encipherment=False, key_agreement=False,
+                                     encipher_only=False, decipher_only=False), critical=True)
         .sign(private_key, algorithm=None)
     )
     key_pem = private_key.private_bytes(

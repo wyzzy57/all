@@ -47,7 +47,7 @@ func TestLoadRejectsInsecurePlatformURLByDefault(t *testing.T) {
 }
 
 func TestLoadAllowsExplicitInsecureLocalPlatformURL(t *testing.T) {
-	for _, host := range []string{"localhost", "127.0.0.1", "api-service"} {
+	for _, host := range []string{"localhost", "127.0.0.1", "api-service", "host.docker.internal"} {
 		t.Run(host, func(t *testing.T) {
 			setRequiredEnvironment(t, "http://"+host+":8000", "edge-01")
 			t.Setenv("VISIOX_AGENT_ALLOW_INSECURE_LOCAL", "true")

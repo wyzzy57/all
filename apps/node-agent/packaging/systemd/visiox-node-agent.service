@@ -1,0 +1,21 @@
+[Unit]
+Description=Visiox Node Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=visiox-agent
+Group=visiox-agent
+EnvironmentFile=/etc/visiox-agent/agent.env
+ExecStart=/usr/local/bin/visiox-node-agent
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/visiox-agent
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

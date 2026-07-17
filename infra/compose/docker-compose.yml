@@ -20,8 +20,12 @@ services:
         condition: service_started
     environment:
       VISIOX_TRAINING_RUNS_ROOT: /workspace/training-runs
+      VISIOX_AGENT_GATEWAY_ENABLED: "true"
+      VISIOX_AGENT_AUTO_GENERATE_CA: "true"
+      VISIOX_AGENT_PUBLIC_WS_URL: ${VISIOX_AGENT_PUBLIC_WS_URL:-ws://host.docker.internal:8000/agent/v1/connect}
     volumes:
       - training-runs:/workspace/training-runs:ro
+      - agent-pki:/var/lib/visiox/pki
 
   label-sync-worker:
     build:
@@ -183,3 +187,4 @@ volumes:
   label-studio-data:
   training-runs:
   mlflow-data:
+  agent-pki:

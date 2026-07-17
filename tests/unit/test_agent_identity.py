@@ -92,6 +92,8 @@ def test_ca_issues_node_certificate_and_verifies_nonce(tmp_path: Path) -> None:
     )
 
     certificate = x509.load_pem_x509_certificate(issued.certificate_pem.encode())
+    ca_certificate = x509.load_pem_x509_certificate(settings.agent_ca_cert_path.read_bytes())
+    assert ca_certificate.extensions.get_extension_for_class(x509.KeyUsage).value.key_cert_sign
     assert certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value == "node-123"
     assert certificate.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value == x509.ExtendedKeyUsage(
         [ExtendedKeyUsageOID.CLIENT_AUTH]
