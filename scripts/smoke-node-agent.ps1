@@ -38,21 +38,12 @@ function Remove-SmokeContainer {
         [string]$Description
     )
 
-    $errors = [System.Collections.Generic.List[string]]::new()
-    & docker stop --timeout 5 $ContainerId
-    $stopExitCode = $LASTEXITCODE
-    if ($stopExitCode -ne 0) {
-        [void]$errors.Add("docker stop failed with exit code $stopExitCode")
-    }
+    $null = & docker stop --timeout 5 $ContainerId
 
-    & docker rm --force $ContainerId
+    $null = & docker rm --force $ContainerId
     $removeExitCode = $LASTEXITCODE
     if ($removeExitCode -ne 0) {
-        [void]$errors.Add("docker rm --force failed with exit code $removeExitCode")
-    }
-
-    if ($errors.Count -ne 0) {
-        throw "$Description cleanup failed: $($errors -join '; ')"
+        throw "$Description cleanup failed: docker rm --force failed with exit code $removeExitCode"
     }
 }
 
