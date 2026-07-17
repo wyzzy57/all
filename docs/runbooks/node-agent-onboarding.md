@@ -12,7 +12,9 @@ container runtime or deploy models.
 - An enrollment token is a one-time bearer secret. It expires after the
   configured token lifetime (15 minutes by default), is consumed by a
   successful enrollment, and must not be put in source control, logs, tickets,
-  or shell history.
+  or shell history. The Agent alone may automatically repeat its exact durable
+  enrollment request after a lost response; a changed request ID, CSR/key,
+  node name, or platform binding is rejected.
 - The Agent generates its Ed25519 device private key locally. Enrollment sends
   a CSR and returns a device certificate plus the CA certificate, never a
   private key. The private key, certificate, and durable event spool remain in
@@ -408,9 +410,13 @@ unset ENROLLMENT_TOKEN
 unset TOKEN_RESPONSE
 ```
 
-Do not retry enrollment with the same token after success or failure. A token
-is one-time and a successfully enrolled token will be rejected on reuse. If it
-expires or is unavailable, create a new token instead.
+Do not manually retry enrollment with the same token. Before its first request,
+the Agent persists its generated key and stable enrollment request ID. If the
+server commits but the response is lost, the restarted Agent automatically
+repeats that exact request and receives the original certificate response. Any
+different request ID, CSR/key, node name, or platform binding is rejected. If
+the Agent has no pending request or enrolled identity, create a new token
+instead.
 
 ## 4. Install and Start the Agent
 
@@ -497,9 +503,15 @@ sudo journalctl -u visiox-node-agent -n 200 --no-pager
 ## 6. Certificate Rotation and Routine Diagnostics
 
 M1 rotates device certificates through the authenticated Gateway when a
-certificate enters its 30-day renewal window. The Agent generates a new CSR
-for the same locally retained private key; the control plane replaces the
-certificate and rejects the old certificate on reconnect.
+certificate enters its 30-day renewal window. The Agent generates a CSR for
+the same locally retained private key and durably records a renewal request.
+The control plane stages a candidate certificate while the old certificate
+remains valid. The Agent durably stores the candidate before it acknowledges
+readiness; only then does the control plane activate it and reject the old
+certificate. If a candidate, acknowledgement, or activation response is lost,
+the Agent retains the old and pending certificates across restart and recovers
+on reconnect without moving the private key. Do not edit Agent state files to
+force this sequence.
 
 M1 rotates device certificates under the same CA but does not provide
 zero-downtime CA rotation. Replacing the CA requires a maintenance window and

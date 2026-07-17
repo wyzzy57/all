@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -48,32 +49,36 @@ func Ensure(
 		return state.Identity{}, err
 	}
 
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	pending, pendingFound, err := store.PendingEnrollment()
 	if err != nil {
-		return state.Identity{}, fmt.Errorf("generate identity key: %w", err)
+		return state.Identity{}, fmt.Errorf("load pending enrollment: %w", err)
 	}
-	privateKeyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if !pendingFound {
+		if strings.TrimSpace(cfg.EnrollmentToken) == "" {
+			return state.Identity{}, fmt.Errorf("enrollment token is required before identity exists")
+		}
+		pending, err = newPendingEnrollment(cfg, facts)
+		if err != nil {
+			return state.Identity{}, err
+		}
+		if err := store.SavePendingEnrollment(pending); err != nil {
+			return state.Identity{}, fmt.Errorf("persist pending enrollment: %w", err)
+		}
+	}
+	privateKey, err := parsePendingPrivateKey(pending.PrivateKeyPEM)
 	if err != nil {
-		return state.Identity{}, fmt.Errorf("encode identity key: %w", err)
+		return state.Identity{}, fmt.Errorf("load pending enrollment key: %w", err)
 	}
-	privateKeyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKeyDER}))
-
-	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
-		Subject: pkix.Name{CommonName: cfg.NodeName},
-	}, privateKey)
-	if err != nil {
-		return state.Identity{}, fmt.Errorf("create certificate request: %w", err)
-	}
-	csrPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
 
 	requestBody, err := json.Marshal(protocol.EnrollmentRequest{
-		ProtocolVersion: protocol.ProtocolVersion,
-		Token:           cfg.EnrollmentToken,
-		NodeName:        cfg.NodeName,
-		Architecture:    facts.Architecture,
-		PlatformKind:    facts.PlatformKind,
-		AgentVersion:    cfg.AgentVersion,
-		CSRPEM:          csrPEM,
+		ProtocolVersion:     protocol.ProtocolVersion,
+		Token:               pending.Token,
+		EnrollmentRequestID: pending.RequestID,
+		NodeName:            pending.NodeName,
+		Architecture:        pending.Architecture,
+		PlatformKind:        pending.PlatformKind,
+		AgentVersion:        pending.AgentVersion,
+		CSRPEM:              pending.CSRPEM,
 	})
 	if err != nil {
 		return state.Identity{}, fmt.Errorf("encode enrollment request: %w", err)
@@ -116,13 +121,16 @@ func Ensure(
 		return state.Identity{}, err
 	}
 
-	certificate, err := validateEnrollmentResponse(enrollment, publicKey, cfg.AllowInsecureLocal)
+	if enrollment.EnrollmentRequestID != pending.RequestID {
+		return state.Identity{}, fmt.Errorf("enrollment response request ID does not match pending enrollment")
+	}
+	certificate, err := validateEnrollmentResponse(enrollment, privateKey.Public().(ed25519.PublicKey), cfg.AllowInsecureLocal)
 	if err != nil {
 		return state.Identity{}, err
 	}
 	identity := state.Identity{
 		NodeID:                   enrollment.NodeID,
-		PrivateKeyPEM:            privateKeyPEM,
+		PrivateKeyPEM:            pending.PrivateKeyPEM,
 		CertificatePEM:           enrollment.CertificatePEM,
 		CACertificatePEM:         enrollment.CACertificatePEM,
 		CertificateExpiresAt:     certificate.NotAfter,
@@ -133,6 +141,64 @@ func Ensure(
 		return state.Identity{}, fmt.Errorf("persist identity: %w", err)
 	}
 	return identity, nil
+}
+
+func newPendingEnrollment(cfg config.Config, facts protocol.EnrollmentFacts) (state.PendingEnrollment, error) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return state.PendingEnrollment{}, fmt.Errorf("generate identity key: %w", err)
+	}
+	privateKeyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return state.PendingEnrollment{}, fmt.Errorf("encode identity key: %w", err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: cfg.NodeName},
+	}, privateKey)
+	if err != nil {
+		return state.PendingEnrollment{}, fmt.Errorf("create certificate request: %w", err)
+	}
+	requestID, err := enrollmentRequestID()
+	if err != nil {
+		return state.PendingEnrollment{}, err
+	}
+	if !publicKey.Equal(privateKey.Public()) {
+		return state.PendingEnrollment{}, fmt.Errorf("generated enrollment key is invalid")
+	}
+	return state.PendingEnrollment{
+		RequestID:     requestID,
+		Token:         cfg.EnrollmentToken,
+		NodeName:      cfg.NodeName,
+		Architecture:  facts.Architecture,
+		PlatformKind:  facts.PlatformKind,
+		AgentVersion:  cfg.AgentVersion,
+		PrivateKeyPEM: string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKeyDER})),
+		CSRPEM:        string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})),
+	}, nil
+}
+
+func enrollmentRequestID() (string, error) {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		return "", fmt.Errorf("generate enrollment request ID: %w", err)
+	}
+	return hex.EncodeToString(value), nil
+}
+
+func parsePendingPrivateKey(privateKeyPEM string) (ed25519.PrivateKey, error) {
+	block, rest := pem.Decode([]byte(privateKeyPEM))
+	if block == nil || block.Type != "PRIVATE KEY" || len(strings.TrimSpace(string(rest))) != 0 {
+		return nil, fmt.Errorf("private key is not valid PEM")
+	}
+	privateKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse private key: %w", err)
+	}
+	signer, ok := privateKey.(ed25519.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("private key is not Ed25519")
+	}
+	return signer, nil
 }
 
 func validateFacts(facts protocol.EnrollmentFacts) error {
@@ -186,6 +252,9 @@ func validateEnrollmentResponse(
 	}
 	if response.NodeID == "" {
 		return nil, fmt.Errorf("enrollment response node ID must not be empty")
+	}
+	if response.EnrollmentRequestID == "" {
+		return nil, fmt.Errorf("enrollment response request ID must not be empty")
 	}
 	if response.HeartbeatIntervalSeconds <= 0 {
 		return nil, fmt.Errorf("enrollment heartbeat interval must be positive")

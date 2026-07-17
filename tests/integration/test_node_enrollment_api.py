@@ -1,5 +1,6 @@
 import base64
 import json
+from uuid import uuid4
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -29,15 +30,22 @@ def _create_token(client, name: str = "factory-a") -> str:
     return response.json()["token"]
 
 
-def _enrollment_payload(token: str, name: str = "edge-01") -> dict[str, object]:
+def _enrollment_payload(
+    token: str,
+    name: str = "edge-01",
+    *,
+    enrollment_request_id: str | None = None,
+    csr_pem: str | None = None,
+) -> dict[str, object]:
     return {
         "protocol_version": 1,
         "token": token,
+        "enrollment_request_id": enrollment_request_id or f"enroll-{uuid4().hex}",
         "node_name": name,
         "architecture": "arm64",
         "platform_kind": "jetson",
         "agent_version": "0.1.0",
-        "csr_pem": new_agent_csr(name)[1],
+        "csr_pem": csr_pem or new_agent_csr(name)[1],
     }
 
 
@@ -60,6 +68,7 @@ def test_enrollment_token_is_returned_once_and_consumed(
         json={
             "protocol_version": 1,
             "token": raw_token,
+            "enrollment_request_id": "enroll-token-consumption-001",
             "node_name": "edge-01",
             "architecture": "arm64",
             "platform_kind": "jetson",
@@ -72,6 +81,7 @@ def test_enrollment_token_is_returned_once_and_consumed(
         json={
             "protocol_version": 1,
             "token": raw_token,
+            "enrollment_request_id": "enroll-token-consumption-replay-001",
             "node_name": "edge-02",
             "architecture": "arm64",
             "platform_kind": "jetson",
@@ -95,6 +105,63 @@ def test_enrollment_token_is_returned_once_and_consumed(
         assert raw_token not in repr(stored_token.__dict__)
         assert stored_token.used_at is not None
         assert stored_token.node_id == enrolled.json()["node_id"]
+
+
+def test_enrollment_replays_the_committed_response_after_response_loss(
+    agent_api_client,
+    agent_session_factory: sessionmaker[Session],
+) -> None:
+    raw_token = _create_token(agent_api_client, "response-loss")
+    _, csr_pem = new_agent_csr("edge-response-loss")
+    request_id = "enroll-response-loss-001"
+    payload = _enrollment_payload(
+        raw_token,
+        "edge-response-loss",
+        enrollment_request_id=request_id,
+        csr_pem=csr_pem,
+    )
+
+    committed = agent_api_client.post("/agent/v1/enroll", json=payload)
+    recovered = agent_api_client.post("/agent/v1/enroll", json=payload)
+
+    assert committed.status_code == 201
+    assert recovered.status_code == 201
+    assert recovered.json() == committed.json()
+    assert committed.json()["enrollment_request_id"] == request_id
+    assert "PRIVATE KEY" not in committed.text
+    with agent_session_factory() as session:
+        tokens = list(session.scalars(select(AgentEnrollmentToken)))
+        nodes = list(session.scalars(select(ComputeNode)))
+        assert len(tokens) == 1
+        assert len(nodes) == 1
+        assert tokens[0].enrollment_request_id == request_id
+        assert tokens[0].enrollment_csr_fingerprint
+        assert "PRIVATE KEY" not in (tokens[0].enrollment_certificate_pem or "")
+
+
+def test_enrollment_rejects_mismatched_replay_after_commit(agent_api_client) -> None:
+    raw_token = _create_token(agent_api_client, "mismatched-replay")
+    _, csr_pem = new_agent_csr("edge-mismatched-replay")
+    payload = _enrollment_payload(
+        raw_token,
+        "edge-mismatched-replay",
+        enrollment_request_id="enroll-mismatched-replay-001",
+        csr_pem=csr_pem,
+    )
+
+    committed = agent_api_client.post("/agent/v1/enroll", json=payload)
+    assert committed.status_code == 201
+
+    mismatches = [
+        {"enrollment_request_id": "enroll-mismatched-replay-002"},
+        {"csr_pem": new_agent_csr("edge-mismatched-replay")[1]},
+        {"node_name": "edge-mismatched-replay-other"},
+        {"platform_kind": "x86_nvidia"},
+    ]
+    for mismatch in mismatches:
+        replay = {**payload, **mismatch}
+        rejected = agent_api_client.post("/agent/v1/enroll", json=replay)
+        assert rejected.status_code == 409
 
 
 def test_node_listing_marks_stale_online_node_offline(
@@ -409,6 +476,7 @@ def test_protocol_messages_reject_unknown_fields_and_unsupported_versions() -> N
             {
                 "protocol_version": 1,
                 "type": "certificate_renewal_request",
+                "renewal_request_id": "renewal-discriminator-001",
                 "csr_pem": "x" * 100,
             },
         ),
@@ -493,11 +561,13 @@ def test_pem_limit_uses_utf8_bytes_instead_of_character_count() -> None:
     CertificateRenewalRequest(
         protocol_version=1,
         type="certificate_renewal_request",
+        renewal_request_id="renewal-pem-limit-001",
         csr_pem="x" * MAX_PEM_BYTES,
     )
     with pytest.raises(ValidationError, match="PEM exceeds 16 KiB"):
         CertificateRenewalRequest(
             protocol_version=1,
             type="certificate_renewal_request",
+            renewal_request_id="renewal-pem-limit-001",
             csr_pem=multibyte_pem,
         )

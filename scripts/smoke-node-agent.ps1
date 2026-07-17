@@ -4,13 +4,15 @@ param()
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $apiBaseUrl = if ($env:VISIOX_SMOKE_API_URL) { $env:VISIOX_SMOKE_API_URL.TrimEnd('/') } else { "http://127.0.0.1:8000" }
-$nodeName = "smoke-x86-node"
-$containerName = "visiox-agent-smoke-x86-node"
+$smokeRunId = [guid]::NewGuid().ToString("N").Substring(0, 12)
 $smokeLabel = "com.visiox.node-agent.smoke=true"
+$smokeRunLabel = "com.visiox.node-agent.smoke.run=$smokeRunId"
 $imageName = "visiox-node-agent:smoke"
-$statePath = Join-Path $repoRoot ".local\visiox-agent\$nodeName"
-$containerId = $null
-$inventoryEnvFile = Join-Path ([System.IO.Path]::GetTempPath()) "visiox-agent-inventory-$PID.env"
+$stateBasePath = Join-Path $repoRoot ".local\visiox-agent"
+$stateRoot = Join-Path $stateBasePath "smoke-$smokeRunId"
+$inventoryEnvFile = Join-Path ([System.IO.Path]::GetTempPath()) "visiox-agent-inventory-$PID-$smokeRunId.env"
+$agents = [System.Collections.Generic.List[object]]::new()
+$stateRootCreated = $false
 $primaryFailure = $null
 $cleanupFailures = [System.Collections.Generic.List[string]]::new()
 
@@ -38,35 +40,46 @@ function Remove-SmokeContainer {
         [string]$Description
     )
 
+    $matches = @(Get-DockerContainerIds -Description "Inspect smoke container" -Arguments @(
+        "ps", "--all", "--quiet", "--filter", "id=$ContainerId"
+    ))
+    if ($matches.Count -eq 0) {
+        return
+    }
+    if (
+        $matches.Count -ne 1 -or
+        -not $ContainerId.StartsWith($matches[0], [System.StringComparison]::OrdinalIgnoreCase)
+    ) {
+        throw "$Description cleanup refused an unexpected container match"
+    }
     $null = & docker stop --timeout 5 $ContainerId
-
     $null = & docker rm --force $ContainerId
-    $removeExitCode = $LASTEXITCODE
-    if ($removeExitCode -ne 0) {
-        throw "$Description cleanup failed: docker rm --force failed with exit code $removeExitCode"
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description cleanup failed: docker rm --force failed with exit code $LASTEXITCODE"
     }
 }
 
-function Remove-StaleLabeledSmokeContainer {
-    $nameFilter = 'name=^/' + $containerName + '$'
-    $namedContainerIds = @(Get-DockerContainerIds -Description "Inspect smoke container name" -Arguments @(
-        "ps", "--all", "--quiet", "--filter", $nameFilter
-    ))
-    if ($namedContainerIds.Count -eq 0) {
-        return
-    }
-    if ($namedContainerIds.Count -ne 1) {
-        throw "Refusing to reclaim $($namedContainerIds.Count) containers named $containerName"
-    }
+function Assert-SafeSmokeStatePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
 
-    $labeledContainerIds = @(Get-DockerContainerIds -Description "Inspect smoke container label" -Arguments @(
-        "ps", "--all", "--quiet", "--filter", $nameFilter, "--filter", "label=$smokeLabel"
-    ))
-    if ($labeledContainerIds.Count -ne 1 -or $labeledContainerIds[0] -ne $namedContainerIds[0]) {
-        throw "Refusing to remove existing container $($namedContainerIds[0]): it is not the labeled smoke container"
+    $trimCharacters = [char[]]@('\', '/')
+    $basePath = [System.IO.Path]::GetFullPath($stateBasePath).TrimEnd($trimCharacters)
+    $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd($trimCharacters)
+    $prefix = $basePath + [System.IO.Path]::DirectorySeparatorChar
+    $relativePath = if ($fullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $fullPath.Substring($prefix.Length)
     }
-
-    Remove-SmokeContainer -ContainerId $namedContainerIds[0] -Description "Stale labeled smoke container"
+    else {
+        ""
+    }
+    $runDirectory = ($relativePath -split '[\\/]')[0]
+    if (-not $fullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $runDirectory -notlike "smoke-*") {
+        throw "Refusing to manage unsafe smoke state path: $fullPath"
+    }
 }
 
 function Initialize-SmokeStateDirectory {
@@ -75,6 +88,11 @@ function Initialize-SmokeStateDirectory {
         [string]$Path
     )
 
+    Assert-SafeSmokeStatePath -Path $Path
+    if (Test-Path -LiteralPath $Path) {
+        throw "Refusing to reuse an existing smoke state directory: $Path"
+    }
+    New-Item -ItemType Directory -Path $Path | Out-Null
     $arguments = @(
         "run", "--rm", "--user", "0:0", "--network", "none",
         "--entrypoint", "/bin/sh",
@@ -87,10 +105,16 @@ function Initialize-SmokeStateDirectory {
     }
 }
 
+function Remove-SmokeStateRoot {
+    Assert-SafeSmokeStatePath -Path $stateRoot
+    if (Test-Path -LiteralPath $stateRoot) {
+        Remove-Item -LiteralPath $stateRoot -Recurse -Force
+    }
+}
+
 function Assert-SmokeImageRunsAsAgentUser {
     $imageUser = @(& docker image inspect --format '{{.Config.User}}' $imageName)
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
+    if ($LASTEXITCODE -ne 0) {
         throw "Could not inspect the smoke image user"
     }
     if (($imageUser | Select-Object -Last 1).Trim() -ne "visiox-agent") {
@@ -105,13 +129,36 @@ function Assert-SmokeContainerRunsAsAgentUser {
     )
 
     $containerUser = @(& docker container inspect --format '{{.Config.User}}' $ContainerId)
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
+    if ($LASTEXITCODE -ne 0) {
         throw "Could not inspect the smoke container user"
     }
     if (($containerUser | Select-Object -Last 1).Trim() -ne "visiox-agent") {
         throw "Smoke container must run as visiox-agent"
     }
+}
+
+function Wait-SmokeNodeOnline {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$NodeName
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $nodes = Invoke-RestMethod -Uri "$apiBaseUrl/nodes" -Method Get
+            $node = @($nodes.items) | Where-Object { $_.name -eq $NodeName } | Select-Object -First 1
+            if ($null -ne $node -and $node.status -eq "online" -and -not [string]::IsNullOrWhiteSpace([string]$node.id)) {
+                return $node
+            }
+        }
+        catch {
+            Start-Sleep -Seconds 2
+            continue
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw "Timed out waiting for $NodeName to become online"
 }
 
 function Write-SmokeDiagnostics {
@@ -120,29 +167,29 @@ function Write-SmokeDiagnostics {
     if ($LASTEXITCODE -ne 0) {
         Write-Output "Recent API logs were unavailable"
     }
-    if ($containerId) {
-        Write-Output "Recent Agent logs:"
-        & docker logs --tail 100 $containerId
-        if ($LASTEXITCODE -ne 0) {
-            Write-Output "Recent Agent logs were unavailable"
+    foreach ($agent in $agents) {
+        if ($agent.ContainerId) {
+            Write-Output "Recent Agent logs for $($agent.NodeName):"
+            & docker logs --tail 100 $agent.ContainerId
+            if ($LASTEXITCODE -ne 0) {
+                Write-Output "Recent Agent logs were unavailable"
+            }
         }
     }
 }
 
 try {
-    Remove-StaleLabeledSmokeContainer
+    New-Item -ItemType Directory -Force -Path $stateBasePath | Out-Null
+    Assert-SafeSmokeStatePath -Path $stateRoot
+    if (Test-Path -LiteralPath $stateRoot) {
+        throw "Refusing to reuse an existing smoke run directory: $stateRoot"
+    }
+    New-Item -ItemType Directory -Path $stateRoot | Out-Null
+    $stateRootCreated = $true
 
     $health = Invoke-RestMethod -Uri "$apiBaseUrl/health" -Method Get
     if ($health.status -ne "ok") {
         throw "API health check did not return status=ok"
-    }
-
-    $tokenBody = @{ name = $nodeName } | ConvertTo-Json -Compress
-    $tokenResponse = Invoke-RestMethod -Uri "$apiBaseUrl/agent/v1/enrollment-tokens" -Method Post `
-        -ContentType "application/json" -Body $tokenBody
-    $enrollmentToken = [string]$tokenResponse.token
-    if ([string]::IsNullOrWhiteSpace($enrollmentToken)) {
-        throw "Enrollment token response did not contain a token"
     }
 
     & docker build --file (Join-Path $repoRoot "apps/node-agent/Dockerfile") `
@@ -152,67 +199,85 @@ try {
     }
     Assert-SmokeImageRunsAsAgentUser
 
-    New-Item -ItemType Directory -Force $statePath | Out-Null
-    $statePath = (Resolve-Path $statePath).Path
-    Initialize-SmokeStateDirectory -Path $statePath
-
     $inventoryJson = @"
 {"protocol_version":1,"type":"inventory","architecture":"amd64","platform_kind":"x86_nvidia","capabilities":{"nvidia_gpu":true},"resources":{"cpu_logical_cores":8,"memory_total_bytes":8589934592,"memory_available_bytes":4294967296,"gpus":[{"index":0,"uuid":"GPU-smoke","name":"Smoke GPU","compute_capability":"8.9","memory_total_bytes":8589934592,"memory_free_bytes":4294967296,"driver":"smoke"}]},"fingerprint":{"platform_kind":"x86_nvidia","architecture":"amd64","gpu_names":["Smoke GPU"],"compute_capabilities":["8.9"],"driver":"smoke"},"agent_version":"0.1.0-test"}
-"@
-    $inventoryJson = $inventoryJson.Trim()
-
+"@.Trim()
     [System.IO.File]::WriteAllText(
         $inventoryEnvFile,
         "VISIOX_AGENT_TEST_INVENTORY_JSON=$inventoryJson",
         [System.Text.UTF8Encoding]::new($false)
     )
 
-    $runArguments = @(
-        "run", "--detach", "--name", $containerName, "--label", $smokeLabel,
-        "--add-host", "host.docker.internal:host-gateway",
-        "--mount", "type=bind,source=$statePath,target=/var/lib/visiox-agent",
-        "--env-file", $inventoryEnvFile,
-        "--env", "VISIOX_AGENT_PLATFORM_URL=http://host.docker.internal:8000",
-        "--env", "VISIOX_AGENT_ALLOW_INSECURE_LOCAL=true",
-        "--env", "VISIOX_AGENT_VERSION=0.1.0-test",
-        "--env", "VISIOX_AGENT_NODE_NAME=$nodeName",
-        "--env", "VISIOX_AGENT_ENROLLMENT_TOKEN=$enrollmentToken",
-        $imageName
-    )
-    $runOutput = @(& docker @runArguments)
-    $runExitCode = $LASTEXITCODE
-    if ($runExitCode -ne 0) {
-        throw "Could not start the smoke Agent container"
-    }
-    $containerId = ($runOutput | Select-Object -Last 1).Trim()
-    if ([string]::IsNullOrWhiteSpace($containerId)) {
-        throw "Could not determine the smoke Agent container ID"
+    foreach ($index in 1..2) {
+        $nodeName = "smoke-x86-$smokeRunId-$index"
+        $containerName = "visiox-agent-smoke-$smokeRunId-$index"
+        $agentStatePath = Join-Path $stateRoot "agent-$index"
+        $tokenBody = @{ name = $nodeName } | ConvertTo-Json -Compress
+        $tokenResponse = Invoke-RestMethod -Uri "$apiBaseUrl/agent/v1/enrollment-tokens" -Method Post `
+            -ContentType "application/json" -Body $tokenBody
+        $enrollmentToken = [string]$tokenResponse.token
+        if ([string]::IsNullOrWhiteSpace($enrollmentToken)) {
+            throw "Enrollment token response did not contain a token for $nodeName"
+        }
+        if ($agents | Where-Object { $_.EnrollmentToken -eq $enrollmentToken }) {
+            throw "API returned a duplicate enrollment token during the same smoke run"
+        }
+
+        Initialize-SmokeStateDirectory -Path $agentStatePath
+        $agent = [pscustomobject]@{
+            NodeName = $nodeName
+            ContainerName = $containerName
+            StatePath = (Resolve-Path $agentStatePath).Path
+            EnrollmentToken = $enrollmentToken
+            ContainerId = $null
+            NodeId = $null
+        }
+        [void]$agents.Add($agent)
+
+        $runArguments = @(
+            "run", "--detach", "--name", $agent.ContainerName,
+            "--label", $smokeLabel, "--label", $smokeRunLabel,
+            "--add-host", "host.docker.internal:host-gateway",
+            "--mount", "type=bind,source=$($agent.StatePath),target=/var/lib/visiox-agent",
+            "--env-file", $inventoryEnvFile,
+            "--env", "VISIOX_AGENT_PLATFORM_URL=http://host.docker.internal:8000",
+            "--env", "VISIOX_AGENT_ALLOW_INSECURE_LOCAL=true",
+            "--env", "VISIOX_AGENT_VERSION=0.1.0-test",
+            "--env", "VISIOX_AGENT_NODE_NAME=$($agent.NodeName)",
+            "--env", "VISIOX_AGENT_ENROLLMENT_TOKEN=$($agent.EnrollmentToken)",
+            $imageName
+        )
+        $runOutput = @(& docker @runArguments)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not start the smoke Agent container for $($agent.NodeName)"
+        }
+        $agent.ContainerId = ($runOutput | Select-Object -Last 1).Trim()
+        if ([string]::IsNullOrWhiteSpace($agent.ContainerId)) {
+            throw "Could not determine the smoke Agent container ID for $($agent.NodeName)"
+        }
+
+        $onlineNode = Wait-SmokeNodeOnline -NodeName $agent.NodeName
+        $agent.NodeId = [string]$onlineNode.id
+        Assert-SmokeContainerRunsAsAgentUser -ContainerId $agent.ContainerId
+        if (-not (Test-Path -LiteralPath (Join-Path $agent.StatePath "agent.db"))) {
+            throw "Smoke Agent $($agent.NodeName) did not persist agent.db in its bind-mounted state directory"
+        }
     }
 
-    $deadline = [DateTime]::UtcNow.AddSeconds(60)
-    $nodeOnline = $false
-    while ([DateTime]::UtcNow -lt $deadline) {
-        try {
-            $nodes = Invoke-RestMethod -Uri "$apiBaseUrl/nodes" -Method Get
-            $node = @($nodes.items) | Where-Object { $_.name -eq $nodeName } | Select-Object -First 1
-            if ($null -ne $node -and $node.status -eq "online") {
-                $nodeOnline = $true
-                break
-            }
-        }
-        catch {
-            Start-Sleep -Seconds 2
-            continue
-        }
-        Start-Sleep -Seconds 2
+    $nodeNames = @($agents | ForEach-Object { $_.NodeName })
+    $nodeIds = @($agents | ForEach-Object { $_.NodeId })
+    if ($nodeNames.Count -ne 2 -or (@($nodeNames | Select-Object -Unique)).Count -ne 2) {
+        throw "Smoke run did not produce two distinct node names"
     }
-    if (-not $nodeOnline) {
-        throw "Timed out waiting for $nodeName to become online"
+    if ($nodeIds.Count -ne 2 -or (@($nodeIds | Select-Object -Unique)).Count -ne 2) {
+        throw "Smoke run did not produce two distinct enrolled node IDs"
     }
-
-    Assert-SmokeContainerRunsAsAgentUser -ContainerId $containerId
-    if (-not (Test-Path -LiteralPath (Join-Path $statePath "agent.db"))) {
-        throw "Smoke Agent did not persist agent.db in the bind-mounted state directory"
+    $nodes = Invoke-RestMethod -Uri "$apiBaseUrl/nodes" -Method Get
+    foreach ($agent in $agents) {
+        $node = @($nodes.items) | Where-Object { $_.id -eq $agent.NodeId -and $_.name -eq $agent.NodeName } | Select-Object -First 1
+        if ($null -eq $node -or $node.status -ne "online") {
+            throw "Fresh smoke node $($agent.NodeName) was not online in the shared database"
+        }
     }
 }
 catch {
@@ -226,13 +291,15 @@ catch {
     }
 }
 finally {
-    if ($containerId) {
-        try {
-            Remove-SmokeContainer -ContainerId $containerId -Description "Smoke Agent container"
-        }
-        catch {
-            [void]$cleanupFailures.Add($_.Exception.Message)
-            Write-Output ("Smoke cleanup failed: " + $_.Exception.Message)
+    foreach ($agent in $agents) {
+        if ($agent.ContainerId) {
+            try {
+                Remove-SmokeContainer -ContainerId $agent.ContainerId -Description "Smoke Agent $($agent.NodeName)"
+            }
+            catch {
+                [void]$cleanupFailures.Add($_.Exception.Message)
+                Write-Output ("Smoke cleanup failed: " + $_.Exception.Message)
+            }
         }
     }
     try {
@@ -243,6 +310,15 @@ finally {
     catch {
         [void]$cleanupFailures.Add("Could not remove the inventory environment file: $($_.Exception.Message)")
         Write-Output ("Smoke cleanup failed: " + $_.Exception.Message)
+    }
+    if ($stateRootCreated) {
+        try {
+            Remove-SmokeStateRoot
+        }
+        catch {
+            [void]$cleanupFailures.Add("Could not remove the smoke state directory: $($_.Exception.Message)")
+            Write-Output ("Smoke cleanup failed: " + $_.Exception.Message)
+        }
     }
 }
 
@@ -257,4 +333,5 @@ if ($cleanupFailures.Count -ne 0) {
     exit 1
 }
 
-Write-Output "$nodeName online"
+$summary = $agents | ForEach-Object { "$($_.NodeName) ($($_.NodeId))" }
+Write-Output ("Smoke run $smokeRunId enrolled two fresh nodes: " + ($summary -join ', '))

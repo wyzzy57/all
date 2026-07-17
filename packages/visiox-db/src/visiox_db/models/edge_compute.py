@@ -30,6 +30,12 @@ class ComputeNode(IdMixin, TimestampMixin, Base):
     certificate_serial: Mapped[str | None] = mapped_column(String(80), unique=True)
     certificate_fingerprint: Mapped[str | None] = mapped_column(String(128), unique=True)
     certificate_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    pending_certificate_serial: Mapped[str | None] = mapped_column(String(80), unique=True)
+    pending_certificate_fingerprint: Mapped[str | None] = mapped_column(String(128), unique=True)
+    pending_certificate_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    pending_certificate_pem: Mapped[str | None] = mapped_column(Text)
+    pending_renewal_request_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    pending_renewal_csr_fingerprint: Mapped[str | None] = mapped_column(String(64))
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
@@ -40,6 +46,16 @@ class AgentEnrollmentToken(IdMixin, TimestampMixin, Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     node_id: Mapped[str | None] = mapped_column(ForeignKey("compute_nodes.id"))
+    enrollment_request_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    enrollment_csr_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    enrollment_node_name: Mapped[str | None] = mapped_column(String(160))
+    enrollment_architecture: Mapped[str | None] = mapped_column(String(32))
+    enrollment_platform_kind: Mapped[str | None] = mapped_column(String(40))
+    enrollment_agent_version: Mapped[str | None] = mapped_column(String(40))
+    enrollment_certificate_pem: Mapped[str | None] = mapped_column(Text)
+    enrollment_ca_certificate_pem: Mapped[str | None] = mapped_column(Text)
+    enrollment_gateway_url: Mapped[str | None] = mapped_column(String(2048))
+    enrollment_heartbeat_interval_seconds: Mapped[int | None] = mapped_column(Integer)
 
 
 class NodeCommand(IdMixin, TimestampMixin, Base):

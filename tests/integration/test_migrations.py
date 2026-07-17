@@ -76,6 +76,65 @@ def test_alembic_uses_environment_database_url_over_ini_default(tmp_path, monkey
     assert REMOVED_TABLES.isdisjoint(table_names)
 
 
+def test_agent_identity_recovery_columns_upgrade_downgrade_and_upgrade(tmp_path):
+    database_path = tmp_path / "agent-identity-recovery.db"
+    database_url = f"sqlite:///{database_path}"
+    config = _alembic_config(database_url)
+
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    inspector = inspect(engine)
+    token_columns = {column["name"] for column in inspector.get_columns("agent_enrollment_tokens")}
+    node_columns = {column["name"] for column in inspector.get_columns("compute_nodes")}
+    assert {
+        "enrollment_request_id",
+        "enrollment_csr_fingerprint",
+        "enrollment_certificate_pem",
+        "enrollment_ca_certificate_pem",
+        "enrollment_gateway_url",
+        "enrollment_heartbeat_interval_seconds",
+    }.issubset(token_columns)
+    assert {
+        "pending_certificate_serial",
+        "pending_certificate_fingerprint",
+        "pending_certificate_expires_at",
+        "pending_certificate_pem",
+        "pending_renewal_request_id",
+        "pending_renewal_csr_fingerprint",
+    }.issubset(node_columns)
+    assert "enrollment_request_id" in {
+        column for constraint in inspector.get_unique_constraints("agent_enrollment_tokens") for column in constraint["column_names"]
+    }
+    node_unique_columns = {
+        column
+        for constraint in inspector.get_unique_constraints("compute_nodes")
+        for column in constraint["column_names"]
+    }
+    assert {
+        "pending_certificate_serial",
+        "pending_certificate_fingerprint",
+        "pending_renewal_request_id",
+    }.issubset(node_unique_columns)
+    assert "ix_compute_nodes_pending_certificate_expires_at" in {
+        index["name"] for index in inspector.get_indexes("compute_nodes")
+    }
+
+    command.downgrade(config, "20260715_0001")
+    inspector = inspect(create_engine(database_url))
+    assert "enrollment_request_id" not in {
+        column["name"] for column in inspector.get_columns("agent_enrollment_tokens")
+    }
+    assert "pending_certificate_pem" not in {
+        column["name"] for column in inspector.get_columns("compute_nodes")
+    }
+
+    command.upgrade(config, "head")
+    inspector = inspect(create_engine(database_url))
+    assert "enrollment_request_id" in {
+        column["name"] for column in inspector.get_columns("agent_enrollment_tokens")
+    }
+
+
 def test_training_jobs_does_not_reference_trained_models(tmp_path):
     database_path = tmp_path / "visiox.db"
     database_url = f"sqlite:///{database_path}"

@@ -10,6 +10,7 @@ from visiox_api.schemas.agent_protocol import EnrollmentRequest, InventoryMessag
 from visiox_api.services.agent_identity import (
     AgentIdentityError,
     IssuedAgentCertificate,
+    csr_fingerprint_sha256,
     hash_enrollment_token,
     issue_agent_certificate,
 )
@@ -37,6 +38,9 @@ class CreatedEnrollmentToken:
 class EnrollmentResult:
     node: ComputeNode
     certificate: IssuedAgentCertificate
+    enrollment_request_id: str
+    gateway_url: str
+    heartbeat_interval_seconds: int
 
 
 _DEFAULT_POOLS = {
@@ -83,11 +87,12 @@ class NodeRegistryService:
                 .where(AgentEnrollmentToken.token_hash == token_hash)
                 .with_for_update()
             )
-            if (
-                token is None
-                or token.used_at is not None
-                or _as_utc(token.expires_at) <= current_time
-            ):
+            if token is None:
+                raise EnrollmentRejected("Enrollment rejected")
+            csr_fingerprint = csr_fingerprint_sha256(request.csr_pem)
+            if token.used_at is not None:
+                return self._replay_enrollment(token, request, csr_fingerprint)
+            if _as_utc(token.expires_at) <= current_time:
                 raise EnrollmentRejected("Enrollment rejected")
             if self.session.scalar(select(ComputeNode.id).where(ComputeNode.name == request.node_name)):
                 raise EnrollmentRejected("Enrollment rejected")
@@ -121,8 +126,24 @@ class NodeRegistryService:
             node.certificate_expires_at = certificate.expires_at
             token.used_at = current_time
             token.node_id = node.id
+            token.enrollment_request_id = request.enrollment_request_id
+            token.enrollment_csr_fingerprint = csr_fingerprint
+            token.enrollment_node_name = request.node_name
+            token.enrollment_architecture = request.architecture
+            token.enrollment_platform_kind = request.platform_kind
+            token.enrollment_agent_version = request.agent_version
+            token.enrollment_certificate_pem = certificate.certificate_pem
+            token.enrollment_ca_certificate_pem = certificate.ca_certificate_pem
+            token.enrollment_gateway_url = self.settings.agent_public_ws_url
+            token.enrollment_heartbeat_interval_seconds = self.settings.agent_heartbeat_interval_seconds
             self.session.commit()
-            return EnrollmentResult(node=node, certificate=certificate)
+            return EnrollmentResult(
+                node=node,
+                certificate=certificate,
+                enrollment_request_id=request.enrollment_request_id,
+                gateway_url=self.settings.agent_public_ws_url,
+                heartbeat_interval_seconds=self.settings.agent_heartbeat_interval_seconds,
+            )
         except IntegrityError:
             self.session.rollback()
             raise EnrollmentRejected("Enrollment rejected") from None
@@ -132,6 +153,56 @@ class NodeRegistryService:
         except Exception:
             self.session.rollback()
             raise
+
+    def _replay_enrollment(
+        self,
+        token: AgentEnrollmentToken,
+        request: EnrollmentRequest,
+        csr_fingerprint: str,
+    ) -> EnrollmentResult:
+        if not self._matches_enrollment_retry(token, request, csr_fingerprint):
+            raise EnrollmentRejected("Enrollment rejected")
+        node = self.session.get(ComputeNode, token.node_id)
+        if (
+            node is None
+            or node.certificate_serial is None
+            or node.certificate_fingerprint is None
+            or node.certificate_expires_at is None
+            or token.enrollment_certificate_pem is None
+            or token.enrollment_ca_certificate_pem is None
+            or token.enrollment_gateway_url is None
+            or token.enrollment_heartbeat_interval_seconds is None
+        ):
+            raise EnrollmentRejected("Enrollment rejected")
+        certificate = IssuedAgentCertificate(
+            certificate_pem=token.enrollment_certificate_pem,
+            ca_certificate_pem=token.enrollment_ca_certificate_pem,
+            serial_number=node.certificate_serial,
+            fingerprint_sha256=node.certificate_fingerprint,
+            expires_at=_as_utc(node.certificate_expires_at),
+        )
+        return EnrollmentResult(
+            node=node,
+            certificate=certificate,
+            enrollment_request_id=token.enrollment_request_id,
+            gateway_url=token.enrollment_gateway_url,
+            heartbeat_interval_seconds=token.enrollment_heartbeat_interval_seconds,
+        )
+
+    @staticmethod
+    def _matches_enrollment_retry(
+        token: AgentEnrollmentToken,
+        request: EnrollmentRequest,
+        csr_fingerprint: str,
+    ) -> bool:
+        return (
+            token.enrollment_request_id == request.enrollment_request_id
+            and token.enrollment_csr_fingerprint == csr_fingerprint
+            and token.enrollment_node_name == request.node_name
+            and token.enrollment_architecture == request.architecture
+            and token.enrollment_platform_kind == request.platform_kind
+            and token.enrollment_agent_version == request.agent_version
+        )
 
     def apply_inventory(
         self,

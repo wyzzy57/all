@@ -1080,7 +1080,7 @@ For each connection:
 3. Read protocol v1 challenge.
 4. Sign decoded nonce with stored Ed25519 key.
 5. Send authenticate message, require authenticated response, and reject heartbeat intervals outside 5-300 seconds.
-6. When `CertificateExpiresAt <= now + 30 days`, generate a CSR with the existing private key, send `certificate_renewal_request`, verify the returned certificate uses that same public key and chains to the enrolled CA, then atomically replace only the certificate and expiry in bbolt.
+6. When `CertificateExpiresAt <= now + 30 days`, durably create a stable renewal request and CSR with the existing private key. Store a returned candidate certificate before sending `certificate_renewal_ack`; retain the old and pending certificates until `certificate_renewal_activated`. On reconnect retry the old identity first while activation is pending, then promote the pending identity only after it authenticates if activation confirmation was lost.
 7. Send inventory, one heartbeat, and up to 100 pending events immediately after authentication/renewal.
 8. Repeat heartbeat and pending-event delivery on every server-provided heartbeat interval.
 9. Apply `events_acked` only after validating the ACK cursor is not ahead of the highest sent sequence.
@@ -1235,11 +1235,11 @@ Preserve the current Label Studio host command and `80:8080` mapping exactly as 
 The script must:
 
 1. Verify API `/health`.
-2. Create one enrollment token through `POST /agent/v1/enrollment-tokens`.
+2. Create two enrollment tokens through `POST /agent/v1/enrollment-tokens`.
 3. Build the Agent image.
-4. Run one disposable Agent with `VISIOX_AGENT_PLATFORM_URL=http://host.docker.internal:8000`, `VISIOX_AGENT_ALLOW_INSECURE_LOCAL=true`, `VISIOX_AGENT_VERSION=0.1.0-test`, the returned token, node name `smoke-x86-node`, and a test-only injected inventory fixture.
-5. Poll `GET /nodes` for at most 60 seconds until the node is `online`.
-6. Stop/remove the Agent container in `finally`.
+4. Run two disposable Agents with `VISIOX_AGENT_PLATFORM_URL=http://host.docker.internal:8000`, `VISIOX_AGENT_ALLOW_INSECURE_LOCAL=true`, `VISIOX_AGENT_VERSION=0.1.0-test`, distinct returned tokens, unique run-scoped node names and state directories, and a test-only injected inventory fixture.
+5. Poll `GET /nodes` for at most 60 seconds per Agent until both nodes are `online`, then verify distinct node IDs and names in the same database.
+6. Stop/remove only the run-labeled Agent containers and the script-created run-scoped state directory in `finally`.
 7. Exit nonzero and print recent API/Agent logs on failure.
 
 The injected fixture is allowed only when `VISIOX_AGENT_TEST_INVENTORY_JSON` is set and `AgentVersion` ends with `-test`; production builds reject it.
@@ -1252,9 +1252,10 @@ Run:
 python -m pytest tests/integration/test_agent_ca_startup.py tests/integration/test_agent_gateway.py tests/integration/test_node_enrollment_api.py -q
 .\scripts\build-node-agent.ps1
 .\scripts\smoke-node-agent.ps1
+.\scripts\smoke-node-agent.ps1
 ```
 
-Expected: tests PASS, two binaries exist in `dist/`, and the smoke script reports `smoke-x86-node online`.
+Expected: tests PASS, two binaries exist in `dist/`, and each smoke invocation reports two distinct fresh online nodes against the same Compose database.
 
 - [ ] **Step 8: Commit packaging and E2E support**
 
@@ -1337,9 +1338,10 @@ Run:
 docker compose -f infra/compose/docker-compose.yml up -d --build api-service postgres redis minio registry
 docker compose -f infra/compose/docker-compose.yml exec api-service alembic upgrade head
 .\scripts\smoke-node-agent.ps1
+.\scripts\smoke-node-agent.ps1
 ```
 
-Expected: migration reaches `20260715_0001`, API stays healthy, and one dynamically enrolled smoke node reaches `online`.
+Expected: migration reaches head, API stays healthy, and each invocation creates two distinct dynamically enrolled smoke nodes without seed data or name/state reuse.
 
 - [ ] **Step 5: Verify no secrets or generated binaries are staged**
 
@@ -1366,10 +1368,10 @@ git commit -m "docs: add node agent onboarding runbook"
 M1 is complete only when all of the following are demonstrated:
 
 - The platform host has no NVIDIA GPU dependency.
-- One-time enrollment returns a certificate but never a private key.
-- Reusing an enrollment token fails.
+- One-time enrollment returns a certificate but never a private key, while an Agent can recover a lost response only by replaying its exact durable request.
+- Reusing an enrollment token with a different request, CSR/key, node name, or platform binding fails.
 - An Agent authenticates by signing a server nonce with its enrolled key.
-- A certificate inside the 30-day renewal window rotates over the authenticated Gateway, the private key remains unchanged, and the old certificate is rejected on reconnect.
+- A certificate inside the 30-day renewal window stages and activates over the authenticated Gateway, survives candidate/ACK/activation response loss, keeps the private key unchanged, and rejects the old certificate after activation.
 - A real Agent-created node, not seed data, appears in `GET /nodes`.
 - Jetson and x86 inventory fixtures map to separate default resource pools.
 - Enrollment/inventory architecture mismatches become `incompatible` instead of entering an incorrect pool.

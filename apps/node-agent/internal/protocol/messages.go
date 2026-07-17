@@ -24,17 +24,19 @@ type EnrollmentFacts struct {
 }
 
 type EnrollmentRequest struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	Token           string `json:"token"`
-	NodeName        string `json:"node_name"`
-	Architecture    string `json:"architecture"`
-	PlatformKind    string `json:"platform_kind"`
-	AgentVersion    string `json:"agent_version"`
-	CSRPEM          string `json:"csr_pem"`
+	ProtocolVersion     int    `json:"protocol_version"`
+	Token               string `json:"token"`
+	EnrollmentRequestID string `json:"enrollment_request_id"`
+	NodeName            string `json:"node_name"`
+	Architecture        string `json:"architecture"`
+	PlatformKind        string `json:"platform_kind"`
+	AgentVersion        string `json:"agent_version"`
+	CSRPEM              string `json:"csr_pem"`
 }
 
 type EnrollmentResponse struct {
 	ProtocolVersion          int    `json:"protocol_version"`
+	EnrollmentRequestID      string `json:"enrollment_request_id"`
 	NodeID                   string `json:"node_id"`
 	CertificatePEM           string `json:"certificate_pem"`
 	CACertificatePEM         string `json:"ca_certificate_pem"`
@@ -86,12 +88,27 @@ type EventsAckMessage struct {
 
 type CertificateRenewalRequest struct {
 	Envelope
-	CSRPEM string `json:"csr_pem"`
+	RenewalRequestID string `json:"renewal_request_id"`
+	CSRPEM           string `json:"csr_pem"`
 }
 
-type CertificateRenewedMessage struct {
+type CertificateRenewalCandidateMessage struct {
 	Envelope
-	CertificatePEM string `json:"certificate_pem"`
+	RenewalRequestID             string `json:"renewal_request_id"`
+	CertificatePEM               string `json:"certificate_pem"`
+	CertificateFingerprintSHA256 string `json:"certificate_fingerprint_sha256"`
+}
+
+type CertificateRenewalAckMessage struct {
+	Envelope
+	RenewalRequestID             string `json:"renewal_request_id"`
+	CertificateFingerprintSHA256 string `json:"certificate_fingerprint_sha256"`
+}
+
+type CertificateRenewalActivatedMessage struct {
+	Envelope
+	RenewalRequestID             string `json:"renewal_request_id"`
+	CertificateFingerprintSHA256 string `json:"certificate_fingerprint_sha256"`
 }
 
 type ErrorMessage struct {

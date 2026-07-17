@@ -165,6 +165,69 @@ func TestStoreSavesAndLoadsMatchingIdentity(t *testing.T) {
 	}
 }
 
+func TestStoreRetainsPendingRenewalAcrossRestartUntilPromotion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeExpiry := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	identity, privateKey, ca := newTestIdentity(t, "node-1", activeExpiry)
+	if err := store.SaveIdentity(identity); err != nil {
+		t.Fatal(err)
+	}
+	pending := PendingRenewal{
+		RequestID: "renewal-restart-001",
+		CSRPEM:    csrPEMForPrivateKey(t, privateKey, identity.NodeID),
+	}
+	if err := store.SavePendingRenewal(pending); err != nil {
+		t.Fatal(err)
+	}
+	candidatePEM := ca.signCertificate(
+		t,
+		privateKey.Public(),
+		identity.NodeID,
+		activeExpiry.Add(time.Hour),
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	)
+	candidate, err := parseCertificate(candidatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := certificateFingerprint(candidate)
+	if err := store.SaveRenewalCandidate(pending.RequestID, candidatePEM, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	storedPending, found, err := reopened.PendingRenewal()
+	if err != nil || !found || storedPending.CertificatePEM != candidatePEM ||
+		storedPending.CertificateFingerprintSHA256 != fingerprint {
+		t.Fatalf("pending renewal was not retained across restart: found=%v pending=%#v err=%v", found, storedPending, err)
+	}
+	before, found, err := reopened.Identity()
+	if err != nil || !found || before.CertificatePEM != identity.CertificatePEM {
+		t.Fatalf("active identity changed before activation: found=%v identity=%#v err=%v", found, before, err)
+	}
+	if err := reopened.PromotePendingRenewal(pending.RequestID, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	after, found, err := reopened.Identity()
+	if err != nil || !found || after.CertificatePEM != candidatePEM {
+		t.Fatalf("pending renewal was not promoted: found=%v identity=%#v err=%v", found, after, err)
+	}
+	if _, found, err := reopened.PendingRenewal(); err != nil || found {
+		t.Fatalf("pending renewal remained after promotion: found=%v err=%v", found, err)
+	}
+}
+
 func TestStoreRejectsIdentityWithMismatchedCertificate(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "agent.db"))
 	if err != nil {
@@ -393,6 +456,25 @@ func newTestIdentity(t *testing.T, nodeID string, expiresAt time.Time) (Identity
 		GatewayURL:               "wss://platform.example.com/agent/v1/ws",
 		HeartbeatIntervalSeconds: 30,
 	}, privateKey, ca
+}
+
+func csrPEMForPrivateKey(t *testing.T, privateKey ed25519.PrivateKey, nodeID string) string {
+	t.Helper()
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: nodeID},
+	}, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+}
+
+func parseCertificate(certificatePEM string) (*x509.Certificate, error) {
+	block, _ := pem.Decode([]byte(certificatePEM))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, os.ErrInvalid
+	}
+	return x509.ParseCertificate(block.Bytes)
 }
 
 func newTestCA(t *testing.T) *testCA {

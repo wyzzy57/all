@@ -35,6 +35,11 @@ def hash_enrollment_token(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode()).hexdigest()
 
 
+def csr_fingerprint_sha256(csr_pem: str) -> str:
+    csr = _load_valid_csr(csr_pem)
+    return hashlib.sha256(csr.public_bytes(serialization.Encoding.DER)).hexdigest()
+
+
 def ensure_agent_ca(settings: Settings) -> None:
     cert_exists = settings.agent_ca_cert_path.is_file()
     key_exists = settings.agent_ca_key_path.is_file()
@@ -57,9 +62,9 @@ def issue_agent_certificate(
 ) -> IssuedAgentCertificate:
     current_time = _as_utc(now)
     try:
-        csr = x509.load_pem_x509_csr(csr_pem.encode())
+        csr = _load_valid_csr(csr_pem)
         public_key = csr.public_key()
-        if not csr.is_signature_valid or not isinstance(public_key, ed25519.Ed25519PublicKey):
+        if not isinstance(public_key, ed25519.Ed25519PublicKey):
             raise ValueError
         normalized_node_id = node_id.strip()
         if not normalized_node_id:
@@ -175,6 +180,16 @@ def _generate_agent_ca(settings: Settings) -> None:
         key_file.write(key_pem)
     os.chmod(settings.agent_ca_key_path, 0o600)
     settings.agent_ca_cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+
+
+def _load_valid_csr(csr_pem: str) -> x509.CertificateSigningRequest:
+    try:
+        csr = x509.load_pem_x509_csr(csr_pem.encode())
+        if not csr.is_signature_valid:
+            raise ValueError
+    except Exception:
+        raise AgentIdentityError("Certificate request is invalid") from None
+    return csr
 
 
 def _load_agent_ca(

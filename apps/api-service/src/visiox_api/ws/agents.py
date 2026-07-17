@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import secrets
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -14,8 +15,10 @@ from starlette.websockets import WebSocketDisconnect
 from visiox_api.schemas.agent_protocol import (
     AuthenticateMessage,
     AuthenticatedMessage,
+    CertificateRenewalAckMessage,
+    CertificateRenewalActivatedMessage,
+    CertificateRenewalCandidateMessage,
     CertificateRenewalRequest,
-    CertificateRenewedMessage,
     ChallengeMessage,
     ErrorMessage,
     EventBatchMessage,
@@ -26,8 +29,8 @@ from visiox_api.schemas.agent_protocol import (
 )
 from visiox_api.services.agent_identity import (
     AgentIdentityError,
-    IssuedAgentCertificate,
     VerifiedAgentIdentity,
+    csr_fingerprint_sha256,
     issue_agent_certificate,
     verify_agent_signature,
 )
@@ -44,6 +47,7 @@ _MESSAGE_MODELS = {
     "heartbeat": HeartbeatMessage,
     "event_batch": EventBatchMessage,
     "certificate_renewal_request": CertificateRenewalRequest,
+    "certificate_renewal_ack": CertificateRenewalAckMessage,
 }
 
 
@@ -57,6 +61,16 @@ class AgentAuthenticationRejected(Exception):
 
 class EventSequenceConflict(Exception):
     """Raised when a stored event sequence is replayed with different content."""
+
+
+class CertificateRenewalRejected(Exception):
+    """Raised when a renewal candidate cannot be safely replayed or activated."""
+
+
+@dataclass(frozen=True, slots=True)
+class RenewalCandidate:
+    certificate_pem: str
+    fingerprint_sha256: str
 
 
 def get_agent_gateway_session_factory() -> sessionmaker[Session]:
@@ -149,10 +163,21 @@ async def _receive_agent_messages(
                 )
             elif isinstance(message, CertificateRenewalRequest):
                 with session_factory() as session:
-                    renewed = _renew_agent_certificate(session, identity, message, settings)
+                    candidate = _stage_agent_certificate_renewal(session, identity, message, settings)
                 await websocket.send_json(
-                    CertificateRenewedMessage(
-                        certificate_pem=renewed.certificate_pem
+                    CertificateRenewalCandidateMessage(
+                        renewal_request_id=message.renewal_request_id,
+                        certificate_pem=candidate.certificate_pem,
+                        certificate_fingerprint_sha256=candidate.fingerprint_sha256,
+                    ).model_dump(mode="json")
+                )
+            elif isinstance(message, CertificateRenewalAckMessage):
+                with session_factory() as session:
+                    fingerprint = _activate_agent_certificate_renewal(session, identity, message)
+                await websocket.send_json(
+                    CertificateRenewalActivatedMessage(
+                        renewal_request_id=message.renewal_request_id,
+                        certificate_fingerprint_sha256=fingerprint,
                     ).model_dump(mode="json")
                 )
         except EventSequenceConflict:
@@ -161,7 +186,7 @@ async def _receive_agent_messages(
                 "event_conflict",
                 "Event sequence conflicts with stored event",
             )
-        except AgentIdentityError:
+        except (AgentIdentityError, CertificateRenewalRejected):
             await _send_error(
                 websocket,
                 "invalid_certificate_request",
@@ -210,7 +235,7 @@ def _parse_authentication(raw_message: str) -> tuple[AuthenticateMessage, bytes]
 
 def _parse_agent_message(
     raw_message: str,
-) -> InventoryMessage | HeartbeatMessage | EventBatchMessage | CertificateRenewalRequest:
+) -> InventoryMessage | HeartbeatMessage | EventBatchMessage | CertificateRenewalRequest | CertificateRenewalAckMessage:
     payload = _load_json_object(raw_message)
     model = _MESSAGE_MODELS.get(payload.get("type"))
     if model is None:
@@ -326,12 +351,12 @@ def _canonical_json_digest(value: object) -> bytes:
     return hashlib.sha256(canonical).digest()
 
 
-def _renew_agent_certificate(
+def _stage_agent_certificate_renewal(
     session: Session,
     identity: VerifiedAgentIdentity,
     request: CertificateRenewalRequest,
     settings: Settings,
-) -> IssuedAgentCertificate:
+) -> RenewalCandidate:
     try:
         node = session.scalar(
             select(ComputeNode)
@@ -344,12 +369,72 @@ def _renew_agent_certificate(
             or node.certificate_fingerprint != identity.fingerprint_sha256
         ):
             raise AgentAuthenticationRejected
+        csr_fingerprint = csr_fingerprint_sha256(request.csr_pem)
+        if node.pending_renewal_request_id is not None:
+            if (
+                node.pending_renewal_request_id != request.renewal_request_id
+                or node.pending_renewal_csr_fingerprint != csr_fingerprint
+                or node.pending_certificate_pem is None
+                or node.pending_certificate_fingerprint is None
+            ):
+                raise CertificateRenewalRejected
+            return RenewalCandidate(
+                certificate_pem=node.pending_certificate_pem,
+                fingerprint_sha256=node.pending_certificate_fingerprint,
+            )
+
         renewed = issue_agent_certificate(request.csr_pem, identity.node_id, settings)
-        node.certificate_serial = renewed.serial_number
-        node.certificate_fingerprint = renewed.fingerprint_sha256
-        node.certificate_expires_at = renewed.expires_at
+        node.pending_certificate_serial = renewed.serial_number
+        node.pending_certificate_fingerprint = renewed.fingerprint_sha256
+        node.pending_certificate_expires_at = renewed.expires_at
+        node.pending_certificate_pem = renewed.certificate_pem
+        node.pending_renewal_request_id = request.renewal_request_id
+        node.pending_renewal_csr_fingerprint = csr_fingerprint
         session.commit()
-        return renewed
+        return RenewalCandidate(
+            certificate_pem=renewed.certificate_pem,
+            fingerprint_sha256=renewed.fingerprint_sha256,
+        )
+    except Exception:
+        session.rollback()
+        raise
+
+
+def _activate_agent_certificate_renewal(
+    session: Session,
+    identity: VerifiedAgentIdentity,
+    acknowledgement: CertificateRenewalAckMessage,
+) -> str:
+    try:
+        node = session.scalar(
+            select(ComputeNode)
+            .where(ComputeNode.id == identity.node_id)
+            .with_for_update()
+        )
+        if (
+            node is None
+            or node.certificate_serial != identity.serial_number
+            or node.certificate_fingerprint != identity.fingerprint_sha256
+        ):
+            raise AgentAuthenticationRejected
+        if (
+            node.pending_renewal_request_id != acknowledgement.renewal_request_id
+            or node.pending_certificate_fingerprint != acknowledgement.certificate_fingerprint_sha256
+            or node.pending_certificate_serial is None
+            or node.pending_certificate_expires_at is None
+        ):
+            raise CertificateRenewalRejected
+        node.certificate_serial = node.pending_certificate_serial
+        node.certificate_fingerprint = node.pending_certificate_fingerprint
+        node.certificate_expires_at = node.pending_certificate_expires_at
+        node.pending_certificate_serial = None
+        node.pending_certificate_fingerprint = None
+        node.pending_certificate_expires_at = None
+        node.pending_certificate_pem = None
+        node.pending_renewal_request_id = None
+        node.pending_renewal_csr_fingerprint = None
+        session.commit()
+        return acknowledgement.certificate_fingerprint_sha256
     except Exception:
         session.rollback()
         raise

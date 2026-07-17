@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"crypto"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/wyzzy57/all/apps/node-agent/internal/protocol"
@@ -22,6 +24,8 @@ var (
 	metaBucket     = []byte("meta")
 
 	currentIdentityKey    = []byte("current")
+	pendingEnrollmentKey  = []byte("pending_enrollment")
+	pendingRenewalKey     = []byte("pending_renewal")
 	nextEventSequenceKey  = []byte("next_event_sequence")
 	ackedEventSequenceKey = []byte("acked_event_sequence")
 )
@@ -34,6 +38,29 @@ type Identity struct {
 	CertificateExpiresAt     time.Time
 	GatewayURL               string
 	HeartbeatIntervalSeconds int
+}
+
+// PendingEnrollment is the durable, retry-safe bootstrap request. It is cleared
+// atomically when the matching enrolled identity is saved.
+type PendingEnrollment struct {
+	RequestID     string
+	Token         string
+	NodeName      string
+	Architecture  string
+	PlatformKind  string
+	AgentVersion  string
+	PrivateKeyPEM string
+	CSRPEM        string
+}
+
+// PendingRenewal holds a candidate while the currently active certificate can
+// still authenticate a retry or acknowledgement.
+type PendingRenewal struct {
+	RequestID                    string
+	CSRPEM                       string
+	CertificatePEM               string
+	CertificateFingerprintSHA256 string
+	CertificateExpiresAt         time.Time
 }
 
 type Store struct {
@@ -98,7 +125,141 @@ func (s *Store) SaveIdentity(identity Identity) error {
 		return fmt.Errorf("encode identity: %w", err)
 	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		return tx.Bucket(identityBucket).Put(currentIdentityKey, encoded)
+		bucket := tx.Bucket(identityBucket)
+		if err := bucket.Put(currentIdentityKey, encoded); err != nil {
+			return err
+		}
+		return bucket.Delete(pendingEnrollmentKey)
+	})
+}
+
+func (s *Store) PendingEnrollment() (PendingEnrollment, bool, error) {
+	var pending PendingEnrollment
+	found := false
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		stored := tx.Bucket(identityBucket).Get(pendingEnrollmentKey)
+		if stored == nil {
+			return nil
+		}
+		if err := json.Unmarshal(stored, &pending); err != nil {
+			return fmt.Errorf("decode pending enrollment: %w", err)
+		}
+		found = true
+		return nil
+	})
+	return pending, found, err
+}
+
+func (s *Store) SavePendingEnrollment(pending PendingEnrollment) error {
+	if err := validatePendingEnrollment(pending); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(pending)
+	if err != nil {
+		return fmt.Errorf("encode pending enrollment: %w", err)
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(identityBucket).Put(pendingEnrollmentKey, encoded)
+	})
+}
+
+func (s *Store) PendingRenewal() (PendingRenewal, bool, error) {
+	var pending PendingRenewal
+	found := false
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		stored := tx.Bucket(identityBucket).Get(pendingRenewalKey)
+		if stored == nil {
+			return nil
+		}
+		if err := json.Unmarshal(stored, &pending); err != nil {
+			return fmt.Errorf("decode pending renewal: %w", err)
+		}
+		found = true
+		return nil
+	})
+	return pending, found, err
+}
+
+func (s *Store) SavePendingRenewal(pending PendingRenewal) error {
+	if strings.TrimSpace(pending.RequestID) == "" || strings.TrimSpace(pending.CSRPEM) == "" {
+		return fmt.Errorf("pending renewal request is incomplete")
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(identityBucket)
+		stored := bucket.Get(currentIdentityKey)
+		if stored == nil {
+			return fmt.Errorf("identity is not initialized")
+		}
+		var identity Identity
+		if err := json.Unmarshal(stored, &identity); err != nil {
+			return fmt.Errorf("decode identity: %w", err)
+		}
+		if err := validateRenewalCSR(identity.PrivateKeyPEM, pending.CSRPEM); err != nil {
+			return err
+		}
+		encoded, err := json.Marshal(pending)
+		if err != nil {
+			return fmt.Errorf("encode pending renewal: %w", err)
+		}
+		return bucket.Put(pendingRenewalKey, encoded)
+	})
+}
+
+func (s *Store) SaveRenewalCandidate(requestID, certificatePEM, fingerprint string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(identityBucket)
+		identity, pending, err := loadIdentityAndPendingRenewal(bucket)
+		if err != nil {
+			return err
+		}
+		if pending.RequestID != requestID || strings.TrimSpace(certificatePEM) == "" || strings.TrimSpace(fingerprint) == "" {
+			return fmt.Errorf("renewal candidate does not match pending request")
+		}
+		certificate, err := validateCertificate(identity.PrivateKeyPEM, certificatePEM, identity.CACertificatePEM)
+		if err != nil {
+			return err
+		}
+		if !certificate.NotAfter.After(identity.CertificateExpiresAt) || certificateFingerprint(certificate) != fingerprint {
+			return fmt.Errorf("renewal candidate is invalid")
+		}
+		pending.CertificatePEM = certificatePEM
+		pending.CertificateFingerprintSHA256 = fingerprint
+		pending.CertificateExpiresAt = certificate.NotAfter
+		encoded, err := json.Marshal(pending)
+		if err != nil {
+			return fmt.Errorf("encode pending renewal: %w", err)
+		}
+		return bucket.Put(pendingRenewalKey, encoded)
+	})
+}
+
+func (s *Store) PromotePendingRenewal(requestID, fingerprint string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(identityBucket)
+		identity, pending, err := loadIdentityAndPendingRenewal(bucket)
+		if err != nil {
+			return err
+		}
+		if pending.RequestID != requestID || pending.CertificateFingerprintSHA256 != fingerprint || pending.CertificatePEM == "" {
+			return fmt.Errorf("renewal activation does not match pending candidate")
+		}
+		certificate, err := validateCertificate(identity.PrivateKeyPEM, pending.CertificatePEM, identity.CACertificatePEM)
+		if err != nil {
+			return err
+		}
+		if certificateFingerprint(certificate) != fingerprint {
+			return fmt.Errorf("renewal activation fingerprint is invalid")
+		}
+		identity.CertificatePEM = pending.CertificatePEM
+		identity.CertificateExpiresAt = certificate.NotAfter
+		encoded, err := json.Marshal(identity)
+		if err != nil {
+			return fmt.Errorf("encode identity: %w", err)
+		}
+		if err := bucket.Put(currentIdentityKey, encoded); err != nil {
+			return err
+		}
+		return bucket.Delete(pendingRenewalKey)
 	})
 }
 
@@ -226,17 +387,9 @@ func (s *Store) AckEvents(throughSequence uint64) error {
 }
 
 func validateCertificate(privateKeyPEM, certificatePEM, caCertificatePEM string) (*x509.Certificate, error) {
-	privateBlock, _ := pem.Decode([]byte(privateKeyPEM))
-	if privateBlock == nil {
-		return nil, fmt.Errorf("private key is not valid PEM")
-	}
-	privateKey, err := x509.ParsePKCS8PrivateKey(privateBlock.Bytes)
+	signer, err := parsePrivateKey(privateKeyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("parse PKCS#8 private key: %w", err)
-	}
-	signer, ok := privateKey.(crypto.Signer)
-	if !ok {
-		return nil, fmt.Errorf("private key does not expose a public key")
+		return nil, err
 	}
 
 	certificateBlock, _ := pem.Decode([]byte(certificatePEM))
@@ -270,6 +423,86 @@ func validateCertificate(privateKeyPEM, certificatePEM, caCertificatePEM string)
 		return nil, fmt.Errorf("verify client certificate: %w", err)
 	}
 	return certificate, nil
+}
+
+func validatePendingEnrollment(pending PendingEnrollment) error {
+	if strings.TrimSpace(pending.RequestID) == "" || strings.TrimSpace(pending.Token) == "" ||
+		strings.TrimSpace(pending.NodeName) == "" || strings.TrimSpace(pending.Architecture) == "" ||
+		strings.TrimSpace(pending.PlatformKind) == "" || strings.TrimSpace(pending.AgentVersion) == "" ||
+		strings.TrimSpace(pending.PrivateKeyPEM) == "" || strings.TrimSpace(pending.CSRPEM) == "" {
+		return fmt.Errorf("pending enrollment request is incomplete")
+	}
+	return validateRenewalCSR(pending.PrivateKeyPEM, pending.CSRPEM)
+}
+
+func validateRenewalCSR(privateKeyPEM, csrPEM string) error {
+	signer, err := parsePrivateKey(privateKeyPEM)
+	if err != nil {
+		return err
+	}
+	csrBlock, rest := pem.Decode([]byte(csrPEM))
+	if csrBlock == nil || csrBlock.Type != "CERTIFICATE REQUEST" || len(strings.TrimSpace(string(rest))) != 0 {
+		return fmt.Errorf("certificate request is not valid PEM")
+	}
+	csr, err := x509.ParseCertificateRequest(csrBlock.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse certificate request: %w", err)
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return fmt.Errorf("verify certificate request: %w", err)
+	}
+	privatePublicKey, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return fmt.Errorf("marshal private-key public key: %w", err)
+	}
+	csrPublicKey, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
+	if err != nil {
+		return fmt.Errorf("marshal certificate-request public key: %w", err)
+	}
+	if !bytes.Equal(privatePublicKey, csrPublicKey) {
+		return fmt.Errorf("certificate request public key does not match private key")
+	}
+	return nil
+}
+
+func parsePrivateKey(privateKeyPEM string) (crypto.Signer, error) {
+	privateBlock, rest := pem.Decode([]byte(privateKeyPEM))
+	if privateBlock == nil || privateBlock.Type != "PRIVATE KEY" || len(strings.TrimSpace(string(rest))) != 0 {
+		return nil, fmt.Errorf("private key is not valid PEM")
+	}
+	privateKey, err := x509.ParsePKCS8PrivateKey(privateBlock.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse PKCS#8 private key: %w", err)
+	}
+	signer, ok := privateKey.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("private key does not expose a public key")
+	}
+	return signer, nil
+}
+
+func loadIdentityAndPendingRenewal(bucket *bbolt.Bucket) (Identity, PendingRenewal, error) {
+	var identity Identity
+	var pending PendingRenewal
+	storedIdentity := bucket.Get(currentIdentityKey)
+	if storedIdentity == nil {
+		return Identity{}, PendingRenewal{}, fmt.Errorf("identity is not initialized")
+	}
+	if err := json.Unmarshal(storedIdentity, &identity); err != nil {
+		return Identity{}, PendingRenewal{}, fmt.Errorf("decode identity: %w", err)
+	}
+	storedPending := bucket.Get(pendingRenewalKey)
+	if storedPending == nil {
+		return Identity{}, PendingRenewal{}, fmt.Errorf("pending renewal is not initialized")
+	}
+	if err := json.Unmarshal(storedPending, &pending); err != nil {
+		return Identity{}, PendingRenewal{}, fmt.Errorf("decode pending renewal: %w", err)
+	}
+	return identity, pending, nil
+}
+
+func certificateFingerprint(certificate *x509.Certificate) string {
+	return fmt.Sprintf("%x", sha256.Sum256(certificate.Raw))
 }
 
 func sequenceKey(sequence uint64) []byte {

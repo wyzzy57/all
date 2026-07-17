@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -39,6 +41,7 @@ const (
 var (
 	errGatewayServerRejected            = errors.New("Gateway server rejected connection")
 	errGatewayServerRequestedRetry      = errors.New("Gateway server requested retry")
+	errGatewayAuthenticationRejected    = errors.New("Gateway authentication was rejected")
 	errInvalidStoredCertificate         = errors.New("invalid stored certificate")
 	errInvalidRenewedCertificate        = errors.New("invalid renewed certificate")
 	errInvalidHeartbeatInterval         = errors.New("heartbeat interval is outside allowed range")
@@ -152,6 +155,38 @@ func (c *Client) runConnection(ctx context.Context) (bool, error) {
 	if identity.NodeID == "" {
 		return false, fatalErrorf("stored identity node ID is empty")
 	}
+	pending, pendingFound, err := c.store.PendingRenewal()
+	if err != nil {
+		return false, fatalErrorf("load pending renewal: %v", err)
+	}
+	if pendingFound && pending.CertificatePEM != "" {
+		stable, err := c.runAuthenticatedConnection(ctx, identity, pending, true, false)
+		if !errors.Is(err, errGatewayAuthenticationRejected) {
+			return stable, err
+		}
+		candidateIdentity := identity
+		candidateIdentity.CertificatePEM = pending.CertificatePEM
+		candidateIdentity.CertificateExpiresAt = pending.CertificateExpiresAt
+		stable, err = c.runAuthenticatedConnection(ctx, candidateIdentity, pending, true, true)
+		if errors.Is(err, errGatewayAuthenticationRejected) {
+			return stable, fatal(err)
+		}
+		return stable, err
+	}
+	stable, err := c.runAuthenticatedConnection(ctx, identity, pending, pendingFound, false)
+	if errors.Is(err, errGatewayAuthenticationRejected) {
+		return stable, fatal(err)
+	}
+	return stable, err
+}
+
+func (c *Client) runAuthenticatedConnection(
+	ctx context.Context,
+	identity state.Identity,
+	pending state.PendingRenewal,
+	pendingFound bool,
+	promotePendingAfterAuthentication bool,
+) (bool, error) {
 	signer, err := parseStoredPrivateKey(identity.PrivateKeyPEM)
 	if err != nil {
 		return false, fatal(err)
@@ -186,16 +221,44 @@ func (c *Client) runConnection(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !identity.CertificateExpiresAt.After(time.Now().Add(certificateRenewalWindow)) {
-		renewed, err := renewCertificate(ctx, conn, identity, signer)
-		if err != nil {
+	if promotePendingAfterAuthentication {
+		if err := c.store.PromotePendingRenewal(pending.RequestID, pending.CertificateFingerprintSHA256); err != nil {
+			return false, fatal(fmt.Errorf("promote pending renewal: %w", err))
+		}
+		return c.runLiveConnection(ctx, conn, time.Duration(heartbeatSeconds)*time.Second)
+	}
+	if pendingFound || !identity.CertificateExpiresAt.After(time.Now().Add(certificateRenewalWindow)) {
+		if !pendingFound {
+			pending, err = newPendingRenewal(identity, signer)
+			if err != nil {
+				return false, err
+			}
+			if err := c.store.SavePendingRenewal(pending); err != nil {
+				return false, fatal(fmt.Errorf("persist renewal request: %w", err))
+			}
+		}
+		if pending.CertificatePEM == "" {
+			candidate, err := requestRenewalCandidate(ctx, conn, identity, signer, pending)
+			if err != nil {
+				return false, err
+			}
+			if err := c.store.SaveRenewalCandidate(
+				pending.RequestID,
+				candidate.CertificatePEM,
+				candidate.CertificateFingerprintSHA256,
+			); err != nil {
+				return false, fatal(fmt.Errorf("persist renewal candidate: %w", err))
+			}
+			pending.CertificatePEM = candidate.CertificatePEM
+			pending.CertificateFingerprintSHA256 = candidate.CertificateFingerprintSHA256
+			pending.CertificateExpiresAt = candidate.CertificateExpiresAt
+		}
+		if err := acknowledgeRenewalCandidate(ctx, conn, pending); err != nil {
 			return false, err
 		}
-		if err := c.store.UpdateCertificate(renewed.pem, renewed.certificate.NotAfter); err != nil {
-			return false, fatal(fmt.Errorf("persist renewed certificate: %w", err))
+		if err := c.store.PromotePendingRenewal(pending.RequestID, pending.CertificateFingerprintSHA256); err != nil {
+			return false, fatal(fmt.Errorf("promote pending renewal: %w", err))
 		}
-		identity.CertificatePEM = renewed.pem
-		identity.CertificateExpiresAt = renewed.certificate.NotAfter
 	}
 
 	return c.runLiveConnection(ctx, conn, time.Duration(heartbeatSeconds)*time.Second)
@@ -304,56 +367,102 @@ func authenticate(
 	return authenticated.HeartbeatIntervalSeconds, nil
 }
 
-type renewedCertificate struct {
-	pem         string
-	certificate *x509.Certificate
-}
-
-func renewCertificate(
-	ctx context.Context,
-	conn *websocket.Conn,
-	identity state.Identity,
-	signer ed25519.PrivateKey,
-) (renewedCertificate, error) {
+func newPendingRenewal(identity state.Identity, signer ed25519.PrivateKey) (state.PendingRenewal, error) {
 	csrDER, err := x509.CreateCertificateRequest(cryptorand.Reader, &x509.CertificateRequest{
 		Subject: pkix.Name{CommonName: identity.NodeID},
 	}, signer)
 	if err != nil {
-		return renewedCertificate{}, fatal(fmt.Errorf("create certificate renewal request: %w", err))
+		return state.PendingRenewal{}, fatal(fmt.Errorf("create certificate renewal request: %w", err))
 	}
-	csrPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+	requestID, err := renewalRequestID()
+	if err != nil {
+		return state.PendingRenewal{}, err
+	}
+	return state.PendingRenewal{
+		RequestID: requestID,
+		CSRPEM:    string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})),
+	}, nil
+}
+
+func renewalRequestID() (string, error) {
+	value := make([]byte, 16)
+	if _, err := cryptorand.Read(value); err != nil {
+		return "", fatal(fmt.Errorf("generate renewal request ID: %w", err))
+	}
+	return hex.EncodeToString(value), nil
+}
+
+func requestRenewalCandidate(
+	ctx context.Context,
+	conn *websocket.Conn,
+	identity state.Identity,
+	signer ed25519.PrivateKey,
+	pending state.PendingRenewal,
+) (state.PendingRenewal, error) {
 	if err := writeJSONMessage(ctx, conn, protocol.CertificateRenewalRequest{
-		Envelope: protocol.Envelope{ProtocolVersion: protocol.ProtocolVersion, Type: "certificate_renewal_request"},
-		CSRPEM:   csrPEM,
+		Envelope:         protocol.Envelope{ProtocolVersion: protocol.ProtocolVersion, Type: "certificate_renewal_request"},
+		RenewalRequestID: pending.RequestID,
+		CSRPEM:           pending.CSRPEM,
 	}); err != nil {
-		return renewedCertificate{}, err
+		return state.PendingRenewal{}, err
 	}
 
-	rawRenewed, err := readTextMessage(ctx, conn)
+	rawCandidate, err := readTextMessage(ctx, conn)
 	if err != nil {
-		return renewedCertificate{}, err
+		return state.PendingRenewal{}, err
 	}
-	var renewed protocol.CertificateRenewedMessage
-	if err := decodeStrictMessage(rawRenewed, "certificate_renewed", &renewed); err != nil {
-		return renewedCertificate{}, fatal(err)
+	var candidate protocol.CertificateRenewalCandidateMessage
+	if err := decodeStrictMessage(rawCandidate, "certificate_renewal_candidate", &candidate); err != nil {
+		return state.PendingRenewal{}, fatal(err)
 	}
-	if err := requireEnvelope(renewed.Envelope, "certificate_renewed"); err != nil {
-		return renewedCertificate{}, fatal(err)
+	if err := requireEnvelope(candidate.Envelope, "certificate_renewal_candidate"); err != nil {
+		return state.PendingRenewal{}, fatal(err)
+	}
+	if candidate.RenewalRequestID != pending.RequestID || candidate.CertificateFingerprintSHA256 == "" {
+		return state.PendingRenewal{}, fatal(errInvalidRenewedCertificate)
 	}
 	certificate, err := validateDeviceCertificate(
-		renewed.CertificatePEM,
+		candidate.CertificatePEM,
 		identity.CACertificatePEM,
 		identity.NodeID,
 		signer.Public().(ed25519.PublicKey),
 		time.Now(),
 	)
 	if err != nil {
-		return renewedCertificate{}, fatal(errInvalidRenewedCertificate)
+		return state.PendingRenewal{}, fatal(errInvalidRenewedCertificate)
 	}
-	if !certificate.NotAfter.After(identity.CertificateExpiresAt) {
-		return renewedCertificate{}, fatal(errInvalidRenewedCertificate)
+	if !certificate.NotAfter.After(identity.CertificateExpiresAt) || certificateFingerprint(certificate) != candidate.CertificateFingerprintSHA256 {
+		return state.PendingRenewal{}, fatal(errInvalidRenewedCertificate)
 	}
-	return renewedCertificate{pem: renewed.CertificatePEM, certificate: certificate}, nil
+	pending.CertificatePEM = candidate.CertificatePEM
+	pending.CertificateFingerprintSHA256 = candidate.CertificateFingerprintSHA256
+	pending.CertificateExpiresAt = certificate.NotAfter
+	return pending, nil
+}
+
+func acknowledgeRenewalCandidate(ctx context.Context, conn *websocket.Conn, pending state.PendingRenewal) error {
+	if err := writeJSONMessage(ctx, conn, protocol.CertificateRenewalAckMessage{
+		Envelope:                     protocol.Envelope{ProtocolVersion: protocol.ProtocolVersion, Type: "certificate_renewal_ack"},
+		RenewalRequestID:             pending.RequestID,
+		CertificateFingerprintSHA256: pending.CertificateFingerprintSHA256,
+	}); err != nil {
+		return err
+	}
+	rawActivated, err := readTextMessage(ctx, conn)
+	if err != nil {
+		return err
+	}
+	var activated protocol.CertificateRenewalActivatedMessage
+	if err := decodeStrictMessage(rawActivated, "certificate_renewal_activated", &activated); err != nil {
+		return fatal(err)
+	}
+	if err := requireEnvelope(activated.Envelope, "certificate_renewal_activated"); err != nil {
+		return fatal(err)
+	}
+	if activated.RenewalRequestID != pending.RequestID || activated.CertificateFingerprintSHA256 != pending.CertificateFingerprintSHA256 {
+		return fatal(errInvalidRenewedCertificate)
+	}
+	return nil
 }
 
 func (c *Client) runLiveConnection(
@@ -560,7 +669,7 @@ func readTextMessage(ctx context.Context, conn *websocket.Conn) ([]byte, error) 
 		case websocket.StatusProtocolError, websocket.StatusUnsupportedData, websocket.StatusPolicyViolation:
 			return nil, fatalErrorf("Gateway closed the connection for a protocol violation")
 		case websocket.StatusCode(4403):
-			return nil, fatalErrorf("Gateway authentication was rejected")
+			return nil, errGatewayAuthenticationRejected
 		default:
 			return nil, fmt.Errorf("Gateway connection closed")
 		}
@@ -662,6 +771,10 @@ func validateDeviceCertificate(
 		return nil, fmt.Errorf("verify device certificate chain: %w", err)
 	}
 	return certificate, nil
+}
+
+func certificateFingerprint(certificate *x509.Certificate) string {
+	return fmt.Sprintf("%x", sha256.Sum256(certificate.Raw))
 }
 
 func appendEnrolledCA(systemRoots *x509.CertPool, caCertificatePEM string) (*x509.CertPool, error) {

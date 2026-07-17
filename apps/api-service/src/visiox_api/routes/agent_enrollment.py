@@ -67,9 +67,10 @@ def enroll_agent(
             detail="Certificate request is invalid",
         ) from None
     return EnrollmentResponse(
+        enrollment_request_id=result.enrollment_request_id,
         node_id=result.node.id,
         certificate_pem=result.certificate.certificate_pem,
         ca_certificate_pem=result.certificate.ca_certificate_pem,
-        gateway_url=settings.agent_public_ws_url,
-        heartbeat_interval_seconds=settings.agent_heartbeat_interval_seconds,
+        gateway_url=result.gateway_url,
+        heartbeat_interval_seconds=result.heartbeat_interval_seconds,
     )

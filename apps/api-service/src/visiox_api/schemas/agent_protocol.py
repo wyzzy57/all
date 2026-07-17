@@ -10,6 +10,8 @@ MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_INVENTORY_SECTION_BYTES = 64 * 1024
 MAX_PEM_BYTES = 16 * 1024
 MAX_EVENT_BATCH_SIZE = 100
+REQUEST_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$"
+FINGERPRINT_PATTERN = r"^[a-f0-9]{64}$"
 
 
 def validate_raw_message_size(message: str | bytes) -> None:
@@ -58,6 +60,7 @@ class ProtocolModel(BaseModel):
 class EnrollmentRequest(ProtocolModel):
     protocol_version: Literal[1]
     token: str = Field(min_length=32, max_length=256)
+    enrollment_request_id: str = Field(pattern=REQUEST_ID_PATTERN)
     node_name: str = Field(min_length=1, max_length=160, pattern=r"^[\w.-]+$")
     architecture: Literal["amd64", "arm64"]
     platform_kind: Literal["jetson", "x86_nvidia"]
@@ -69,6 +72,7 @@ class EnrollmentRequest(ProtocolModel):
 
 class EnrollmentResponse(ProtocolModel):
     protocol_version: Literal[1] = 1
+    enrollment_request_id: str = Field(pattern=REQUEST_ID_PATTERN)
     node_id: str
     certificate_pem: str = Field(min_length=100)
     ca_certificate_pem: str = Field(min_length=100)
@@ -152,17 +156,34 @@ class EventsAckMessage(ProtocolModel):
 class CertificateRenewalRequest(ProtocolModel):
     protocol_version: Literal[1]
     type: Literal["certificate_renewal_request"]
+    renewal_request_id: str = Field(pattern=REQUEST_ID_PATTERN)
     csr_pem: str = Field(min_length=100)
 
     _csr_fits = field_validator("csr_pem")(_validate_pem_size)
 
 
-class CertificateRenewedMessage(ProtocolModel):
+class CertificateRenewalCandidateMessage(ProtocolModel):
     protocol_version: Literal[1] = 1
-    type: Literal["certificate_renewed"] = "certificate_renewed"
+    type: Literal["certificate_renewal_candidate"] = "certificate_renewal_candidate"
+    renewal_request_id: str = Field(pattern=REQUEST_ID_PATTERN)
     certificate_pem: str = Field(min_length=100)
+    certificate_fingerprint_sha256: str = Field(pattern=FINGERPRINT_PATTERN)
 
     _certificate_fits = field_validator("certificate_pem")(_validate_pem_size)
+
+
+class CertificateRenewalAckMessage(ProtocolModel):
+    protocol_version: Literal[1]
+    type: Literal["certificate_renewal_ack"]
+    renewal_request_id: str = Field(pattern=REQUEST_ID_PATTERN)
+    certificate_fingerprint_sha256: str = Field(pattern=FINGERPRINT_PATTERN)
+
+
+class CertificateRenewalActivatedMessage(ProtocolModel):
+    protocol_version: Literal[1] = 1
+    type: Literal["certificate_renewal_activated"] = "certificate_renewal_activated"
+    renewal_request_id: str = Field(pattern=REQUEST_ID_PATTERN)
+    certificate_fingerprint_sha256: str = Field(pattern=FINGERPRINT_PATTERN)
 
 
 class ErrorMessage(ProtocolModel):

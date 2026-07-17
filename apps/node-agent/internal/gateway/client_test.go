@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -179,9 +180,32 @@ func TestClientRenewsCertificateBeforeExpiry(t *testing.T) {
 			return
 		}
 		renewedPEM := ca.SignCSR(t, request.CSRPEM, storedIdentity.NodeID, time.Now().Add(365*24*time.Hour))
-		if err := peerWriteJSON(conn, protocol.CertificateRenewedMessage{
-			Envelope:       testEnvelope("certificate_renewed"),
-			CertificatePEM: renewedPEM,
+		renewedCertificate, err := parsePeerCertificate(renewedPEM)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		fingerprint := testCertificateFingerprint(renewedCertificate)
+		if err := peerWriteJSON(conn, protocol.CertificateRenewalCandidateMessage{
+			Envelope:                     testEnvelope("certificate_renewal_candidate"),
+			RenewalRequestID:             request.RenewalRequestID,
+			CertificatePEM:               renewedPEM,
+			CertificateFingerprintSHA256: fingerprint,
+		}); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		var acknowledgement protocol.CertificateRenewalAckMessage
+		if err := peerReadJSON(conn, &acknowledgement); err != nil ||
+			acknowledgement.RenewalRequestID != request.RenewalRequestID ||
+			acknowledgement.CertificateFingerprintSHA256 != fingerprint {
+			reportServerError(serverErrors, fmt.Errorf("invalid renewal acknowledgement: %v", err))
+			return
+		}
+		if err := peerWriteJSON(conn, protocol.CertificateRenewalActivatedMessage{
+			Envelope:                     testEnvelope("certificate_renewal_activated"),
+			RenewalRequestID:             request.RenewalRequestID,
+			CertificateFingerprintSHA256: fingerprint,
 		}); err != nil {
 			reportServerError(serverErrors, err)
 			return
@@ -239,6 +263,484 @@ func TestClientRenewsCertificateBeforeExpiry(t *testing.T) {
 	assertNoServerError(t, serverErrors)
 }
 
+func TestClientPersistsRenewalCandidateBeforeAcknowledgement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("close store: %v", closeErr)
+		}
+	}()
+	serverReady := make(chan struct{}, 1)
+	serverErrors := make(chan error, 1)
+	var (
+		storedIdentity state.Identity
+		signer         ed25519.PrivateKey
+		ca             *testsupport.CA
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, storedIdentity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		_, rawRenewal, err := peerRead(conn)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		var renewalFields map[string]json.RawMessage
+		if err := json.Unmarshal(rawRenewal, &renewalFields); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		var requestID, csrPEM string
+		if err := json.Unmarshal(renewalFields["renewal_request_id"], &requestID); err != nil || requestID == "" {
+			reportServerError(serverErrors, fmt.Errorf("renewal request is missing a stable request ID: %v", err))
+			return
+		}
+		if err := json.Unmarshal(renewalFields["csr_pem"], &csrPEM); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		candidatePEM := ca.SignCSR(t, csrPEM, storedIdentity.NodeID, time.Now().Add(365*24*time.Hour))
+		certificate, err := parsePeerCertificate(candidatePEM)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		candidate := map[string]any{
+			"protocol_version":               protocol.ProtocolVersion,
+			"type":                           "certificate_renewal_candidate",
+			"renewal_request_id":             requestID,
+			"certificate_pem":                candidatePEM,
+			"certificate_fingerprint_sha256": testCertificateFingerprint(certificate),
+		}
+		if err := peerWriteJSON(conn, candidate); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		_, rawAck, err := peerRead(conn)
+		if err != nil {
+			reportServerError(serverErrors, fmt.Errorf("read renewal acknowledgement: %w", err))
+			return
+		}
+		var acknowledgement map[string]json.RawMessage
+		if err := json.Unmarshal(rawAck, &acknowledgement); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		var acknowledgementType, acknowledgedRequestID string
+		_ = json.Unmarshal(acknowledgement["type"], &acknowledgementType)
+		_ = json.Unmarshal(acknowledgement["renewal_request_id"], &acknowledgedRequestID)
+		if acknowledgementType != "certificate_renewal_ack" || acknowledgedRequestID != requestID {
+			reportServerError(serverErrors, fmt.Errorf("unexpected renewal acknowledgement: %s", rawAck))
+			return
+		}
+		pending, found, err := store.PendingRenewal()
+		if err != nil || !found || pending.CertificatePEM != candidatePEM ||
+			pending.CertificateFingerprintSHA256 != testCertificateFingerprint(certificate) {
+			reportServerError(serverErrors, fmt.Errorf("candidate was not committed before acknowledgement: found=%v err=%v", found, err))
+			return
+		}
+		serverReady <- struct{}{}
+	}))
+	defer server.Close()
+
+	storedIdentity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-1",
+		websocketURL(server.URL),
+		time.Now().Add(29*24*time.Hour),
+	)
+	originalCertificate := storedIdentity.CertificatePEM
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	runDone := runClient(ctx, New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)))
+	waitSignalOrError(t, ctx, serverReady, serverErrors, "renewal acknowledgement")
+	current, found, err := store.Identity()
+	if err != nil || !found || current.CertificatePEM != originalCertificate {
+		cancel()
+		t.Fatalf("candidate acknowledgement changed active identity before activation: found=%v err=%v", found, err)
+	}
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	assertNoServerError(t, serverErrors)
+}
+
+func TestClientRetriesStableRenewalRequestAfterCandidateDeliveryLoss(t *testing.T) {
+	store := openGatewayStore(t)
+	serverReady := make(chan struct{}, 1)
+	serverErrors := make(chan error, 1)
+	var (
+		identity     state.Identity
+		signer       ed25519.PrivateKey
+		ca           *testsupport.CA
+		pending      state.PendingRenewal
+		candidatePEM string
+		fingerprint  string
+		connections  atomic.Int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		var request protocol.CertificateRenewalRequest
+		if err := peerReadJSON(conn, &request); err != nil ||
+			request.RenewalRequestID != pending.RequestID || request.CSRPEM != pending.CSRPEM {
+			reportServerError(serverErrors, fmt.Errorf("renewal retry did not reuse the pending request: %v", err))
+			return
+		}
+		switch connections.Add(1) {
+		case 1:
+			// The server staged a candidate, but its response is lost before delivery.
+			return
+		case 2:
+			if err := peerWriteJSON(conn, protocol.CertificateRenewalCandidateMessage{
+				Envelope:                     testEnvelope("certificate_renewal_candidate"),
+				RenewalRequestID:             pending.RequestID,
+				CertificatePEM:               candidatePEM,
+				CertificateFingerprintSHA256: fingerprint,
+			}); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := expectRenewalAcknowledgement(conn, pending, fingerprint); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := peerWriteJSON(conn, protocol.CertificateRenewalActivatedMessage{
+				Envelope:                     testEnvelope("certificate_renewal_activated"),
+				RenewalRequestID:             pending.RequestID,
+				CertificateFingerprintSHA256: fingerprint,
+			}); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := expectLiveInventory(conn); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			serverReady <- struct{}{}
+		default:
+			reportServerError(serverErrors, fmt.Errorf("unexpected renewal connection %d", connections.Load()))
+		}
+	}))
+	defer server.Close()
+
+	identity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-1",
+		websocketURL(server.URL),
+		time.Now().Add(29*24*time.Hour),
+	)
+	pending = state.PendingRenewal{
+		RequestID: "renewal-candidate-loss-001",
+		CSRPEM:    csrPEMForKey(t, signer, identity.NodeID),
+	}
+	if err := store.SavePendingRenewal(pending); err != nil {
+		t.Fatal(err)
+	}
+	candidatePEM = ca.SignCSR(t, pending.CSRPEM, identity.NodeID, time.Now().Add(365*24*time.Hour))
+	candidate, err := parsePeerCertificate(candidatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint = testCertificateFingerprint(candidate)
+
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	runDone := runClient(ctx, New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)))
+	waitSignalOrError(t, ctx, serverReady, serverErrors, "candidate-delivery recovery")
+	assertPromotedRenewal(t, store, candidatePEM)
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	if connections.Load() != 2 {
+		t.Fatalf("renewal connections = %d, want 2", connections.Load())
+	}
+	assertNoServerError(t, serverErrors)
+}
+
+func TestClientRetriesPendingAcknowledgementAfterAcknowledgementLoss(t *testing.T) {
+	store := openGatewayStore(t)
+	serverReady := make(chan struct{}, 1)
+	serverErrors := make(chan error, 1)
+	var (
+		identity     state.Identity
+		signer       ed25519.PrivateKey
+		ca           *testsupport.CA
+		pending      state.PendingRenewal
+		candidatePEM string
+		fingerprint  string
+		connections  atomic.Int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := expectRenewalAcknowledgement(conn, pending, fingerprint); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		switch connections.Add(1) {
+		case 1:
+			// The ACK was lost before the server committed the candidate.
+			return
+		case 2:
+			if err := peerWriteJSON(conn, protocol.CertificateRenewalActivatedMessage{
+				Envelope:                     testEnvelope("certificate_renewal_activated"),
+				RenewalRequestID:             pending.RequestID,
+				CertificateFingerprintSHA256: fingerprint,
+			}); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := expectLiveInventory(conn); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			serverReady <- struct{}{}
+		default:
+			reportServerError(serverErrors, fmt.Errorf("unexpected acknowledgement connection %d", connections.Load()))
+		}
+	}))
+	defer server.Close()
+
+	identity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-1",
+		websocketURL(server.URL),
+		time.Now().Add(29*24*time.Hour),
+	)
+	pending, candidatePEM, fingerprint = savePendingRenewalCandidate(t, store, identity, signer, ca)
+
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	runDone := runClient(ctx, New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)))
+	waitSignalOrError(t, ctx, serverReady, serverErrors, "acknowledgement-loss recovery")
+	assertPromotedRenewal(t, store, candidatePEM)
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	if connections.Load() != 2 {
+		t.Fatalf("acknowledgement connections = %d, want 2", connections.Load())
+	}
+	assertNoServerError(t, serverErrors)
+}
+
+func TestClientPromotesPendingCertificateAfterActivationConfirmationLoss(t *testing.T) {
+	store := openGatewayStore(t)
+	serverReady := make(chan struct{}, 1)
+	serverErrors := make(chan error, 1)
+	var (
+		identity          state.Identity
+		candidateIdentity state.Identity
+		signer            ed25519.PrivateKey
+		ca                *testsupport.CA
+		pending           state.PendingRenewal
+		candidatePEM      string
+		fingerprint       string
+		connections       atomic.Int32
+		serverCommitted   atomic.Bool
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		switch connections.Add(1) {
+		case 1:
+			if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := expectRenewalAcknowledgement(conn, pending, fingerprint); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			// The server commits, but the activation response is lost to the Agent.
+			serverCommitted.Store(true)
+			return
+		case 2:
+			if err := challengeAndVerifyAuthenticate(conn, identity, signer, ca); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := conn.Close(websocket.StatusCode(4403), "agent identity rejected"); err != nil {
+				reportServerError(serverErrors, err)
+			}
+			return
+		case 3:
+			if err := authenticatePeer(conn, candidateIdentity, signer, ca, 5); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := expectLiveInventory(conn); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			serverReady <- struct{}{}
+		default:
+			reportServerError(serverErrors, fmt.Errorf("unexpected activation-loss connection %d", connections.Load()))
+		}
+	}))
+	defer server.Close()
+
+	identity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-1",
+		websocketURL(server.URL),
+		time.Now().Add(29*24*time.Hour),
+	)
+	pending, candidatePEM, fingerprint = savePendingRenewalCandidate(t, store, identity, signer, ca)
+	candidateIdentity = identity
+	candidateIdentity.CertificatePEM = candidatePEM
+	candidate, err := parsePeerCertificate(candidatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateIdentity.CertificateExpiresAt = candidate.NotAfter
+
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	runDone := runClient(ctx, New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)))
+	waitSignalOrError(t, ctx, serverReady, serverErrors, "activation-confirmation recovery")
+	if !serverCommitted.Load() {
+		cancel()
+		t.Fatal("server did not commit the renewal before the activation response was lost")
+	}
+	assertPromotedRenewal(t, store, candidatePEM)
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	if connections.Load() != 3 {
+		t.Fatalf("activation-loss connections = %d, want 3", connections.Load())
+	}
+	assertNoServerError(t, serverErrors)
+}
+
+func TestClientDoesNotAcknowledgeRenewalCandidateWhenLocalPersistenceFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverDone := make(chan struct{}, 1)
+	serverErrors := make(chan error, 1)
+	var (
+		identity     state.Identity
+		signer       ed25519.PrivateKey
+		ca           *testsupport.CA
+		acknowledged atomic.Bool
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { serverDone <- struct{}{} }()
+		conn, acceptErr := websocket.Accept(w, r, nil)
+		if acceptErr != nil {
+			reportServerError(serverErrors, acceptErr)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, identity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		var request protocol.CertificateRenewalRequest
+		if err := peerReadJSON(conn, &request); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		candidatePEM := ca.SignCSR(t, request.CSRPEM, identity.NodeID, time.Now().Add(365*24*time.Hour))
+		candidate, err := parsePeerCertificate(candidatePEM)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := store.Close(); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := peerWriteJSON(conn, protocol.CertificateRenewalCandidateMessage{
+			Envelope:                     testEnvelope("certificate_renewal_candidate"),
+			RenewalRequestID:             request.RenewalRequestID,
+			CertificatePEM:               candidatePEM,
+			CertificateFingerprintSHA256: testCertificateFingerprint(candidate),
+		}); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if _, raw, readErr := peerRead(conn); readErr == nil {
+			envelope, decodeErr := decodePeerEnvelope(raw)
+			if decodeErr != nil {
+				reportServerError(serverErrors, decodeErr)
+				return
+			}
+			acknowledged.Store(envelope.Type == "certificate_renewal_ack")
+		}
+	}))
+	defer server.Close()
+
+	identity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-1",
+		websocketURL(server.URL),
+		time.Now().Add(29*24*time.Hour),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	defer cancel()
+	err = New(testGatewayConfig(), store, testInventory(), WithBackoff(zeroBackoff)).Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "persist renewal candidate") {
+		t.Fatalf("error = %v, want candidate persistence failure", err)
+	}
+	select {
+	case <-serverDone:
+	case serverErr := <-serverErrors:
+		t.Fatal(serverErr)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for failed candidate persistence")
+	}
+	if acknowledged.Load() {
+		t.Fatal("Agent acknowledged a renewal candidate that was not persisted locally")
+	}
+	assertNoServerError(t, serverErrors)
+}
+
 func TestClientRejectsRenewalWithoutExpiryAdvance(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -274,9 +776,16 @@ func TestClientRejectsRenewalWithoutExpiryAdvance(t *testing.T) {
 					reportServerError(serverErrors, fmt.Errorf("read renewal request: %v", err))
 					return
 				}
-				if err := peerWriteJSON(conn, protocol.CertificateRenewedMessage{
-					Envelope:       testEnvelope("certificate_renewed"),
-					CertificatePEM: returnedCertificate,
+				certificate, parseErr := parsePeerCertificate(returnedCertificate)
+				if parseErr != nil {
+					reportServerError(serverErrors, parseErr)
+					return
+				}
+				if err := peerWriteJSON(conn, protocol.CertificateRenewalCandidateMessage{
+					Envelope:                     testEnvelope("certificate_renewal_candidate"),
+					RenewalRequestID:             renewal.RenewalRequestID,
+					CertificatePEM:               returnedCertificate,
+					CertificateFingerprintSHA256: testCertificateFingerprint(certificate),
 				}); err != nil {
 					reportServerError(serverErrors, err)
 					return
@@ -1189,9 +1698,15 @@ func TestClientRejectsInvalidRenewedCertificates(t *testing.T) {
 					reportServerError(serverErrors, fmt.Errorf("read renewal request: %v", err))
 					return
 				}
-				if err := peerWriteJSON(conn, protocol.CertificateRenewedMessage{
-					Envelope:       testEnvelope("certificate_renewed"),
-					CertificatePEM: returnedCertificate,
+				fingerprint := strings.Repeat("0", 64)
+				if certificate, parseErr := parsePeerCertificate(returnedCertificate); parseErr == nil {
+					fingerprint = testCertificateFingerprint(certificate)
+				}
+				if err := peerWriteJSON(conn, protocol.CertificateRenewalCandidateMessage{
+					Envelope:                     testEnvelope("certificate_renewal_candidate"),
+					RenewalRequestID:             renewal.RenewalRequestID,
+					CertificatePEM:               returnedCertificate,
+					CertificateFingerprintSHA256: fingerprint,
 				}); err != nil {
 					reportServerError(serverErrors, err)
 					return
@@ -1498,6 +2013,72 @@ func testEnvelope(messageType string) protocol.Envelope {
 	return protocol.Envelope{ProtocolVersion: protocol.ProtocolVersion, Type: messageType}
 }
 
+func expectRenewalAcknowledgement(
+	conn *websocket.Conn,
+	pending state.PendingRenewal,
+	fingerprint string,
+) error {
+	var acknowledgement protocol.CertificateRenewalAckMessage
+	if err := peerReadJSON(conn, &acknowledgement); err != nil {
+		return err
+	}
+	if acknowledgement.Envelope != testEnvelope("certificate_renewal_ack") ||
+		acknowledgement.RenewalRequestID != pending.RequestID ||
+		acknowledgement.CertificateFingerprintSHA256 != fingerprint {
+		return fmt.Errorf("unexpected renewal acknowledgement: %#v", acknowledgement)
+	}
+	return nil
+}
+
+func expectLiveInventory(conn *websocket.Conn) error {
+	var inventory protocol.InventoryMessage
+	if err := peerReadJSON(conn, &inventory); err != nil {
+		return err
+	}
+	if inventory.Envelope != testEnvelope("inventory") {
+		return fmt.Errorf("expected inventory after renewal, got %#v", inventory.Envelope)
+	}
+	return nil
+}
+
+func savePendingRenewalCandidate(
+	t *testing.T,
+	store *state.Store,
+	identity state.Identity,
+	signer ed25519.PrivateKey,
+	ca *testsupport.CA,
+) (state.PendingRenewal, string, string) {
+	t.Helper()
+	pending := state.PendingRenewal{
+		RequestID: "renewal-pending-candidate-001",
+		CSRPEM:    csrPEMForKey(t, signer, identity.NodeID),
+	}
+	if err := store.SavePendingRenewal(pending); err != nil {
+		t.Fatal(err)
+	}
+	candidatePEM := ca.SignCSR(t, pending.CSRPEM, identity.NodeID, time.Now().Add(365*24*time.Hour))
+	candidate, err := parsePeerCertificate(candidatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := testCertificateFingerprint(candidate)
+	if err := store.SaveRenewalCandidate(pending.RequestID, candidatePEM, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	return pending, candidatePEM, fingerprint
+}
+
+func assertPromotedRenewal(t *testing.T, store *state.Store, candidatePEM string) {
+	t.Helper()
+	identity, found, err := store.Identity()
+	if err != nil || !found || identity.CertificatePEM != candidatePEM {
+		t.Fatalf("renewal was not promoted: found=%v identity=%#v err=%v", found, identity, err)
+	}
+	if _, found, err := store.PendingRenewal(); err != nil || found {
+		t.Fatalf("pending renewal remained after promotion: found=%v err=%v", found, err)
+	}
+}
+
 func testInventory() protocol.InventoryMessage {
 	return protocol.InventoryMessage{
 		Envelope:     testEnvelope("inventory"),
@@ -1634,6 +2215,10 @@ func parsePeerCertificate(certificatePEM string) (*x509.Certificate, error) {
 		return nil, fmt.Errorf("certificate is not one PEM block")
 	}
 	return x509.ParseCertificate(block.Bytes)
+}
+
+func testCertificateFingerprint(certificate *x509.Certificate) string {
+	return fmt.Sprintf("%x", sha256.Sum256(certificate.Raw))
 }
 
 func parsePeerCSR(csrPEM string) (*x509.CertificateRequest, error) {

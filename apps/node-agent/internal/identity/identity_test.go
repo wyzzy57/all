@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -46,7 +47,7 @@ func TestEnsureGeneratesCSRAndPersistsReturnedIdentity(t *testing.T) {
 		}
 		wantFields := []string{
 			"protocol_version", "token", "node_name", "architecture",
-			"platform_kind", "agent_version", "csr_pem",
+			"platform_kind", "agent_version", "csr_pem", "enrollment_request_id",
 		}
 		if len(fields) != len(wantFields) {
 			t.Errorf("request field count = %d, want %d", len(fields), len(wantFields))
@@ -64,6 +65,7 @@ func TestEnsureGeneratesCSRAndPersistsReturnedIdentity(t *testing.T) {
 		}
 		if request.ProtocolVersion != protocol.ProtocolVersion ||
 			request.Token != strings.Repeat("x", 32) ||
+			request.EnrollmentRequestID == "" ||
 			request.NodeName != "edge-01" ||
 			request.Architecture != "arm64" ||
 			request.PlatformKind != "jetson" ||
@@ -84,6 +86,7 @@ func TestEnsureGeneratesCSRAndPersistsReturnedIdentity(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		if err := json.NewEncoder(w).Encode(protocol.EnrollmentResponse{
 			ProtocolVersion:          protocol.ProtocolVersion,
+			EnrollmentRequestID:      request.EnrollmentRequestID,
 			NodeID:                   "node-1",
 			CertificatePEM:           ca.SignCSR(t, request.CSRPEM, "node-1", time.Now().Add(365*24*time.Hour)),
 			CACertificatePEM:         ca.PEM(),
@@ -123,6 +126,122 @@ func TestEnsureGeneratesCSRAndPersistsReturnedIdentity(t *testing.T) {
 	}
 	if again != got || calls != 1 {
 		t.Fatalf("existing identity must be reused; calls=%d", calls)
+	}
+}
+
+func TestEnsurePersistsStableEnrollmentAttemptBeforeNetworkAndRecoversResponseLoss(t *testing.T) {
+	ca := testsupport.NewCA(t)
+	path := filepath.Join(t.TempDir(), "agent.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if store != nil {
+			if closeErr := store.Close(); closeErr != nil {
+				t.Errorf("close store: %v", closeErr)
+			}
+		}
+	}()
+
+	type capturedRequest struct {
+		requestID string
+		request   protocol.EnrollmentRequest
+	}
+	var requests []capturedRequest
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			t.Errorf("read enrollment request: %v", readErr)
+			return
+		}
+		if strings.Contains(string(body), "PRIVATE KEY") {
+			t.Error("enrollment request transported a private key")
+			return
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err != nil {
+			t.Errorf("decode enrollment request fields: %v", err)
+			return
+		}
+		var requestID string
+		if err := json.Unmarshal(fields["enrollment_request_id"], &requestID); err != nil || requestID == "" {
+			t.Errorf("enrollment request is missing a stable request ID: %v", err)
+			return
+		}
+		var request protocol.EnrollmentRequest
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Errorf("decode enrollment request: %v", err)
+			return
+		}
+		databaseBytes, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("read durable Agent state before response: %v", err)
+			return
+		}
+		if !strings.Contains(string(databaseBytes), requestID) || !strings.Contains(string(databaseBytes), "PRIVATE KEY") {
+			t.Error("Agent did not durably persist the enrollment request and private key before the HTTP request")
+			return
+		}
+		requests = append(requests, capturedRequest{requestID: requestID, request: request})
+		if len(requests) == 1 {
+			// Simulate a server commit followed by response loss.
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		response := map[string]any{
+			"protocol_version":           protocol.ProtocolVersion,
+			"enrollment_request_id":      requestID,
+			"node_id":                    "node-1",
+			"certificate_pem":            ca.SignCSR(t, request.CSRPEM, "node-1", time.Now().Add(365*24*time.Hour)),
+			"ca_certificate_pem":         ca.PEM(),
+			"gateway_url":                strings.Replace(server.URL, "http://", "ws://", 1) + "/agent/v1/connect",
+			"heartbeat_interval_seconds": 15,
+		}
+		encoded, err := json.Marshal(response)
+		if err != nil {
+			t.Errorf("encode enrollment response: %v", err)
+			return
+		}
+		if strings.Contains(string(encoded), "PRIVATE KEY") {
+			t.Error("enrollment response transported a private key")
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(encoded)
+	}))
+	defer server.Close()
+
+	cfg := testConfig(server.URL, true)
+	facts := protocol.EnrollmentFacts{Architecture: "arm64", PlatformKind: "jetson"}
+	if _, err := Ensure(context.Background(), cfg, facts, store, server.Client()); err == nil {
+		t.Fatal("expected response-loss enrollment attempt to fail locally")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store = nil
+
+	// A restart must use the durable bootstrap request, even when the environment token is gone.
+	store, err = state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.EnrollmentToken = ""
+	identity, err := Ensure(context.Background(), cfg, facts, store, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.NodeID != "node-1" || len(requests) != 2 {
+		t.Fatalf("recovered enrollment identity = %#v requests=%d", identity, len(requests))
+	}
+	if requests[0].requestID != requests[1].requestID ||
+		requests[0].request.Token != requests[1].request.Token ||
+		requests[0].request.CSRPEM != requests[1].request.CSRPEM ||
+		requests[0].request.NodeName != requests[1].request.NodeName ||
+		requests[0].request.PlatformKind != requests[1].request.PlatformKind {
+		t.Fatalf("restart changed the enrollment retry binding: %#v", requests)
 	}
 }
 
@@ -284,6 +403,7 @@ func TestEnsureRequiresExplicitClientAuthUsage(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(protocol.EnrollmentResponse{
 			ProtocolVersion:          protocol.ProtocolVersion,
+			EnrollmentRequestID:      request.EnrollmentRequestID,
 			NodeID:                   "node-1",
 			CertificatePEM:           ca.signCSR(t, request.CSRPEM, "node-1", x509.KeyUsageDigitalSignature, nil, false),
 			CACertificatePEM:         ca.pem,
@@ -319,6 +439,7 @@ func TestEnsureRejectsCACertificateAsDeviceIdentity(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(protocol.EnrollmentResponse{
 			ProtocolVersion:          protocol.ProtocolVersion,
+			EnrollmentRequestID:      request.EnrollmentRequestID,
 			NodeID:                   "node-1",
 			CertificatePEM:           ca.signCSR(t, request.CSRPEM, "node-1", x509.KeyUsageCertSign, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, true),
 			CACertificatePEM:         ca.pem,
@@ -528,6 +649,7 @@ func enrollmentServerWithStatus(
 		}
 		response := protocol.EnrollmentResponse{
 			ProtocolVersion:          protocol.ProtocolVersion,
+			EnrollmentRequestID:      request.EnrollmentRequestID,
 			NodeID:                   "node-1",
 			CertificatePEM:           ca.SignCSR(t, request.CSRPEM, "node-1", time.Now().Add(24*time.Hour)),
 			CACertificatePEM:         ca.PEM(),
