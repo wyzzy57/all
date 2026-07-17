@@ -453,6 +453,7 @@ run_recovery_tests() {
     test "$(sha256_file "$pre_replacement_live/ca.key")" = "$old_pre_replacement_key"
     test "$(sha256_file "$pre_replacement_live/ca.crt")" = "$old_pre_replacement_cert"
     assert_api_restart_attempted 1
+    assert_output_excludes_private_key "$pre_replacement_offline/ca.key" "$recovery_root/pre-replacement.out"
     printf '%s\n' 'pre-replacement-failure-preserves-live-ca-and-restarts-api=passed'
 
     replacement_live="$recovery_root/replacement-live"
