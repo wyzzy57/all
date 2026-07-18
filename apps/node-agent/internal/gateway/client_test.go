@@ -210,6 +210,268 @@ func TestClientReconnectsAfterGatewayAuthenticationDeadline(t *testing.T) {
 	}
 }
 
+func TestClientReconnectsAfterGatewayUpgradeDeadline(t *testing.T) {
+	store := openGatewayStore(t)
+	serverErrors := make(chan error, 1)
+	firstRequestClosed := make(chan struct{}, 1)
+	secondConnectionReady := make(chan struct{}, 1)
+	var (
+		storedIdentity state.Identity
+		signer         ed25519.PrivateKey
+		ca             *testsupport.CA
+		connections    atomic.Int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch connections.Add(1) {
+		case 1:
+			<-r.Context().Done()
+			firstRequestClosed <- struct{}{}
+		case 2:
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			defer conn.CloseNow()
+			if err := authenticatePeer(conn, storedIdentity, signer, ca, 5); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := expectLiveInventory(conn); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			secondConnectionReady <- struct{}{}
+			<-r.Context().Done()
+		default:
+			reportServerError(serverErrors, fmt.Errorf("unexpected connection %d", connections.Load()))
+		}
+	}))
+	defer server.Close()
+
+	storedIdentity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-upgrade-deadline",
+		websocketURL(server.URL),
+		time.Now().Add(365*24*time.Hour),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	defer cancel()
+	runDone := runClient(ctx, New(
+		testGatewayConfig(),
+		store,
+		testInventory(),
+		WithBackoff(zeroBackoff),
+		WithConnectionDeadlines(100*time.Millisecond, time.Second, time.Second),
+	))
+
+	waitSignalOrError(t, ctx, firstRequestClosed, serverErrors, "stalled upgrade close")
+	waitSignalOrError(t, ctx, secondConnectionReady, serverErrors, "upgrade-timeout reconnect")
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	assertNoServerError(t, serverErrors)
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("Gateway requests = %d, want 2", got)
+	}
+}
+
+func TestClientReconnectsAfterRenewalCandidateDeadline(t *testing.T) {
+	store := openGatewayStore(t)
+	serverErrors := make(chan error, 1)
+	firstCandidateRequestReady := make(chan struct{}, 1)
+	secondConnectionReady := make(chan struct{}, 1)
+	var (
+		storedIdentity state.Identity
+		signer         ed25519.PrivateKey
+		ca             *testsupport.CA
+		connections    atomic.Int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, storedIdentity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		var request protocol.CertificateRenewalRequest
+		if err := peerReadJSON(conn, &request); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+
+		switch connections.Add(1) {
+		case 1:
+			firstCandidateRequestReady <- struct{}{}
+			<-r.Context().Done()
+		case 2:
+			candidatePEM := ca.SignCSR(
+				t,
+				request.CSRPEM,
+				storedIdentity.NodeID,
+				time.Now().Add(365*24*time.Hour),
+			)
+			candidate, parseErr := parsePeerCertificate(candidatePEM)
+			if parseErr != nil {
+				reportServerError(serverErrors, parseErr)
+				return
+			}
+			fingerprint := testCertificateFingerprint(candidate)
+			if err := peerWriteJSON(conn, protocol.CertificateRenewalCandidateMessage{
+				Envelope:                     testEnvelope("certificate_renewal_candidate"),
+				RenewalRequestID:             request.RenewalRequestID,
+				CertificatePEM:               candidatePEM,
+				CertificateFingerprintSHA256: fingerprint,
+			}); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := expectRenewalAcknowledgement(conn, state.PendingRenewal{RequestID: request.RenewalRequestID}, fingerprint); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := peerWriteJSON(conn, protocol.CertificateRenewalActivatedMessage{
+				Envelope:                     testEnvelope("certificate_renewal_activated"),
+				RenewalRequestID:             request.RenewalRequestID,
+				CertificateFingerprintSHA256: fingerprint,
+			}); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := expectLiveInventory(conn); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			secondConnectionReady <- struct{}{}
+			<-r.Context().Done()
+		default:
+			reportServerError(serverErrors, fmt.Errorf("unexpected connection %d", connections.Load()))
+		}
+	}))
+	defer server.Close()
+
+	storedIdentity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-candidate-deadline",
+		websocketURL(server.URL),
+		time.Now().Add(29*24*time.Hour),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	defer cancel()
+	runDone := runClient(ctx, New(
+		testGatewayConfig(),
+		store,
+		testInventory(),
+		WithBackoff(zeroBackoff),
+		WithConnectionDeadlines(100*time.Millisecond, time.Second, time.Second),
+	))
+
+	waitSignalOrError(t, ctx, firstCandidateRequestReady, serverErrors, "stalled candidate request")
+	waitSignalOrError(t, ctx, secondConnectionReady, serverErrors, "candidate-timeout reconnect")
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	assertNoServerError(t, serverErrors)
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("Gateway connections = %d, want 2", got)
+	}
+}
+
+func TestClientReconnectsAfterRenewalActivationDeadline(t *testing.T) {
+	store := openGatewayStore(t)
+	serverErrors := make(chan error, 1)
+	firstAcknowledgementReady := make(chan struct{}, 1)
+	secondConnectionReady := make(chan struct{}, 1)
+	var (
+		storedIdentity state.Identity
+		signer         ed25519.PrivateKey
+		ca             *testsupport.CA
+		pending        state.PendingRenewal
+		fingerprint    string
+		connections    atomic.Int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, storedIdentity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := expectRenewalAcknowledgement(conn, pending, fingerprint); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+
+		switch connections.Add(1) {
+		case 1:
+			firstAcknowledgementReady <- struct{}{}
+			<-r.Context().Done()
+		case 2:
+			if err := peerWriteJSON(conn, protocol.CertificateRenewalActivatedMessage{
+				Envelope:                     testEnvelope("certificate_renewal_activated"),
+				RenewalRequestID:             pending.RequestID,
+				CertificateFingerprintSHA256: fingerprint,
+			}); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := expectLiveInventory(conn); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			secondConnectionReady <- struct{}{}
+			<-r.Context().Done()
+		default:
+			reportServerError(serverErrors, fmt.Errorf("unexpected connection %d", connections.Load()))
+		}
+	}))
+	defer server.Close()
+
+	storedIdentity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-activation-deadline",
+		websocketURL(server.URL),
+		time.Now().Add(29*24*time.Hour),
+	)
+	pending, _, fingerprint = savePendingRenewalCandidate(t, store, storedIdentity, signer, ca)
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	defer cancel()
+	runDone := runClient(ctx, New(
+		testGatewayConfig(),
+		store,
+		testInventory(),
+		WithBackoff(zeroBackoff),
+		WithConnectionDeadlines(100*time.Millisecond, time.Second, time.Second),
+	))
+
+	waitSignalOrError(t, ctx, firstAcknowledgementReady, serverErrors, "stalled activation acknowledgement")
+	waitSignalOrError(t, ctx, secondConnectionReady, serverErrors, "activation-timeout reconnect")
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	assertNoServerError(t, serverErrors)
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("Gateway connections = %d, want 2", got)
+	}
+}
+
 func TestClientReconnectsWhenGatewayStopsRespondingToPings(t *testing.T) {
 	store := openGatewayStore(t)
 	serverErrors := make(chan error, 1)

@@ -38,6 +38,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from redis import asyncio as redis
 
     settings = get_settings()
+    if not settings.is_local_environment:
+        settings.read_management_proxy_auth_token()
     if settings.agent_gateway_enabled:
         ensure_agent_ca(settings)
     app.state.redis = redis.from_url(settings.redis_url, decode_responses=True)

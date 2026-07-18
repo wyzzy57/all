@@ -48,8 +48,8 @@ class Settings(BaseSettings):
     agent_public_ws_url: str = "ws://127.0.0.1:8000/agent/v1/connect"
     agent_gateway_enabled: bool = False
     agent_authentication_timeout_seconds: float = Field(default=15, gt=0, le=60)
-    agent_heartbeat_interval_seconds: int = 15
-    agent_offline_after_seconds: int = 45
+    agent_heartbeat_interval_seconds: int = Field(default=15, ge=5, le=300)
+    agent_offline_after_seconds: int = Field(default=45, gt=0)
     agent_certificate_renew_before_days: int = 30
     agent_max_ws_message_bytes: int = 1024 * 1024
     management_proxy_auth_token_file: Path | None = None
@@ -91,8 +91,15 @@ class Settings(BaseSettings):
                 "agent_public_ws_url must use the environment-appropriate WebSocket scheme "
                 "and path /agent/v1/connect"
             )
-        if not self.is_local_environment:
-            self.read_management_proxy_auth_token()
+        return self
+
+    @model_validator(mode="after")
+    def validate_agent_liveness_thresholds(self) -> Self:
+        minimum_offline_threshold = self.agent_heartbeat_interval_seconds * 3
+        if self.agent_offline_after_seconds < minimum_offline_threshold:
+            raise ValueError(
+                "agent_offline_after_seconds must cover at least three heartbeat intervals"
+            )
         return self
 
 

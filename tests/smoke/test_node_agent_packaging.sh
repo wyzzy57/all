@@ -54,6 +54,27 @@ cat > "$testbin/docker" <<'DOCKER'
 #!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$VISIOX_TEST_DOCKER_LOG"
+if [ "${VISIOX_TEST_PRODUCTION_RELEASE:-0}" = 1 ]; then
+    case " $* " in
+        *" config --format json "*)
+            printf '%s\n' '{"services":{"management-proxy":{"ports":[{"published":"443","target":8443}]},"api-service":{"ports":[]}}}'
+            exit 0
+            ;;
+        *" pg_dump "*)
+            printf '%s\n' 'VISIOX_TEST_CUSTOM_ARCHIVE'
+            exit 0
+            ;;
+        *" pg_restore --list "*)
+            cat >/dev/null
+            printf '%s\n' 'VISIOX_TEST_ARCHIVE_TOC'
+            exit 0
+            ;;
+        *" pg_restore "*)
+            cat >/dev/null
+            exit 0
+            ;;
+    esac
+fi
 case " $* " in
     *" stop api-service "*)
         if [ "${VISIOX_TEST_FAIL_STOP:-0}" = 1 ] && [ ! -e "$VISIOX_TEST_STATE/stop-failed" ]; then
@@ -600,6 +621,24 @@ extract_documented_mtls_verification() {
     fi
 }
 
+extract_documented_runbook_block() {
+    block_name=$1
+    start_marker=$2
+    end_marker=$3
+    output_path=$4
+    start_count=$(tr -d '\r' < "$runbook" | grep -Fxc "$start_marker" || true)
+    end_count=$(tr -d '\r' < "$runbook" | grep -Fxc "$end_marker" || true)
+    if [ "$start_count" != 1 ] || [ "$end_count" != 1 ]; then
+        printf '%s\n' "documented-$block_name-block=missing" >&2
+        exit 1
+    fi
+    tr -d '\r' < "$runbook" | sed -n "/^$start_marker$/,/^$end_marker$/p" | sed '1d;$d' > "$output_path"
+    if [ ! -s "$output_path" ]; then
+        printf '%s\n' "documented-$block_name-block=empty" >&2
+        exit 1
+    fi
+}
+
 assert_mtls_curl_event() {
     if ! grep -Fqx "$1" "$curl_log"; then
         printf '%s\n' 'documented-mtls-curl-event=missing' >&2
@@ -622,10 +661,52 @@ run_documentation_checks() {
     fi
     grep -Fq 'exec -T api-service python -c' "$runbook"
     grep -Fq 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' "$runbook"
+    grep -Fq 'sudo tee "$backup_file"' "$runbook"
+    grep -Fq 'pg_restore --list' "$runbook"
     grep -Fq 'run --rm api-migrate' "$runbook"
     grep -Fq 'alembic current --check-heads' "$runbook"
-    grep -Fq 'Keep api-service stopped after a failed migration' "$runbook"
-    grep -Fq 'Restore the verified backup with the previous release before restarting api-service' "$runbook"
+    grep -Fq 'stop api-service label-sync-worker training-worker' "$runbook"
+    grep -Fq 'Keep all database writers stopped after a failed migration' "$runbook"
+    grep -Fq 'Restore the verified backup' "$runbook"
+    grep -Fq 'with the previous release before restarting database writers' "$runbook"
+    grep -Fq 'up -d api-service label-sync-worker training-worker' "$runbook"
+    grep -Fq '"alembic>=1.17.1,<2.0"' "$repo_root/pyproject.toml"
+
+    release_script="$workdir/documented-production-release.sh"
+    rollback_script="$workdir/documented-production-rollback.sh"
+    extract_documented_runbook_block \
+        'production-release' \
+        '# BEGIN production database migration release' \
+        '# END production database migration release' \
+        "$release_script"
+    extract_documented_runbook_block \
+        'production-rollback' \
+        '# BEGIN production database rollback' \
+        '# END production database rollback' \
+        "$rollback_script"
+    release_backup_dir="$workdir/production-backups"
+    : > "$docker_log"
+    VISIOX_TEST_PRODUCTION_RELEASE=1 VISIOX_BACKUP_DIR="$release_backup_dir" \
+        bash "$release_script" > "$workdir/production-release.out" 2>&1
+    release_backup_file=$(find "$release_backup_dir" -type f -name '*.dump' -print -quit)
+    test -n "$release_backup_file"
+    test -s "$release_backup_file"
+    grep -Fq 'stop api-service label-sync-worker training-worker' "$docker_log"
+    grep -Fq 'run --rm api-migrate' "$docker_log"
+    grep -Fq 'run --rm api-migrate alembic current --check-heads' "$docker_log"
+
+    : > "$docker_log"
+    VISIOX_TEST_PRODUCTION_RELEASE=1 VISIOX_POSTGRES_BACKUP_FILE="$release_backup_file" \
+        bash "$rollback_script" > "$workdir/production-rollback.out" 2>&1
+    stop_line=$(grep -Fn 'stop api-service label-sync-worker training-worker' "$docker_log" | cut -d: -f1)
+    restore_line=$(grep -Fn 'pg_restore -U' "$docker_log" | cut -d: -f1)
+    start_line=$(grep -Fn 'up -d api-service label-sync-worker training-worker' "$docker_log" | cut -d: -f1)
+    test -n "$stop_line"
+    test -n "$restore_line"
+    test -n "$start_line"
+    test "$stop_line" -lt "$restore_line"
+    test "$restore_line" -lt "$start_line"
+    printf '%s\n' 'production-migration-documentation=passed'
     extract_documented_mtls_verification
     : > "$curl_log"
     set +e

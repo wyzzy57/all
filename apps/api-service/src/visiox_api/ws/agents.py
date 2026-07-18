@@ -5,7 +5,7 @@ import json
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from fastapi import APIRouter, Depends, WebSocket
 from pydantic import ValidationError
@@ -44,6 +44,8 @@ from visiox_db.session import create_session_factory
 
 
 router = APIRouter(tags=["agent-gateway"])
+
+_T = TypeVar("_T")
 
 _MESSAGE_MODELS = {
     "inventory": InventoryMessage,
@@ -121,8 +123,12 @@ async def agent_gateway(
         )
         if verified.node_id != auth.node_id:
             raise AgentAuthenticationRejected
-        with session_factory() as session:
-            verified = _authenticate_registered_node(session, verified, settings)
+        verified = await _run_session_operation(
+            session_factory,
+            _authenticate_registered_node,
+            verified,
+            settings,
+        )
     except (AgentIdentityError, AgentAuthenticationRejected):
         await websocket.close(code=4403, reason="agent identity rejected")
         return
@@ -153,24 +159,38 @@ async def _receive_agent_messages(
 
         try:
             if isinstance(message, InventoryMessage):
-                with session_factory() as session:
-                    _require_current_session_credential(session, identity)
-                    NodeRegistryService(session, settings).apply_inventory(
-                        identity.node_id, message
-                    )
+                await _run_session_operation(
+                    session_factory,
+                    _apply_inventory_message,
+                    identity,
+                    message,
+                    settings,
+                )
             elif isinstance(message, HeartbeatMessage):
-                with session_factory() as session:
-                    _require_current_session_credential(session, identity)
-                    NodeRegistryService(session, settings).mark_seen(identity.node_id)
+                await _run_session_operation(
+                    session_factory,
+                    _apply_heartbeat_message,
+                    identity,
+                    settings,
+                )
             elif isinstance(message, EventBatchMessage):
-                with session_factory() as session:
-                    through_sequence = _persist_event_batch(session, identity, message)
+                through_sequence = await _run_session_operation(
+                    session_factory,
+                    _persist_event_batch,
+                    identity,
+                    message,
+                )
                 await websocket.send_json(
                     EventsAckMessage(through_sequence=through_sequence).model_dump(mode="json")
                 )
             elif isinstance(message, CertificateRenewalRequest):
-                with session_factory() as session:
-                    candidate = _stage_agent_certificate_renewal(session, identity, message, settings)
+                candidate = await _run_session_operation(
+                    session_factory,
+                    _stage_agent_certificate_renewal,
+                    identity,
+                    message,
+                    settings,
+                )
                 await websocket.send_json(
                     CertificateRenewalCandidateMessage(
                         renewal_request_id=message.renewal_request_id,
@@ -179,10 +199,13 @@ async def _receive_agent_messages(
                     ).model_dump(mode="json")
                 )
             elif isinstance(message, CertificateRenewalAckMessage):
-                with session_factory() as session:
-                    identity = _activate_agent_certificate_renewal(
-                        session, identity, message, settings
-                    )
+                identity = await _run_session_operation(
+                    session_factory,
+                    _activate_agent_certificate_renewal,
+                    identity,
+                    message,
+                    settings,
+                )
                 await websocket.send_json(
                     CertificateRenewalActivatedMessage(
                         renewal_request_id=message.renewal_request_id,
@@ -204,6 +227,42 @@ async def _receive_agent_messages(
         except (AgentAuthenticationRejected, NodeNotFound):
             await websocket.close(code=4403, reason="agent identity rejected")
             return
+
+
+async def _run_session_operation(
+    session_factory: sessionmaker[Session],
+    operation: Callable[..., _T],
+    *args: object,
+) -> _T:
+    return await asyncio.to_thread(_run_session_operation_sync, session_factory, operation, args)
+
+
+def _run_session_operation_sync(
+    session_factory: sessionmaker[Session],
+    operation: Callable[..., _T],
+    args: tuple[object, ...],
+) -> _T:
+    with session_factory() as session:
+        return operation(session, *args)
+
+
+def _apply_inventory_message(
+    session: Session,
+    identity: VerifiedAgentIdentity,
+    message: InventoryMessage,
+    settings: Settings,
+) -> None:
+    _require_current_session_credential(session, identity)
+    NodeRegistryService(session, settings).apply_inventory(identity.node_id, message)
+
+
+def _apply_heartbeat_message(
+    session: Session,
+    identity: VerifiedAgentIdentity,
+    settings: Settings,
+) -> None:
+    _require_current_session_credential(session, identity)
+    NodeRegistryService(session, settings).mark_seen(identity.node_id)
 
 
 async def _receive_text_frame(websocket: WebSocket, settings: Settings) -> str:

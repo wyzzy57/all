@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 from visiox_common.settings import Settings, get_settings
 
@@ -20,17 +19,22 @@ def _production_settings(secret_path: Path) -> Settings:
     )
 
 
-def test_production_settings_fail_closed_when_management_proxy_secret_is_missing(tmp_path: Path) -> None:
-    with pytest.raises(ValidationError, match="management proxy authentication token"):
-        _production_settings(tmp_path / "missing-proxy-token")
+def test_production_worker_settings_do_not_require_management_proxy_secret(tmp_path: Path) -> None:
+    settings = _production_settings(tmp_path / "missing-proxy-token")
+
+    assert settings.environment == "production"
+    with pytest.raises(ValueError, match="management proxy authentication token"):
+        settings.read_management_proxy_auth_token()
 
 
 def test_production_settings_reject_management_proxy_secret_with_whitespace(tmp_path: Path) -> None:
     secret_path = tmp_path / "management-proxy-token"
     secret_path.write_text(f"{'a' * 64} \n", encoding="ascii")
 
-    with pytest.raises(ValidationError, match="management proxy authentication token is invalid"):
-        _production_settings(secret_path)
+    settings = _production_settings(secret_path)
+
+    with pytest.raises(ValueError, match="management proxy authentication token is invalid"):
+        settings.read_management_proxy_auth_token()
 
 
 def test_management_routes_require_the_proxy_secret_but_public_enrollment_remains_public(

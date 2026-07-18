@@ -9,7 +9,7 @@ services:
     restart: "no"
     depends_on:
       postgres:
-        condition: service_started
+        condition: service_healthy
     environment:
       VISIOX_ENV: production
     networks:
@@ -44,10 +44,20 @@ services:
         condition: service_completed_successfully
 
   label-sync-worker:
+    environment:
+      VISIOX_ENV: production
+    depends_on:
+      api-migrate:
+        condition: service_completed_successfully
     networks:
       application-internal:
 
   training-worker:
+    environment:
+      VISIOX_ENV: production
+    depends_on:
+      api-migrate:
+        condition: service_completed_successfully
     networks:
       application-internal:
 
@@ -64,6 +74,12 @@ services:
 
   postgres:
     ports: !reset []
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
     networks:
       application-internal:
       api-dependencies:

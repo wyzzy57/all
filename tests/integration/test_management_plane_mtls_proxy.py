@@ -255,9 +255,30 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         migration_environment = migration.get("environment", {})
         if migration_environment.get("VISIOX_ENV") != "production":
             raise AssertionError("migration job must use production configuration")
+        migration_postgres_dependency = migration.get("depends_on", {}).get("postgres", {})
+        if migration_postgres_dependency.get("condition") != "service_healthy":
+            raise AssertionError("migration job must wait for healthy PostgreSQL")
         migration_dependency = api_service.get("depends_on", {}).get("api-migrate", {})
         if migration_dependency.get("condition") != "service_completed_successfully":
             raise AssertionError("api-service must wait for the migration job to complete")
+        postgres_healthcheck = services["postgres"].get("healthcheck", {})
+        postgres_healthcheck_test = postgres_healthcheck.get("test", [])
+        if "pg_isready" not in " ".join(str(part) for part in postgres_healthcheck_test):
+            raise AssertionError("production PostgreSQL must expose a pg_isready healthcheck")
+        for worker_name in ("label-sync-worker", "training-worker"):
+            worker = services[worker_name]
+            if worker.get("environment", {}).get("VISIOX_ENV") != "production":
+                raise AssertionError(f"production {worker_name} must set VISIOX_ENV=production")
+            worker_migration_dependency = worker.get("depends_on", {}).get("api-migrate", {})
+            if worker_migration_dependency.get("condition") != "service_completed_successfully":
+                raise AssertionError(f"production {worker_name} must wait for migrations")
+            worker_secret_targets = {
+                secret.get("target") for secret in worker.get("secrets", [])
+            }
+            if "management_proxy_auth_token" in worker_secret_targets:
+                raise AssertionError(
+                    f"production {worker_name} must not receive the management proxy secret"
+                )
         published_ports = {
             service_name: service.get("ports", [])
             for service_name, service in services.items()

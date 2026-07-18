@@ -1,8 +1,11 @@
 import asyncio
 import base64
 import json
+import threading
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from time import sleep
+from types import SimpleNamespace
 
 import pytest
 from cryptography import x509
@@ -59,6 +62,38 @@ class _StalledAuthenticationWebSocket:
 
     async def close(self, code: int, reason: str) -> None:
         self.closed = (code, reason)
+
+
+class _AuthenticatedThenDisconnectWebSocket:
+    def __init__(self) -> None:
+        self.accepted = False
+        self.messages: list[dict[str, object]] = []
+        self.receive_count = 0
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def send_json(self, message: dict[str, object]) -> None:
+        self.messages.append(message)
+
+    async def receive(self) -> dict[str, object]:
+        self.receive_count += 1
+        if self.receive_count == 1:
+            return {"type": "websocket.receive", "text": "{}"}
+        return {"type": "websocket.disconnect", "code": 1000, "reason": "test complete"}
+
+    async def close(self, code: int, reason: str) -> None:
+        raise AssertionError(f"authenticated connection closed unexpectedly: {code} {reason}")
+
+
+class _ObservableStalledAuthenticationWebSocket(_StalledAuthenticationWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed_event = threading.Event()
+
+    async def close(self, code: int, reason: str) -> None:
+        await super().close(code, reason)
+        self.closed_event.set()
 
 
 def new_agent_csr(name: str) -> tuple[ed25519.Ed25519PrivateKey, str]:
@@ -242,6 +277,82 @@ def test_agent_gateway_closes_unauthenticated_connection_after_authentication_de
     assert websocket.accepted is True
     assert websocket.messages[0]["type"] == "challenge"
     assert websocket.closed == (4408, "agent authentication timed out")
+
+
+def test_blocked_agent_transaction_does_not_block_other_authentication_deadline(monkeypatch) -> None:
+    from visiox_api.services.agent_identity import VerifiedAgentIdentity
+    from visiox_api.ws import agents
+
+    transaction_entered = threading.Event()
+    release_transaction = threading.Event()
+    stalled_websocket = _ObservableStalledAuthenticationWebSocket()
+    authenticated_websocket = _AuthenticatedThenDisconnectWebSocket()
+    deadline_observed_before_release: list[bool] = []
+    identity = VerifiedAgentIdentity(
+        node_id="node-concurrency-test",
+        serial_number="1",
+        fingerprint_sha256="f" * 64,
+        public_key_bytes=b"public-key",
+    )
+
+    monkeypatch.setattr(
+        agents,
+        "_parse_authentication",
+        lambda raw_message: (
+            SimpleNamespace(node_id=identity.node_id, certificate_pem="certificate"),
+            b"signature",
+        ),
+    )
+    monkeypatch.setattr(agents, "verify_agent_signature", lambda *args: identity)
+
+    def block_registered_node_transaction(session, verified, settings):
+        transaction_entered.set()
+        if not release_transaction.wait(timeout=1):
+            raise AssertionError("test transaction was not released")
+        return verified
+
+    monkeypatch.setattr(agents, "_authenticate_registered_node", block_registered_node_transaction)
+
+    def observe_authentication_deadline() -> None:
+        if not transaction_entered.wait(timeout=1):
+            deadline_observed_before_release.append(False)
+            release_transaction.set()
+            return
+        deadline_observed_before_release.append(stalled_websocket.closed_event.wait(timeout=0.25))
+        release_transaction.set()
+
+    observer = threading.Thread(target=observe_authentication_deadline)
+    observer.start()
+    settings = Settings(
+        _env_file=None,
+        environment="local",
+        agent_gateway_enabled=True,
+        agent_authentication_timeout_seconds=0.01,
+    )
+
+    async def run_connections() -> None:
+        await asyncio.gather(
+            agents.agent_gateway(
+                authenticated_websocket,
+                session_factory=lambda: nullcontext(None),
+                settings=settings,
+            ),
+            agents.agent_gateway(
+                stalled_websocket,
+                session_factory=lambda: nullcontext(None),
+                settings=settings,
+            ),
+        )
+
+    try:
+        asyncio.run(asyncio.wait_for(run_connections(), timeout=1))
+    finally:
+        release_transaction.set()
+        observer.join(timeout=1)
+
+    assert observer.is_alive() is False
+    assert deadline_observed_before_release == [True]
+    assert stalled_websocket.closed == (4408, "agent authentication timed out")
 
 
 def test_agent_gateway_rejects_wrong_signature_opaquely(

@@ -39,3 +39,19 @@ def test_production_lifespan_refuses_to_generate_missing_ca(tmp_path, monkeypatc
     with pytest.raises(RuntimeError, match="Agent CA material is required"):
         with TestClient(create_app()):
             pass
+
+
+def test_production_api_lifespan_requires_management_proxy_secret(tmp_path, monkeypatch):
+    settings = Settings(
+        _env_file=None,
+        VISIOX_ENV="production",
+        agent_gateway_enabled=False,
+        agent_public_ws_url="wss://platform.example/agent/v1/connect",
+        management_proxy_auth_token_file=tmp_path / "missing-management-proxy-token",
+        seed_base_models_on_startup=False,
+    )
+    monkeypatch.setattr("visiox_api.main.get_settings", lambda: settings)
+
+    with pytest.raises(ValueError, match="management proxy authentication token"):
+        with TestClient(create_app()):
+            pass

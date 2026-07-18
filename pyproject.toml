@@ -9,7 +9,7 @@ description = "Private YOLO26 model management platform"
 requires-python = ">=3.12"
 dependencies = [
   "albumentations>=1.4,<2.0",
-  "alembic>=1.13,<2.0",
+  "alembic>=1.17.1,<2.0",
   "cleanvision>=0.3,<0.4",
   "cryptography>=45,<47",
   "fastapi>=0.115,<1.0",

@@ -235,41 +235,47 @@ variables above. The `config` check must report only `management-proxy` as a
 published service and no `api-service` port before anything is started.
 
 ```bash
+# BEGIN production database migration release
 set -euo pipefail
 compose_args=(
   -f infra/compose/docker-compose.yml
   -f infra/compose/docker-compose.production-mtls.yml
 )
 
+stop_database_writers() {
+  docker compose "${compose_args[@]}" stop api-service label-sync-worker training-worker
+}
+
 docker compose "${compose_args[@]}" config --format json |
   jq -e '([.services | to_entries[] | select((.value.ports // []) | length > 0) | .key] == ["management-proxy"]) and ((.services["api-service"].ports // []) | length == 0)'
+stop_database_writers
 docker compose "${compose_args[@]}" up -d postgres
 
-backup_dir='/srv/visiox/backups'
+backup_dir=${VISIOX_BACKUP_DIR:-/srv/visiox/backups}
 backup_file="$backup_dir/postgres-$(date -u +%Y%m%dT%H%M%SZ).dump"
 sudo install -d -o root -g root -m 0700 "$backup_dir"
 umask 077
 docker compose "${compose_args[@]}" exec -T postgres \
-  sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" --format=custom' > "$backup_file"
-test -s "$backup_file"
-
-stop_release() {
-  docker compose "${compose_args[@]}" stop api-service || true
-}
+  sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" --format=custom' |
+  sudo tee "$backup_file" >/dev/null
+sudo test -s "$backup_file"
+sudo cat "$backup_file" |
+  docker compose "${compose_args[@]}" exec -T postgres pg_restore --list >/dev/null
 
 if ! docker compose "${compose_args[@]}" run --rm api-migrate; then
-  stop_release
-  printf '%s\n' 'Keep api-service stopped after a failed migration.' >&2
+  stop_database_writers
+  printf '%s\n' 'Keep all database writers stopped after a failed migration.' >&2
   exit 1
 fi
 if ! docker compose "${compose_args[@]}" run --rm api-migrate alembic current --check-heads; then
-  stop_release
-  printf '%s\n' 'Keep api-service stopped after a failed migration.' >&2
+  stop_database_writers
+  printf '%s\n' 'Keep all database writers stopped after a failed migration.' >&2
   exit 1
 fi
 
 docker compose "${compose_args[@]}" up -d --wait
 docker compose "${compose_args[@]}" ps
+# END production database migration release
 ```
 
 `api-migrate` is a one-shot service. `api-service` has a
@@ -281,21 +287,33 @@ recreates.
 
 ### Migration Failure and Controlled Rollback
 
-Keep `api-service` stopped after a failed migration. Do not issue a blind
+Keep all database writers stopped after a failed migration. Do not issue a blind
 `alembic downgrade` in production: data migrations may not be reversible. Fix
 the migration and repeat the backup, upgrade, and `--check-heads` commands, or
-roll back under an approved maintenance window. Restore the verified backup with the previous release before restarting api-service. The rollback operator
-must stop the API, use the previous release's known-compatible image and
+roll back under an approved maintenance window. The rollback operator must stop
+all database writers, use the previous release's known-compatible image and
 migration revision, restore the custom-format archive, verify the intended
-revision, and only then start the API:
+revision, and only then start all database writers. Restore the verified backup
+with the previous release before restarting database writers. Check out the
+approved previous release or restore its pinned Compose image references before
+running this block:
 
 ```bash
-docker compose "${compose_args[@]}" stop api-service
-cat "$backup_file" | docker compose "${compose_args[@]}" exec -T postgres \
+# BEGIN production database rollback
+set -euo pipefail
+compose_args=(
+  -f infra/compose/docker-compose.yml
+  -f infra/compose/docker-compose.production-mtls.yml
+)
+backup_file=${VISIOX_POSTGRES_BACKUP_FILE:?VISIOX_POSTGRES_BACKUP_FILE must name the verified custom-format archive}
+
+docker compose "${compose_args[@]}" stop api-service label-sync-worker training-worker
+sudo test -s "$backup_file"
+sudo cat "$backup_file" | docker compose "${compose_args[@]}" exec -T postgres \
   sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists'
-# Switch Compose images/configuration back to the approved previous release.
 docker compose "${compose_args[@]}" run --rm api-migrate alembic current --check-heads
-docker compose "${compose_args[@]}" up -d api-service
+docker compose "${compose_args[@]}" up -d api-service label-sync-worker training-worker
+# END production database rollback
 ```
 
 After startup, run the operator mTLS and direct-backend isolation verification

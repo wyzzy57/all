@@ -57,13 +57,14 @@ var (
 type Option func(*Client)
 
 type Client struct {
-	cfg                   config.Config
-	store                 *state.Store
-	inventory             protocol.InventoryMessage
-	backoff               func(attempt int) time.Duration
-	authenticationTimeout time.Duration
-	pingInterval          time.Duration
-	pongReadDeadline      time.Duration
+	cfg                     config.Config
+	store                   *state.Store
+	inventory               protocol.InventoryMessage
+	backoff                 func(attempt int) time.Duration
+	authenticationTimeout   time.Duration
+	synchronousPhaseTimeout time.Duration
+	pingInterval            time.Duration
+	pongReadDeadline        time.Duration
 }
 
 func New(cfg config.Config, store *state.Store, inventory protocol.InventoryMessage, options ...Option) *Client {
@@ -81,13 +82,14 @@ func New(cfg config.Config, store *state.Store, inventory protocol.InventoryMess
 		inventory.Fingerprint = map[string]any{}
 	}
 	client := &Client{
-		cfg:                   cfg,
-		store:                 store,
-		inventory:             inventory,
-		backoff:               jitteredExponentialBackoff,
-		authenticationTimeout: authenticationTimeout,
-		pingInterval:          pingInterval,
-		pongReadDeadline:      pongReadDeadline,
+		cfg:                     cfg,
+		store:                   store,
+		inventory:               inventory,
+		backoff:                 jitteredExponentialBackoff,
+		authenticationTimeout:   authenticationTimeout,
+		synchronousPhaseTimeout: authenticationTimeout,
+		pingInterval:            pingInterval,
+		pongReadDeadline:        pongReadDeadline,
 	}
 	for _, option := range options {
 		if option != nil {
@@ -105,8 +107,10 @@ func WithBackoff(backoff func(attempt int) time.Duration) Option {
 	}
 }
 
-// WithConnectionDeadlines overrides connection liveness timings for tests and
-// controlled deployments. Non-positive values retain the production defaults.
+// WithConnectionDeadlines overrides pre-live phase, ping, and Pong deadlines
+// for tests and controlled deployments. The first value independently bounds
+// Dial, authentication, renewal candidate, and renewal activation phases.
+// Non-positive values retain the production defaults.
 func WithConnectionDeadlines(
 	authenticationTimeoutValue time.Duration,
 	pingIntervalValue time.Duration,
@@ -115,6 +119,7 @@ func WithConnectionDeadlines(
 	return func(client *Client) {
 		if authenticationTimeoutValue > 0 {
 			client.authenticationTimeout = authenticationTimeoutValue
+			client.synchronousPhaseTimeout = authenticationTimeoutValue
 		}
 		if pingIntervalValue > 0 {
 			client.pingInterval = pingIntervalValue
@@ -289,7 +294,9 @@ func (c *Client) runAuthenticatedConnection(
 		return false, fatal(err)
 	}
 	defer transport.CloseIdleConnections()
-	conn, _, err := websocket.Dial(ctx, identity.GatewayURL, &websocket.DialOptions{HTTPClient: httpClient})
+	dialCtx, cancelDial := context.WithTimeout(ctx, c.synchronousPhaseTimeout)
+	conn, _, err := websocket.Dial(dialCtx, identity.GatewayURL, &websocket.DialOptions{HTTPClient: httpClient})
+	cancelDial()
 	if err != nil {
 		return false, fmt.Errorf("Gateway connection failed")
 	}
@@ -319,7 +326,9 @@ func (c *Client) runAuthenticatedConnection(
 			}
 		}
 		if pending.CertificatePEM == "" {
-			candidate, err := requestRenewalCandidate(ctx, conn, identity, signer, pending)
+			renewalCandidateCtx, cancelRenewalCandidate := context.WithTimeout(ctx, c.synchronousPhaseTimeout)
+			candidate, err := requestRenewalCandidate(renewalCandidateCtx, conn, identity, signer, pending)
+			cancelRenewalCandidate()
 			if err != nil {
 				return false, err
 			}
@@ -334,7 +343,10 @@ func (c *Client) runAuthenticatedConnection(
 			pending.CertificateFingerprintSHA256 = candidate.CertificateFingerprintSHA256
 			pending.CertificateExpiresAt = candidate.CertificateExpiresAt
 		}
-		if err := acknowledgeRenewalCandidate(ctx, conn, pending); err != nil {
+		renewalActivationCtx, cancelRenewalActivation := context.WithTimeout(ctx, c.synchronousPhaseTimeout)
+		err := acknowledgeRenewalCandidate(renewalActivationCtx, conn, pending)
+		cancelRenewalActivation()
+		if err != nil {
 			return false, err
 		}
 		if err := c.store.PromotePendingRenewal(pending.RequestID, pending.CertificateFingerprintSHA256); err != nil {
