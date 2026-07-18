@@ -33,6 +33,7 @@ MANAGEMENT_REQUESTS = (
     ("POST", "/nodes/node-123/drain"),
     ("GET", "/resource-pools"),
 )
+PROXY_AUTH_TOKEN = "a" * 64
 
 
 class CommandError(AssertionError):
@@ -78,6 +79,7 @@ class ManagementPlaneMtlsProxyIntegrationTest(unittest.TestCase):
         cls.project_name = f"visioxmtls{uuid.uuid4().hex[:12]}"
         cls.compose_env = os.environ.copy()
         cls.compose_env["VISIOX_MTLS_TEST_CERT_DIR"] = str(cls.temp_dir)
+        cls.compose_env["VISIOX_MTLS_TEST_PROXY_TOKEN_PATH"] = str(cls.temp_dir / "management-proxy-token")
         cls.addClassCleanup(cls._cleanup_resources)
         cls._generate_certificates()
         cls._validate_production_compose()
@@ -141,6 +143,7 @@ make_leaf() {
 make_ca server-ca
 make_ca operator-ca
 make_ca untrusted-ca
+make_ca agent-ca
 make_leaf server server-ca serverAuth 'DNS:localhost,IP:127.0.0.1'
 make_leaf trusted-client operator-ca clientAuth ''
 make_leaf untrusted-client untrusted-ca clientAuth ''
@@ -159,6 +162,7 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             ],
             redact_output=True,
         )
+        (cls.temp_dir / "management-proxy-token").write_text(f"{PROXY_AUTH_TOKEN}\n", encoding="ascii")
 
     @classmethod
     def _validate_production_compose(cls) -> None:
@@ -170,6 +174,11 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
                 "VISIOX_MANAGEMENT_TLS_KEY_PATH": str(cls.temp_dir / "server.key"),
                 "VISIOX_MANAGEMENT_OPERATOR_CA_PATH": str(cls.temp_dir / "operator-ca.crt"),
                 "VISIOX_AGENT_PUBLIC_WS_URL": "wss://visiox-control.test/agent/v1/connect",
+                "VISIOX_AGENT_CA_CERT_HOST_PATH": str(cls.temp_dir / "agent-ca.crt"),
+                "VISIOX_AGENT_CA_KEY_HOST_PATH": str(cls.temp_dir / "agent-ca.key"),
+                "VISIOX_MANAGEMENT_PROXY_AUTH_TOKEN_HOST_PATH": str(
+                    cls.temp_dir / "management-proxy-token"
+                ),
             }
         )
         missing_wss_env = config_env.copy()
@@ -214,6 +223,27 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         api_service = services["api-service"]
         if api_service.get("ports"):
             raise AssertionError("api-service still publishes a host port")
+        api_environment = api_service.get("environment", {})
+        expected_api_environment = {
+            "VISIOX_ENV": "production",
+            "VISIOX_AGENT_AUTO_GENERATE_CA": "false",
+            "VISIOX_AGENT_CA_CERT_PATH": "/run/secrets/agent_ca_certificate",
+            "VISIOX_AGENT_CA_KEY_PATH": "/run/secrets/agent_ca_private_key",
+            "VISIOX_MANAGEMENT_PROXY_AUTH_TOKEN_FILE": "/run/secrets/management_proxy_auth_token",
+        }
+        for name, expected_value in expected_api_environment.items():
+            if api_environment.get(name) != expected_value:
+                raise AssertionError(f"production api-service must set {name}={expected_value!r}")
+        if any(volume.get("target") == "/var/lib/visiox/pki" for volume in api_service.get("volumes", [])):
+            raise AssertionError("production api-service must not retain the writable agent PKI volume")
+        api_secrets = {secret.get("target"): secret for secret in api_service.get("secrets", [])}
+        for target in (
+            "agent_ca_certificate",
+            "agent_ca_private_key",
+            "management_proxy_auth_token",
+        ):
+            if target not in api_secrets:
+                raise AssertionError(f"production api-service secret is missing: {target}")
         published_ports = {
             service_name: service.get("ports", [])
             for service_name, service in services.items()
@@ -262,6 +292,17 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             volume = proxy_volumes.get(target_path)
             if volume is None or not volume.get("read_only"):
                 raise AssertionError(f"required read-only proxy mount missing: {target_path}")
+        proxy_secrets = {secret.get("target"): secret for secret in services["management-proxy"].get("secrets", [])}
+        if "management_proxy_auth_token" not in proxy_secrets:
+            raise AssertionError("management-proxy must receive the proxy authentication token as a Docker secret")
+        root_secrets = resolved.get("secrets", {})
+        for secret_name in (
+            "agent_ca_certificate",
+            "agent_ca_private_key",
+            "management_proxy_auth_token",
+        ):
+            if not root_secrets.get(secret_name, {}).get("file"):
+                raise AssertionError(f"production Docker secret must be backed by a required host file: {secret_name}")
         networks = resolved.get("networks", {})
         if not networks.get("management-backend", {}).get("internal"):
             raise AssertionError("management-backend must be an internal network")
@@ -272,7 +313,21 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
 
     @classmethod
     def _start_proxy(cls) -> None:
-        run_command(
+        command = [
+            "docker",
+            "compose",
+            "-p",
+            cls.project_name,
+            "-f",
+            str(TEST_COMPOSE),
+            "up",
+            "-d",
+            "--wait",
+        ]
+        result = run_command(command, env=cls.compose_env, check=False)
+        if result.returncode == 0:
+            return
+        logs = run_command(
             [
                 "docker",
                 "compose",
@@ -280,12 +335,14 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
                 cls.project_name,
                 "-f",
                 str(TEST_COMPOSE),
-                "up",
-                "-d",
-                "--wait",
+                "logs",
+                "--no-color",
+                "management-proxy",
             ],
             env=cls.compose_env,
+            check=False,
         )
+        raise CommandError(f"proxy did not start:\n{result.stdout}\n{logs.stdout}")
 
     @classmethod
     def _published_proxy_port(cls) -> int:
@@ -338,9 +395,12 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         method: str,
         path: str,
         client_name: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, Any] | None]:
         body = b"{}" if method == "POST" else None
         headers = {"Host": "visiox-control.test"}
+        if extra_headers:
+            headers.update(extra_headers)
         if body is not None:
             headers["Content-Type"] = "application/json"
         connection = HTTPSConnection(
@@ -377,7 +437,11 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             result = run_command(compose_command, env=cls.compose_env, check=False)
             if result.returncode:
                 cleanup_errors.append(result.stdout.strip())
-        for network in (f"{cls.project_name}_public", f"{cls.project_name}_control-plane"):
+        for network in (
+            f"{cls.project_name}_public",
+            f"{cls.project_name}_api-dependencies",
+            f"{cls.project_name}_management-backend",
+        ):
             remaining = run_command(["docker", "network", "inspect", network], check=False)
             if remaining.returncode == 0:
                 cleanup_errors.append(f"test network remains: {network}")
@@ -403,7 +467,15 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         if cleanup_errors:
             raise AssertionError("; ".join(error for error in cleanup_errors if error))
 
-    def _assert_reached_backend(self, status: int, payload: dict[str, Any] | None, method: str, path: str) -> None:
+    def _assert_reached_backend(
+        self,
+        status: int,
+        payload: dict[str, Any] | None,
+        method: str,
+        path: str,
+        *,
+        management: bool = False,
+    ) -> None:
         self.assertEqual(status, 200)
         self.assertIsNotNone(payload)
         assert payload is not None
@@ -412,6 +484,7 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         self.assertEqual(payload["headers"]["host"], "visiox-control.test")
         self.assertEqual(payload["headers"]["x-forwarded-proto"], "https")
         self.assertTrue(payload["headers"]["x-forwarded-for"])
+        self.assertEqual(payload["management_proxy_authenticated"], management)
 
     def test_protected_routes_require_trusted_operator_certificate(self) -> None:
         for method, path in MANAGEMENT_REQUESTS:
@@ -420,7 +493,7 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
                 self.assertIn(status, {401, 403})
             with self.subTest(method=method, path=path, certificate="trusted"):
                 status, payload = self._request(method, path, "trusted-client")
-                self._assert_reached_backend(status, payload, method, path)
+                self._assert_reached_backend(status, payload, method, path, management=True)
 
     def test_untrusted_operator_certificate_fails_before_backend(self) -> None:
         try:
@@ -433,6 +506,27 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
     def test_public_enrollment_reaches_backend_without_operator_certificate(self) -> None:
         status, payload = self._request("POST", "/agent/v1/enroll")
         self._assert_reached_backend(status, payload, "POST", "/agent/v1/enroll")
+
+    def test_client_cannot_spoof_or_override_the_proxy_token(self) -> None:
+        trusted_status, trusted_payload = self._request(
+            "GET",
+            "/nodes",
+            "trusted-client",
+            {"X-Visiox-Management-Proxy-Token": "b" * 64},
+        )
+        self._assert_reached_backend(
+            trusted_status,
+            trusted_payload,
+            "GET",
+            "/nodes",
+            management=True,
+        )
+        untrusted_status, _ = self._request(
+            "GET",
+            "/nodes",
+            extra_headers={"X-Visiox-Management-Proxy-Token": PROXY_AUTH_TOKEN},
+        )
+        self.assertIn(untrusted_status, {401, 403})
 
     def test_websocket_upgrade_is_forwarded_without_operator_certificate(self) -> None:
         request = (
@@ -486,6 +580,36 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             check=False,
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_dependency_peer_cannot_bypass_management_proxy(self) -> None:
+        request = (
+            "from urllib.error import HTTPError\n"
+            "from urllib.request import Request, urlopen\n"
+            "request = Request('http://api-service:8000/nodes')\n"
+            "try:\n"
+            "    response = urlopen(request, timeout=5)\n"
+            "    print(response.status)\n"
+            "except HTTPError as error:\n"
+            "    print(error.code)\n"
+        )
+        result = run_command(
+            [
+                "docker",
+                "compose",
+                "-p",
+                self.project_name,
+                "-f",
+                str(TEST_COMPOSE),
+                "exec",
+                "-T",
+                "dependency-peer",
+                "python",
+                "-c",
+                request,
+            ],
+            env=self.compose_env,
+        )
+        self.assertEqual(result.stdout.strip(), "403")
 
 
 if __name__ == "__main__":

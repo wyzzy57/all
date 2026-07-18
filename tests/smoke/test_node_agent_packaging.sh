@@ -215,6 +215,14 @@ assert_installed_metadata() {
     test "$(stat -c '%U:%G:%a' /etc/systemd/system/visiox-node-agent.service)" = 'root:root:644'
 }
 
+assert_installed_server_ca() {
+    expected_source=$1
+    test "$(stat -c '%U:%G:%a' /etc/visiox-agent/server-ca.crt)" = 'root:visiox-agent:640'
+    cmp "$expected_source" /etc/visiox-agent/server-ca.crt
+    grep -Fqx 'VISIOX_AGENT_SERVER_CA_FILE=/etc/visiox-agent/server-ca.crt' \
+        /etc/visiox-agent/agent.env
+}
+
 run_installer_tests() {
     input_dir="$workdir/installer-input"
     mkdir -p "$input_dir"
@@ -252,6 +260,32 @@ run_installer_tests() {
     test "$(wc -l < "$systemctl_log" | tr -d ' ')" = 6
     printf '%s\n' 'existing-wrong-primary-group-reconciled=passed'
     printf '%s\n' 'ownership-and-modes=passed'
+
+    server_ca_source="$input_dir/private-lan-server-ca.crt"
+    printf '%s\n' 'test server CA fixture' > "$server_ca_source"
+    printf '%s\n' \
+        'VISIOX_AGENT_PLATFORM_URL=https://example.invalid' \
+        "VISIOX_AGENT_SERVER_CA_FILE=$server_ca_source" > "$agent_env"
+    sh "$installer" "$agent_env" "$binary" "$unit"
+    assert_installed_server_ca "$server_ca_source"
+
+    printf '%s\n' 'VISIOX_AGENT_PLATFORM_URL=https://example.invalid' > "$agent_env"
+    sh "$installer" "$agent_env" "$binary" "$unit"
+    test ! -e /etc/visiox-agent/server-ca.crt
+    if grep -Fq 'VISIOX_AGENT_SERVER_CA_FILE=' /etc/visiox-agent/agent.env; then
+        printf '%s\n' 'stale-server-ca-config=unexpected' >&2
+        exit 1
+    fi
+
+    printf '%s\n' \
+        'VISIOX_AGENT_PLATFORM_URL=https://example.invalid' \
+        "VISIOX_AGENT_SERVER_CA_FILE=$input_dir/missing-server-ca.crt" > "$agent_env"
+    set +e
+    sh "$installer" "$agent_env" "$binary" "$unit" > "$workdir/missing-server-ca.out" 2>&1
+    missing_server_ca_status=$?
+    set -e
+    test "$missing_server_ca_status" -ne 0
+    printf '%s\n' 'private-lan-server-ca-installation=passed'
 }
 
 extract_documented_installer_expansion() {
@@ -572,6 +606,12 @@ assert_mtls_curl_event() {
 }
 
 run_documentation_checks() {
+    grep -Fqx 'ReadOnlyPaths=/etc/visiox-agent' \
+        "$repo_root/apps/node-agent/packaging/systemd/visiox-node-agent.service"
+    grep -Fq 'VISIOX_AGENT_SERVER_CA_FILE=/etc/visiox-agent/server-ca.crt' "$runbook"
+    grep -Fq 'It must never be used as the HTTPS or WSS' "$runbook"
+    grep -Fq 'server trust root.' "$runbook"
+    grep -Fq 'VISIOX_MANAGEMENT_PROXY_AUTH_TOKEN_HOST_PATH' "$runbook"
     extract_documented_mtls_verification
     : > "$curl_log"
     set +e

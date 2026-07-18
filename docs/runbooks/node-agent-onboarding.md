@@ -19,6 +19,13 @@ container runtime or deploy models.
   a CSR and returns a device certificate plus the CA certificate, never a
   private key. The private key, certificate, and durable event spool remain in
   `/var/lib/visiox-agent/agent.db` with mode `0600`.
+- The returned Agent CA is a **device issuer**: it verifies the Agent's client
+  certificate at the control plane. It must never be used as the HTTPS or WSS
+  server trust root. By default the Agent trusts operating-system roots for
+  both enrollment HTTPS and the Gateway WSS connection. Set
+  `VISIOX_AGENT_SERVER_CA_FILE` only when the control plane uses a private LAN
+  server CA; the installer stores that public CA at
+  `/etc/visiox-agent/server-ca.crt` for the service user.
 - M1 does not add application authentication to the management endpoints.
   Production must enforce the operator mTLS boundary below before exposing
   those routes. Anyone who can create a token can authorize a new device during
@@ -29,10 +36,14 @@ container runtime or deploy models.
 Production is not ready until a TLS-terminating reverse proxy enforces and
 verifies this policy. Do not rely on a management-network allowlist alone, and
 do not forward a missing or untrusted operator certificate to `api-service`.
-`api-service` must have a private proxy-only listener or network, with a
-network policy or firewall that permits its backend port only from the reverse
-proxy. Do not publish or route that backend listener to operator, edge, or
-public networks. The local Compose `8000` publication in
+The production overlay keeps `api-service` off public networks and removes its
+host port. Because API dependencies share an internal Docker network, the
+application also requires an internal proxy authentication token for every
+management route. Nginx reads that token from a Docker secret only after mTLS
+succeeds, clears any client-supplied header with the same name, and injects its
+own value. A dependency-network peer that calls `api-service` directly is
+therefore rejected even though the network must remain bidirectional for API
+dependencies. The local Compose `8000` publication in
 `infra/compose/docker-compose.yml` is development-only and must not be exposed
 in production.
 Configure the proxy to require a client certificate trusted by the platform's
@@ -120,9 +131,10 @@ prerequisite; M1 is not production-ready without all three.
 ## 1. Configure the Production Control Plane
 
 M1 production requires a durable, self-signed Ed25519 Agent CA. Create it once
-on the control-plane host, retain an offline backup under the platform's key
-management policy, and mount the directory read-only into `api-service` at
-`/var/lib/visiox/pki`.
+on the control-plane host and retain an offline backup under the platform's key
+management policy. The production Compose overlay injects the certificate and
+private key into `api-service` as read-only Docker secrets; it does not mount a
+writable PKI volume into the API container.
 
 ```bash
 sudo install -d -o root -g root -m 0700 /srv/visiox/pki
@@ -140,17 +152,34 @@ location and recovery authorization. This inventory value is the durable
 same-CA identity: do not derive it from an untrusted backup or from the live
 host during recovery.
 
-The production deployment must set these values for `api-service` and bind
-mount `/srv/visiox/pki:/var/lib/visiox/pki:ro`:
+Create a separate, random proxy-to-API authorization token. This is an internal
+Docker secret, not an operator credential; never print it or pass it as a
+browser/curl header.
+
+```bash
+sudo install -d -o root -g root -m 0700 /srv/visiox/secrets
+sudo sh -c 'umask 077; openssl rand -hex 32 > /srv/visiox/secrets/management-proxy-auth-token'
+sudo chmod 0600 /srv/visiox/secrets/management-proxy-auth-token
+```
+
+The production deployment must set these host file paths before rendering the
+Compose overlay:
 
 ```dotenv
 VISIOX_ENV=production
 VISIOX_AGENT_GATEWAY_ENABLED=true
 VISIOX_AGENT_AUTO_GENERATE_CA=false
-VISIOX_AGENT_CA_CERT_PATH=/var/lib/visiox/pki/ca.crt
-VISIOX_AGENT_CA_KEY_PATH=/var/lib/visiox/pki/ca.key
+VISIOX_AGENT_CA_CERT_HOST_PATH=/srv/visiox/pki/ca.crt
+VISIOX_AGENT_CA_KEY_HOST_PATH=/srv/visiox/pki/ca.key
+VISIOX_MANAGEMENT_PROXY_AUTH_TOKEN_HOST_PATH=/srv/visiox/secrets/management-proxy-auth-token
 VISIOX_AGENT_PUBLIC_WS_URL=wss://visiox-control.example.internal/agent/v1/connect
 ```
+
+`docker compose ... config` and service startup fail closed when any of these
+host files is absent. `api-service` receives the Agent CA files and proxy token
+under `/run/secrets`; `management-proxy` receives only the proxy token. Do not
+replace this secret wiring with environment literals, a database value, or a
+writable named volume.
 
 `VISIOX_AGENT_PUBLIC_WS_URL` is a control-plane setting, not an Agent setting.
 It must be a LAN-reachable `wss://` URL at `/agent/v1/connect`, served with a
@@ -180,7 +209,10 @@ control-plane host. `server.crt` must contain the server certificate and any
 required intermediate chain. Do not copy any private key, operator certificate,
 or CA private key into the repository, an image, a ticket, or a shell log.
 The proxy needs only the public operator CA certificate; each operator keeps
-their own client certificate and key in approved local secret storage.
+their own client certificate and key in approved local secret storage. It also
+reads `management-proxy-auth-token` from the Docker secret configured above and
+overwrites any incoming `X-Visiox-Management-Proxy-Token` header, so an
+operator cannot supply or spoof the internal authorization value.
 
 ```bash
 sudo install -d -o root -g root -m 0750 /srv/visiox/management-tls
@@ -193,6 +225,9 @@ export VISIOX_MANAGEMENT_TLS_CERT_PATH='/srv/visiox/management-tls/server.crt'
 export VISIOX_MANAGEMENT_TLS_KEY_PATH='/srv/visiox/management-tls/server.key'
 export VISIOX_MANAGEMENT_OPERATOR_CA_PATH='/srv/visiox/operator-ca/operator-ca.crt'
 export VISIOX_MANAGEMENT_PROXY_PORT='8443'
+export VISIOX_AGENT_CA_CERT_HOST_PATH='/srv/visiox/pki/ca.crt'
+export VISIOX_AGENT_CA_KEY_HOST_PATH='/srv/visiox/pki/ca.key'
+export VISIOX_MANAGEMENT_PROXY_AUTH_TOKEN_HOST_PATH='/srv/visiox/secrets/management-proxy-auth-token'
 export VISIOX_AGENT_PUBLIC_WS_URL='wss://visiox-control.example.internal/agent/v1/connect'
 ```
 
@@ -466,6 +501,11 @@ esac
 scp "dist/visiox-node-agent-linux-$VISIOX_AGENT_ARCH" "$EDGE_HOST:/tmp/visiox-node-agent"
 scp apps/node-agent/packaging/install.sh "$EDGE_HOST:/tmp/visiox-node-agent-install.sh"
 scp apps/node-agent/packaging/systemd/visiox-node-agent.service "$EDGE_HOST:/tmp/visiox-node-agent.service"
+# Only when the control-plane HTTPS/WSS certificate is not rooted in the edge
+# host's operating-system trust store:
+if [ -n "${VISIOX_PRIVATE_LAN_SERVER_CA_FILE:-}" ]; then
+  scp "$VISIOX_PRIVATE_LAN_SERVER_CA_FILE" "$EDGE_HOST:/tmp/visiox-server-ca.crt"
+fi
 ```
 
 ## 3. Create a One-Time Enrollment Token
@@ -515,7 +555,7 @@ account separately.
 ```bash
 (
   umask 077
-  trap 'rm -f /tmp/visiox-node-agent.env' EXIT HUP INT TERM
+  trap 'rm -f /tmp/visiox-node-agent.env /tmp/visiox-server-ca.crt' EXIT HUP INT TERM
   read -rsp 'Enrollment token: ' VISIOX_AGENT_ENROLLMENT_TOKEN; echo
   cat > /tmp/visiox-node-agent.env <<EOF
 VISIOX_AGENT_PLATFORM_URL=https://visiox-control.example.internal
@@ -524,12 +564,30 @@ VISIOX_AGENT_ENROLLMENT_TOKEN=$VISIOX_AGENT_ENROLLMENT_TOKEN
 VISIOX_AGENT_STATE_DIR=/var/lib/visiox-agent
 VISIOX_AGENT_VERSION=0.1.0
 EOF
+  if [ -r /tmp/visiox-server-ca.crt ]; then
+    printf '%s\n' 'VISIOX_AGENT_SERVER_CA_FILE=/tmp/visiox-server-ca.crt' >> /tmp/visiox-node-agent.env
+  fi
   unset VISIOX_AGENT_ENROLLMENT_TOKEN
   sudo sh /tmp/visiox-node-agent-install.sh /tmp/visiox-node-agent.env /tmp/visiox-node-agent /tmp/visiox-node-agent.service
 )
 sudo systemctl status visiox-node-agent --no-pager
 sudo journalctl -u visiox-node-agent -n 200 --no-pager
 ```
+
+Leave `VISIOX_AGENT_SERVER_CA_FILE` unset when the control-plane server
+certificate chains to the edge host's operating-system roots. When a private
+LAN server CA is required, the installer copies the supplied public CA to
+`/etc/visiox-agent/server-ca.crt`, makes it readable only by the
+`visiox-agent` group, and rewrites the installed environment file to that
+stable path:
+
+```dotenv
+VISIOX_AGENT_SERVER_CA_FILE=/etc/visiox-agent/server-ca.crt
+```
+
+The same setting is used for the initial enrollment HTTPS request and every
+subsequent Gateway WSS connection. It does not alter device certificate
+verification and must not point to the Agent issuer CA returned by enrollment.
 
 The supported installer invocation above is the primary procedure. The
 following audited expansion is a review and emergency-manual-install reference
@@ -549,9 +607,33 @@ if ! id visiox-agent >/dev/null 2>&1; then
 elif [ "$(id -g visiox-agent)" != "$(getent group visiox-agent | cut -d: -f3)" ]; then
   sudo usermod --gid visiox-agent visiox-agent
 fi
+installed_server_ca=/etc/visiox-agent/server-ca.crt
+server_ca_source=$(sed -n 's/^VISIOX_AGENT_SERVER_CA_FILE=//p' /tmp/visiox-node-agent.env | tail -n 1)
+if [ -n "$server_ca_source" ]; then
+  case "$server_ca_source" in
+    /*) ;;
+    *) printf '%s\n' 'VISIOX_AGENT_SERVER_CA_FILE must be an absolute readable file' >&2; exit 1 ;;
+  esac
+  if [ ! -f "$server_ca_source" ] || [ ! -r "$server_ca_source" ]; then
+    printf '%s\n' 'VISIOX_AGENT_SERVER_CA_FILE is unavailable' >&2
+    exit 1
+  fi
+fi
 sudo install -d -o visiox-agent -g visiox-agent -m 0750 /var/lib/visiox-agent
 sudo install -d -o root -g visiox-agent -m 0750 /etc/visiox-agent
 sudo install -o root -g visiox-agent -m 0640 /tmp/visiox-node-agent.env /etc/visiox-agent/agent.env
+sudo sed -i '/^VISIOX_AGENT_SERVER_CA_FILE=/d' /etc/visiox-agent/agent.env
+if [ -n "$server_ca_source" ]; then
+  if [ "$server_ca_source" != "$installed_server_ca" ]; then
+    sudo install -o root -g visiox-agent -m 0640 "$server_ca_source" "$installed_server_ca"
+  else
+    sudo chown root:visiox-agent "$installed_server_ca"
+    sudo chmod 0640 "$installed_server_ca"
+  fi
+  printf '%s\n' "VISIOX_AGENT_SERVER_CA_FILE=$installed_server_ca" | sudo tee -a /etc/visiox-agent/agent.env >/dev/null
+else
+  sudo rm -f "$installed_server_ca"
+fi
 sudo install -o root -g root -m 0755 /tmp/visiox-node-agent /usr/local/bin/visiox-node-agent
 sudo install -o root -g root -m 0644 /tmp/visiox-node-agent.service /etc/systemd/system/visiox-node-agent.service
 sudo systemctl daemon-reload
@@ -559,10 +641,10 @@ sudo systemctl enable --now visiox-node-agent
 # END audited node-agent installer expansion
 ```
 
-The service runs as `visiox-agent`, has a read-only system filesystem, and may
-write only below `/var/lib/visiox-agent`. Do not change ownership of
-`agent.db`, copy it off the node, or inspect it with a tool that can modify
-BoltDB.
+The service runs as `visiox-agent`, reads `/etc/visiox-agent` but has a
+read-only system filesystem, and may write only below
+`/var/lib/visiox-agent`. Do not change ownership of `agent.db`, copy it off the
+node, or inspect it with a tool that can modify BoltDB.
 
 ## 5. Verify Enrollment and Remove the Bootstrap Secret
 
@@ -654,6 +736,7 @@ sudo rm -f /etc/systemd/system/visiox-node-agent.service
 sudo systemctl daemon-reload
 sudo rm -f /usr/local/bin/visiox-node-agent
 sudo rm -f /etc/visiox-agent/agent.env
+sudo rm -f /etc/visiox-agent/server-ca.crt
 sudo rmdir /etc/visiox-agent
 sudo rm -rf /var/lib/visiox-agent
 sudo userdel visiox-agent

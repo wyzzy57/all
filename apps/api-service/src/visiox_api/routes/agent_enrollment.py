@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from visiox_api.schemas.agent_protocol import EnrollmentRequest, EnrollmentResponse
 from visiox_api.services.agent_identity import AgentIdentityError
+from visiox_api.services.management_proxy import require_management_proxy
 from visiox_api.services.node_registry import EnrollmentRejected, NodeRegistryService
 from visiox_common.settings import Settings, get_settings
 from visiox_db.session import get_session
@@ -36,6 +37,7 @@ def get_agent_enrollment_session() -> Generator[Session]:
     "/enrollment-tokens",
     response_model=EnrollmentTokenResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_management_proxy)],
 )
 def create_enrollment_token(
     request: EnrollmentTokenRequest,

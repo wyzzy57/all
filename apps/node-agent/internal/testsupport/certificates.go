@@ -3,10 +3,12 @@ package testsupport
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"testing"
 	"time"
 
@@ -51,6 +53,43 @@ func NewCA(t testing.TB) *CA {
 
 func (c *CA) PEM() string {
 	return c.certificatePEM
+}
+
+func (c *CA) ServerTLSConfig(t testing.TB, hostname string) *tls.Config {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: hostname},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	if ipAddress := net.ParseIP(hostname); ipAddress != nil {
+		template.IPAddresses = []net.IP{ipAddress}
+	} else {
+		template.DNSNames = []string{hostname}
+	}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, template, c.certificate, publicKey, c.privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := tls.X509KeyPair(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKeyDER}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
 }
 
 func (c *CA) SignCSR(t testing.TB, csrPEM, nodeID string, expiresAt time.Time) string {

@@ -20,6 +20,12 @@ from visiox_api.services.agent_identity import (
 from visiox_common.settings import Settings
 
 
+def _management_proxy_secret(tmp_path: Path) -> Path:
+    secret_path = tmp_path / "management-proxy-token"
+    secret_path.write_text("a" * 64, encoding="ascii")
+    return secret_path
+
+
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
     values: dict[str, object] = {
         "agent_ca_cert_path": tmp_path / "ca.crt",
@@ -27,6 +33,8 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         "agent_auto_generate_ca": True,
     }
     values.update(overrides)
+    if values.get("VISIOX_ENV", "local") != "local":
+        values.setdefault("management_proxy_auth_token_file", _management_proxy_secret(tmp_path))
     return Settings(_env_file=None, **values)
 
 
@@ -294,18 +302,23 @@ def test_agent_gateway_settings_default_disabled_and_accept_local_ws() -> None:
     assert settings.agent_public_ws_url == "ws://127.0.0.1:8000/agent/v1/connect"
 
 
-def test_agent_gateway_settings_require_wss_outside_local() -> None:
+def test_agent_gateway_settings_require_wss_outside_local(tmp_path: Path) -> None:
     settings = Settings(
         _env_file=None,
         VISIOX_ENV="production",
         agent_public_ws_url="wss://visiox.example/agent/v1/connect",
+        management_proxy_auth_token_file=_management_proxy_secret(tmp_path),
     )
 
     assert settings.agent_public_ws_url.startswith("wss://")
 
 
-def test_agent_gateway_settings_secure_the_untouched_default_outside_local() -> None:
-    settings = Settings(_env_file=None, VISIOX_ENV="test")
+def test_agent_gateway_settings_secure_the_untouched_default_outside_local(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        VISIOX_ENV="test",
+        management_proxy_auth_token_file=_management_proxy_secret(tmp_path),
+    )
 
     assert settings.agent_public_ws_url == "wss://127.0.0.1:8000/agent/v1/connect"
 

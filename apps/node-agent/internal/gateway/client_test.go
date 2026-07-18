@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -2206,43 +2207,73 @@ func TestClientCancellationJoinsReaderGoroutine(t *testing.T) {
 	assertNoServerError(t, serverErrors)
 }
 
-func TestAppendEnrolledCAKeepsSystemRoots(t *testing.T) {
-	systemCA := testsupport.NewCA(t)
-	enrolledCA := testsupport.NewCA(t)
-	systemRoots := x509.NewCertPool()
-	if !systemRoots.AppendCertsFromPEM([]byte(systemCA.PEM())) {
-		t.Fatal("append system fixture CA")
-	}
+func TestGatewayHTTPClientDoesNotTrustDeviceIssuerAsServerRoot(t *testing.T) {
+	deviceIssuer := testsupport.NewCA(t)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err == nil {
+			_ = conn.CloseNow()
+		}
+	}))
+	server.TLS = deviceIssuer.ServerTLSConfig(t, "127.0.0.1")
+	server.StartTLS()
+	defer server.Close()
 
-	combined, err := appendEnrolledCA(systemRoots, enrolledCA.PEM())
+	client := New(config.Config{}, nil, protocol.InventoryMessage{})
+	httpClient, transport, err := client.gatewayHTTPClient(state.Identity{
+		GatewayURL:       strings.Replace(server.URL, "https://", "wss://", 1) + "/agent/v1/connect",
+		CACertificatePEM: deviceIssuer.PEM(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(combined.Subjects()) != 2 {
-		t.Fatalf("combined roots contain %d subjects, want 2", len(combined.Subjects()))
+	defer transport.CloseIdleConnections()
+
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	defer cancel()
+	conn, _, dialErr := websocket.Dial(ctx, strings.Replace(server.URL, "https://", "wss://", 1)+"/agent/v1/connect", &websocket.DialOptions{HTTPClient: httpClient})
+	if conn != nil {
+		_ = conn.CloseNow()
+	}
+	if dialErr == nil {
+		t.Fatal("device issuer CA must not authenticate the Gateway TLS server")
 	}
 }
 
-func TestGatewayHTTPClientRedactsInvalidStoredCA(t *testing.T) {
-	const marker = "stored-ca-rollover-secret"
-	client := New(config.Config{}, nil, protocol.InventoryMessage{})
-	_, transport, err := client.gatewayHTTPClient(state.Identity{
-		GatewayURL: "wss://gateway.example/agent/v1/connect",
-		CACertificatePEM: string(pem.EncodeToMemory(&pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: []byte(marker),
-		})),
+func TestGatewayHTTPClientTrustsOnlyExplicitConfiguredServerCA(t *testing.T) {
+	serverCA := testsupport.NewCA(t)
+	serverCAPath := filepath.Join(t.TempDir(), "server-ca.crt")
+	if err := os.WriteFile(serverCAPath, []byte(serverCA.PEM()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err == nil {
+			_ = conn.CloseNow()
+		}
+	}))
+	server.TLS = serverCA.ServerTLSConfig(t, "127.0.0.1")
+	server.StartTLS()
+	defer server.Close()
+
+	deviceIssuer := testsupport.NewCA(t)
+	client := New(config.Config{ServerCAFile: serverCAPath}, nil, protocol.InventoryMessage{})
+	httpClient, transport, err := client.gatewayHTTPClient(state.Identity{
+		GatewayURL:       strings.Replace(server.URL, "https://", "wss://", 1) + "/agent/v1/connect",
+		CACertificatePEM: deviceIssuer.PEM(),
 	})
-	if transport != nil {
-		transport.CloseIdleConnections()
+	if err != nil {
+		t.Fatal(err)
 	}
-	const want = "invalid stored certificate"
-	if err == nil || err.Error() != want {
-		t.Fatalf("error = %q, want exact stored-certificate rejection %q", err, want)
+	defer transport.CloseIdleConnections()
+
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, strings.Replace(server.URL, "https://", "wss://", 1)+"/agent/v1/connect", &websocket.DialOptions{HTTPClient: httpClient})
+	if err != nil {
+		t.Fatalf("explicit configured server CA did not authenticate Gateway TLS: %v", err)
 	}
-	if strings.Contains(err.Error(), marker) || strings.Contains(err.Error(), "x509") {
-		t.Fatalf("stored CA rejection leaked parse diagnostics: %v", err)
-	}
+	_ = conn.CloseNow()
 }
 
 func TestGatewayHTTPClientRestrictsPlaintextToExplicitLocalHosts(t *testing.T) {

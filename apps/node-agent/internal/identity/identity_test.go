@@ -677,6 +677,16 @@ func testConfig(platformURL string, allowInsecure bool) config.Config {
 	}
 }
 
+func TestEnrollmentHTTPClientFailsClosedForMissingConfiguredServerCA(t *testing.T) {
+	_, _, err := enrollmentHTTPClient(
+		config.Config{ServerCAFile: filepath.Join(t.TempDir(), "missing-server-ca.crt")},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("configured enrollment server CA must fail closed when it is unavailable")
+	}
+}
+
 func openStore(t *testing.T) *state.Store {
 	t.Helper()
 	store, err := state.Open(filepath.Join(t.TempDir(), "agent.db"))

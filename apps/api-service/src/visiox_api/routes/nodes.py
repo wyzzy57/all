@@ -8,12 +8,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from visiox_api.services.node_registry import refresh_stale_nodes
+from visiox_api.services.management_proxy import require_management_proxy
 from visiox_common.settings import Settings, get_settings
 from visiox_db.models import ComputeNode, ResourcePool
 from visiox_db.session import get_session
 
 
-router = APIRouter(tags=["nodes"])
+router = APIRouter(tags=["nodes"], dependencies=[Depends(require_management_proxy)])
 
 
 class NodeResponse(BaseModel):

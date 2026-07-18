@@ -8,7 +8,12 @@ services:
         target: /app/backend.py
         read_only: true
     networks:
-      - control-plane
+      - api-dependencies
+      - management-backend
+    environment:
+      VISIOX_TEST_PROXY_TOKEN_FILE: /run/secrets/management_proxy_auth_token
+    secrets:
+      - management_proxy_auth_token
 
   management-proxy:
     image: nginx:stable-alpine
@@ -16,10 +21,16 @@ services:
       - api-service
     ports:
       - "127.0.0.1::8443"
+    entrypoint: ["/bin/sh", "/usr/local/bin/visiox-management-proxy-entrypoint.sh"]
+    command: []
     volumes:
       - type: bind
         source: ../../../infra/proxy/nginx.conf
-        target: /etc/nginx/nginx.conf
+        target: /etc/nginx/nginx.conf.template
+        read_only: true
+      - type: bind
+        source: ../../../infra/proxy/entrypoint.sh
+        target: /usr/local/bin/visiox-management-proxy-entrypoint.sh
         read_only: true
       - type: bind
         source: ${VISIOX_MTLS_TEST_CERT_DIR}
@@ -31,9 +42,23 @@ services:
         read_only: true
     networks:
       - public
-      - control-plane
+      - management-backend
+    secrets:
+      - management_proxy_auth_token
+
+  dependency-peer:
+    image: python:3.12-alpine
+    command: ["sh", "-c", "while :; do sleep 3600; done"]
+    networks:
+      - api-dependencies
 
 networks:
   public:
-  control-plane:
+  api-dependencies:
     internal: true
+  management-backend:
+    internal: true
+
+secrets:
+  management_proxy_auth_token:
+    file: ${VISIOX_MTLS_TEST_PROXY_TOKEN_PATH:?VISIOX_MTLS_TEST_PROXY_TOKEN_PATH is required}

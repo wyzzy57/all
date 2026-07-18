@@ -1,8 +1,18 @@
 package config
 
 import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadRequiresPlatformURLAndNodeName(t *testing.T) {
@@ -92,9 +102,86 @@ func TestLoadRejectsMalformedPlatformURLAndBoolean(t *testing.T) {
 	})
 }
 
+func TestServerTLSConfigUsesOperatingSystemRootsByDefault(t *testing.T) {
+	tlsConfig, err := (Config{}).ServerTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tlsConfig.RootCAs != nil {
+		t.Fatal("default server TLS config must defer to operating-system roots")
+	}
+}
+
+func TestServerTLSConfigLoadsOnlyExplicitPrivateServerCA(t *testing.T) {
+	serverCA, subject := testServerCAPEM(t)
+	serverCAPath := filepath.Join(t.TempDir(), "server-ca.crt")
+	if err := os.WriteFile(serverCAPath, []byte(serverCA), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tlsConfig, err := (Config{ServerCAFile: serverCAPath}).ServerTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tlsConfig.RootCAs == nil {
+		t.Fatal("explicit private server CA must be appended to TLS roots")
+	}
+	for _, candidate := range tlsConfig.RootCAs.Subjects() {
+		if bytes.Equal(candidate, subject) {
+			return
+		}
+	}
+	t.Fatal("explicit private server CA was not added to TLS roots")
+}
+
+func TestServerTLSConfigFailsClosedForMissingAndInvalidFiles(t *testing.T) {
+	for name, contents := range map[string]string{
+		"missing": "",
+		"invalid": "not a certificate",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "server-ca.crt")
+			if contents != "" {
+				if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := (Config{ServerCAFile: path}).ServerTLSConfig(); err == nil {
+				t.Fatal("configured server CA file must fail closed when unreadable or invalid")
+			}
+		})
+	}
+}
+
 func setRequiredEnvironment(t *testing.T, platformURL, nodeName string) {
 	t.Helper()
 	t.Setenv("VISIOX_AGENT_PLATFORM_URL", platformURL)
 	t.Setenv("VISIOX_AGENT_NODE_NAME", nodeName)
 	t.Setenv("VISIOX_AGENT_ENROLLMENT_TOKEN", "token")
+}
+
+func testServerCAPEM(t *testing.T) (string, []byte) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(99),
+		Subject:               pkix.Name{CommonName: "Visiox Test Server Root"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), certificate.RawSubject
 }

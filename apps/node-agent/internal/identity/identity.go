@@ -94,7 +94,13 @@ func Ensure(
 	}
 	request.Header.Set("Content-Type", "application/json")
 
-	httpClient := enrollmentHTTPClient(client)
+	httpClient, transport, err := enrollmentHTTPClient(cfg, client)
+	if err != nil {
+		return state.Identity{}, err
+	}
+	if transport != nil {
+		defer transport.CloseIdleConnections()
+	}
 	response, err := httpClient.Do(request)
 	if err != nil {
 		return state.Identity{}, fmt.Errorf("send enrollment request: %w", err)
@@ -219,16 +225,29 @@ func enrollmentEndpoint(platformURL string) (string, error) {
 	return parsed.ResolveReference(&url.URL{Path: enrollmentPath}).String(), nil
 }
 
-func enrollmentHTTPClient(client *http.Client) *http.Client {
-	if client == nil {
-		client = http.DefaultClient
+func enrollmentHTTPClient(
+	cfg config.Config,
+	client *http.Client,
+) (*http.Client, *http.Transport, error) {
+	if client == nil || cfg.ServerCAFile != "" {
+		transport, err := cfg.ServerHTTPTransport()
+		if err != nil {
+			return nil, nil, err
+		}
+		return &http.Client{
+			Transport: transport,
+			Timeout:   enrollmentTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}, transport, nil
 	}
 	copy := *client
 	copy.Timeout = enrollmentTimeout
 	copy.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	return &copy
+	return &copy, nil, nil
 }
 
 func requireJSONEnd(decoder *json.Decoder) error {

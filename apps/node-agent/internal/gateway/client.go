@@ -6,7 +6,6 @@ import (
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -334,22 +333,9 @@ func (c *Client) gatewayHTTPClient(identity state.Identity) (*http.Client, *http
 		return nil, nil, fmt.Errorf("stored Gateway URL has an invalid scheme")
 	}
 
-	systemRoots, err := x509.SystemCertPool()
+	transport, err := c.cfg.ServerHTTPTransport()
 	if err != nil {
-		return nil, nil, fmt.Errorf("load operating-system certificate roots: %w", err)
-	}
-	combinedRoots, err := appendEnrolledCA(systemRoots, identity.CACertificatePEM)
-	if err != nil {
-		return nil, nil, errInvalidStoredCertificate
-	}
-	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return nil, nil, fmt.Errorf("default HTTP transport is unavailable")
-	}
-	transport := defaultTransport.Clone()
-	transport.TLSClientConfig = &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		RootCAs:    combinedRoots,
+		return nil, nil, fmt.Errorf("configure Gateway TLS client: %w", err)
 	}
 	client := &http.Client{
 		Transport: transport,
@@ -826,19 +812,6 @@ func validateDeviceCertificate(
 
 func certificateFingerprint(certificate *x509.Certificate) string {
 	return fmt.Sprintf("%x", sha256.Sum256(certificate.Raw))
-}
-
-func appendEnrolledCA(systemRoots *x509.CertPool, caCertificatePEM string) (*x509.CertPool, error) {
-	if systemRoots == nil {
-		return nil, fmt.Errorf("operating-system certificate roots are unavailable")
-	}
-	caCertificate, err := parseEnrolledCA(caCertificatePEM, time.Now())
-	if err != nil {
-		return nil, err
-	}
-	combined := systemRoots.Clone()
-	combined.AddCert(caCertificate)
-	return combined, nil
 }
 
 func parseSingleCertificate(certificatePEM, label string) (*x509.Certificate, error) {

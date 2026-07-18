@@ -2,7 +2,24 @@ services:
   api-service:
     ports: !reset []
     environment:
+      VISIOX_ENV: production
+      VISIOX_AGENT_AUTO_GENERATE_CA: "false"
+      VISIOX_AGENT_CA_CERT_PATH: /run/secrets/agent_ca_certificate
+      VISIOX_AGENT_CA_KEY_PATH: /run/secrets/agent_ca_private_key
+      VISIOX_MANAGEMENT_PROXY_AUTH_TOKEN_FILE: /run/secrets/management_proxy_auth_token
       VISIOX_AGENT_PUBLIC_WS_URL: "${VISIOX_AGENT_PUBLIC_WS_URL:?VISIOX_AGENT_PUBLIC_WS_URL must be set to the public wss URL}"
+    volumes: !reset
+      - training-runs:/workspace/training-runs:ro
+    secrets:
+      - source: agent_ca_certificate
+        target: agent_ca_certificate
+        mode: 0444
+      - source: agent_ca_private_key
+        target: agent_ca_private_key
+        mode: 0400
+      - source: management_proxy_auth_token
+        target: management_proxy_auth_token
+        mode: 0444
     networks:
       api-dependencies:
       management-backend:
@@ -62,12 +79,18 @@ services:
       api-service:
         condition: service_started
     restart: unless-stopped
+    entrypoint: ["/bin/sh", "/usr/local/bin/visiox-management-proxy-entrypoint.sh"]
+    command: []
     ports:
       - "${VISIOX_MANAGEMENT_PROXY_PORT:-8443}:8443"
     volumes:
       - type: bind
         source: ../proxy/nginx.conf
-        target: /etc/nginx/nginx.conf
+        target: /etc/nginx/nginx.conf.template
+        read_only: true
+      - type: bind
+        source: ../proxy/entrypoint.sh
+        target: /usr/local/bin/visiox-management-proxy-entrypoint.sh
         read_only: true
       - type: bind
         source: "${VISIOX_MANAGEMENT_TLS_CERT_PATH:?VISIOX_MANAGEMENT_TLS_CERT_PATH is required}"
@@ -84,6 +107,10 @@ services:
     networks:
       management-public:
       management-backend:
+    secrets:
+      - source: management_proxy_auth_token
+        target: management_proxy_auth_token
+        mode: 0444
 
 networks:
   application-internal:
@@ -93,3 +120,11 @@ networks:
   management-backend:
     internal: true
   management-public:
+
+secrets:
+  agent_ca_certificate:
+    file: "${VISIOX_AGENT_CA_CERT_HOST_PATH:?VISIOX_AGENT_CA_CERT_HOST_PATH is required}"
+  agent_ca_private_key:
+    file: "${VISIOX_AGENT_CA_KEY_HOST_PATH:?VISIOX_AGENT_CA_KEY_HOST_PATH is required}"
+  management_proxy_auth_token:
+    file: "${VISIOX_MANAGEMENT_PROXY_AUTH_TOKEN_HOST_PATH:?VISIOX_MANAGEMENT_PROXY_AUTH_TOKEN_HOST_PATH is required}"

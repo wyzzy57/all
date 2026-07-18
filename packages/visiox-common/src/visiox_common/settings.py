@@ -1,10 +1,14 @@
 from functools import lru_cache
 from pathlib import Path
+import re
 from typing import Self
 from urllib.parse import urlsplit
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_MANAGEMENT_PROXY_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,256}\Z")
 
 
 class Settings(BaseSettings):
@@ -47,14 +51,34 @@ class Settings(BaseSettings):
     agent_offline_after_seconds: int = 45
     agent_certificate_renew_before_days: int = 30
     agent_max_ws_message_bytes: int = 1024 * 1024
+    management_proxy_auth_token_file: Path | None = None
+
+    @property
+    def is_local_environment(self) -> bool:
+        return self.environment == "local"
+
+    def read_management_proxy_auth_token(self) -> str:
+        if self.is_local_environment:
+            return ""
+        if self.management_proxy_auth_token_file is None:
+            raise ValueError("management proxy authentication token is required for non-local environments")
+        try:
+            token = self.management_proxy_auth_token_file.read_text(encoding="ascii").removesuffix("\n").removesuffix("\r")
+        except (OSError, UnicodeError) as error:
+            raise ValueError(
+                "management proxy authentication token is required for non-local environments"
+            ) from error
+        if not _MANAGEMENT_PROXY_TOKEN_PATTERN.fullmatch(token):
+            raise ValueError("management proxy authentication token is invalid")
+        return token
 
     @model_validator(mode="after")
     def validate_agent_public_ws_url(self) -> Self:
-        if self.environment.lower() != "local" and "agent_public_ws_url" not in self.model_fields_set:
+        if not self.is_local_environment and "agent_public_ws_url" not in self.model_fields_set:
             self.agent_public_ws_url = self.agent_public_ws_url.replace("ws://", "wss://", 1)
 
         parsed = urlsplit(self.agent_public_ws_url)
-        required_schemes = {"ws", "wss"} if self.environment.lower() == "local" else {"wss"}
+        required_schemes = {"ws", "wss"} if self.is_local_environment else {"wss"}
         if (
             parsed.scheme.lower() not in required_schemes
             or not parsed.hostname
@@ -66,6 +90,8 @@ class Settings(BaseSettings):
                 "agent_public_ws_url must use the environment-appropriate WebSocket scheme "
                 "and path /agent/v1/connect"
             )
+        if not self.is_local_environment:
+            self.read_management_proxy_auth_token()
         return self
 
 
