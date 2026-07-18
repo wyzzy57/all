@@ -1,4 +1,6 @@
 .superpowers/
+.codex-logs/
+.planning/
 .worktrees/
 .tools/
 .venv/

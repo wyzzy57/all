@@ -162,7 +162,7 @@ services:
       - label-studio
       - start
       - --host
-      - http://10.10.40.2:8080
+      - 0.0.0.0
       - --username
       - ${LABEL_STUDIO_USERNAME:-admin@example.com}
       - --password
@@ -176,6 +176,7 @@ services:
       LABEL_STUDIO_PASSWORD: ${LABEL_STUDIO_PASSWORD:-visiox123}
       LABEL_STUDIO_USER_TOKEN: ${LABEL_STUDIO_USER_TOKEN:-visiox-label-studio-token}
     ports:
+      - "80:8080"
       - "8080:8080"
     volumes:
       - label-studio-data:/label-studio/data
