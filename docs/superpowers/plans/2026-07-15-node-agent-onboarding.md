@@ -1076,7 +1076,7 @@ Normalize architecture to `arm64` or `amd64`. Store raw version strings only aft
 For each connection:
 
 1. Load identity from bbolt.
-2. Dial `GatewayURL` with the operating-system trust store and append the enrolled platform CA as an additional root; never replace system roots with only the device CA.
+2. Dial `GatewayURL` with the operating-system trust store by default. A deployment may append only a separately provisioned `VISIOX_AGENT_SERVER_CA_FILE` for a private HTTPS/WSS server CA. It must never add the enrolled device issuer CA to the Gateway TLS root store: the device issuer validates Agent client certificates only and is not a server trust root.
 3. Read protocol v1 challenge.
 4. Sign decoded nonce with stored Ed25519 key.
 5. Send authenticate message, require authenticated response, and reject heartbeat intervals outside 5-300 seconds.

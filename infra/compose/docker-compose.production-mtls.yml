@@ -1,4 +1,20 @@
 services:
+  api-migrate:
+    build:
+      context: ../..
+      dockerfile: apps/api-service/Dockerfile
+    env_file:
+      - ../../.env
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_started
+    environment:
+      VISIOX_ENV: production
+    networks:
+      api-dependencies:
+
   api-service:
     ports: !reset []
     environment:
@@ -23,6 +39,9 @@ services:
     networks:
       api-dependencies:
       management-backend:
+    depends_on:
+      api-migrate:
+        condition: service_completed_successfully
 
   label-sync-worker:
     networks:
@@ -82,7 +101,7 @@ services:
     entrypoint: ["/bin/sh", "/usr/local/bin/visiox-management-proxy-entrypoint.sh"]
     command: []
     ports:
-      - "${VISIOX_MANAGEMENT_PROXY_PORT:-8443}:8443"
+      - "443:8443"
     volumes:
       - type: bind
         source: ../proxy/nginx.conf

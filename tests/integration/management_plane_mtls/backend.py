@@ -81,6 +81,10 @@ class BackendHandler(BaseHTTPRequestHandler):
         self.send_header("X-Backend-Forwarded-Proto", self.headers.get("X-Forwarded-Proto", ""))
         self.send_header("X-Backend-Forwarded-For", self.headers.get("X-Forwarded-For", ""))
         self.send_header("X-Backend-Host", self.headers.get("Host", ""))
+        self.send_header(
+            "X-Backend-Management-Proxy-Token",
+            self.headers.get(MANAGEMENT_PROXY_AUTH_TOKEN_HEADER, ""),
+        )
         self.end_headers()
 
     def _send_json(self) -> None:

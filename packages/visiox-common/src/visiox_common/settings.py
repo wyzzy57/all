@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     agent_enrollment_token_ttl_minutes: int = 15
     agent_public_ws_url: str = "ws://127.0.0.1:8000/agent/v1/connect"
     agent_gateway_enabled: bool = False
+    agent_authentication_timeout_seconds: float = Field(default=15, gt=0, le=60)
     agent_heartbeat_interval_seconds: int = 15
     agent_offline_after_seconds: int = 45
     agent_certificate_renew_before_days: int = 30

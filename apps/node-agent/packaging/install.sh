@@ -59,4 +59,5 @@ install -o root -g root -m 0755 "$binary_source" /usr/local/bin/visiox-node-agen
 install -o root -g root -m 0644 "$unit_source" /etc/systemd/system/visiox-node-agent.service
 
 systemctl daemon-reload
-systemctl enable --now visiox-node-agent
+systemctl enable visiox-node-agent
+systemctl restart visiox-node-agent

@@ -131,7 +131,7 @@ class HeartbeatMessage(ProtocolModel):
 
 
 class AgentEvent(ProtocolModel):
-    sequence: int = Field(ge=0)
+    sequence: int = Field(ge=1)
     event_type: str = Field(min_length=1, max_length=80)
     command_id: str | None = Field(default=None, max_length=36)
     stage: str | None = Field(default=None, max_length=120)

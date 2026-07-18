@@ -257,7 +257,8 @@ run_installer_tests() {
     test "$(id -gn visiox-agent)" = 'visiox-agent'
     test "$(grep -c '^--gid visiox-agent visiox-agent$' "$usermod_log")" = 1
     assert_installed_metadata
-    test "$(wc -l < "$systemctl_log" | tr -d ' ')" = 6
+    test "$(grep -Fxc 'enable visiox-node-agent' "$systemctl_log")" = 3
+    test "$(grep -Fxc 'restart visiox-node-agent' "$systemctl_log")" = 3
     printf '%s\n' 'existing-wrong-primary-group-reconciled=passed'
     printf '%s\n' 'ownership-and-modes=passed'
 
@@ -292,13 +293,13 @@ extract_documented_installer_expansion() {
     documented_installer_script="$workdir/documented-node-agent-install.sh"
     start_marker='# BEGIN audited node-agent installer expansion'
     end_marker='# END audited node-agent installer expansion'
-    start_count=$(grep -Fxc "$start_marker" "$runbook" || true)
-    end_count=$(grep -Fxc "$end_marker" "$runbook" || true)
+    start_count=$(tr -d '\r' < "$runbook" | grep -Fxc "$start_marker" || true)
+    end_count=$(tr -d '\r' < "$runbook" | grep -Fxc "$end_marker" || true)
     if [ "$start_count" != 1 ] || [ "$end_count" != 1 ]; then
         printf '%s\n' 'documented-installer-expansion-block=missing' >&2
         exit 1
     fi
-    sed -n "/^$start_marker$/,/^$end_marker$/p" "$runbook" | sed '1d;$d' > "$documented_installer_script"
+    tr -d '\r' < "$runbook" | sed -n "/^$start_marker$/,/^$end_marker$/p" | sed '1d;$d' > "$documented_installer_script"
     if [ ! -s "$documented_installer_script" ]; then
         printf '%s\n' 'documented-installer-expansion-block=empty' >&2
         exit 1
@@ -325,7 +326,8 @@ run_documented_installer_expansion_test() {
     test "$(grep -c '^--gid visiox-agent visiox-agent$' "$usermod_log")" = 1
     assert_installed_metadata
     grep -Fqx 'daemon-reload' "$systemctl_log"
-    grep -Fqx 'enable --now visiox-node-agent' "$systemctl_log"
+    grep -Fqx 'enable visiox-node-agent' "$systemctl_log"
+    grep -Fqx 'restart visiox-node-agent' "$systemctl_log"
     rm -f /tmp/visiox-node-agent.env /tmp/visiox-node-agent /tmp/visiox-node-agent.service
     printf '%s\n' 'documented-installer-expansion=passed'
 }
@@ -354,7 +356,7 @@ ca_certificate_sha256_fingerprint() {
 
 extract_documented_recovery() {
     recovery_script="$workdir/documented-ca-recovery.sh"
-    sed -n '/^sudo bash -seu -- /,/^RECOVER_AGENT_CA$/p' "$runbook" > "$recovery_script"
+    tr -d '\r' < "$runbook" | sed -n '/^sudo bash -seu -- /,/^RECOVER_AGENT_CA$/p' > "$recovery_script"
     test "$(grep -c '^RECOVER_AGENT_CA$' "$recovery_script")" = 1
     test -s "$recovery_script"
 }
@@ -585,13 +587,13 @@ extract_documented_mtls_verification() {
     mtls_script="$workdir/documented-mtls-verification.sh"
     start_marker='# BEGIN operator mTLS and backend isolation verification'
     end_marker='# END operator mTLS and backend isolation verification'
-    start_count=$(grep -Fxc "$start_marker" "$runbook" || true)
-    end_count=$(grep -Fxc "$end_marker" "$runbook" || true)
+    start_count=$(tr -d '\r' < "$runbook" | grep -Fxc "$start_marker" || true)
+    end_count=$(tr -d '\r' < "$runbook" | grep -Fxc "$end_marker" || true)
     if [ "$start_count" != 1 ] || [ "$end_count" != 1 ]; then
         printf '%s\n' 'documented-mtls-verification-block=missing' >&2
         exit 1
     fi
-    sed -n "/^$start_marker$/,/^$end_marker$/p" "$runbook" | sed '1d;$d' > "$mtls_script"
+    tr -d '\r' < "$runbook" | sed -n "/^$start_marker$/,/^$end_marker$/p" | sed '1d;$d' > "$mtls_script"
     if [ ! -s "$mtls_script" ]; then
         printf '%s\n' 'documented-mtls-verification-block=empty' >&2
         exit 1
@@ -612,6 +614,18 @@ run_documentation_checks() {
     grep -Fq 'It must never be used as the HTTPS or WSS' "$runbook"
     grep -Fq 'server trust root.' "$runbook"
     grep -Fq 'VISIOX_MANAGEMENT_PROXY_AUTH_TOKEN_HOST_PATH' "$runbook"
+    grep -Fq 'must never add the enrolled device issuer CA to the Gateway TLS root store' \
+        "$repo_root/docs/superpowers/plans/2026-07-15-node-agent-onboarding.md"
+    if grep -Fq '"$VISIOX_API_URL/health"' "$runbook"; then
+        printf '%s\n' 'routine-diagnostics-must-not-call-proxy-health=failed' >&2
+        exit 1
+    fi
+    grep -Fq 'exec -T api-service python -c' "$runbook"
+    grep -Fq 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' "$runbook"
+    grep -Fq 'run --rm api-migrate' "$runbook"
+    grep -Fq 'alembic current --check-heads' "$runbook"
+    grep -Fq 'Keep api-service stopped after a failed migration' "$runbook"
+    grep -Fq 'Restore the verified backup with the previous release before restarting api-service' "$runbook"
     extract_documented_mtls_verification
     : > "$curl_log"
     set +e

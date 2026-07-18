@@ -35,6 +35,9 @@ const (
 	minimumHeartbeatSeconds  = 5
 	maximumHeartbeatSeconds  = 300
 	certificateRenewalWindow = 30 * 24 * time.Hour
+	authenticationTimeout    = 15 * time.Second
+	pingInterval             = 30 * time.Second
+	pongReadDeadline         = 10 * time.Second
 )
 
 var (
@@ -54,10 +57,13 @@ var (
 type Option func(*Client)
 
 type Client struct {
-	cfg       config.Config
-	store     *state.Store
-	inventory protocol.InventoryMessage
-	backoff   func(attempt int) time.Duration
+	cfg                   config.Config
+	store                 *state.Store
+	inventory             protocol.InventoryMessage
+	backoff               func(attempt int) time.Duration
+	authenticationTimeout time.Duration
+	pingInterval          time.Duration
+	pongReadDeadline      time.Duration
 }
 
 func New(cfg config.Config, store *state.Store, inventory protocol.InventoryMessage, options ...Option) *Client {
@@ -75,10 +81,13 @@ func New(cfg config.Config, store *state.Store, inventory protocol.InventoryMess
 		inventory.Fingerprint = map[string]any{}
 	}
 	client := &Client{
-		cfg:       cfg,
-		store:     store,
-		inventory: inventory,
-		backoff:   jitteredExponentialBackoff,
+		cfg:                   cfg,
+		store:                 store,
+		inventory:             inventory,
+		backoff:               jitteredExponentialBackoff,
+		authenticationTimeout: authenticationTimeout,
+		pingInterval:          pingInterval,
+		pongReadDeadline:      pongReadDeadline,
 	}
 	for _, option := range options {
 		if option != nil {
@@ -92,6 +101,26 @@ func WithBackoff(backoff func(attempt int) time.Duration) Option {
 	return func(client *Client) {
 		if backoff != nil {
 			client.backoff = backoff
+		}
+	}
+}
+
+// WithConnectionDeadlines overrides connection liveness timings for tests and
+// controlled deployments. Non-positive values retain the production defaults.
+func WithConnectionDeadlines(
+	authenticationTimeoutValue time.Duration,
+	pingIntervalValue time.Duration,
+	pongReadDeadlineValue time.Duration,
+) Option {
+	return func(client *Client) {
+		if authenticationTimeoutValue > 0 {
+			client.authenticationTimeout = authenticationTimeoutValue
+		}
+		if pingIntervalValue > 0 {
+			client.pingInterval = pingIntervalValue
+		}
+		if pongReadDeadlineValue > 0 {
+			client.pongReadDeadline = pongReadDeadlineValue
 		}
 	}
 }
@@ -267,7 +296,9 @@ func (c *Client) runAuthenticatedConnection(
 	defer conn.CloseNow()
 	conn.SetReadLimit(maximumMessageBytes)
 
-	heartbeatSeconds, err := authenticate(ctx, conn, identity, signer)
+	authenticationCtx, cancelAuthentication := context.WithTimeout(ctx, c.authenticationTimeout)
+	heartbeatSeconds, err := authenticate(authenticationCtx, conn, identity, signer)
+	cancelAuthentication()
 	if err != nil {
 		return false, err
 	}
@@ -531,6 +562,8 @@ func (c *Client) runLiveConnection(
 
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
+	pingTicker := time.NewTicker(c.pingInterval)
+	defer pingTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -541,6 +574,17 @@ func (c *Client) runLiveConnection(
 			}
 			if err := c.writePendingEvents(ctx, conn, &highestSent); err != nil {
 				return stable, err
+			}
+			stable = true
+		case <-pingTicker.C:
+			// Ping waits for a Pong while readServerMessages keeps consuming control frames.
+			// Its deadline therefore bounds a half-open Gateway read without imposing an
+			// application-message deadline on an otherwise healthy idle connection.
+			pongCtx, cancelPong := context.WithTimeout(ctx, c.pongReadDeadline)
+			err := conn.Ping(pongCtx)
+			cancelPong()
+			if err != nil {
+				return stable, fmt.Errorf("Gateway pong read deadline exceeded: %w", err)
 			}
 			stable = true
 		case result := <-readerResults:

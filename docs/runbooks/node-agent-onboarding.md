@@ -224,7 +224,6 @@ sudo install -o root -g root -m 0644 "$VISIOX_OPERATOR_CA_CERT" /srv/visiox/oper
 export VISIOX_MANAGEMENT_TLS_CERT_PATH='/srv/visiox/management-tls/server.crt'
 export VISIOX_MANAGEMENT_TLS_KEY_PATH='/srv/visiox/management-tls/server.key'
 export VISIOX_MANAGEMENT_OPERATOR_CA_PATH='/srv/visiox/operator-ca/operator-ca.crt'
-export VISIOX_MANAGEMENT_PROXY_PORT='8443'
 export VISIOX_AGENT_CA_CERT_HOST_PATH='/srv/visiox/pki/ca.crt'
 export VISIOX_AGENT_CA_KEY_HOST_PATH='/srv/visiox/pki/ca.key'
 export VISIOX_MANAGEMENT_PROXY_AUTH_TOKEN_HOST_PATH='/srv/visiox/secrets/management-proxy-auth-token'
@@ -244,8 +243,59 @@ compose_args=(
 
 docker compose "${compose_args[@]}" config --format json |
   jq -e '([.services | to_entries[] | select((.value.ports // []) | length > 0) | .key] == ["management-proxy"]) and ((.services["api-service"].ports // []) | length == 0)'
+docker compose "${compose_args[@]}" up -d postgres
+
+backup_dir='/srv/visiox/backups'
+backup_file="$backup_dir/postgres-$(date -u +%Y%m%dT%H%M%SZ).dump"
+sudo install -d -o root -g root -m 0700 "$backup_dir"
+umask 077
+docker compose "${compose_args[@]}" exec -T postgres \
+  sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" --format=custom' > "$backup_file"
+test -s "$backup_file"
+
+stop_release() {
+  docker compose "${compose_args[@]}" stop api-service || true
+}
+
+if ! docker compose "${compose_args[@]}" run --rm api-migrate; then
+  stop_release
+  printf '%s\n' 'Keep api-service stopped after a failed migration.' >&2
+  exit 1
+fi
+if ! docker compose "${compose_args[@]}" run --rm api-migrate alembic current --check-heads; then
+  stop_release
+  printf '%s\n' 'Keep api-service stopped after a failed migration.' >&2
+  exit 1
+fi
+
 docker compose "${compose_args[@]}" up -d --wait
 docker compose "${compose_args[@]}" ps
+```
+
+`api-migrate` is a one-shot service. `api-service` has a
+`service_completed_successfully` dependency on it, so a normal production
+`up` cannot silently start the API against an old schema. The explicit
+migration run above is intentionally repeated by the final `up`; Alembic
+`upgrade head` is idempotent and the dependency remains a guard for future
+recreates.
+
+### Migration Failure and Controlled Rollback
+
+Keep `api-service` stopped after a failed migration. Do not issue a blind
+`alembic downgrade` in production: data migrations may not be reversible. Fix
+the migration and repeat the backup, upgrade, and `--check-heads` commands, or
+roll back under an approved maintenance window. Restore the verified backup with the previous release before restarting api-service. The rollback operator
+must stop the API, use the previous release's known-compatible image and
+migration revision, restore the custom-format archive, verify the intended
+revision, and only then start the API:
+
+```bash
+docker compose "${compose_args[@]}" stop api-service
+cat "$backup_file" | docker compose "${compose_args[@]}" exec -T postgres \
+  sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists'
+# Switch Compose images/configuration back to the approved previous release.
+docker compose "${compose_args[@]}" run --rm api-migrate alembic current --check-heads
+docker compose "${compose_args[@]}" up -d api-service
 ```
 
 After startup, run the operator mTLS and direct-backend isolation verification
@@ -637,7 +687,8 @@ fi
 sudo install -o root -g root -m 0755 /tmp/visiox-node-agent /usr/local/bin/visiox-node-agent
 sudo install -o root -g root -m 0644 /tmp/visiox-node-agent.service /etc/systemd/system/visiox-node-agent.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now visiox-node-agent
+sudo systemctl enable visiox-node-agent
+sudo systemctl restart visiox-node-agent
 # END audited node-agent installer expansion
 ```
 
@@ -697,7 +748,8 @@ configuration:
 ```bash
 sudo systemctl status visiox-node-agent --no-pager
 sudo journalctl -u visiox-node-agent -n 200 --no-pager
-curl --fail --silent --show-error "$VISIOX_API_URL/health"
+docker compose -f infra/compose/docker-compose.yml -f infra/compose/docker-compose.production-mtls.yml \
+  exec -T api-service python -c "from urllib.request import urlopen; response = urlopen('http://127.0.0.1:8000/health', timeout=10); response.read(); raise SystemExit(response.status != 200)"
 curl --fail --silent --show-error \
   --cert "$VISIOX_OPERATOR_CERT_FILE" \
   --key "$VISIOX_OPERATOR_KEY_FILE" \

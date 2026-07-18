@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import json
@@ -95,8 +96,12 @@ async def agent_gateway(
         ChallengeMessage(nonce=base64.b64encode(nonce).decode()).model_dump(mode="json")
     )
     try:
-        raw_auth = await _receive_text_frame(websocket, settings)
-        auth, signature = _parse_authentication(raw_auth)
+        async with asyncio.timeout(settings.agent_authentication_timeout_seconds):
+            raw_auth = await _receive_text_frame(websocket, settings)
+            auth, signature = _parse_authentication(raw_auth)
+    except TimeoutError:
+        await websocket.close(code=4408, reason="agent authentication timed out")
+        return
     except WebSocketDisconnect:
         return
     except AgentAuthenticationRejected:

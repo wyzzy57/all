@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 from datetime import UTC, datetime, timedelta
@@ -13,7 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.websockets import WebSocketDisconnect
 
-from visiox_common.settings import get_settings
+from visiox_common.settings import Settings, get_settings
 from visiox_db.models import ComputeNode, NodeEvent, ResourcePool
 
 
@@ -38,6 +39,26 @@ INVALID_CERTIFICATE_REQUEST = {
     "message": "Certificate request rejected",
     "retryable": False,
 }
+
+
+class _StalledAuthenticationWebSocket:
+    def __init__(self) -> None:
+        self.accepted = False
+        self.messages: list[dict[str, object]] = []
+        self.closed: tuple[int, str] | None = None
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def send_json(self, message: dict[str, object]) -> None:
+        self.messages.append(message)
+
+    async def receive(self) -> dict[str, object]:
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    async def close(self, code: int, reason: str) -> None:
+        self.closed = (code, reason)
 
 
 def new_agent_csr(name: str) -> tuple[ed25519.Ed25519PrivateKey, str]:
@@ -199,6 +220,28 @@ def test_agent_gateway_authenticates_updates_inventory_and_acks_events(
     node = agent_api_client.get(f"/nodes/{node_id}").json()
     assert node["status"] == "online"
     assert node["fingerprint"]["tensorrt"] == "10.3"
+
+
+def test_agent_gateway_closes_unauthenticated_connection_after_authentication_deadline() -> None:
+    from visiox_api.ws.agents import agent_gateway
+
+    websocket = _StalledAuthenticationWebSocket()
+    settings = Settings(
+        _env_file=None,
+        environment="local",
+        agent_gateway_enabled=True,
+        agent_authentication_timeout_seconds=0.01,
+    )
+
+    asyncio.run(
+        asyncio.wait_for(
+            agent_gateway(websocket, session_factory=lambda: None, settings=settings), timeout=0.1
+        )
+    )
+
+    assert websocket.accepted is True
+    assert websocket.messages[0]["type"] == "challenge"
+    assert websocket.closed == (4408, "agent authentication timed out")
 
 
 def test_agent_gateway_rejects_wrong_signature_opaquely(

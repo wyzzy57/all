@@ -141,6 +141,146 @@ func TestClientAuthenticatesAndAcknowledgesEvents(t *testing.T) {
 	assertNoServerError(t, serverErrors)
 }
 
+func TestClientReconnectsAfterGatewayAuthenticationDeadline(t *testing.T) {
+	store := openGatewayStore(t)
+	serverErrors := make(chan error, 1)
+	firstConnectionClosed := make(chan struct{}, 1)
+	secondConnectionReady := make(chan struct{}, 1)
+	var (
+		storedIdentity state.Identity
+		signer         ed25519.PrivateKey
+		ca             *testsupport.CA
+		connections    atomic.Int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+
+		switch connections.Add(1) {
+		case 1:
+			_, _, _ = peerRead(conn)
+			firstConnectionClosed <- struct{}{}
+		case 2:
+			if err := authenticatePeer(conn, storedIdentity, signer, ca, 5); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			if err := expectLiveInventory(conn); err != nil {
+				reportServerError(serverErrors, err)
+				return
+			}
+			secondConnectionReady <- struct{}{}
+			<-r.Context().Done()
+		default:
+			reportServerError(serverErrors, fmt.Errorf("unexpected connection %d", connections.Load()))
+		}
+	}))
+	defer server.Close()
+
+	storedIdentity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-auth-deadline",
+		websocketURL(server.URL),
+		time.Now().Add(365*24*time.Hour),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	runDone := runClient(ctx, New(
+		testGatewayConfig(),
+		store,
+		testInventory(),
+		WithBackoff(zeroBackoff),
+		WithConnectionDeadlines(100*time.Millisecond, time.Second, time.Second),
+	))
+
+	waitSignalOrError(t, ctx, firstConnectionClosed, serverErrors, "authentication deadline close")
+	waitSignalOrError(t, ctx, secondConnectionReady, serverErrors, "authenticated reconnect")
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	assertNoServerError(t, serverErrors)
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("Gateway connections = %d, want 2", got)
+	}
+}
+
+func TestClientReconnectsWhenGatewayStopsRespondingToPings(t *testing.T) {
+	store := openGatewayStore(t)
+	serverErrors := make(chan error, 1)
+	firstConnectionReady := make(chan struct{}, 1)
+	secondConnectionReady := make(chan struct{}, 1)
+	releaseFirstConnection := make(chan struct{})
+	var (
+		storedIdentity state.Identity
+		signer         ed25519.PrivateKey
+		ca             *testsupport.CA
+		connections    atomic.Int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		defer conn.CloseNow()
+		if err := authenticatePeer(conn, storedIdentity, signer, ca, 5); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+		if err := expectLiveInventory(conn); err != nil {
+			reportServerError(serverErrors, err)
+			return
+		}
+
+		switch connections.Add(1) {
+		case 1:
+			firstConnectionReady <- struct{}{}
+			<-releaseFirstConnection
+		case 2:
+			secondConnectionReady <- struct{}{}
+			<-r.Context().Done()
+		default:
+			reportServerError(serverErrors, fmt.Errorf("unexpected connection %d", connections.Load()))
+		}
+	}))
+	defer server.Close()
+
+	storedIdentity, signer, ca = testsupport.NewStoredIdentity(
+		t,
+		store,
+		"node-pong-deadline",
+		websocketURL(server.URL),
+		time.Now().Add(365*24*time.Hour),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), peerTimeout)
+	runDone := runClient(ctx, New(
+		testGatewayConfig(),
+		store,
+		testInventory(),
+		WithBackoff(zeroBackoff),
+		WithConnectionDeadlines(time.Second, 100*time.Millisecond, 100*time.Millisecond),
+	))
+
+	waitSignalOrError(t, ctx, firstConnectionReady, serverErrors, "first live connection")
+	waitSignalOrError(t, ctx, secondConnectionReady, serverErrors, "pong-timeout reconnect")
+	close(releaseFirstConnection)
+	cancel()
+	if err := waitClient(t, runDone); err != nil {
+		t.Fatalf("Run returned an error after cancellation: %v", err)
+	}
+	assertNoServerError(t, serverErrors)
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("Gateway connections = %d, want 2", got)
+	}
+}
+
 func TestClientRenewsCertificateBeforeExpiry(t *testing.T) {
 	store := openGatewayStore(t)
 	serverReady := make(chan struct{}, 1)

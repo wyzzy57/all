@@ -531,6 +531,19 @@ def test_protocol_messages_enforce_base64_utc_batch_and_json_size_bounds() -> No
             fingerprint={},
             agent_version="0.1.0",
         )
+    with pytest.raises(ValidationError):
+        EventBatchMessage(
+            protocol_version=1,
+            type="event_batch",
+            events=[
+                {
+                    "sequence": 0,
+                    "event_type": "progress",
+                    "payload": {},
+                    "occurred_at": datetime.now(UTC),
+                }
+            ],
+        )
 
 
 def test_raw_message_size_uses_received_utf8_bytes_before_json_parsing() -> None:

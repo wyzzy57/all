@@ -169,7 +169,6 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         config_env = cls.compose_env.copy()
         config_env.update(
             {
-                "VISIOX_MANAGEMENT_PROXY_PORT": "8443",
                 "VISIOX_MANAGEMENT_TLS_CERT_PATH": str(cls.temp_dir / "server.crt"),
                 "VISIOX_MANAGEMENT_TLS_KEY_PATH": str(cls.temp_dir / "server.key"),
                 "VISIOX_MANAGEMENT_OPERATOR_CA_PATH": str(cls.temp_dir / "operator-ca.crt"),
@@ -244,6 +243,21 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         ):
             if target not in api_secrets:
                 raise AssertionError(f"production api-service secret is missing: {target}")
+        migration = services.get("api-migrate")
+        if migration is None:
+            raise AssertionError("production overlay must define the Alembic migration job")
+        if migration.get("command") != ["alembic", "upgrade", "head"]:
+            raise AssertionError("migration job must run alembic upgrade head")
+        if migration.get("restart") not in {"no", ""}:
+            raise AssertionError("migration job must be one-shot")
+        if set(migration.get("networks", {})) != {"api-dependencies"}:
+            raise AssertionError("migration job must use only the dependency network")
+        migration_environment = migration.get("environment", {})
+        if migration_environment.get("VISIOX_ENV") != "production":
+            raise AssertionError("migration job must use production configuration")
+        migration_dependency = api_service.get("depends_on", {}).get("api-migrate", {})
+        if migration_dependency.get("condition") != "service_completed_successfully":
+            raise AssertionError("api-service must wait for the migration job to complete")
         published_ports = {
             service_name: service.get("ports", [])
             for service_name, service in services.items()
@@ -253,7 +267,10 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             raise AssertionError(f"production merge publishes non-proxy ports: {published_ports}")
         if len(published_ports["management-proxy"]) != 1:
             raise AssertionError("management-proxy must publish exactly one port")
-        target = published_ports["management-proxy"][0].get("target")
+        published_proxy_port = published_ports["management-proxy"][0]
+        if str(published_proxy_port.get("published")) != "443":
+            raise AssertionError("production proxy must publish host port 443")
+        target = published_proxy_port.get("target")
         if target != 8443:
             raise AssertionError("proxy must publish its TLS listener")
         api_networks = set(api_service.get("networks", {}))
@@ -269,6 +286,7 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         }
         expected_api_dependency_services = {
             "api-service",
+            "api-migrate",
             "postgres",
             "redis",
             "minio",
@@ -529,9 +547,19 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         self.assertIn(untrusted_status, {401, 403})
 
     def test_websocket_upgrade_is_forwarded_without_operator_certificate(self) -> None:
+        proxy_config = PROXY_CONFIG.read_text(encoding="utf-8")
+        self.assertIn(
+            "limit_conn_zone $binary_remote_addr zone=agent_ws_connections:10m;", proxy_config
+        )
+        self.assertIn(
+            "limit_req_zone $binary_remote_addr zone=agent_ws_requests:10m rate=60r/m;", proxy_config
+        )
+        self.assertIn("limit_conn agent_ws_connections 32;", proxy_config)
+        self.assertIn("limit_req zone=agent_ws_requests burst=20 nodelay;", proxy_config)
         request = (
             "GET /agent/v1/connect HTTP/1.1\r\n"
             "Host: visiox-control.test\r\n"
+            "X-Visiox-Management-Proxy-Token: forged-browser-token\r\n"
             "Connection: Upgrade\r\n"
             "Upgrade: websocket\r\n"
             "Sec-WebSocket-Version: 13\r\n"
@@ -549,6 +577,8 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         self.assertIn("x-backend-forwarded-proto: https", lowered)
         self.assertIn("x-backend-forwarded-for:", lowered)
         self.assertIn("x-backend-host: visiox-control.test", lowered)
+        self.assertIn("x-backend-management-proxy-token: ", lowered)
+        self.assertNotIn("x-backend-management-proxy-token: forged-browser-token", lowered)
 
     def test_unknown_management_variants_are_denied(self) -> None:
         for method, path in (
