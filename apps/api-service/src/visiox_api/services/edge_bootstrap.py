@@ -129,23 +129,36 @@ class EdgeBootstrapChannel:
         )
         self._clock = clock
 
-    def request(self, request: dict[str, Any]) -> dict[str, Any]:
+    def request(
+        self,
+        request: dict[str, Any],
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         request_id = request.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             raise BootstrapChannelError("Edge bootstrap channel failed")
-        deadline = self._clock() + REQUEST_TIMEOUT_SECONDS
-        wire_request = {**request, _CLIENT_DEADLINE_FIELD: deadline}
+        request_deadline = min(
+            deadline if deadline is not None else float("inf"),
+            self._clock() + REQUEST_TIMEOUT_SECONDS,
+        )
+        _remaining(request_deadline, self._clock)
+        wire_request = {**request, _CLIENT_DEADLINE_FIELD: request_deadline}
         frame = _encode(wire_request)
         connection = self._socket_factory()
         try:
-            _set_timeout(connection, deadline, self._clock)
+            _set_timeout(connection, request_deadline, self._clock)
             connection.connect(str(self._socket_path))
-            _set_timeout(connection, deadline, self._clock)
+            _set_timeout(connection, request_deadline, self._clock)
             connection.sendall(frame)
-            _set_timeout(connection, deadline, self._clock)
+            _set_timeout(connection, request_deadline, self._clock)
             connection.shutdown(socket.SHUT_WR)
-            response = _decode(connection, deadline=deadline, clock=self._clock)
-            _set_timeout(connection, deadline, self._clock)
+            response = _decode(
+                connection,
+                deadline=request_deadline,
+                clock=self._clock,
+            )
+            _set_timeout(connection, request_deadline, self._clock)
             if connection.recv(1) != b"":
                 raise BootstrapChannelError("Edge bootstrap channel failed")
         except BootstrapChannelError:
@@ -206,8 +219,14 @@ class EdgeBootstrapService:
     def __init__(self, socket_path: Path, *, channel: EdgeBootstrapChannel | None = None) -> None:
         self._channel = channel or EdgeBootstrapChannel(socket_path)
 
-    def scan_host_key(self, *, host: str, port: int) -> dict[str, Any]:
-        return self._send("scan_host_key", host=host, port=port)
+    def scan_host_key(
+        self,
+        *,
+        host: str,
+        port: int,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        return self._send("scan_host_key", host=host, port=port, deadline=deadline)
 
     def bootstrap(
         self,
@@ -218,6 +237,7 @@ class EdgeBootstrapService:
         password: str,
         confirmed_fingerprint: str,
         node_name: str,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         return self._send(
             "bootstrap",
@@ -227,6 +247,7 @@ class EdgeBootstrapService:
             password=password,
             confirmed_fingerprint=confirmed_fingerprint,
             node_name=node_name,
+            deadline=deadline,
         )
 
     def test_connection(self, *, node_id: str) -> dict[str, Any]:
@@ -235,9 +256,16 @@ class EdgeBootstrapService:
     def rotate_key(self, *, node_id: str) -> dict[str, Any]:
         return self._send("rotate_key", node_id=node_id)
 
-    def _send(self, operation: str, **payload: Any) -> dict[str, Any]:
+    def _send(
+        self,
+        operation: str,
+        *,
+        deadline: float | None = None,
+        **payload: Any,
+    ) -> dict[str, Any]:
         response = self._channel.request(
-            {"request_id": str(uuid4()), "operation": operation, **payload}
+            {"request_id": str(uuid4()), "operation": operation, **payload},
+            deadline=deadline,
         )
         response.pop("request_id", None)
         return response

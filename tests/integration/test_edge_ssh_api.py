@@ -1,11 +1,15 @@
+import asyncio
 from typing import Any
 
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 import logging
+import time
 
 import pytest
 
 from visiox_api.main import create_app
+from visiox_api.routes import edge_ssh
 from visiox_api.routes.edge_ssh import get_edge_bootstrap_service
 
 
@@ -23,8 +27,16 @@ class FakeBootstrapService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    def scan_host_key(self, *, host: str, port: int) -> dict[str, Any]:
-        self.calls.append(("scan_host_key", {"host": host, "port": port}))
+    def scan_host_key(
+        self,
+        *,
+        host: str,
+        port: int,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            ("scan_host_key", {"host": host, "port": port, "deadline": deadline})
+        )
         return {
             "status": "ok",
             "host_key_type": "ssh-ed25519",
@@ -62,6 +74,26 @@ def test_scan_host_key_route_never_accepts_or_forwards_password() -> None:
     assert response.status_code == 422
     assert service.calls == []
     assert "must-not-pass" not in response.text
+
+
+def test_scan_host_key_malformed_password_returns_fixed_redacted_422() -> None:
+    service = FakeBootstrapService()
+    client = _client(service)
+
+    response = client.post(
+        "/edge-nodes/scan-host-key",
+        json={
+            "host": "10.0.0.8",
+            "port": 22,
+            "password": {"secret": "scan-secret"},
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Host-key scan request is invalid"}
+    assert "scan-secret" not in response.text
+    assert "input" not in response.text
+    assert service.calls == []
 
 
 def test_bootstrap_request_forwards_password_only_to_private_worker_service() -> None:
@@ -136,6 +168,61 @@ def test_bootstrap_oversized_body_returns_fixed_redacted_422() -> None:
     assert response.json() == {"detail": "Bootstrap request is invalid"}
     assert "oversized-secret" not in response.text
     assert service.calls == []
+
+
+def test_bootstrap_thread_scheduling_is_bounded_by_http_deadline() -> None:
+    started = time.monotonic()
+    deadline = started + 0.05
+
+    def slow_call() -> dict[str, Any]:
+        time.sleep(0.078)
+        return {"status": "ok", "node_id": "too-late"}
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(edge_ssh._invoke_with_deadline(slow_call, deadline))
+    elapsed = time.monotonic() - started
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.detail == "Edge bootstrap request timed out"
+    assert elapsed < 0.078
+
+
+def test_bootstrap_raw_body_read_is_inside_http_deadline() -> None:
+    async def delayed_receive():
+        await asyncio.sleep(0.078)
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/edge-nodes/bootstrap",
+            "raw_path": b"/edge-nodes/bootstrap",
+            "query_string": b"",
+            "headers": [],
+            "client": ("testclient", 50000),
+            "server": ("testserver", 80),
+        },
+        delayed_receive,
+    )
+    started = time.monotonic()
+    deadline = started + 0.05
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            edge_ssh._read_request_model(
+                request,
+                edge_ssh.BootstrapRequest,
+                invalid_detail="Bootstrap request is invalid",
+                deadline=deadline,
+            )
+        )
+    elapsed = time.monotonic() - started
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.detail == "Edge bootstrap request timed out"
+    assert elapsed < 0.078
 
 
 def test_connection_and_rotate_routes_forward_only_node_identifier() -> None:

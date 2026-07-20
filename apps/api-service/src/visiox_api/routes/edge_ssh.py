@@ -1,10 +1,12 @@
+import asyncio
 from typing import Annotated, Any
 
 import json
+import threading
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from visiox_api.services.edge_bootstrap import (
     BootstrapChannelError,
@@ -22,7 +24,11 @@ router = APIRouter(
 )
 
 MAX_BOOTSTRAP_HTTP_BODY_BYTES = 64 * 1024
+REQUEST_TIMEOUT_SECONDS = 60.0
+_DEADLINE_SCHEDULER_GUARD_SECONDS = 0.02
 _INVALID_BOOTSTRAP_DETAIL = "Bootstrap request is invalid"
+_INVALID_SCAN_DETAIL = "Host-key scan request is invalid"
+_REQUEST_TIMEOUT_DETAIL = "Edge bootstrap request timed out"
 
 
 class ScanHostKeyRequest(BaseModel):
@@ -100,16 +106,32 @@ def _invoke(call: Any) -> dict[str, Any]:
 
 
 @router.post("/scan-host-key", response_model=ScanHostKeyResponse)
-def scan_host_key(
-    request: ScanHostKeyRequest,
+async def scan_host_key(
+    http_request: Request,
     service: BootstrapServiceDependency,
 ) -> dict[str, Any]:
+    deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+    request = await _read_request_model(
+        http_request,
+        ScanHostKeyRequest,
+        invalid_detail=_INVALID_SCAN_DETAIL,
+        deadline=deadline,
+    )
     if request.password is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Password is not accepted for host-key scans",
         )
-    return _invoke(lambda: service.scan_host_key(host=request.host, port=request.port))
+    return await _invoke_with_deadline(
+        lambda: _invoke(
+            lambda: service.scan_host_key(
+                host=request.host,
+                port=request.port,
+                deadline=deadline,
+            )
+        ),
+        deadline,
+    )
 
 
 @router.post(
@@ -121,10 +143,16 @@ async def bootstrap(
     http_request: Request,
     service: BootstrapServiceDependency,
 ) -> dict[str, Any]:
-    request = await _read_bootstrap_request(http_request)
+    deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+    request = await _read_request_model(
+        http_request,
+        BootstrapRequest,
+        invalid_detail=_INVALID_BOOTSTRAP_DETAIL,
+        deadline=deadline,
+    )
     password = request.password.get_secret_value()
     try:
-        return await run_in_threadpool(
+        return await _invoke_with_deadline(
             lambda: _invoke(
                 lambda: service.bootstrap(
                     host=request.host,
@@ -133,29 +161,99 @@ async def bootstrap(
                     password=password,
                     confirmed_fingerprint=request.confirmed_fingerprint,
                     node_name=request.node_name,
+                    deadline=deadline,
                 )
-            )
+            ),
+            deadline,
         )
     finally:
         password = ""
 
 
-async def _read_bootstrap_request(http_request: Request) -> BootstrapRequest:
+async def _read_request_model(
+    http_request: Request,
+    model_type: type[BootstrapRequest] | type[ScanHostKeyRequest],
+    *,
+    invalid_detail: str,
+    deadline: float,
+) -> BootstrapRequest | ScanHostKeyRequest:
     body = bytearray()
     try:
-        async for chunk in http_request.stream():
-            if len(body) + len(chunk) > MAX_BOOTSTRAP_HTTP_BODY_BYTES:
+        async with asyncio.timeout(_wait_timeout(deadline)):
+            async for chunk in http_request.stream():
+                if len(body) + len(chunk) > MAX_BOOTSTRAP_HTTP_BODY_BYTES:
+                    raise ValueError
+                body.extend(chunk)
+            value = json.loads(bytes(body))
+            if not isinstance(value, dict):
                 raise ValueError
-            body.extend(chunk)
-        value = json.loads(bytes(body))
-        if not isinstance(value, dict):
-            raise ValueError
-        return BootstrapRequest.model_validate(value)
+            return model_type.model_validate(value)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=_REQUEST_TIMEOUT_DETAIL,
+        ) from None
     except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=_INVALID_BOOTSTRAP_DETAIL,
+            detail=invalid_detail,
         ) from None
+
+
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
+
+
+async def _invoke_with_deadline(call: Any, deadline: float) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    completed: asyncio.Future[dict[str, Any]] = loop.create_future()
+
+    def publish(value: dict[str, Any] | None, error: BaseException | None) -> None:
+        if completed.done():
+            return
+        if error is not None:
+            completed.set_exception(error)
+        else:
+            assert value is not None
+            completed.set_result(value)
+
+    def invoke() -> None:
+        try:
+            value = call()
+            error = None
+        except BaseException as caught:
+            value = None
+            error = caught
+        try:
+            loop.call_soon_threadsafe(publish, value, error)
+        except RuntimeError:
+            pass
+
+    threading.Thread(
+        target=invoke,
+        name="visiox-edge-bootstrap-api",
+        daemon=True,
+    ).start()
+    try:
+        return await asyncio.wait_for(
+            completed,
+            timeout=_wait_timeout(deadline),
+        )
+    except TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=_REQUEST_TIMEOUT_DETAIL,
+        ) from None
+
+
+def _wait_timeout(deadline: float) -> float:
+    return max(
+        0.0,
+        _remaining(deadline) - _DEADLINE_SCHEDULER_GUARD_SECONDS,
+    )
 
 
 @router.post("/{id}/test-connection", response_model=EdgeNodeOperationResponse)

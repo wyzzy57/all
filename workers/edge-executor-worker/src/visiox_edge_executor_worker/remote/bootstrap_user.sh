@@ -20,30 +20,35 @@ print(operation)
 PY
 )"
 
-PRIVILEGE=()
-if [ "$(id -u)" -ne 0 ]; then
-    PRIVILEGE=(sudo -n)
+CURRENT_UID="$(id -u)"
+CURRENT_USER="$(id -un)"
+BOOTSTRAP_PRIVILEGE=()
+KEY_PRIVILEGE=()
+if [ "${CURRENT_UID}" -ne 0 ]; then
+    if [ "${OPERATION}" = "bootstrap_add" ]; then
+        BOOTSTRAP_PRIVILEGE=(sudo -n)
+    fi
+    if [ "${CURRENT_USER}" != "${EDGE_USER}" ]; then
+        KEY_PRIVILEGE=(sudo -n)
+    fi
 fi
 
 if [ "${OPERATION}" = "bootstrap_add" ]; then
     if ! id -u visiox-edge >/dev/null 2>&1; then
-        "${PRIVILEGE[@]}" useradd --create-home --shell /bin/bash visiox-edge
+        "${BOOTSTRAP_PRIVILEGE[@]}" useradd --create-home --shell /bin/bash visiox-edge
     fi
-    "${PRIVILEGE[@]}" groupadd -f docker
-    "${PRIVILEGE[@]}" usermod -aG docker visiox-edge
-elif [ "$(id -un)" != "${EDGE_USER}" ]; then
-    exit 2
+    "${BOOTSTRAP_PRIVILEGE[@]}" groupadd -f docker
+    "${BOOTSTRAP_PRIVILEGE[@]}" usermod -aG docker visiox-edge
 fi
 
-if [ "$(id -un)" = "${EDGE_USER}" ]; then
+if [ "${CURRENT_USER}" = "${EDGE_USER}" ]; then
     install -d -m 0700 "${SSH_DIR}"
-    TEMP_KEYS="$(mktemp "${SSH_DIR}/authorized_keys.XXXXXX")"
 else
-    "${PRIVILEGE[@]}" install -d -m 0700 -o visiox-edge -g visiox-edge "${SSH_DIR}"
-    TEMP_KEYS="$(mktemp "${DATA_PATH%/*}/authorized_keys.XXXXXX")"
+    "${KEY_PRIVILEGE[@]}" install -d -m 0700 -o visiox-edge -g visiox-edge "${SSH_DIR}"
 fi
+TEMP_KEYS="$("${KEY_PRIVILEGE[@]}" mktemp "${SSH_DIR}/authorized_keys.XXXXXX")"
 
-python3 - "${DATA_PATH}" "${AUTHORIZED_KEYS}" "${TEMP_KEYS}" <<'PY'
+"${KEY_PRIVILEGE[@]}" python3 - "${DATA_PATH}" "${AUTHORIZED_KEYS}" "${TEMP_KEYS}" <<'PY'
 import json
 from pathlib import Path
 import re
@@ -103,10 +108,10 @@ output_path.write_text(
 )
 PY
 
-chmod 0600 "${TEMP_KEYS}"
-if [ "$(id -un)" = "${EDGE_USER}" ]; then
+"${KEY_PRIVILEGE[@]}" chmod 0600 "${TEMP_KEYS}"
+if [ "${CURRENT_USER}" = "${EDGE_USER}" ]; then
     mv -f "${TEMP_KEYS}" "${AUTHORIZED_KEYS}"
 else
-    "${PRIVILEGE[@]}" install -m 0600 -o visiox-edge -g visiox-edge "${TEMP_KEYS}" "${AUTHORIZED_KEYS}"
-    rm -f "${TEMP_KEYS}"
+    "${KEY_PRIVILEGE[@]}" install -m 0600 -o visiox-edge -g visiox-edge "${TEMP_KEYS}" "${AUTHORIZED_KEYS}"
+    "${KEY_PRIVILEGE[@]}" rm -f "${TEMP_KEYS}"
 fi

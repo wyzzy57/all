@@ -20,7 +20,8 @@ _CHANNEL_READ_BYTES = 64 * 1024
 _DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 _MIN_POLL_INTERVAL_SECONDS = 0.01
 _MAX_POLL_INTERVAL_SECONDS = 0.1
-_OPERATION_JOIN_SECONDS = 0.01
+_DEADLINE_SCHEDULER_GUARD_SECONDS = 0.01
+_OPERATION_JOIN_SECONDS = 0.001
 
 
 class HostKeyMismatchError(Exception):
@@ -155,7 +156,8 @@ def _run_with_deadline(
     )
     worker.start()
     remaining = deadline - time.monotonic()
-    if remaining <= 0 or not completed.wait(remaining):
+    wait_seconds = max(0.0, remaining - _DEADLINE_SCHEDULER_GUARD_SECONDS)
+    if remaining <= 0 or not completed.wait(wait_seconds):
         on_timeout()
         worker.join(_OPERATION_JOIN_SECONDS)
         raise timeout_error(timeout_message)
@@ -188,14 +190,23 @@ def scan_host_key(
     transport = None
     try:
         transport = transport_factory(opened_socket)
-        transport.banner_timeout = _remaining(
-            deadline,
-            TimeoutError,
-            "SSH host-key scan timed out",
+        def start_client() -> None:
+            remaining = _remaining(
+                deadline,
+                TimeoutError,
+                "SSH host-key scan timed out",
+            )
+            transport.banner_timeout = remaining
+            transport.start_client(timeout=remaining)
+
+        _run_with_deadline(
+            start_client,
+            deadline=deadline,
+            timeout_error=TimeoutError,
+            timeout_message="SSH host-key scan timed out",
+            on_timeout=lambda: _close_transport_and_socket(transport, opened_socket),
         )
-        transport.start_client(
-            timeout=_remaining(deadline, TimeoutError, "SSH host-key scan timed out")
-        )
+        _remaining(deadline, TimeoutError, "SSH host-key scan timed out")
         return _scanned_host_key(transport.get_remote_server_key())
     finally:
         _close_transport_and_socket(transport, opened_socket)
@@ -292,27 +303,57 @@ class StrictSshClient:
         transport = None
         try:
             transport = self._transport_factory(opened_socket)
-            transport.banner_timeout = phase_timeout(
-                self._banner_timeout_seconds,
-                "SSH connection timed out",
-            )
-            transport.auth_timeout = phase_timeout(
-                self._auth_timeout_seconds,
-                "SSH authentication timed out",
-            )
-            transport.start_client(
-                timeout=phase_timeout(
+            def close_connection() -> None:
+                _close_transport_and_socket(transport, opened_socket)
+
+            def start_client() -> None:
+                remaining = phase_timeout(
                     self._connect_timeout_seconds,
                     "SSH connection timed out",
                 )
+                transport.banner_timeout = min(
+                    self._banner_timeout_seconds,
+                    remaining,
+                )
+                transport.start_client(timeout=remaining)
+
+            _run_with_deadline(
+                start_client,
+                deadline=deadline or _deadline(self._connect_timeout_seconds),
+                timeout_error=TimeoutError,
+                timeout_message="SSH connection timed out",
+                on_timeout=close_connection,
             )
+            if deadline is not None:
+                _remaining(deadline, TimeoutError, "SSH connection timed out")
             actual_fingerprint = _fingerprint_sha256(transport.get_remote_server_key())
             if not hmac.compare_digest(actual_fingerprint, expected_fingerprint):
                 raise HostKeyMismatchError("SSH host key did not match the configured fingerprint")
 
             try:
-                authenticate(transport)
-                authenticated = transport.is_authenticated()
+                def authenticate_and_check() -> bool:
+                    transport.auth_timeout = phase_timeout(
+                        self._auth_timeout_seconds,
+                        "SSH authentication timed out",
+                    )
+                    authenticate(transport)
+                    return transport.is_authenticated()
+
+                authenticated = _run_with_deadline(
+                    authenticate_and_check,
+                    deadline=deadline or _deadline(self._auth_timeout_seconds),
+                    timeout_error=SshAuthenticationError,
+                    timeout_message="SSH authentication timed out",
+                    on_timeout=close_connection,
+                )
+                if deadline is not None:
+                    _remaining(
+                        deadline,
+                        SshAuthenticationError,
+                        "SSH authentication timed out",
+                    )
+            except SshAuthenticationError:
+                raise
             except Exception:
                 raise SshAuthenticationError("SSH authentication failed") from None
             if not authenticated:
@@ -493,20 +534,30 @@ class StrictSshSession:
         home_attributes = sftp.lstat(home)
         owner_uid = getattr(home_attributes, "st_uid", None)
         directory = posixpath.join(home, f".visiox-{secrets.token_hex(16)}")
-        sftp.mkdir(directory, mode=0o700)
-        sftp.chmod(directory, 0o700)
-        attributes = sftp.lstat(directory)
-        if (
-            not stat.S_ISDIR(attributes.st_mode)
-            or stat.S_IMODE(attributes.st_mode) != 0o700
-            or (
-                owner_uid is not None
-                and getattr(attributes, "st_uid", None) is not None
-                and attributes.st_uid != owner_uid
-            )
-        ):
-            raise SftpTransferError("SFTP directory creation failed")
-        return RemotePrivateDirectory(path=directory, owner_uid=owner_uid)
+        created = False
+        try:
+            sftp.mkdir(directory, mode=0o700)
+            created = True
+            sftp.chmod(directory, 0o700)
+            attributes = sftp.lstat(directory)
+            if (
+                not stat.S_ISDIR(attributes.st_mode)
+                or stat.S_IMODE(attributes.st_mode) != 0o700
+                or (
+                    owner_uid is not None
+                    and getattr(attributes, "st_uid", None) is not None
+                    and attributes.st_uid != owner_uid
+                )
+            ):
+                raise SftpTransferError("SFTP directory creation failed")
+            return RemotePrivateDirectory(path=directory, owner_uid=owner_uid)
+        except Exception:
+            if created:
+                try:
+                    sftp.rmdir(directory)
+                except Exception:
+                    pass
+            raise
 
     def upload_bytes_exclusive(
         self,

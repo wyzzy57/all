@@ -169,6 +169,18 @@ class FakeTransport:
             raise self.close_error
 
 
+class SlowBannerTransport(FakeTransport):
+    def start_client(self, timeout: float) -> None:
+        time.sleep(0.078)
+        super().start_client(timeout)
+
+
+class SlowAuthenticationTransport(FakeTransport):
+    def auth_publickey(self, username: str, key: object) -> None:
+        time.sleep(0.078)
+        super().auth_publickey(username, key)
+
+
 class BlockingParamikoRequestTransport(FakeTransport):
     """Attach a real Paramiko channel whose request event is never acknowledged."""
 
@@ -315,6 +327,40 @@ class ExistingFileSftp:
         self.closed = True
 
 
+class InvalidPrivateDirectorySftp:
+    def __init__(self, channel: FakeChannel) -> None:
+        self.channel = channel
+        self.created_path: str | None = None
+        self.removed_directories: list[str] = []
+        self.closed = False
+
+    def normalize(self, path: str) -> str:
+        assert path == "."
+        return "/home/operator"
+
+    def lstat(self, path: str):
+        if path == "/home/operator":
+            mode = stat.S_IFDIR | 0o700
+        else:
+            assert path == self.created_path
+            mode = stat.S_IFDIR | 0o770
+        return type("Attributes", (), {"st_mode": mode, "st_uid": 1000})()
+
+    def mkdir(self, path: str, mode: int) -> None:
+        assert mode == 0o700
+        self.created_path = path
+
+    def chmod(self, path: str, mode: int) -> None:
+        assert path == self.created_path
+        assert mode == 0o700
+
+    def rmdir(self, path: str) -> None:
+        self.removed_directories.append(path)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _fingerprint(key: FakeHostKey) -> str:
     digest = hashlib.sha256(key.asbytes()).digest()
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
@@ -431,6 +477,46 @@ def test_authenticated_connect_accepts_a_caller_total_deadline() -> None:
     assert socket_timeouts and 0 < socket_timeouts[0] <= 0.5
     assert 0 < transport.start_timeout <= 0.5
     assert 0 < transport.auth_timeout <= 0.5
+
+
+@pytest.mark.parametrize(
+    ("transport_type", "expected_error"),
+    [
+        (SlowBannerTransport, TimeoutError),
+        (SlowAuthenticationTransport, SshAuthenticationError),
+    ],
+    ids=["banner", "authentication"],
+)
+def test_authenticated_connect_enforces_fifty_millisecond_wall_clock_deadline(
+    transport_type,
+    expected_error,
+) -> None:
+    remote_key = FakeHostKey("ssh-ed25519", b"host-key-a")
+    fake_socket = FakeSocket()
+    transport = transport_type(fake_socket, remote_key)
+    client = StrictSshClient(
+        connect_timeout_seconds=10,
+        auth_timeout_seconds=10,
+        banner_timeout_seconds=10,
+        socket_factory=lambda address, timeout: fake_socket,
+        transport_factory=lambda opened_socket: transport,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(expected_error):
+        client.connect(
+            host="edge.example",
+            port=22,
+            username="edge",
+            private_key=object(),
+            expected_fingerprint=_fingerprint(remote_key),
+            timeout_seconds=0.05,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.078
+    assert transport.closed
+    assert fake_socket.closed
 
 
 @pytest.mark.parametrize("operation", ["scan", "connect"])
@@ -780,6 +866,21 @@ def test_exclusive_upload_never_removes_a_preexisting_remote_file() -> None:
         )
 
     assert existing_sftp.removed == []
+
+
+def test_private_workspace_validation_failure_removes_only_new_directory() -> None:
+    channel = FakeChannel()
+    invalid_sftp = InvalidPrivateDirectorySftp(channel)
+    session, _, _ = _connected_session(
+        channel=channel,
+        sftp_client_factory=lambda opened_channel: invalid_sftp,
+    )
+
+    with pytest.raises(SftpTransferError, match=r"^SFTP directory creation failed$"):
+        session.create_private_directory(timeout_seconds=2)
+
+    assert invalid_sftp.created_path is not None
+    assert invalid_sftp.removed_directories == [invalid_sftp.created_path]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode semantics required")

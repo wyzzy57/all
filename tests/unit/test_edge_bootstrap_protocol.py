@@ -734,12 +734,25 @@ def test_bootstrap_script_is_idempotent_and_keeps_dynamic_data_out_of_commands()
     assert "managed_line not in lines" in script
     assert "sudo -n" in script
     assert "$(id -u)" in script
-    assert 'if [ "$(id -un)" = "${EDGE_USER}" ]' in script
+    assert 'if [ "${CURRENT_USER}" = "${EDGE_USER}" ]' in script
     assert "one-time" not in script.lower()
     assert "password" not in script.lower()
     assert "eval " not in script
     assert "echo " not in script
     assert "/tmp/visiox-bootstrap" not in script
+
+
+def test_bootstrap_script_elevates_managed_key_operations_only_when_required() -> None:
+    script = resources.files("visiox_edge_executor_worker").joinpath(
+        "remote", "bootstrap_user.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'CURRENT_USER="$(id -un)"' in script
+    assert 'if [ "${CURRENT_USER}" != "${EDGE_USER}" ]' in script
+    assert "KEY_PRIVILEGE=(sudo -n)" in script
+    assert '"${KEY_PRIVILEGE[@]}" python3 -' in script
+    assert '"${KEY_PRIVILEGE[@]}" mktemp' in script
+    assert 'elif [ "$(id -un)" != "${EDGE_USER}" ]; then\n    exit 2' not in script
 
 
 def test_bootstrap_cli_initializes_security_before_server_start(monkeypatch, tmp_path) -> None:
