@@ -84,7 +84,11 @@ class BlockingWorkPool:
                 function=partial(function, *args, **kwargs),
             )
         )
-        return await asyncio.shield(future)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            future.add_done_callback(self._consume_detached_exception)
+            raise
 
     def stop_accepting(self) -> None:
         self._accepting.clear()
@@ -173,6 +177,12 @@ class BlockingWorkPool:
             future.set_exception(error)
         else:
             future.set_result(result)
+
+    @staticmethod
+    def _consume_detached_exception(future: asyncio.Future[Any]) -> None:
+        if future.cancelled():
+            return
+        future.exception()
 
 
 class EdgeOperationHandler(Protocol):

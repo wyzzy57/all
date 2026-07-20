@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import redirect_stderr
+import gc
+import io
 import json
 import logging
 import os
@@ -508,6 +511,53 @@ def test_cancelled_waiter_does_not_release_blocking_work_backpressure() -> None:
         await pool.shutdown(grace_seconds=0.01)
 
     asyncio.run(exercise())
+
+
+def test_cancelled_waiter_consumes_late_secret_failure_without_loop_diagnostics() -> None:
+    from visiox_edge_executor_worker.runner import BlockingWorkPool
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    loop_contexts: list[dict[str, object]] = []
+    captured_stderr = io.StringIO()
+
+    def fail_after_cancellation() -> None:
+        first_started.set()
+        release_first.wait(timeout=2)
+        raise ValueError("password=cancelled-secret")
+
+    def complete_second() -> str:
+        second_started.set()
+        return "pool-remains-usable"
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+        pool = BlockingWorkPool(max_workers=1)
+        detached_task = asyncio.create_task(pool.run(fail_after_cancellation))
+        assert await asyncio.to_thread(first_started.wait, 1)
+        detached_task.cancel()
+        await asyncio.gather(detached_task, return_exceptions=True)
+        del detached_task
+
+        second_task = asyncio.create_task(pool.run(complete_second))
+        await asyncio.sleep(0.02)
+        assert second_started.is_set() is False
+        release_first.set()
+        assert await asyncio.wait_for(second_task, timeout=1) == "pool-remains-usable"
+        await pool.shutdown(grace_seconds=0.01)
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+
+    with redirect_stderr(captured_stderr):
+        asyncio.run(exercise())
+
+    diagnostic_text = captured_stderr.getvalue()
+    assert loop_contexts == []
+    assert "Future exception was never retrieved" not in diagnostic_text
+    assert "cancelled-secret" not in diagnostic_text
 
 
 def test_stuck_blocking_work_cannot_hold_worker_process_past_shutdown_grace() -> None:
