@@ -23,9 +23,39 @@ services:
       VISIOX_AGENT_GATEWAY_ENABLED: "true"
       VISIOX_AGENT_AUTO_GENERATE_CA: "true"
       VISIOX_AGENT_PUBLIC_WS_URL: ${VISIOX_AGENT_PUBLIC_WS_URL:-ws://host.docker.internal:8000/agent/v1/connect}
+      VISIOX_EDGE_BOOTSTRAP_SOCKET: /run/visiox-edge/edge-bootstrap.sock
     volumes:
       - training-runs:/workspace/training-runs:ro
       - agent-pki:/var/lib/visiox/pki
+      - edge-runtime:/run/visiox-edge
+
+  edge-executor-worker:
+    build:
+      context: ../..
+      dockerfile: apps/api-service/Dockerfile
+    env_file:
+      - ../../.env
+    command:
+      - python
+      - -m
+      - visiox_edge_executor_worker.runner
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+    environment:
+      VISIOX_EDGE_BOOTSTRAP_SOCKET: /run/visiox-edge/edge-bootstrap.sock
+      VISIOX_EDGE_CREDENTIAL_MASTER_KEY_FILE: /run/secrets/edge_credential_master_key
+    volumes:
+      - edge-runtime:/run/visiox-edge
+      - ../../workers/edge-executor-worker/remote:/app/workers/edge-executor-worker/remote:ro
+    secrets:
+      - source: edge_credential_master_key
+        target: edge_credential_master_key
+        mode: 0400
+    deploy:
+      replicas: 1
 
   label-sync-worker:
     build:
@@ -189,3 +219,8 @@ volumes:
   training-runs:
   mlflow-data:
   agent-pki:
+  edge-runtime:
+
+secrets:
+  edge_credential_master_key:
+    file: ../../.local-secrets/edge_credential_master_key

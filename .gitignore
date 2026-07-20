@@ -13,5 +13,6 @@ __pycache__/
 .env
 /dist/
 /.local/visiox-agent/
+.local-secrets/
 agent.db
 *.agent-ca.key
