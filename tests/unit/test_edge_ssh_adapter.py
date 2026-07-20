@@ -1,6 +1,8 @@
 import base64
 import hashlib
 import socket as socket_module
+import threading
+import time
 
 import paramiko
 import pytest
@@ -10,8 +12,10 @@ from visiox_edge_executor_worker.ssh import (
     SftpTransferError,
     SftpTransferTimeoutError,
     SshAuthenticationError,
+    SshCommandError,
     SshCommandOutputLimitError,
     SshCommandTimeoutError,
+    SshSessionClosedError,
     StrictSshClient,
     scan_host_key,
 )
@@ -161,6 +165,83 @@ class FakeTransport:
             raise self.close_error
 
 
+class BlockingParamikoRequestTransport(FakeTransport):
+    """Attach a real Paramiko channel whose request event is never acknowledged."""
+
+    def __init__(self, socket: FakeSocket, remote_key: FakeHostKey) -> None:
+        super().__init__(socket, remote_key)
+        self.channel = paramiko.Channel(17)
+        self.channel.active = True
+        self.channel.transport = self
+        self.request_started = threading.Event()
+
+    def _send_user_message(self, message) -> None:
+        self.request_started.set()
+
+    def get_exception(self):
+        return None
+
+    def _unlink_channel(self, channel_id: int) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+        self.channel._unlink()
+
+
+class BlockingOpenTransport(FakeTransport):
+    """Model Paramiko's registered-but-not-yet-returned channel-open wait."""
+
+    def __init__(self, socket: FakeSocket, remote_key: FakeHostKey) -> None:
+        super().__init__(socket, remote_key)
+        self.open_started = threading.Event()
+        self.open_released = threading.Event()
+        self.registered_channel: paramiko.Channel | None = None
+
+    def open_session(self, timeout: float) -> paramiko.Channel:
+        self.open_timeouts.append(timeout)
+        channel = paramiko.Channel(23)
+        channel.active = True
+        channel.transport = self
+        self.registered_channel = channel
+        self.open_started.set()
+        self.open_released.wait()
+        raise paramiko.SSHException("channel open interrupted")
+
+    def _unlink_channel(self, channel_id: int) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+        if self.registered_channel is not None:
+            self.registered_channel._unlink()
+        self.open_released.set()
+
+
+class AcknowledgedParamikoRequestTransport(BlockingParamikoRequestTransport):
+    def _send_user_message(self, message) -> None:
+        self.request_started.set()
+        self.channel.event_ready = True
+        self.channel.event.set()
+
+
+class SlowChunkSftpClient:
+    def __init__(self, channel: paramiko.Channel) -> None:
+        self.channel = channel
+        self.closed = False
+        self.chunk_count = 0
+
+    def putfo(self, source, remote_path: str) -> None:
+        while source.read(1):
+            if self.channel.closed:
+                raise socket_module.timeout("transport closed")
+            self.chunk_count += 1
+            time.sleep(0.005)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeSftpClient:
     def __init__(self, channel: FakeChannel, *, put_error: Exception | None = None) -> None:
         self.channel = channel
@@ -211,6 +292,45 @@ def _connected_session(
         expected_fingerprint=_fingerprint(remote_key),
     )
     return session, transport, fake_socket
+
+
+def _session_for_transport(transport, fake_socket, *, sftp_client_factory=None):
+    client = StrictSshClient(
+        connect_timeout_seconds=3,
+        auth_timeout_seconds=4,
+        banner_timeout_seconds=5,
+        socket_factory=lambda address, timeout: fake_socket,
+        transport_factory=lambda opened_socket: transport,
+        sftp_client_factory=sftp_client_factory,
+    )
+    return client.connect(
+        host="edge.example",
+        port=22,
+        username="edge",
+        private_key=object(),
+        expected_fingerprint=_fingerprint(transport.remote_key),
+    )
+
+
+def _call_with_hard_test_guard(call, cleanup, hard_limit_seconds: float):
+    outcome: dict[str, object] = {}
+
+    def invoke() -> None:
+        try:
+            outcome["result"] = call()
+        except BaseException as error:
+            outcome["error"] = error
+
+    started = time.monotonic()
+    caller = threading.Thread(target=invoke, daemon=True)
+    caller.start()
+    caller.join(hard_limit_seconds)
+    elapsed = time.monotonic() - started
+    if caller.is_alive():
+        cleanup()
+        caller.join(0.1)
+        pytest.fail(f"operation exceeded hard test guard of {hard_limit_seconds:.3f}s")
+    return outcome, elapsed
 
 
 def test_scan_host_key_returns_a_structured_sha256_fingerprint() -> None:
@@ -411,19 +531,31 @@ def test_command_that_never_exits_times_out_and_closes_channel() -> None:
     assert channel.closed
 
 
-def test_command_deadline_remains_active_while_output_is_continuously_ready(monkeypatch) -> None:
-    channel = FakeChannel(stdout_chunks=[b"chunk"] * 10)
-    session, _, _ = _connected_session(channel=channel)
-    clock_values = iter([0.0, 0.1, 0.2, 0.3, 1.1])
-    monkeypatch.setattr(
-        "visiox_edge_executor_worker.ssh.time.monotonic",
-        lambda: next(clock_values),
-    )
+def test_command_deadline_remains_active_while_output_is_continuously_ready() -> None:
+    class ContinuouslyReadyChannel(FakeChannel):
+        def __init__(self) -> None:
+            super().__init__(never_exits=True)
+
+        def recv_ready(self) -> bool:
+            return True
+
+        def recv(self, size: int) -> bytes:
+            time.sleep(0.003)
+            return b"chunk"
+
+    channel = ContinuouslyReadyChannel()
+    session, transport, fake_socket = _connected_session(channel=channel)
+    timeout_seconds = 0.04
+    started = time.monotonic()
 
     with pytest.raises(SshCommandTimeoutError, match=r"^SSH command timed out$"):
-        session.run("continuous-output", timeout_seconds=1)
+        session.run("continuous-output", timeout_seconds=timeout_seconds)
 
+    elapsed = time.monotonic() - started
+    assert timeout_seconds * 0.75 <= elapsed < timeout_seconds * 2.75
     assert channel.closed
+    assert transport.closed
+    assert fake_socket.closed
 
 
 def test_command_open_timeout_is_fixed_and_redacted() -> None:
@@ -546,3 +678,157 @@ def test_sftp_client_construction_failure_closes_channel() -> None:
         session.upload_bytes(b"payload", "/tmp/payload", timeout_seconds=1)
 
     assert channel.closed
+
+
+def test_exec_request_wait_obeys_wall_clock_deadline_and_permanently_closes_session() -> None:
+    remote_key = FakeHostKey("ssh-ed25519", b"host-key-a")
+    fake_socket = FakeSocket()
+    transport = BlockingParamikoRequestTransport(fake_socket, remote_key)
+    session = _session_for_transport(transport, fake_socket)
+    timeout_seconds = 0.04
+
+    outcome, elapsed = _call_with_hard_test_guard(
+        lambda: session.run("secret-command", timeout_seconds=timeout_seconds),
+        session.close,
+        hard_limit_seconds=timeout_seconds * 2.75,
+    )
+
+    assert isinstance(outcome.get("error"), SshCommandTimeoutError)
+    assert str(outcome["error"]) == "SSH command timed out"
+    assert timeout_seconds * 0.75 <= elapsed < timeout_seconds * 2.75
+    assert transport.request_started.is_set()
+    assert transport.channel.event.is_set()
+    assert transport.channel.closed
+    assert transport.closed
+    assert fake_socket.closed
+
+    with pytest.raises(SshSessionClosedError, match=r"^SSH session is closed$"):
+        session.run("must-not-run", timeout_seconds=1)
+
+
+def test_sftp_subsystem_request_wait_obeys_wall_clock_deadline_and_closes_everything() -> None:
+    remote_key = FakeHostKey("ssh-ed25519", b"host-key-a")
+    fake_socket = FakeSocket()
+    transport = BlockingParamikoRequestTransport(fake_socket, remote_key)
+    session = _session_for_transport(
+        transport,
+        fake_socket,
+        sftp_client_factory=lambda channel: pytest.fail("SFTP construction must not be reached"),
+    )
+    timeout_seconds = 0.04
+
+    outcome, elapsed = _call_with_hard_test_guard(
+        lambda: session.upload_bytes(b"secret-data", "/secret/path", timeout_seconds),
+        session.close,
+        hard_limit_seconds=timeout_seconds * 2.75,
+    )
+
+    assert isinstance(outcome.get("error"), SftpTransferTimeoutError)
+    assert str(outcome["error"]) == "SFTP upload timed out"
+    assert timeout_seconds * 0.75 <= elapsed < timeout_seconds * 2.75
+    assert transport.request_started.is_set()
+    assert transport.channel.event.is_set()
+    assert transport.channel.closed
+    assert transport.closed
+    assert fake_socket.closed
+
+
+def test_sftp_open_wait_closes_registered_channel_that_was_never_returned() -> None:
+    remote_key = FakeHostKey("ssh-ed25519", b"host-key-a")
+    fake_socket = FakeSocket()
+    transport = BlockingOpenTransport(fake_socket, remote_key)
+    session = _session_for_transport(transport, fake_socket)
+    timeout_seconds = 0.04
+
+    outcome, elapsed = _call_with_hard_test_guard(
+        lambda: session.upload_bytes(b"secret-data", "/secret/path", timeout_seconds),
+        session.close,
+        hard_limit_seconds=timeout_seconds * 2.75,
+    )
+
+    assert isinstance(outcome.get("error"), SftpTransferTimeoutError)
+    assert str(outcome["error"]) == "SFTP upload timed out"
+    assert timeout_seconds * 0.75 <= elapsed < timeout_seconds * 2.75
+    assert transport.open_started.is_set()
+    assert transport.registered_channel is not None
+    assert transport.registered_channel.closed
+    assert transport.closed
+    assert fake_socket.closed
+
+
+def test_sftp_continuous_small_chunks_cannot_extend_total_deadline() -> None:
+    remote_key = FakeHostKey("ssh-ed25519", b"host-key-a")
+    fake_socket = FakeSocket()
+    transport = AcknowledgedParamikoRequestTransport(fake_socket, remote_key)
+    created: list[SlowChunkSftpClient] = []
+
+    def create_sftp(channel: paramiko.Channel) -> SlowChunkSftpClient:
+        client = SlowChunkSftpClient(channel)
+        created.append(client)
+        return client
+
+    session = _session_for_transport(
+        transport,
+        fake_socket,
+        sftp_client_factory=create_sftp,
+    )
+    timeout_seconds = 0.05
+
+    outcome, elapsed = _call_with_hard_test_guard(
+        lambda: session.upload_bytes(b"x" * 100, "/secret/path", timeout_seconds),
+        session.close,
+        hard_limit_seconds=timeout_seconds * 2.6,
+    )
+
+    assert isinstance(outcome.get("error"), SftpTransferTimeoutError)
+    assert str(outcome["error"]) == "SFTP upload timed out"
+    assert timeout_seconds * 0.75 <= elapsed < timeout_seconds * 2.6
+    assert created[0].chunk_count > 1
+    assert created[0].closed
+    assert transport.channel.closed
+    assert transport.closed
+    assert fake_socket.closed
+
+
+def test_command_failure_is_fixed_and_redacts_remote_command() -> None:
+    command = "echo top-secret-command"
+    channel = FakeChannel(exec_error=RuntimeError(f"server rejected {command}"))
+    session, _, _ = _connected_session(channel=channel)
+
+    with pytest.raises(SshCommandError, match=r"^SSH command failed$") as exc_info:
+        session.run(command, timeout_seconds=1)
+
+    assert command not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize("max_output_bytes", [0, 4 * 1024 * 1024 + 1])
+def test_strict_client_rejects_output_limits_outside_hard_bounds(max_output_bytes: int) -> None:
+    with pytest.raises(ValueError, match=r"^SSH max output bytes must be between 1 and 4194304$"):
+        StrictSshClient(
+            connect_timeout_seconds=3,
+            auth_timeout_seconds=4,
+            banner_timeout_seconds=5,
+            max_output_bytes=max_output_bytes,
+        )
+
+
+def test_idle_command_polling_uses_bounded_backoff_and_timeout_closes_session(monkeypatch) -> None:
+    channel = FakeChannel(never_exits=True)
+    session, transport, fake_socket = _connected_session(channel=channel)
+    real_sleep = time.sleep
+    sleeps: list[float] = []
+
+    def record_sleep(duration: float) -> None:
+        sleeps.append(duration)
+        real_sleep(duration)
+
+    monkeypatch.setattr("visiox_edge_executor_worker.ssh.time.sleep", record_sleep)
+
+    with pytest.raises(SshCommandTimeoutError, match=r"^SSH command timed out$"):
+        session.run("idle", timeout_seconds=0.075)
+
+    assert sleeps[:3] == pytest.approx([0.01, 0.02, 0.04], abs=0.005)
+    assert all(duration <= 0.1 for duration in sleeps)
+    assert transport.closed
+    assert fake_socket.closed

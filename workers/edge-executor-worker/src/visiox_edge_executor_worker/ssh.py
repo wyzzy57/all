@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import io
 import socket
+import threading
 import time
 from typing import Any, Callable
 
@@ -13,7 +14,9 @@ import paramiko
 _MAX_TIMEOUT_SECONDS = 60
 _CHANNEL_READ_BYTES = 64 * 1024
 _DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
-_POLL_INTERVAL_SECONDS = 0.01
+_MIN_POLL_INTERVAL_SECONDS = 0.01
+_MAX_POLL_INTERVAL_SECONDS = 0.1
+_OPERATION_JOIN_SECONDS = 0.01
 
 
 class HostKeyMismatchError(Exception):
@@ -28,6 +31,10 @@ class SshCommandTimeoutError(Exception):
     """Raised when a command exceeds its deadline."""
 
 
+class SshCommandError(Exception):
+    """Raised with a fixed message when a command fails."""
+
+
 class SshCommandOutputLimitError(Exception):
     """Raised instead of silently truncating command output."""
 
@@ -38,6 +45,10 @@ class SftpTransferTimeoutError(Exception):
 
 class SftpTransferError(Exception):
     """Raised with a fixed message when an SFTP upload fails."""
+
+
+class SshSessionClosedError(Exception):
+    """Raised when an operation is attempted on a closed SSH session."""
 
 
 @dataclass(frozen=True)
@@ -57,6 +68,12 @@ class CommandResult:
 class SftpTransferResult:
     remote_path: str
     bytes_transferred: int
+
+
+@dataclass
+class _OperationOutcome:
+    value: Any = None
+    error: BaseException | None = None
 
 
 def _fingerprint_sha256(host_key: Any) -> str:
@@ -102,6 +119,41 @@ def _close_transport_and_socket(transport: Any | None, opened_socket: Any) -> No
         _close_quietly(opened_socket)
 
 
+def _run_with_deadline(
+    operation: Callable[[], Any],
+    *,
+    deadline: float,
+    timeout_error: type[Exception],
+    timeout_message: str,
+    on_timeout: Callable[[], None],
+) -> Any:
+    outcome = _OperationOutcome()
+    completed = threading.Event()
+
+    def invoke() -> None:
+        try:
+            outcome.value = operation()
+        except BaseException as error:
+            outcome.error = error
+        finally:
+            completed.set()
+
+    worker = threading.Thread(
+        target=invoke,
+        name="visiox-ssh-bounded-operation",
+        daemon=True,
+    )
+    worker.start()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not completed.wait(remaining):
+        on_timeout()
+        worker.join(_OPERATION_JOIN_SECONDS)
+        raise timeout_error(timeout_message)
+    if outcome.error is not None:
+        raise outcome.error
+    return outcome.value
+
+
 def _is_timeout_error(error: Exception) -> bool:
     return isinstance(error, (socket.timeout, TimeoutError)) or (
         isinstance(error, paramiko.SSHException)
@@ -145,8 +197,12 @@ class StrictSshClient:
         self._connect_timeout_seconds = _validate_timeout(connect_timeout_seconds)
         self._auth_timeout_seconds = _validate_timeout(auth_timeout_seconds)
         self._banner_timeout_seconds = _validate_timeout(banner_timeout_seconds)
-        if max_output_bytes <= 0:
-            raise ValueError("SSH max output bytes must be positive")
+        if (
+            not isinstance(max_output_bytes, int)
+            or isinstance(max_output_bytes, bool)
+            or not 1 <= max_output_bytes <= _DEFAULT_MAX_OUTPUT_BYTES
+        ):
+            raise ValueError("SSH max output bytes must be between 1 and 4194304")
         self._max_output_bytes = max_output_bytes
         self._socket_factory = socket_factory
         self._transport_factory = transport_factory
@@ -160,7 +216,7 @@ class StrictSshClient:
         username: str,
         private_key: paramiko.PKey | bytes,
         expected_fingerprint: str,
-    ) -> "SshSession":
+    ) -> "StrictSshSession":
         def authenticate(transport: Any) -> None:
             transport.auth_publickey(username, _load_private_key(private_key))
 
@@ -179,7 +235,7 @@ class StrictSshClient:
         username: str,
         password: str,
         expected_fingerprint: str,
-    ) -> "SshSession":
+    ) -> "StrictSshSession":
         def authenticate(transport: Any) -> None:
             transport.auth_password(username, password)
 
@@ -197,7 +253,7 @@ class StrictSshClient:
         port: int,
         expected_fingerprint: str,
         authenticate: Callable[[Any], None],
-    ) -> "SshSession":
+    ) -> "StrictSshSession":
         opened_socket = self._socket_factory((host, port), self._connect_timeout_seconds)
         transport = None
         try:
@@ -216,7 +272,7 @@ class StrictSshClient:
                 raise SshAuthenticationError("SSH authentication failed") from None
             if not authenticated:
                 raise SshAuthenticationError("SSH authentication failed")
-            return SshSession(
+            return StrictSshSession(
                 transport,
                 opened_socket,
                 max_output_bytes=self._max_output_bytes,
@@ -243,7 +299,7 @@ def _load_private_key(private_key: paramiko.PKey | bytes) -> paramiko.PKey:
     raise SshAuthenticationError("SSH authentication failed")
 
 
-class SshSession:
+class StrictSshSession:
     def __init__(
         self,
         transport: Any,
@@ -256,6 +312,8 @@ class SshSession:
         self._opened_socket = opened_socket
         self._max_output_bytes = max_output_bytes
         self._sftp_client_factory = sftp_client_factory
+        self._state_lock = threading.Lock()
+        self._closed = False
 
     def run(
         self,
@@ -264,8 +322,31 @@ class SshSession:
         timeout_seconds: float | None = None,
         timeout: float | None = None,
     ) -> CommandResult:
+        self._ensure_open()
         operation_timeout = self._resolve_timeout(timeout_seconds, timeout)
         deadline = _deadline(operation_timeout)
+        try:
+            return _run_with_deadline(
+                lambda: self._run_command(command, deadline),
+                deadline=deadline,
+                timeout_error=SshCommandTimeoutError,
+                timeout_message="SSH command timed out",
+                on_timeout=self.close,
+            )
+        except SshSessionClosedError:
+            raise
+        except SshCommandOutputLimitError:
+            raise
+        except SshCommandTimeoutError:
+            self.close()
+            raise SshCommandTimeoutError("SSH command timed out") from None
+        except Exception as error:
+            if _is_timeout_error(error):
+                self.close()
+                raise SshCommandTimeoutError("SSH command timed out") from None
+            raise SshCommandError("SSH command failed") from None
+
+    def _run_command(self, command: str, deadline: float) -> CommandResult:
         channel = None
         try:
             channel = self._transport.open_session(
@@ -274,12 +355,6 @@ class SshSession:
             channel.settimeout(_remaining(deadline, SshCommandTimeoutError, "SSH command timed out"))
             channel.exec_command(command)
             return self._collect_command_result(channel, deadline)
-        except SshCommandTimeoutError:
-            raise
-        except Exception as error:
-            if _is_timeout_error(error):
-                raise SshCommandTimeoutError("SSH command timed out") from None
-            raise
         finally:
             _close_quietly(channel)
 
@@ -287,6 +362,7 @@ class SshSession:
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
         output_bytes = 0
+        poll_interval = _MIN_POLL_INTERVAL_SECONDS
 
         while True:
             remaining = _remaining(deadline, SshCommandTimeoutError, "SSH command timed out")
@@ -313,6 +389,9 @@ class SshSession:
                 self._enforce_output_limit(output_bytes)
                 drained = True
 
+            if drained:
+                poll_interval = _MIN_POLL_INTERVAL_SECONDS
+
             if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
                 return CommandResult(
                     exit_status=channel.recv_exit_status(),
@@ -321,7 +400,8 @@ class SshSession:
                 )
 
             if not drained:
-                time.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
+                time.sleep(min(poll_interval, remaining))
+                poll_interval = min(poll_interval * 2, _MAX_POLL_INTERVAL_SECONDS)
 
     def _enforce_output_limit(self, output_bytes: int) -> None:
         if output_bytes > self._max_output_bytes:
@@ -333,7 +413,33 @@ class SshSession:
         remote_path: str,
         timeout_seconds: float,
     ) -> SftpTransferResult:
+        self._ensure_open()
         deadline = _deadline(timeout_seconds)
+        try:
+            return _run_with_deadline(
+                lambda: self._upload_bytes(data, remote_path, deadline),
+                deadline=deadline,
+                timeout_error=SftpTransferTimeoutError,
+                timeout_message="SFTP upload timed out",
+                on_timeout=self.close,
+            )
+        except SshSessionClosedError:
+            raise
+        except SftpTransferTimeoutError:
+            self.close()
+            raise SftpTransferTimeoutError("SFTP upload timed out") from None
+        except Exception as error:
+            if _is_timeout_error(error):
+                self.close()
+                raise SftpTransferTimeoutError("SFTP upload timed out") from None
+            raise SftpTransferError("SFTP upload failed") from None
+
+    def _upload_bytes(
+        self,
+        data: bytes,
+        remote_path: str,
+        deadline: float,
+    ) -> SftpTransferResult:
         channel = None
         sftp = None
         try:
@@ -348,18 +454,21 @@ class SshSession:
             sftp.putfo(io.BytesIO(data), remote_path)
             _remaining(deadline, SftpTransferTimeoutError, "SFTP upload timed out")
             return SftpTransferResult(remote_path=remote_path, bytes_transferred=len(data))
-        except SftpTransferTimeoutError:
-            raise
-        except Exception as error:
-            if _is_timeout_error(error):
-                raise SftpTransferTimeoutError("SFTP upload timed out") from None
-            raise SftpTransferError("SFTP upload failed") from None
         finally:
             _close_quietly(sftp)
             _close_quietly(channel)
 
     def close(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
         _close_transport_and_socket(self._transport, self._opened_socket)
+
+    def _ensure_open(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise SshSessionClosedError("SSH session is closed")
 
     @staticmethod
     def _resolve_timeout(timeout_seconds: float | None, timeout: float | None) -> float:
@@ -368,3 +477,6 @@ class SshSession:
         if timeout_seconds is None and timeout is None:
             raise ValueError("SSH command timeout is required")
         return timeout_seconds if timeout_seconds is not None else timeout  # type: ignore[return-value]
+
+
+SshSession = StrictSshSession

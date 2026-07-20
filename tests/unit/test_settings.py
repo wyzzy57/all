@@ -66,3 +66,18 @@ def test_edge_credential_master_key_requires_existing_exact_32_byte_docker_secre
     missing_settings = Settings(_env_file=None, edge_credential_master_key_file=tmp_path / "missing")
     with pytest.raises(ValueError, match="unavailable"):
         missing_settings.read_edge_credential_master_key()
+
+
+@pytest.mark.parametrize("max_output_bytes", [0, 4 * 1024 * 1024 + 1])
+def test_edge_ssh_max_output_bytes_rejects_values_outside_hard_bounds(
+    max_output_bytes: int,
+) -> None:
+    with pytest.raises(ValidationError, match="edge_ssh_max_output_bytes"):
+        Settings(_env_file=None, edge_ssh_max_output_bytes=max_output_bytes)
+
+
+@pytest.mark.parametrize("max_output_bytes", [1, 128, 4 * 1024 * 1024])
+def test_edge_ssh_max_output_bytes_accepts_inclusive_hard_bounds(max_output_bytes: int) -> None:
+    settings = Settings(_env_file=None, edge_ssh_max_output_bytes=max_output_bytes)
+
+    assert settings.edge_ssh_max_output_bytes == max_output_bytes
