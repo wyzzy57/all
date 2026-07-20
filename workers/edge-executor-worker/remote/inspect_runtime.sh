@@ -46,20 +46,21 @@ for key, value in sorted(labels.items()):
     command.extend(["--filter", f"label={key}={value}"])
 listed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=20)
 container_ids = [item for item in listed.stdout.splitlines() if item]
-if len(container_ids) > 2 or any(not re.fullmatch(r"[0-9a-f]{12,64}", item) for item in container_ids):
+if any(not re.fullmatch(r"[0-9a-f]{12,64}", item) for item in container_ids):
     raise SystemExit(4)
 
 containers = []
-if container_ids:
+for offset in range(0, len(container_ids), 100):
+    batch = container_ids[offset : offset + 100]
     inspected = subprocess.run(
-        ["/usr/bin/docker", "inspect", *container_ids],
+        ["/usr/bin/docker", "inspect", *batch],
         check=True,
         capture_output=True,
         text=True,
         timeout=20,
     )
     records = json.loads(inspected.stdout)
-    if not isinstance(records, list) or len(records) != len(container_ids):
+    if not isinstance(records, list) or len(records) != len(batch):
         raise SystemExit(4)
     for record in records:
         state = record.get("State", {})

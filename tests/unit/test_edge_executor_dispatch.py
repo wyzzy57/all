@@ -5,6 +5,8 @@ import json
 import logging
 from pathlib import Path
 import signal
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -180,6 +182,38 @@ def test_repository_claim_and_finalize_are_atomic_and_idempotent() -> None:
     assert repeated.error_code is None
 
 
+def test_repository_persists_only_structurally_sanitized_failure_details() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        session.add(
+            RemoteExecution(
+                id="exec-redaction",
+                node_id="node-1",
+                operation="deploy",
+                idempotency_key="deploy-redaction-attempt-1",
+            )
+        )
+        session.commit()
+    repository = RemoteExecutionRepository(session_factory)
+    assert repository.claim("exec-redaction") is not None
+
+    finalized = repository.finalize(
+        "exec-redaction",
+        ExecutionResult.failed(
+            error_code="credential=code-secret",
+            error_message="DB_PASSWORD=db-secret Authorization=Digest auth-secret",
+        ),
+    )
+
+    assert finalized.error_code == "EDGE_OPERATION_FAILED"
+    assert finalized.error_message is not None
+    assert "code-secret" not in finalized.error_code.casefold()
+    assert "db-secret" not in finalized.error_message.casefold()
+    assert "auth-secret" not in finalized.error_message.casefold()
+
+
 def test_queue_acknowledges_only_after_durable_terminal_state() -> None:
     redis_client = FakeRedis()
     outcomes = iter([False, True])
@@ -334,11 +368,98 @@ def test_signal_callbacks_request_shutdown() -> None:
     assert application.shutdown_requests == 2
 
 
+def test_blocking_dispatch_keeps_signal_shutdown_and_cleanup_responsive() -> None:
+    from visiox_edge_executor_worker import runner
+
+    started = threading.Event()
+    release = threading.Event()
+    events: list[str] = []
+
+    class BlockingDispatcher:
+        def dispatch(self, command, *, reclaim_running: bool = False):
+            started.set()
+            release.wait(timeout=2)
+            return SimpleNamespace(durable_terminal=True)
+
+    class QueueRedis(FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivered = False
+
+        async def xgroup_create(self, *args, **kwargs):
+            return None
+
+        async def xautoclaim(self, *args, **kwargs):
+            return b"0-0", [], []
+
+        async def xreadgroup(self, *args, **kwargs):
+            if not self.delivered:
+                self.delivered = True
+                return [(b"edge-stream", [(b"1-0", _stream_fields())])]
+            await asyncio.sleep(1)
+            return []
+
+        async def aclose(self):
+            events.append("redis-close")
+
+    class Reconciler:
+        def reconcile_startup(self, *, stop_requested):
+            return 0
+
+    class Server:
+        def __init__(self) -> None:
+            self.stopped = threading.Event()
+
+        def serve_forever(self):
+            self.stopped.wait(timeout=2)
+
+        def stop(self):
+            events.append("server-stop")
+            self.stopped.set()
+
+    async def exercise() -> tuple[float, bool]:
+        redis_client = QueueRedis()
+        blocking_pool = runner.BlockingWorkPool(max_workers=1)
+        queue = EdgeExecutorQueue(
+            redis_client,
+            BlockingDispatcher(),
+            stream_name="edge-stream",
+            consumer_name="worker-1",
+            blocking_pool=blocking_pool,
+        )
+        application = runner.EdgeExecutorApplication(
+            dispatcher=SimpleNamespace(),
+            reconciler=Reconciler(),
+            queue=queue,
+            bootstrap_server=Server(),
+            redis_client=redis_client,
+            blocking_pool=blocking_pool,
+            shutdown_grace_seconds=0.05,
+        )
+        loop = asyncio.get_running_loop()
+        run_task = asyncio.create_task(application.run())
+        assert await asyncio.to_thread(started.wait, 1)
+        before = time.monotonic()
+        loop.call_soon(application.request_shutdown)
+        await asyncio.wait_for(run_task, timeout=0.3)
+        return time.monotonic() - before, release.is_set()
+
+    try:
+        elapsed, handler_released = asyncio.run(exercise())
+    finally:
+        release.set()
+
+    assert elapsed < 0.3
+    assert handler_released is False
+    assert events.count("server-stop") >= 1
+    assert events == [*filter(lambda item: item == "server-stop", events), "redis-close"]
+
+
 def test_application_cleanup_stops_queue_socket_and_redis() -> None:
     events: list[str] = []
 
     class Reconciler:
-        def reconcile_startup(self):
+        def reconcile_startup(self, *, stop_requested):
             events.append("reconcile")
 
     class Queue:
@@ -389,7 +510,7 @@ def test_application_retries_database_reconciliation_before_starting_listeners()
         def __init__(self) -> None:
             self.attempts = 0
 
-        def reconcile_startup(self):
+        def reconcile_startup(self, *, stop_requested):
             self.attempts += 1
             events.append(f"db:{self.attempts}")
             if self.attempts < 3:
@@ -434,6 +555,59 @@ def test_application_retries_database_reconciliation_before_starting_listeners()
 
     assert events[:5] == ["db:1", "sleep:0.25", "db:2", "sleep:0.5", "db:3"]
     assert events.index("db:3") < events.index("group")
+
+
+def test_application_shutdown_interrupts_consumer_group_readiness() -> None:
+    events: list[str] = []
+    group_started = asyncio.Event()
+
+    class Reconciler:
+        def reconcile_startup(self, *, stop_requested):
+            return 0
+
+    class Queue:
+        async def ensure_consumer_group(self):
+            group_started.set()
+            await asyncio.Event().wait()
+
+        async def run_forever(self, *, group_ready=False):
+            raise AssertionError("queue listener must not start during shutdown")
+
+        def stop(self):
+            events.append("queue-stop")
+
+    class Server:
+        def serve_forever(self):
+            raise AssertionError("socket listener must not start during shutdown")
+
+        def stop(self):
+            events.append("server-stop")
+
+    class Redis:
+        async def aclose(self):
+            events.append("redis-close")
+
+    from visiox_edge_executor_worker.runner import EdgeExecutorApplication
+
+    async def exercise() -> None:
+        application = EdgeExecutorApplication(
+            dispatcher=SimpleNamespace(),
+            reconciler=Reconciler(),
+            queue=Queue(),
+            bootstrap_server=Server(),
+            redis_client=Redis(),
+            shutdown_grace_seconds=0.01,
+        )
+        run_task = asyncio.create_task(application.run())
+        await group_started.wait()
+        application.request_shutdown()
+        await asyncio.wait_for(run_task, timeout=0.1)
+
+    asyncio.run(exercise())
+
+    assert "queue-stop" in events
+    assert "server-stop" in events
+    assert events[-1] == "redis-close"
 
 
 def test_security_initializes_before_redis_or_socket_runtime_is_created(tmp_path) -> None:

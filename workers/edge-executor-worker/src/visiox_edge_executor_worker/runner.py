@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from dataclasses import field
+from functools import partial
 import json
 import logging
 import os
 import signal
 import socket
+import threading
 from typing import Any, Protocol
 
 from redis.asyncio import Redis
@@ -36,6 +40,30 @@ DEFAULT_RECLAIM_IDLE_MS = 60_000
 RETRY_ATTEMPTS = 5
 RETRY_INITIAL_SECONDS = 0.25
 RETRY_MAX_SECONDS = 4.0
+BLOCKING_WORKERS = 4
+SHUTDOWN_GRACE_SECONDS = 5.0
+
+
+class BlockingWorkPool:
+    def __init__(self, *, max_workers: int = BLOCKING_WORKERS) -> None:
+        if max_workers < 1:
+            raise ValueError("blocking work pool requires at least one worker")
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="edge-blocking",
+        )
+        self._slots = asyncio.Semaphore(max_workers)
+
+    async def run(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        async with self._slots:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                self._executor,
+                partial(function, *args, **kwargs),
+            )
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 class EdgeOperationHandler(Protocol):
@@ -141,6 +169,7 @@ class EdgeExecutorQueue:
         consumer_name: str,
         reclaim_idle_ms: int = DEFAULT_RECLAIM_IDLE_MS,
         sleep: Callable[[float], Any] = asyncio.sleep,
+        blocking_pool: BlockingWorkPool | None = None,
     ) -> None:
         self._redis = redis_client
         self._dispatcher = dispatcher
@@ -150,6 +179,7 @@ class EdgeExecutorQueue:
         self._reclaim_cursor = "0-0"
         self._stopping = asyncio.Event()
         self._sleep = sleep
+        self._blocking_pool = blocking_pool or BlockingWorkPool()
 
     async def ensure_consumer_group(self) -> None:
         delay = RETRY_INITIAL_SECONDS
@@ -181,10 +211,13 @@ class EdgeExecutorQueue:
         *,
         reclaimed: bool = False,
     ) -> bool:
+        if self._stopping.is_set():
+            return False
         normalized_message_id = _decode_text(message_id)
         try:
             command = decode_task_command(fields)
-            outcome = self._dispatcher.dispatch(
+            outcome = await self._blocking_pool.run(
+                self._dispatcher.dispatch,
                 command,
                 reclaim_running=reclaimed,
             )
@@ -213,10 +246,12 @@ class EdgeExecutorQueue:
         self._reclaim_cursor = _decode_text(reclaimed[0])
         reclaimed_messages = reclaimed[1]
         for message_id, fields in reclaimed_messages:
+            if self._stopping.is_set():
+                break
             processed += int(
                 await self.process_message(message_id, fields, reclaimed=True)
             )
-        if processed >= count:
+        if processed >= count or self._stopping.is_set():
             return processed
 
         batches = await self._redis.xreadgroup(
@@ -228,6 +263,8 @@ class EdgeExecutorQueue:
         )
         for _, messages in batches:
             for message_id, fields in messages:
+                if self._stopping.is_set():
+                    return processed
                 processed += int(await self.process_message(message_id, fields))
         return processed
 
@@ -259,36 +296,93 @@ class EdgeExecutorApplication:
     bootstrap_server: BootstrapServer
     redis_client: Any
     sleep: Callable[[float], Any] = asyncio.sleep
+    blocking_pool: BlockingWorkPool = field(default_factory=BlockingWorkPool)
+    shutdown_grace_seconds: float = SHUTDOWN_GRACE_SECONDS
+    _shutdown_requested: threading.Event = field(
+        default_factory=threading.Event,
+        init=False,
+    )
+    _shutdown_event: asyncio.Event = field(default_factory=asyncio.Event, init=False)
 
     async def run(self) -> None:
-        await self._reconcile_with_retry()
-        await self.queue.ensure_consumer_group()
-        server_task = asyncio.create_task(asyncio.to_thread(self.bootstrap_server.serve_forever))
-        queue_task = asyncio.create_task(self.queue.run_forever(group_ready=True))
-        tasks = {server_task, queue_task}
+        shutdown_task = asyncio.create_task(self._shutdown_event.wait())
+        tasks: set[asyncio.Task[Any]] = set()
         try:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
+            reconciliation_task = asyncio.create_task(self._reconcile_with_retry())
+            tasks.add(reconciliation_task)
+            if not await self._stage_completed(reconciliation_task, shutdown_task):
+                return
+            if self.is_shutdown_requested():
+                return
+
+            group_task = asyncio.create_task(self.queue.ensure_consumer_group())
+            tasks.add(group_task)
+            if not await self._stage_completed(group_task, shutdown_task):
+                return
+            if self.is_shutdown_requested():
+                return
+
+            server_task = asyncio.create_task(
+                asyncio.to_thread(self.bootstrap_server.serve_forever)
+            )
+            queue_task = asyncio.create_task(self.queue.run_forever(group_ready=True))
+            tasks.update((server_task, queue_task))
+            done, _ = await asyncio.wait(
+                tasks | {shutdown_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done - {shutdown_task}:
                 task.result()
         finally:
             self.queue.stop()
             self.bootstrap_server.stop()
-            for task in tasks:
+            pending = {task for task in tasks if not task.done()}
+            if pending:
+                _, pending = await asyncio.wait(
+                    pending,
+                    timeout=self.shutdown_grace_seconds,
+                )
+            for task in pending:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            shutdown_task.cancel()
+            await asyncio.gather(shutdown_task, return_exceptions=True)
+            self.blocking_pool.close()
             close = getattr(self.redis_client, "aclose", None)
             if close is not None:
                 await close()
 
     def request_shutdown(self) -> None:
+        self._shutdown_requested.set()
+        self._shutdown_event.set()
         self.queue.stop()
         self.bootstrap_server.stop()
+
+    def is_shutdown_requested(self) -> bool:
+        return self._shutdown_requested.is_set()
+
+    async def _stage_completed(
+        self,
+        stage_task: asyncio.Task[Any],
+        shutdown_task: asyncio.Task[bool],
+    ) -> bool:
+        done, _ = await asyncio.wait(
+            {stage_task, shutdown_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stage_task in done:
+            stage_task.result()
+            return True
+        return False
 
     async def _reconcile_with_retry(self) -> None:
         delay = RETRY_INITIAL_SECONDS
         for attempt in range(RETRY_ATTEMPTS):
             try:
-                await asyncio.to_thread(self.reconciler.reconcile_startup)
+                await self.blocking_pool.run(
+                    self.reconciler.reconcile_startup,
+                    stop_requested=self.is_shutdown_requested,
+                )
                 return
             except Exception:
                 if attempt == RETRY_ATTEMPTS - 1:
@@ -310,12 +404,14 @@ def build_application(
     repository = RemoteExecutionRepository(session_factory)
     dispatcher = EdgeExecutionDispatcher(repository, handlers or {})
     reconciler = RemoteRuntimeReconciler(session_factory, repository, security)
+    blocking_pool = BlockingWorkPool()
     redis_client: Redis = redis_factory(settings.redis_url)
     queue = EdgeExecutorQueue(
         redis_client,
         dispatcher,
         stream_name=settings.edge_executor_stream,
         consumer_name=_consumer_name(),
+        blocking_pool=blocking_pool,
     )
     bootstrap_server = server_factory(
         settings,
@@ -328,6 +424,7 @@ def build_application(
         queue=queue,
         bootstrap_server=bootstrap_server,
         redis_client=redis_client,
+        blocking_pool=blocking_pool,
     )
 
 

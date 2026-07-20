@@ -5,21 +5,22 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 _AUTHORIZATION_RE = re.compile(
-    r"(?i)\b(?:proxy-)?authorization\s*:\s*(?:bearer|basic|token|apikey)\s+[^\s,;]+"
-)
-_SECRET_HEADER_RE = re.compile(
-    r"(?i)\b(?:x-api-key|api-key|private-token|x-auth-token|authorization-token)"
-    r"\s*:\s*[^\s,;]+"
+    r"(?i)\b((?:proxy[-_])?authorization)(\s*[:=]\s*)"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\r\n,;]+)"
 )
 _CLI_SECRET_RE = re.compile(
     r"(?i)(--(?:password|passwd|token|api-key|api_key|client-secret|client_secret))"
     r"(?:\s*=\s*|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
-_CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b(password|passwd|registry[_-]?password|token|auth|api[_-]?key|"
+_SENSITIVE_KEY_FAMILY = (
+    r"password|passwd|credentials?|session[_-]?token|token|api[_-]?key|"
     r"client[_-]?secret|secret|private[_-]?key|access[_-]?key|awsaccesskeyid|"
-    r"x-amz-signature|x-amz-credential|x-amz-security-token|sig)"
-    r"[\"']?\s*([=:])\s*(?:\"[^\"]*\"|'[^']*'|[^\s&,;]+)"
+    r"signature|sig|auth|registry[_-]?(?:auth|credentials?|password|token)"
+)
+_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    rf"(?i)(?<![A-Za-z0-9_.-])"
+    rf"([A-Za-z0-9_.-]*(?:{_SENSITIVE_KEY_FAMILY}))[\"']?"
+    r"(\s*[:=]\s*)(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s&,;]+)"
 )
 _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----",
@@ -50,8 +51,10 @@ def redact(value: object) -> str:
 
     text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
     text = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", text)
-    text = _AUTHORIZATION_RE.sub("Authorization: Bearer [REDACTED]", text)
-    text = _SECRET_HEADER_RE.sub("Credential-Header: [REDACTED]", text)
+    text = _AUTHORIZATION_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
+        text,
+    )
     text = _CLI_SECRET_RE.sub(lambda match: f"{match.group(1)} [REDACTED]", text)
     return _CREDENTIAL_ASSIGNMENT_RE.sub(
         lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",

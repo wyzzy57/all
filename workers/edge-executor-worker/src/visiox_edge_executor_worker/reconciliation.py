@@ -84,9 +84,16 @@ class RemoteRuntimeReconciler:
         self._security = security
         self._script = load_packaged_script(_SCRIPT_NAME)
 
-    def reconcile_startup(self) -> int:
+    def reconcile_startup(
+        self,
+        *,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> int:
+        should_stop = stop_requested or (lambda: False)
         reconciled = 0
         for execution in self._repository.list_reconcilable():
+            if should_stop():
+                break
             decision = self._reconcile(execution)
             if isinstance(decision, ExecutionResult):
                 self._repository.finalize(execution.id, decision)
@@ -223,7 +230,7 @@ def _validate_response(response: object) -> list[dict[str, Any]]:
     if not isinstance(response, dict) or set(response) != {"containers"}:
         raise ValueError("remote runtime inspection response is invalid")
     containers = response["containers"]
-    if not isinstance(containers, list) or len(containers) > 2:
+    if not isinstance(containers, list):
         raise ValueError("remote runtime inspection response is invalid")
     validated: list[dict[str, Any]] = []
     for container in containers:

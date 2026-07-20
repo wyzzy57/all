@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine
@@ -15,7 +16,7 @@ from visiox_edge_executor_worker.runner import build_application
 from visiox_edge_executor_worker.scripts import load_packaged_script
 from visiox_edge_executor_worker.ssh import CommandResult, RemotePrivateDirectory
 from visiox_edge_executor_worker.startup import EdgeExecutorSecurityContext
-from visiox_edge_executor_worker.state import RemoteExecutionRepository
+from visiox_edge_executor_worker.state import ExecutionResult, RemoteExecutionRepository
 
 
 class RecordingSshSession:
@@ -193,6 +194,32 @@ def test_reconciler_persists_deterministic_terminal_remote_failure() -> None:
     assert execution.error_message == "Remote runtime exited unsuccessfully"
 
 
+def test_reconciler_contains_three_or_more_matching_remote_runtimes() -> None:
+    reconciler, repository, _ = _runtime(
+        {
+            "containers": [
+                {
+                    "id": character * 64,
+                    "status": "running",
+                    "exit_code": 0,
+                    "oom_killed": False,
+                    "health": "healthy",
+                }
+                for character in ("a", "b", "c")
+            ]
+        }
+    )
+
+    assert reconciler.reconcile_startup() == 1
+
+    execution = repository.load("exec-1")
+    assert execution is not None
+    assert execution.status == "failed"
+    assert execution.phase == "reconciliation_failed"
+    assert execution.error_code == "REMOTE_STATE_AMBIGUOUS"
+    assert execution.error_message == "Multiple remote runtimes matched one execution"
+
+
 def test_reconciler_persists_recoverable_state_for_invalid_remote_response() -> None:
     reconciler, repository, _ = _runtime({"unexpected": "password=secret"})
 
@@ -224,6 +251,30 @@ def test_reconciler_redacts_corrupt_credential_failures(monkeypatch) -> None:
     assert "secret" not in execution.error_message.casefold()
 
 
+def test_reconciler_observes_shutdown_between_remote_executions(monkeypatch) -> None:
+    reconciler, repository, _ = _runtime({"containers": []})
+    executions = [SimpleNamespace(id=f"exec-{index}") for index in range(3)]
+    stopped = threading.Event()
+    visited: list[str] = []
+
+    monkeypatch.setattr(repository, "list_reconcilable", lambda: executions)
+
+    def reconcile_one(execution):
+        visited.append(execution.id)
+        stopped.set()
+        return ExecutionResult.failed(
+            error_code="STOP_TEST",
+            error_message="fixed",
+            phase="test",
+        )
+
+    monkeypatch.setattr(reconciler, "_reconcile", reconcile_one)
+    monkeypatch.setattr(repository, "finalize", lambda *args: None)
+
+    assert reconciler.reconcile_startup(stop_requested=stopped.is_set) == 1
+    assert visited == ["exec-0"]
+
+
 def test_build_application_installs_concrete_reconciler(tmp_path, monkeypatch) -> None:
     secret_path = tmp_path / "master-key"
     secret_path.write_bytes(b"a" * 32)
@@ -251,3 +302,4 @@ def test_static_reconciliation_script_is_packaged_and_uses_structured_docker_cal
     assert "shell=True" not in script
     assert "docker inspect" not in script
     assert "request_path" in script
+    assert "len(container_ids) >" not in script
