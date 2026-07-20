@@ -1,11 +1,17 @@
 import json
 from pathlib import Path
 
+import pytest
+from fastapi import HTTPException
 from sqlalchemy import select
 
-from visiox_api.routes.nodes import get_edge_inventory_service
+from visiox_api.routes.nodes import (
+    _get_or_create_inventory_pool,
+    get_edge_inventory_service,
+    get_node_session,
+)
 from visiox_db.models import ComputeNode, ResourcePool
-from visiox_edge_executor_worker.inventory import parse_inventory
+from visiox_edge_executor_worker.inventory import compatibility_policy, parse_inventory
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "edge_inventory"
@@ -28,6 +34,25 @@ class ProbeService:
             "node_id": node_id,
             "inventory": self.inventory,
         }
+
+
+class ConcurrentMutationProbeService(ProbeService):
+    def __init__(self, inventory, session_factory, manual_pool_id: str) -> None:
+        super().__init__(inventory)
+        self.session_factory = session_factory
+        self.manual_pool_id = manual_pool_id
+
+    def probe(self, *, node_id: str, deadline: float | None = None) -> dict[str, object]:
+        with self.session_factory() as session:
+            node = session.get(ComputeNode, node_id)
+            node.resource_pool_id = self.manual_pool_id
+            node.status = "draining"
+            node.fingerprint = {
+                **node.fingerprint,
+                "concurrent_owner_marker": "preserve-me",
+            }
+            session.commit()
+        return super().probe(node_id=node_id, deadline=deadline)
 
 
 def _seed_node(agent_session_factory, *, name: str = "ssh-gpu") -> str:
@@ -75,6 +100,11 @@ def test_probe_persists_inventory_and_assigns_exact_compatible_pool(
         assert node.resources["gpu_count"] == 1
         assert node.fingerprint["ssh_host_key_fingerprint"] == "SHA256:fixture"
         assert node.fingerprint["compatibility_key"] == body["compatibility_key"]
+        assert node.fingerprint["driver_cuda_compatibility_version"] == "12.4"
+        assert node.fingerprint["cuda_runtime_version"] == "12.4.127-1"
+        assert node.fingerprint["inventory_snapshot"]["driver_cuda_compatibility_version"] == (
+            "12.4"
+        )
         assert pool.name == body["compatibility_key"]
         assert pool.compatibility_policy["compatibility_key"] == body["compatibility_key"]
 
@@ -101,6 +131,139 @@ def test_probe_marks_missing_nvidia_runtime_unsupported_with_no_pool(
         assert node.fingerprint["unsupported_reasons"] == response.json()["unsupported_reasons"]
 
 
+def test_probe_refreshes_after_remote_wait_and_preserves_concurrent_owned_state(
+    agent_api_client,
+    agent_session_factory,
+):
+    node_id = _seed_node(agent_session_factory)
+    inventory = _inventory("x86.json")
+    snapshot = parse_inventory(inventory)
+    with agent_session_factory() as session:
+        manual_pool = ResourcePool(
+            name="x86-manual-concurrent",
+            kind=snapshot.platform_kind,
+            selector={},
+            compatibility_policy=compatibility_policy(snapshot),
+            enabled=True,
+        )
+        session.add(manual_pool)
+        session.commit()
+        manual_pool_id = manual_pool.id
+    service = ConcurrentMutationProbeService(
+        inventory,
+        agent_session_factory,
+        manual_pool_id,
+    )
+    agent_api_client.app.dependency_overrides[get_edge_inventory_service] = lambda: service
+
+    request_session = agent_session_factory()
+    stale_node = request_session.get(ComputeNode, node_id)
+
+    def override_request_session():
+        yield request_session
+
+    agent_api_client.app.dependency_overrides[get_node_session] = override_request_session
+
+    try:
+        response = agent_api_client.post(f"/edge-nodes/{node_id}/probe")
+    finally:
+        request_session.close()
+
+    assert response.status_code == 200
+    assert stale_node is not None
+    assert response.json()["resource_pool_id"] == manual_pool_id
+    with agent_session_factory() as session:
+        node = session.get(ComputeNode, node_id)
+        assert node.resource_pool_id == manual_pool_id
+        assert node.status == "draining"
+        assert node.fingerprint["concurrent_owner_marker"] == "preserve-me"
+        assert node.fingerprint["compatibility_key"] == response.json()["compatibility_key"]
+
+
+@pytest.mark.parametrize(
+    ("enabled", "kind", "policy_mutation"),
+    [
+        (False, "x86_nvidia", {}),
+        (True, "jetson", {}),
+        (True, "x86_nvidia", {"cuda_major": 11}),
+    ],
+)
+def test_probe_rejects_non_accepting_same_name_pool(
+    agent_api_client,
+    agent_session_factory,
+    enabled,
+    kind,
+    policy_mutation,
+):
+    node_id = _seed_node(agent_session_factory)
+    inventory = _inventory("x86.json")
+    snapshot = parse_inventory(inventory)
+    policy = {**compatibility_policy(snapshot), **policy_mutation}
+    with agent_session_factory() as session:
+        session.add(
+            ResourcePool(
+                name="x86_nvidia:x86_64:12:10:8.9",
+                kind=kind,
+                selector={},
+                compatibility_policy=policy,
+                enabled=enabled,
+            )
+        )
+        session.commit()
+    service = ProbeService(inventory)
+    agent_api_client.app.dependency_overrides[get_edge_inventory_service] = lambda: service
+
+    response = agent_api_client.post(f"/edge-nodes/{node_id}/probe")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Resource pool does not accept the node inventory"
+    with agent_session_factory() as session:
+        node = session.get(ComputeNode, node_id)
+        assert node.resource_pool_id is None
+        assert node.platform_kind == "ssh_edge"
+
+
+def test_probe_rejects_disabled_pool_that_wins_creation_race(
+    agent_session_factory,
+    monkeypatch,
+):
+    snapshot = parse_inventory(_inventory("x86.json"))
+    with agent_session_factory() as session:
+        winning_pool = ResourcePool(
+            name="x86_nvidia:x86_64:12:10:8.9",
+            kind="x86_nvidia",
+            selector={},
+            compatibility_policy=compatibility_policy(snapshot),
+            enabled=False,
+        )
+        session.add(winning_pool)
+        session.commit()
+        original_scalar = session.scalar
+        hid_winning_pool = False
+
+        def scalar_with_stale_first_pool_read(statement, *args, **kwargs):
+            nonlocal hid_winning_pool
+            selects_pool = any(
+                description.get("entity") is ResourcePool
+                for description in statement.column_descriptions
+            )
+            if selects_pool and not hid_winning_pool:
+                hid_winning_pool = True
+                return None
+            return original_scalar(statement, *args, **kwargs)
+
+        monkeypatch.setattr(session, "scalar", scalar_with_stale_first_pool_read)
+
+        with pytest.raises(
+            HTTPException,
+            match="Resource pool does not accept the node inventory",
+        ) as exc_info:
+            _get_or_create_inventory_pool(session, snapshot)
+
+        assert hid_winning_pool is True
+        assert exc_info.value.status_code == 409
+
+
 def test_manual_pool_move_requires_an_enabled_matching_compatibility_policy(
     agent_api_client,
     agent_session_factory,
@@ -116,13 +279,13 @@ def test_manual_pool_move_requires_an_enabled_matching_compatibility_policy(
             name="jetson-manual",
             kind="jetson",
             selector={},
-            compatibility_policy={"compatibility_key": probe.json()["compatibility_key"]},
+            compatibility_policy=compatibility_policy(parse_inventory(_inventory("jetson.json"))),
         )
         incompatible = ResourcePool(
             name="x86-manual",
             kind="x86_nvidia",
             selector={},
-            compatibility_policy={"compatibility_key": "x86_nvidia:x86_64:12:10:8.9"},
+            compatibility_policy=compatibility_policy(parse_inventory(_inventory("x86.json"))),
         )
         session.add_all([compatible, incompatible])
         session.commit()

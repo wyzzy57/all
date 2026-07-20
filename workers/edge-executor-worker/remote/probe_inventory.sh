@@ -105,8 +105,29 @@ def nvidia_inventory():
     cuda_match = re.search(r"CUDA Version:\s*([0-9.]+)", summary or "")
     return {
         "driver_version": driver_version,
-        "cuda_version": cuda_match.group(1) if cuda_match else None,
+        "driver_cuda_compatibility_version": cuda_match.group(1) if cuda_match else None,
         "gpus": gpus,
+    }
+
+
+def cuda_inventory():
+    nvcc_output = run(["nvcc", "--version"])
+    nvcc_match = re.search(r"release\s+([0-9.]+)", nvcc_output or "")
+    version_file = None
+    version_json = read_text("/usr/local/cuda/version.json")
+    if version_json:
+        try:
+            decoded = json.loads(version_json)
+            cuda_section = decoded.get("cuda", {}) if isinstance(decoded, dict) else {}
+            if isinstance(cuda_section, dict):
+                candidate = cuda_section.get("version")
+                if isinstance(candidate, str):
+                    version_file = candidate
+        except json.JSONDecodeError:
+            pass
+    return {
+        "nvcc_version": nvcc_match.group(1) if nvcc_match else None,
+        "version_file": version_file,
     }
 
 
@@ -145,6 +166,7 @@ inventory = {
     "memory": {"total_kib": memory_total_kib()},
     "docker": docker_inventory(),
     "nvidia": nvidia_inventory(),
+    "cuda": cuda_inventory(),
     "jetson": {
         "model": device_tree_value("/proc/device-tree/model"),
         "compatible": device_tree_value("/proc/device-tree/compatible"),

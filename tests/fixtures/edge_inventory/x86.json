@@ -22,7 +22,7 @@
   },
   "nvidia": {
     "driver_version": "550.90.07",
-    "cuda_version": "12.4",
+    "driver_cuda_compatibility_version": "12.4",
     "gpus": [
       {
         "name": "NVIDIA RTX 4090",

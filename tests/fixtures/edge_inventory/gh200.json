@@ -1,0 +1,45 @@
+{
+  "os_release": {
+    "id": "ubuntu",
+    "version_id": "24.04",
+    "pretty_name": "Ubuntu 24.04 LTS"
+  },
+  "uname": {
+    "architecture": "aarch64",
+    "kernel_release": "6.8.0-31-generic"
+  },
+  "cpu": {
+    "logical_cores": 72
+  },
+  "memory": {
+    "total_kib": 493000000
+  },
+  "docker": {
+    "available": true,
+    "version": "27.1.1",
+    "runtimes": ["io.containerd.runc.v2", "nvidia", "runc"],
+    "default_runtime": "runc"
+  },
+  "nvidia": {
+    "driver_version": "570.86.15",
+    "driver_cuda_compatibility_version": "12.8",
+    "gpus": [
+      {
+        "name": "NVIDIA GH200 480GB",
+        "uuid": "GPU-gh200-fixture",
+        "memory_total_mib": 97871,
+        "compute_capability": "9.0"
+      }
+    ]
+  },
+  "jetson": {
+    "model": "NVIDIA GH200 Grace Hopper Superchip",
+    "compatible": "nvidia,grace-hopper",
+    "nv_tegra_release": null,
+    "packages": {
+      "cuda-cudart-12-8": "12.8.90-1",
+      "libcudnn9-cuda-12": "9.8.0.87-1",
+      "libnvinfer10": "10.8.0.43-1+cuda12.8"
+    }
+  }
+}

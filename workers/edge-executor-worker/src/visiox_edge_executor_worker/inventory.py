@@ -52,6 +52,8 @@ class InventorySnapshot(BaseModel):
     docker: DockerInventory
     gpus: tuple[GpuInventory, ...]
     driver_version: str | None
+    driver_cuda_compatibility_version: str | None = None
+    cuda_runtime_version: str | None = None
     cuda_version: str | None
     cuda_major: int | None
     cudnn_version: str | None
@@ -71,6 +73,7 @@ def parse_inventory(value: Mapping[str, Any] | bytes | str) -> InventorySnapshot
     memory = _mapping(raw.get("memory"))
     docker_raw = _mapping(raw.get("docker"))
     nvidia = _mapping(raw.get("nvidia"))
+    cuda = _mapping(raw.get("cuda"))
     jetson = _mapping(raw.get("jetson"))
     packages = _mapping(jetson.get("packages"))
 
@@ -79,7 +82,17 @@ def parse_inventory(value: Mapping[str, Any] | bytes | str) -> InventorySnapshot
     jetson_model = _text(jetson.get("model"))
     jetson_release = _text(jetson.get("nv_tegra_release"))
     jetson_compatible = _text(jetson.get("compatible"))
-    is_jetson = any((jetson_model, jetson_release, jetson_compatible))
+    jetpack_version = _package_version(packages, ("nvidia-jetpack",))
+    l4t_version = _package_version(packages, ("nvidia-l4t-core",))
+    kernel_release = _text(uname.get("kernel_release"))
+    is_jetson = _has_jetson_evidence(
+        model=jetson_model,
+        compatible=jetson_compatible,
+        nv_tegra_release=jetson_release,
+        kernel_release=kernel_release,
+        jetpack_version=jetpack_version,
+        l4t_version=l4t_version,
+    )
 
     runtimes = tuple(
         sorted(
@@ -107,8 +120,15 @@ def parse_inventory(value: Mapping[str, Any] | bytes | str) -> InventorySnapshot
     else:
         platform_kind = "unsupported"
 
-    cuda_version = _text(nvidia.get("cuda_version")) or _package_version(
-        packages, ("cuda-cudart", "cuda-toolkit")
+    driver_cuda_compatibility_version = _text(
+        nvidia.get("driver_cuda_compatibility_version")
+    ) or _text(nvidia.get("cuda_version"))
+    cuda_runtime_version = (
+        _package_version(packages, ("cuda-cudart",))
+        or _text(cuda.get("runtime_version"))
+        or _text(cuda.get("version_file"))
+        or _text(cuda.get("nvcc_version"))
+        or _package_version(packages, ("cuda-toolkit",))
     )
     tensorrt_version = _package_version(packages, ("libnvinfer", "tensorrt"))
     cudnn_version = _package_version(packages, ("libcudnn", "cudnn"))
@@ -138,8 +158,8 @@ def parse_inventory(value: Mapping[str, Any] | bytes | str) -> InventorySnapshot
         reasons.append("NVIDIA Container Runtime is unavailable")
     if not gpus and not is_jetson:
         reasons.append("NVIDIA GPU inventory is unavailable")
-    if _version_major(cuda_version) is None:
-        reasons.append("CUDA version is unavailable")
+    if _version_major(cuda_runtime_version) is None:
+        reasons.append("CUDA runtime/toolkit is unavailable")
     if _version_major(tensorrt_version) is None:
         reasons.append("TensorRT version is unavailable")
     if len(compute_capabilities) > 1:
@@ -155,20 +175,22 @@ def parse_inventory(value: Mapping[str, Any] | bytes | str) -> InventorySnapshot
         os_id=os_id,
         os_version=_text(os_release.get("version_id")),
         os_pretty_name=_text(os_release.get("pretty_name")),
-        kernel_release=_text(uname.get("kernel_release")),
+        kernel_release=kernel_release,
         cpu_logical_cores=_integer(cpu.get("logical_cores")),
         memory_total_kib=_integer(memory.get("total_kib")),
         docker=docker,
         gpus=gpus,
         driver_version=_text(nvidia.get("driver_version")),
-        cuda_version=cuda_version,
-        cuda_major=_version_major(cuda_version),
+        driver_cuda_compatibility_version=driver_cuda_compatibility_version,
+        cuda_runtime_version=cuda_runtime_version,
+        cuda_version=cuda_runtime_version,
+        cuda_major=_version_major(cuda_runtime_version),
         cudnn_version=cudnn_version,
         tensorrt_version=tensorrt_version,
         tensorrt_major=_version_major(tensorrt_version),
         compute_capability=compute_capability,
-        jetpack_version=_package_version(packages, ("nvidia-jetpack",)),
-        l4t_version=_package_version(packages, ("nvidia-l4t-core",)),
+        jetpack_version=jetpack_version,
+        l4t_version=l4t_version,
         jetson_model=jetson_model,
     )
 
@@ -200,7 +222,7 @@ def pool_accepts_inventory(
     policy: Mapping[str, Any],
     snapshot: InventorySnapshot,
 ) -> bool:
-    return policy.get("compatibility_key") == compatibility_key(snapshot)
+    return dict(policy) == compatibility_policy(snapshot)
 
 
 def _decode_object(value: Mapping[str, Any] | bytes | str) -> dict[str, Any]:
@@ -292,6 +314,27 @@ def _jetson_compute_capability(model: str | None) -> str | None:
         if marker in normalized:
             return capability
     return None
+
+
+def _has_jetson_evidence(
+    *,
+    model: str | None,
+    compatible: str | None,
+    nv_tegra_release: str | None,
+    kernel_release: str | None,
+    jetpack_version: str | None,
+    l4t_version: str | None,
+) -> bool:
+    return any(
+        (
+            nv_tegra_release,
+            jetpack_version,
+            l4t_version,
+            "jetson" in (model or "").lower(),
+            "tegra" in (compatible or "").lower(),
+            "tegra" in (kernel_release or "").lower(),
+        )
+    )
 
 
 def _key_part(value: object | None) -> str:

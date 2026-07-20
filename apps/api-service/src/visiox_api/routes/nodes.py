@@ -167,7 +167,11 @@ async def probe_edge_node(
             detail="Edge inventory probe returned invalid data",
         ) from None
 
-    pool = _persist_probe_inventory(session, id, snapshot, deadline=deadline)
+    try:
+        pool = _persist_probe_inventory(session, id, snapshot, deadline=deadline)
+    except Exception:
+        session.rollback()
+        raise
     return EdgeNodeProbeResponse(
         status="ok",
         node_id=id,
@@ -205,8 +209,7 @@ def assign_node_resource_pool(
         ) from None
     if (
         not snapshot.supported
-        or not pool.enabled
-        or not pool_accepts_inventory(pool.compatibility_policy, snapshot)
+        or not _resource_pool_accepts_inventory(pool, snapshot)
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -225,7 +228,10 @@ def _persist_probe_inventory(
     deadline: float,
 ) -> ResourcePool | None:
     node = session.scalar(
-        select(ComputeNode).where(ComputeNode.id == node_id).with_for_update()
+        select(ComputeNode)
+        .where(ComputeNode.id == node_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if node is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
@@ -251,6 +257,10 @@ def _persist_probe_inventory(
         **preserved_fingerprint,
         "compatibility_key": key,
         "cuda_version": snapshot.cuda_version,
+        "cuda_runtime_version": snapshot.cuda_runtime_version,
+        "driver_cuda_compatibility_version": (
+            snapshot.driver_cuda_compatibility_version
+        ),
         "tensorrt_version": snapshot.tensorrt_version,
         "compute_capability": snapshot.compute_capability,
         "driver_version": snapshot.driver_version,
@@ -269,8 +279,7 @@ def _persist_probe_inventory(
         )
         if (
             current_pool is not None
-            and current_pool.enabled
-            and pool_accepts_inventory(current_pool.compatibility_policy, snapshot)
+            and _resource_pool_accepts_inventory(current_pool, snapshot)
         ):
             pool = current_pool
         else:
@@ -304,11 +313,7 @@ def _get_or_create_inventory_pool(
     key = compatibility_key(snapshot)
     pool = session.scalar(select(ResourcePool).where(ResourcePool.name == key))
     if pool is not None:
-        if not pool_accepts_inventory(pool.compatibility_policy, snapshot):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Resource pool compatibility policy conflicts with its key",
-            )
+        _require_resource_pool_accepts_inventory(pool, snapshot)
         return pool
     policy = compatibility_policy(snapshot)
     pool = ResourcePool(
@@ -326,13 +331,31 @@ def _get_or_create_inventory_pool(
         winning_pool = session.scalar(select(ResourcePool).where(ResourcePool.name == key))
         if winning_pool is None:
             raise
-        if not pool_accepts_inventory(winning_pool.compatibility_policy, snapshot):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Resource pool compatibility policy conflicts with its key",
-            ) from None
+        _require_resource_pool_accepts_inventory(winning_pool, snapshot)
         return winning_pool
     return pool
+
+
+def _resource_pool_accepts_inventory(
+    pool: ResourcePool,
+    snapshot: InventorySnapshot,
+) -> bool:
+    return (
+        pool.enabled
+        and pool.kind == snapshot.platform_kind
+        and pool_accepts_inventory(pool.compatibility_policy, snapshot)
+    )
+
+
+def _require_resource_pool_accepts_inventory(
+    pool: ResourcePool,
+    snapshot: InventorySnapshot,
+) -> None:
+    if not _resource_pool_accepts_inventory(pool, snapshot):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Resource pool does not accept the node inventory",
+        )
 
 
 def _snapshot_from_node(node: ComputeNode) -> InventorySnapshot:

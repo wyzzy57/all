@@ -50,6 +50,59 @@ def test_compatibility_key_separates_jetson_and_x86(load_fixture, fixture, expec
     assert compatibility_key(parse_inventory(load_fixture(fixture))) == expected
 
 
+def test_non_tegra_aarch64_nvidia_host_is_not_classified_as_jetson(load_fixture):
+    snapshot = parse_inventory(load_fixture("gh200.json"))
+
+    assert snapshot.platform_kind == "unsupported"
+    assert snapshot.supported is False
+    assert "Only Ubuntu Jetson and x86 NVIDIA hosts are supported" in (
+        snapshot.unsupported_reasons
+    )
+
+
+@pytest.mark.parametrize(
+    ("fixture", "driver_ceiling", "runtime_version", "expected_key"),
+    [
+        ("x86.json", "13.0", "12.4.127-1", "x86_nvidia:x86_64:12:10:8.9"),
+        ("jetson.json", "12.8", "12.2.140-1", "jetson:aarch64:12:10:8.7"),
+    ],
+)
+def test_compatibility_uses_installed_cuda_not_driver_ceiling(
+    load_fixture,
+    fixture,
+    driver_ceiling,
+    runtime_version,
+    expected_key,
+):
+    inventory = load_fixture(fixture)
+    inventory["nvidia"]["driver_cuda_compatibility_version"] = driver_ceiling
+
+    snapshot = parse_inventory(inventory)
+
+    assert snapshot.driver_cuda_compatibility_version == driver_ceiling
+    assert snapshot.cuda_runtime_version == runtime_version
+    assert snapshot.cuda_version == runtime_version
+    assert compatibility_key(snapshot) == expected_key
+
+
+def test_driver_cuda_ceiling_without_installed_runtime_is_unsupported(load_fixture):
+    inventory = load_fixture("x86.json")
+    inventory["jetson"]["packages"] = {
+        name: version
+        for name, version in inventory["jetson"]["packages"].items()
+        if not name.startswith(("cuda-cudart", "cuda-toolkit"))
+    }
+
+    snapshot = parse_inventory(inventory)
+
+    assert snapshot.driver_cuda_compatibility_version == "12.4"
+    assert snapshot.cuda_runtime_version is None
+    assert snapshot.cuda_major is None
+    assert snapshot.supported is False
+    assert "CUDA runtime/toolkit is unavailable" in snapshot.unsupported_reasons
+    assert compatibility_key(snapshot) == "x86_nvidia:x86_64:unknown:10:8.9"
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     [
@@ -81,6 +134,8 @@ def test_probe_script_is_packaged_and_uses_only_static_probe_inputs():
         "uname",
         "docker",
         "nvidia-smi",
+        "nvcc",
+        "/usr/local/cuda/version.json",
         "dpkg-query",
     ):
         assert fact in script
