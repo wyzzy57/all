@@ -1,3 +1,4 @@
+import ast
 import json
 import sys
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect
+from sqlalchemy.dialects import postgresql
 
 
 EXPECTED_TABLES = {
@@ -200,6 +202,29 @@ def test_ssh_edge_runtime_upgrade_from_current_head_and_downgrade_back(tmp_path)
         "deployment_instances",
         "distributed_training_runs",
     }.isdisjoint(inspector.get_table_names())
+
+
+def test_ssh_edge_migration_explicit_identifiers_fit_postgresql():
+    migration_path = Path("infra/migrations/versions/20260720_0001_ssh_edge_runtime.py")
+    tree = ast.parse(migration_path.read_text(encoding="utf-8"))
+    identifiers: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {"create_index", "drop_index"}:
+            if node.args and isinstance(node.args[0], ast.Constant):
+                identifiers.append(node.args[0].value)
+        for keyword in node.keywords:
+            if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
+                identifiers.append(keyword.value.value)
+
+    dialect = postgresql.dialect()
+    preparer = dialect.identifier_preparer
+    assert identifiers
+    for identifier in identifiers:
+        dialect.validate_identifier(identifier)
+        assert preparer.quote_identifier(identifier)
 
 
 def test_training_jobs_does_not_reference_trained_models(tmp_path):

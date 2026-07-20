@@ -4,7 +4,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from visiox_api.main import create_app
@@ -139,6 +139,40 @@ def test_post_tasks_marks_task_failed_when_enqueue_fails(session_factory):
         assert saved.status == "FAILED"
         assert saved.error_code == "ENQUEUE_FAILED"
         assert saved.finished_at is not None
+
+
+@pytest.mark.parametrize(
+    ("resource_refs", "payload"),
+    [
+        ({"password_id": "super-secret"}, {}),
+        ({"deployment_service_id": "service-1"}, {"registry_password": "secret"}),
+    ],
+)
+def test_post_tasks_rejects_invalid_edge_command_without_persisting(
+    client: TestClient,
+    session_factory,
+    stream_producer: FakeStreamProducer,
+    resource_refs,
+    payload,
+):
+    with session_factory() as session:
+        before = session.scalar(select(func.count()).select_from(Task))
+
+    response = client.post(
+        "/tasks",
+        json={
+            "task_type": "EDGE_DEPLOY",
+            "resource_refs": resource_refs,
+            "payload": payload,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "identifier-only" in response.json()["detail"]
+    with session_factory() as session:
+        after = session.scalar(select(func.count()).select_from(Task))
+    assert after == before
+    assert stream_producer.commands == []
 
 
 def test_get_tasks_and_get_task_read_persisted_tasks(

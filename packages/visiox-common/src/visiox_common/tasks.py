@@ -1,4 +1,5 @@
 import json
+import re
 from enum import StrEnum
 from typing import Any
 
@@ -41,6 +42,31 @@ EDGE_EXECUTOR_TASK_TYPES = {
     TaskType.EDGE_RESUME_TRAINING,
 }
 
+EDGE_EXECUTOR_RESOURCE_REFS: dict[TaskType, frozenset[str]] = {
+    TaskType.EDGE_PROBE: frozenset({"node_id"}),
+    TaskType.EDGE_DEPLOY: frozenset({"deployment_service_id"}),
+    TaskType.EDGE_STOP_DEPLOYMENT: frozenset({"deployment_service_id"}),
+    TaskType.EDGE_ROLLBACK: frozenset({"deployment_service_id"}),
+    TaskType.EDGE_TRAIN: frozenset({"training_job_id"}),
+    TaskType.EDGE_STOP_TRAINING: frozenset({"training_job_id"}),
+    TaskType.EDGE_RESUME_TRAINING: frozenset({"training_job_id"}),
+}
+
+_RESOURCE_REF_PREFIXES = {
+    "node_id": "node",
+    "deployment_service_id": "service",
+    "training_job_id": "job",
+}
+_UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"
+_SENSITIVE_ID_MARKERS = ("password", "private", "credential", "secret", "token", "bearer", "signature", "x-amz")
+
+
+def _is_platform_id(value: str, prefix: str) -> bool:
+    if any(marker in value.casefold() for marker in _SENSITIVE_ID_MARKERS):
+        return False
+    seeded_id_pattern = rf"{re.escape(prefix)}-[A-Za-z0-9][A-Za-z0-9_-]{{0,63}}"
+    return re.fullmatch(rf"(?:{_UUID_PATTERN}|{seeded_id_pattern})", value) is not None
+
 
 def _json_field(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
@@ -56,7 +82,15 @@ class TaskCommand(BaseModel):
     @model_validator(mode="after")
     def validate_edge_command_is_identifier_only(self) -> "TaskCommand":
         if self.task_type in EDGE_EXECUTOR_TASK_TYPES:
-            if self.payload or any(not key.endswith("_id") for key in self.resource_refs):
+            expected_refs = EDGE_EXECUTOR_RESOURCE_REFS[self.task_type]
+            refs_are_valid = set(self.resource_refs) == expected_refs and all(
+                _is_platform_id(value, _RESOURCE_REF_PREFIXES[key]) for key, value in self.resource_refs.items()
+            )
+            if (
+                self.payload
+                or not _is_platform_id(self.task_id, "task")
+                or not refs_are_valid
+            ):
                 raise ValueError("Edge task commands must use identifier-only resource_refs and an empty payload")
         return self
 

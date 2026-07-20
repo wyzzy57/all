@@ -78,12 +78,12 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["deployment_service_id"],
             ["deployment_services.id"],
-            name="fk_remote_executions_deployment_service_id_deployment_services",
+            name="fk_remote_executions_service",
         ),
         sa.ForeignKeyConstraint(
             ["training_job_id"],
             ["training_jobs.id"],
-            name="fk_remote_executions_training_job_id_training_jobs",
+            name="fk_remote_executions_training_job",
         ),
         sa.UniqueConstraint("idempotency_key", name="uq_remote_executions_idempotency_key"),
     )
@@ -118,7 +118,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["deployment_service_id"],
             ["deployment_services.id"],
-            name="fk_deployment_instances_deployment_service_id_deployment_services",
+            name="fk_deployment_instances_service",
         ),
         sa.ForeignKeyConstraint(["node_id"], ["compute_nodes.id"], name="fk_deployment_instances_node_id_compute_nodes"),
         sa.UniqueConstraint("container_id", name="uq_deployment_instances_container_id"),
@@ -158,12 +158,12 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["training_job_id"],
             ["training_jobs.id"],
-            name="fk_distributed_training_runs_training_job_id_training_jobs",
+            name="fk_distributed_runs_training_job",
         ),
         sa.ForeignKeyConstraint(
             ["resource_pool_id"],
             ["resource_pools.id"],
-            name="fk_distributed_training_runs_resource_pool_id_resource_pools",
+            name="fk_distributed_runs_resource_pool",
         ),
     )
     op.create_index("ix_distributed_training_runs_training_job_id", "distributed_training_runs", ["training_job_id"])

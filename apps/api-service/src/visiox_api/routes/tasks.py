@@ -4,11 +4,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from visiox_common.tasks import TaskCommand, TaskProgressEvent, TaskStatus, TaskType
+from visiox_db.base import new_id
 from visiox_db.models import Task, TrainingJob, TrainingPipeline
 from visiox_db.session import get_session
 from visiox_messaging.streams import RedisStreamProducer
@@ -84,7 +85,22 @@ async def create_task(
     session: Session = Depends(get_task_session),
     producer: Any = Depends(get_stream_producer),
 ) -> Task:
+    task_id = new_id()
+    try:
+        command = TaskCommand(
+            task_id=task_id,
+            task_type=request.task_type,
+            resource_refs=request.resource_refs,
+            payload=request.payload,
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Invalid task command: {exc.errors()[0]['msg']}",
+        ) from exc
+
     task = Task(
+        id=task_id,
         task_type=request.task_type.value,
         status=TaskStatus.QUEUED.value,
         progress=0,
@@ -93,13 +109,6 @@ async def create_task(
     session.add(task)
     session.commit()
     session.refresh(task)
-
-    command = TaskCommand(
-        task_id=task.id,
-        task_type=request.task_type,
-        resource_refs=request.resource_refs,
-        payload=request.payload,
-    )
     try:
         await _enqueue(producer, command)
     except Exception as exc:

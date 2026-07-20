@@ -6,7 +6,12 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from visiox_common.tasks import EDGE_EXECUTOR_TASK_TYPES, TaskCommand, TaskType
+from visiox_common.tasks import (
+    EDGE_EXECUTOR_RESOURCE_REFS,
+    EDGE_EXECUTOR_TASK_TYPES,
+    TaskCommand,
+    TaskType,
+)
 from visiox_db.base import Base
 from visiox_db.models import (
     ComputeNode,
@@ -123,18 +128,42 @@ def test_edge_task_types_use_identifier_only_stream_payload():
     assert json.loads(fields["payload"]) == {}
 
 
-def test_edge_task_commands_reject_non_identifier_data():
-    with pytest.raises(ValidationError, match="identifier-only"):
-        TaskCommand(
-            task_id="task-1",
-            task_type=TaskType.EDGE_DEPLOY,
-            resource_refs={"deployment_service_id": "service-1"},
-            payload={"password": "not-allowed"},
-        )
+def test_each_edge_task_type_has_an_exact_required_resource_ref():
+    expected_refs = {
+        TaskType.EDGE_PROBE: {"node_id": "node-1"},
+        TaskType.EDGE_DEPLOY: {"deployment_service_id": "service-1"},
+        TaskType.EDGE_STOP_DEPLOYMENT: {"deployment_service_id": "service-1"},
+        TaskType.EDGE_ROLLBACK: {"deployment_service_id": "service-1"},
+        TaskType.EDGE_TRAIN: {"training_job_id": "job-1"},
+        TaskType.EDGE_STOP_TRAINING: {"training_job_id": "job-1"},
+        TaskType.EDGE_RESUME_TRAINING: {"training_job_id": "job-1"},
+    }
 
+    assert EDGE_EXECUTOR_RESOURCE_REFS == {
+        task_type: frozenset(resource_refs) for task_type, resource_refs in expected_refs.items()
+    }
+    for task_type, resource_refs in expected_refs.items():
+        command = TaskCommand(task_id="task-1", task_type=task_type, resource_refs=resource_refs)
+        assert command.resource_refs == resource_refs
+
+
+@pytest.mark.parametrize(
+    ("resource_refs", "payload"),
+    [
+        ({"password_id": "super-secret"}, {}),
+        ({"deployment_service_id": "https://storage.test/model?X-Amz-Signature=secret"}, {}),
+        ({"deployment_service_id": "-----BEGIN PRIVATE KEY-----"}, {}),
+        ({"deployment_service_id": "service 1"}, {}),
+        ({}, {}),
+        ({"deployment_service_id": "service-1", "node_id": "node-1"}, {}),
+        ({"deployment_service_id": "service-1"}, {"password": "not-allowed"}),
+    ],
+)
+def test_edge_task_commands_reject_sensitive_invalid_missing_or_extra_refs(resource_refs, payload):
     with pytest.raises(ValidationError, match="identifier-only"):
         TaskCommand(
             task_id="task-1",
             task_type=TaskType.EDGE_DEPLOY,
-            resource_refs={"registry_token": "not-an-identifier"},
+            resource_refs=resource_refs,
+            payload=payload,
         )
