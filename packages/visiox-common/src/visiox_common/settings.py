@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     agent_certificate_renew_before_days: int = 30
     agent_max_ws_message_bytes: int = 1024 * 1024
     management_proxy_auth_token_file: Path | None = None
+    edge_credential_master_key_file: Path = Path("/run/secrets/visiox-edge-credential-master-key")
+    edge_bootstrap_socket: Path = Path("/var/run/visiox/edge-bootstrap.sock")
+    edge_ssh_connect_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    edge_ssh_auth_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    edge_ssh_banner_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    edge_executor_stream: str = "stream:edge_executor.commands"
 
     @property
     def is_local_environment(self) -> bool:
@@ -72,6 +78,15 @@ class Settings(BaseSettings):
         if not _MANAGEMENT_PROXY_TOKEN_PATTERN.fullmatch(token):
             raise ValueError("management proxy authentication token is invalid")
         return token
+
+    def read_edge_credential_master_key(self) -> bytes:
+        try:
+            master_key = self.edge_credential_master_key_file.read_bytes()
+        except OSError as error:
+            raise ValueError("edge credential master key is unavailable") from error
+        if len(master_key) != 32:
+            raise ValueError("edge credential master key must contain exactly 32 raw bytes")
+        return master_key
 
     @model_validator(mode="after")
     def validate_agent_public_ws_url(self) -> Self:

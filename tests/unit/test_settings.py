@@ -48,3 +48,21 @@ def test_agent_heartbeat_and_offline_threshold_accept_safe_boundaries(
 
     assert settings.agent_heartbeat_interval_seconds == heartbeat_seconds
     assert settings.agent_offline_after_seconds == offline_after_seconds
+
+
+def test_edge_credential_master_key_requires_existing_exact_32_byte_docker_secret(tmp_path) -> None:
+    secret_path = tmp_path / "edge-credential-master-key"
+    secret_path.write_bytes(b"a" * 32)
+    settings = Settings(_env_file=None, edge_credential_master_key_file=secret_path)
+
+    assert settings.read_edge_credential_master_key() == b"a" * 32
+
+    secret_path.write_bytes(b"short")
+    with pytest.raises(ValueError, match="32 raw bytes") as exc_info:
+        settings.read_edge_credential_master_key()
+
+    assert "short" not in str(exc_info.value)
+
+    missing_settings = Settings(_env_file=None, edge_credential_master_key_file=tmp_path / "missing")
+    with pytest.raises(ValueError, match="unavailable"):
+        missing_settings.read_edge_credential_master_key()
