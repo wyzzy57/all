@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from visiox_common.tasks import TaskCommand, TaskProgressEvent, TaskStatus, TaskType
+from visiox_common.tasks import EDGE_EXECUTOR_TASK_TYPES, TaskCommand, TaskProgressEvent, TaskStatus, TaskType
 from visiox_db.base import new_id
 from visiox_db.models import Task, TrainingJob, TrainingPipeline
 from visiox_db.session import get_session
@@ -85,6 +85,12 @@ async def create_task(
     session: Session = Depends(get_task_session),
     producer: Any = Depends(get_stream_producer),
 ) -> Task:
+    if request.task_type in EDGE_EXECUTOR_TASK_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Edge task types must be created through a dedicated resource API",
+        )
+
     task_id = new_id()
     try:
         command = TaskCommand(

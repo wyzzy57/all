@@ -167,3 +167,31 @@ def test_edge_task_commands_reject_sensitive_invalid_missing_or_extra_refs(resou
             resource_refs=resource_refs,
             payload=payload,
         )
+
+
+@pytest.mark.parametrize(
+    ("resource_refs", "payload", "sensitive_value"),
+    [
+        ({"deployment_service_id": "service-1"}, {"password": "super-secret"}, "super-secret"),
+        (
+            {"deployment_service_id": "https://storage.test/model?X-Amz-Signature=signed-secret"},
+            {},
+            "signed-secret",
+        ),
+        ({"deployment_service_id": "-----BEGIN PRIVATE KEY-----"}, {}, "PRIVATE KEY"),
+        ({"deployment_service_id": "service-bearer-token"}, {}, "bearer-token"),
+    ],
+)
+def test_edge_task_serialization_revalidates_mutated_current_state(resource_refs, payload, sensitive_value):
+    command = TaskCommand(
+        task_id="task-1",
+        task_type=TaskType.EDGE_DEPLOY,
+        resource_refs={"deployment_service_id": "service-1"},
+    )
+    command.resource_refs = resource_refs
+    command.payload = payload
+
+    with pytest.raises(ValueError, match="identifier-only") as exc_info:
+        command.to_stream_fields()
+
+    assert sensitive_value not in str(exc_info.value)

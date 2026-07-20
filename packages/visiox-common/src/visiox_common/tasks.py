@@ -62,10 +62,28 @@ _SENSITIVE_ID_MARKERS = ("password", "private", "credential", "secret", "token",
 
 
 def _is_platform_id(value: str, prefix: str) -> bool:
+    if not isinstance(value, str):
+        return False
     if any(marker in value.casefold() for marker in _SENSITIVE_ID_MARKERS):
         return False
     seeded_id_pattern = rf"{re.escape(prefix)}-[A-Za-z0-9][A-Za-z0-9_-]{{0,63}}"
     return re.fullmatch(rf"(?:{_UUID_PATTERN}|{seeded_id_pattern})", value) is not None
+
+
+def _validate_edge_boundary(
+    task_type: TaskType,
+    resource_refs: dict[str, str],
+    payload: dict[str, Any],
+) -> None:
+    if task_type not in EDGE_EXECUTOR_TASK_TYPES:
+        return
+
+    expected_refs = EDGE_EXECUTOR_RESOURCE_REFS[task_type]
+    refs_are_valid = set(resource_refs) == expected_refs and all(
+        _is_platform_id(value, _RESOURCE_REF_PREFIXES[key]) for key, value in resource_refs.items()
+    )
+    if payload or not refs_are_valid:
+        raise ValueError("Edge task commands must use identifier-only resource_refs and an empty payload")
 
 
 def _json_field(value: dict[str, Any]) -> str:
@@ -81,25 +99,22 @@ class TaskCommand(BaseModel):
 
     @model_validator(mode="after")
     def validate_edge_command_is_identifier_only(self) -> "TaskCommand":
-        if self.task_type in EDGE_EXECUTOR_TASK_TYPES:
-            expected_refs = EDGE_EXECUTOR_RESOURCE_REFS[self.task_type]
-            refs_are_valid = set(self.resource_refs) == expected_refs and all(
-                _is_platform_id(value, _RESOURCE_REF_PREFIXES[key]) for key, value in self.resource_refs.items()
-            )
-            if (
-                self.payload
-                or not _is_platform_id(self.task_id, "task")
-                or not refs_are_valid
-            ):
-                raise ValueError("Edge task commands must use identifier-only resource_refs and an empty payload")
+        _validate_edge_boundary(self.task_type, self.resource_refs, self.payload)
+        if self.task_type in EDGE_EXECUTOR_TASK_TYPES and not _is_platform_id(self.task_id, "task"):
+            raise ValueError("Edge task commands must use identifier-only resource_refs and an empty payload")
         return self
 
     def to_stream_fields(self) -> dict[str, str]:
+        resource_refs = dict(self.resource_refs)
+        payload = dict(self.payload)
+        _validate_edge_boundary(self.task_type, resource_refs, payload)
+        if self.task_type in EDGE_EXECUTOR_TASK_TYPES and not _is_platform_id(self.task_id, "task"):
+            raise ValueError("Edge task commands must use identifier-only resource_refs and an empty payload")
         return {
             "task_id": self.task_id,
             "task_type": self.task_type.value,
-            "resource_refs": _json_field(self.resource_refs),
-            "payload": _json_field(self.payload),
+            "resource_refs": _json_field(resource_refs),
+            "payload": _json_field(payload),
             "payload_version": str(self.payload_version),
         }
 

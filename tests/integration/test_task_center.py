@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from visiox_api.main import create_app
 from visiox_api.routes.tasks import get_stream_producer, get_task_session, update_task_progress
 from visiox_api.ws.tasks import get_progress_broker
-from visiox_common.tasks import TaskProgressEvent, TaskStatus, TaskType
+from visiox_common.tasks import EDGE_EXECUTOR_TASK_TYPES, TaskProgressEvent, TaskStatus, TaskType
 from visiox_db.models import Task
 from visiox_messaging.pubsub import InMemoryTaskProgressBroker
 
@@ -141,34 +141,36 @@ def test_post_tasks_marks_task_failed_when_enqueue_fails(session_factory):
         assert saved.finished_at is not None
 
 
-@pytest.mark.parametrize(
-    ("resource_refs", "payload"),
-    [
-        ({"password_id": "super-secret"}, {}),
-        ({"deployment_service_id": "service-1"}, {"registry_password": "secret"}),
-    ],
-)
-def test_post_tasks_rejects_invalid_edge_command_without_persisting(
+def test_post_tasks_rejects_every_edge_task_type_without_persisting(
     client: TestClient,
     session_factory,
     stream_producer: FakeStreamProducer,
-    resource_refs,
-    payload,
 ):
+    valid_refs = {
+        TaskType.EDGE_PROBE: {"node_id": "node-1"},
+        TaskType.EDGE_DEPLOY: {"deployment_service_id": "service-1"},
+        TaskType.EDGE_STOP_DEPLOYMENT: {"deployment_service_id": "service-1"},
+        TaskType.EDGE_ROLLBACK: {"deployment_service_id": "service-1"},
+        TaskType.EDGE_TRAIN: {"training_job_id": "job-1"},
+        TaskType.EDGE_STOP_TRAINING: {"training_job_id": "job-1"},
+        TaskType.EDGE_RESUME_TRAINING: {"training_job_id": "job-1"},
+    }
     with session_factory() as session:
         before = session.scalar(select(func.count()).select_from(Task))
 
-    response = client.post(
-        "/tasks",
-        json={
-            "task_type": "EDGE_DEPLOY",
-            "resource_refs": resource_refs,
-            "payload": payload,
-        },
-    )
+    assert set(valid_refs) == EDGE_EXECUTOR_TASK_TYPES
+    for task_type, resource_refs in valid_refs.items():
+        response = client.post(
+            "/tasks",
+            json={
+                "task_type": task_type.value,
+                "resource_refs": resource_refs,
+                "payload": {},
+            },
+        )
+        assert response.status_code == 422
+        assert "dedicated" in response.json()["detail"].lower()
 
-    assert response.status_code == 422
-    assert "identifier-only" in response.json()["detail"]
     with session_factory() as session:
         after = session.scalar(select(func.count()).select_from(Task))
     assert after == before
