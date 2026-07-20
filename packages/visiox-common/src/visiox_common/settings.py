@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     edge_ssh_connect_timeout_seconds: float = Field(default=10, gt=0, le=60)
     edge_ssh_auth_timeout_seconds: float = Field(default=10, gt=0, le=60)
     edge_ssh_banner_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    edge_ssh_max_output_bytes: int = Field(default=4 * 1024 * 1024, gt=0)
     edge_executor_stream: str = "stream:edge_executor.commands"
 
     @property
