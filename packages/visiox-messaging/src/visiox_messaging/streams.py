@@ -1,6 +1,6 @@
 from typing import Any
 
-from visiox_common.tasks import TaskCommand, TaskType
+from visiox_common.tasks import EDGE_EXECUTOR_TASK_TYPES, TaskCommand, TaskType
 
 
 STREAM_BY_TASK_TYPE: dict[TaskType, str] = {
@@ -10,6 +10,7 @@ STREAM_BY_TASK_TYPE: dict[TaskType, str] = {
     TaskType.SYNC_LABEL_STUDIO_DATA: "stream:label_sync.commands",
     TaskType.IMPORT_LABEL_STUDIO_ANNOTATION: "stream:label_sync.commands",
 }
+STREAM_BY_TASK_TYPE.update({task_type: "stream:edge_executor.commands" for task_type in EDGE_EXECUTOR_TASK_TYPES})
 
 
 class RedisStreamProducer:

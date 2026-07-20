@@ -115,3 +115,44 @@ class DeploymentService(IdMixin, TimestampMixin, Base):
     endpoint: Mapped[str] = mapped_column(Text, nullable=False)
     calls: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class DeploymentInstance(IdMixin, TimestampMixin, Base):
+    __tablename__ = "deployment_instances"
+    __table_args__ = (UniqueConstraint("deployment_service_id", "node_id", "instance_name"),)
+
+    deployment_service_id: Mapped[str] = mapped_column(ForeignKey("deployment_services.id"), nullable=False, index=True)
+    node_id: Mapped[str] = mapped_column(ForeignKey("compute_nodes.id"), nullable=False, index=True)
+    instance_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    container_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    image_digest: Mapped[str | None] = mapped_column(String(255))
+    model_checksum: Mapped[str | None] = mapped_column(String(128))
+    engine: Mapped[str] = mapped_column(String(80), nullable=False)
+    engine_digest: Mapped[str | None] = mapped_column(String(255))
+    port: Mapped[int | None] = mapped_column(Integer)
+    endpoint: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="queued", index=True)
+    health_status: Mapped[str | None] = mapped_column(String(32))
+    health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rollback_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class DistributedTrainingRun(IdMixin, TimestampMixin, Base):
+    __tablename__ = "distributed_training_runs"
+
+    training_job_id: Mapped[str] = mapped_column(ForeignKey("training_jobs.id"), nullable=False, index=True)
+    resource_pool_id: Mapped[str] = mapped_column(ForeignKey("resource_pools.id"), nullable=False, index=True)
+    node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    ranks: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    master_addr: Mapped[str] = mapped_column(String(255), nullable=False)
+    master_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    world_size: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    rendezvous_backend: Mapped[str] = mapped_column(String(40), nullable=False, default="c10d")
+    training_image_digest: Mapped[str | None] = mapped_column(String(255))
+    container_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    checkpoint_uri: Mapped[str | None] = mapped_column(Text)
+    checkpoint_checksum: Mapped[str | None] = mapped_column(String(128))
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="queued", index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

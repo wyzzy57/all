@@ -27,6 +27,10 @@ EXPECTED_TABLES |= {
     "agent_enrollment_tokens",
     "node_commands",
     "node_events",
+    "edge_ssh_credentials",
+    "remote_executions",
+    "deployment_instances",
+    "distributed_training_runs",
 }
 
 REMOVED_TABLES = {
@@ -133,6 +137,69 @@ def test_agent_identity_recovery_columns_upgrade_downgrade_and_upgrade(tmp_path)
     assert "enrollment_request_id" in {
         column["name"] for column in inspector.get_columns("agent_enrollment_tokens")
     }
+
+
+def test_ssh_edge_runtime_upgrade_from_current_head_and_downgrade_back(tmp_path):
+    database_path = tmp_path / "ssh-edge-runtime.db"
+    database_url = f"sqlite:///{database_path}"
+    config = _alembic_config(database_url)
+
+    command.upgrade(config, "20260717_0001")
+    inspector = inspect(create_engine(database_url))
+    assert {
+        "edge_ssh_credentials",
+        "remote_executions",
+        "deployment_instances",
+        "distributed_training_runs",
+    }.isdisjoint(inspector.get_table_names())
+
+    command.upgrade(config, "20260720_0001")
+    inspector = inspect(create_engine(database_url))
+    assert {
+        "edge_ssh_credentials",
+        "remote_executions",
+        "deployment_instances",
+        "distributed_training_runs",
+    }.issubset(inspector.get_table_names())
+    assert "node_id" in {
+        column for constraint in inspector.get_unique_constraints("edge_ssh_credentials") for column in constraint["column_names"]
+    }
+    assert "idempotency_key" in {
+        column for constraint in inspector.get_unique_constraints("remote_executions") for column in constraint["column_names"]
+    }
+    assert {foreign_key["referred_table"] for foreign_key in inspector.get_foreign_keys("remote_executions")} >= {
+        "compute_nodes",
+        "deployment_services",
+    }
+    assert {foreign_key["referred_table"] for foreign_key in inspector.get_foreign_keys("deployment_instances")} >= {
+        "compute_nodes",
+        "deployment_services",
+    }
+    assert {foreign_key["referred_table"] for foreign_key in inspector.get_foreign_keys("distributed_training_runs")} >= {
+        "resource_pools",
+        "training_jobs",
+    }
+    assert {
+        "ix_remote_executions_node_id",
+        "ix_remote_executions_status",
+        "ix_deployment_instances_deployment_service_id",
+        "ix_deployment_instances_node_id",
+        "ix_distributed_training_runs_training_job_id",
+        "ix_distributed_training_runs_resource_pool_id",
+    }.issubset({index["name"] for table in (
+        "remote_executions",
+        "deployment_instances",
+        "distributed_training_runs",
+    ) for index in inspector.get_indexes(table)})
+
+    command.downgrade(config, "20260717_0001")
+    inspector = inspect(create_engine(database_url))
+    assert {
+        "edge_ssh_credentials",
+        "remote_executions",
+        "deployment_instances",
+        "distributed_training_runs",
+    }.isdisjoint(inspector.get_table_names())
 
 
 def test_training_jobs_does_not_reference_trained_models(tmp_path):

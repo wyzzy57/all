@@ -2,7 +2,7 @@ import json
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TaskStatus(StrEnum):
@@ -22,6 +22,24 @@ class TaskType(StrEnum):
     PROCESS_DATASET = "PROCESS_DATASET"
     TRAIN_MODEL = "TRAIN_MODEL"
     CONVERT_MODEL = "CONVERT_MODEL"
+    EDGE_PROBE = "EDGE_PROBE"
+    EDGE_DEPLOY = "EDGE_DEPLOY"
+    EDGE_STOP_DEPLOYMENT = "EDGE_STOP_DEPLOYMENT"
+    EDGE_ROLLBACK = "EDGE_ROLLBACK"
+    EDGE_TRAIN = "EDGE_TRAIN"
+    EDGE_STOP_TRAINING = "EDGE_STOP_TRAINING"
+    EDGE_RESUME_TRAINING = "EDGE_RESUME_TRAINING"
+
+
+EDGE_EXECUTOR_TASK_TYPES = {
+    TaskType.EDGE_PROBE,
+    TaskType.EDGE_DEPLOY,
+    TaskType.EDGE_STOP_DEPLOYMENT,
+    TaskType.EDGE_ROLLBACK,
+    TaskType.EDGE_TRAIN,
+    TaskType.EDGE_STOP_TRAINING,
+    TaskType.EDGE_RESUME_TRAINING,
+}
 
 
 def _json_field(value: dict[str, Any]) -> str:
@@ -34,6 +52,13 @@ class TaskCommand(BaseModel):
     resource_refs: dict[str, str] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)
     payload_version: int = 1
+
+    @model_validator(mode="after")
+    def validate_edge_command_is_identifier_only(self) -> "TaskCommand":
+        if self.task_type in EDGE_EXECUTOR_TASK_TYPES:
+            if self.payload or any(not key.endswith("_id") for key in self.resource_refs):
+                raise ValueError("Edge task commands must use identifier-only resource_refs and an empty payload")
+        return self
 
     def to_stream_fields(self) -> dict[str, str]:
         return {
