@@ -21,6 +21,7 @@ _DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 _MIN_POLL_INTERVAL_SECONDS = 0.01
 _MAX_POLL_INTERVAL_SECONDS = 0.1
 _DEADLINE_SCHEDULER_GUARD_SECONDS = 0.01
+_SSH_HANDSHAKE_SCHEDULER_GUARD_SECONDS = 0.02
 _OPERATION_JOIN_SECONDS = 0.001
 
 
@@ -137,6 +138,7 @@ def _run_with_deadline(
     timeout_error: type[Exception],
     timeout_message: str,
     on_timeout: Callable[[], None],
+    scheduler_guard_seconds: float = _DEADLINE_SCHEDULER_GUARD_SECONDS,
 ) -> Any:
     outcome = _OperationOutcome()
     completed = threading.Event()
@@ -156,7 +158,7 @@ def _run_with_deadline(
     )
     worker.start()
     remaining = deadline - time.monotonic()
-    wait_seconds = max(0.0, remaining - _DEADLINE_SCHEDULER_GUARD_SECONDS)
+    wait_seconds = max(0.0, remaining - scheduler_guard_seconds)
     if remaining <= 0 or not completed.wait(wait_seconds):
         on_timeout()
         worker.join(_OPERATION_JOIN_SECONDS)
@@ -205,6 +207,7 @@ def scan_host_key(
             timeout_error=TimeoutError,
             timeout_message="SSH host-key scan timed out",
             on_timeout=lambda: _close_transport_and_socket(transport, opened_socket),
+            scheduler_guard_seconds=_SSH_HANDSHAKE_SCHEDULER_GUARD_SECONDS,
         )
         _remaining(deadline, TimeoutError, "SSH host-key scan timed out")
         return _scanned_host_key(transport.get_remote_server_key())
@@ -323,6 +326,7 @@ class StrictSshClient:
                 timeout_error=TimeoutError,
                 timeout_message="SSH connection timed out",
                 on_timeout=close_connection,
+                scheduler_guard_seconds=_SSH_HANDSHAKE_SCHEDULER_GUARD_SECONDS,
             )
             if deadline is not None:
                 _remaining(deadline, TimeoutError, "SSH connection timed out")
@@ -345,6 +349,7 @@ class StrictSshClient:
                     timeout_error=SshAuthenticationError,
                     timeout_message="SSH authentication timed out",
                     on_timeout=close_connection,
+                    scheduler_guard_seconds=_SSH_HANDSHAKE_SCHEDULER_GUARD_SECONDS,
                 )
                 if deadline is not None:
                     _remaining(

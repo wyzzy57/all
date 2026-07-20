@@ -4,6 +4,7 @@ from typing import Any
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 import logging
+import threading
 import time
 
 import pytest
@@ -47,12 +48,24 @@ class FakeBootstrapService:
         self.calls.append(("bootstrap", request))
         return {"status": "ok", "node_id": "node-1"}
 
-    def test_connection(self, *, node_id: str) -> dict[str, Any]:
-        self.calls.append(("test_connection", {"node_id": node_id}))
+    def test_connection(
+        self,
+        *,
+        node_id: str,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            ("test_connection", {"node_id": node_id, "deadline": deadline})
+        )
         return {"status": "ok", "node_id": node_id}
 
-    def rotate_key(self, *, node_id: str) -> dict[str, Any]:
-        self.calls.append(("rotate_key", {"node_id": node_id}))
+    def rotate_key(
+        self,
+        *,
+        node_id: str,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        self.calls.append(("rotate_key", {"node_id": node_id, "deadline": deadline}))
         return {"status": "ok", "node_id": node_id}
 
 
@@ -234,10 +247,113 @@ def test_connection_and_rotate_routes_forward_only_node_identifier() -> None:
 
     assert test_response.status_code == 200
     assert rotate_response.status_code == 200
-    assert service.calls == [
-        ("test_connection", {"node_id": "node-7"}),
-        ("rotate_key", {"node_id": "node-7"}),
+    assert [call[0] for call in service.calls] == ["test_connection", "rotate_key"]
+    for _, payload in service.calls:
+        assert payload["node_id"] == "node-7"
+        assert isinstance(payload["deadline"], float)
+
+
+@pytest.mark.parametrize(
+    ("path", "operation"),
+    [
+        ("/edge-nodes/node-7/test-connection", "test_connection"),
+        ("/edge-nodes/node-7/rotate-key", "rotate_key"),
+    ],
+)
+def test_node_operation_route_enforces_fifty_millisecond_ingress_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    operation: str,
+) -> None:
+    class SlowService(FakeBootstrapService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered: list[float] = []
+            self.finished = threading.Event()
+
+        def test_connection(self, **request: Any) -> dict[str, Any]:
+            self.calls.append(("test_connection", request))
+            self.entered.append(time.monotonic())
+            try:
+                time.sleep(0.08)
+                return {"status": "ok", "node_id": request["node_id"]}
+            finally:
+                self.finished.set()
+
+        def rotate_key(self, **request: Any) -> dict[str, Any]:
+            self.calls.append(("rotate_key", request))
+            self.entered.append(time.monotonic())
+            try:
+                time.sleep(0.08)
+                return {"status": "ok", "node_id": request["node_id"]}
+            finally:
+                self.finished.set()
+
+    monkeypatch.setattr(edge_ssh, "REQUEST_TIMEOUT_SECONDS", 0.05)
+    service = SlowService()
+    client = _client(service)
+    started = time.monotonic()
+
+    response = client.post(path)
+    elapsed = time.monotonic() - started
+    assert service.finished.wait(0.2)
+
+    assert response.status_code == 504
+    assert response.json() == {"detail": "Edge bootstrap request timed out"}
+    assert elapsed < 0.094
+    assert service.calls[0][0] == operation
+    assert service.entered[0] < service.calls[0][1]["deadline"]
+    assert service.calls[0][1]["deadline"] <= service.entered[0] + 0.05
+
+
+def test_edge_ssh_background_calls_are_bounded_without_queued_work() -> None:
+    started_calls = 0
+    started_lock = threading.Lock()
+    release = threading.Event()
+
+    def blocking_call() -> dict[str, Any]:
+        nonlocal started_calls
+        with started_lock:
+            started_calls += 1
+        release.wait(1.0)
+        return {"status": "ok", "node_id": "node-7"}
+
+    async def run_calls() -> list[dict[str, Any] | HTTPException]:
+        deadline = time.monotonic() + 1.0
+        tasks = [
+            asyncio.create_task(edge_ssh._invoke_with_deadline(blocking_call, deadline))
+            for _ in range(5)
+        ]
+        await asyncio.sleep(0.05)
+        release.set()
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = asyncio.run(run_calls())
+
+    overloads = [
+        result
+        for result in results
+        if isinstance(result, HTTPException) and result.status_code == 503
     ]
+    assert len(overloads) == 1
+    assert overloads[0].detail == "Edge SSH service is busy"
+    assert started_calls == 4
+
+
+def test_edge_ssh_expired_background_deadline_returns_fixed_timeout() -> None:
+    called = False
+
+    def call() -> dict[str, Any]:
+        nonlocal called
+        called = True
+        return {"status": "ok", "node_id": "node-7"}
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(edge_ssh._invoke_with_deadline(call, time.monotonic() - 1.0))
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.detail == "Edge bootstrap request timed out"
+    assert called is False
 
 
 def test_api_openapi_exposes_exact_edge_ssh_routes() -> None:

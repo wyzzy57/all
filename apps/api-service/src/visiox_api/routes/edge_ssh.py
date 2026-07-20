@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any
 
 import json
@@ -29,6 +30,13 @@ _DEADLINE_SCHEDULER_GUARD_SECONDS = 0.02
 _INVALID_BOOTSTRAP_DETAIL = "Bootstrap request is invalid"
 _INVALID_SCAN_DETAIL = "Host-key scan request is invalid"
 _REQUEST_TIMEOUT_DETAIL = "Edge bootstrap request timed out"
+_SERVICE_BUSY_DETAIL = "Edge SSH service is busy"
+_MAX_BACKGROUND_CALLS = 4
+_BACKGROUND_CAPACITY = threading.BoundedSemaphore(_MAX_BACKGROUND_CALLS)
+_BACKGROUND_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_MAX_BACKGROUND_CALLS,
+    thread_name_prefix="visiox-edge-ssh-api",
+)
 
 
 class ScanHostKeyRequest(BaseModel):
@@ -73,6 +81,16 @@ BootstrapServiceDependency = Annotated[
 ]
 
 
+async def get_edge_ssh_request_deadline() -> float:
+    return time.monotonic() + REQUEST_TIMEOUT_SECONDS
+
+
+RequestDeadlineDependency = Annotated[
+    float,
+    Depends(get_edge_ssh_request_deadline),
+]
+
+
 def _invoke(call: Any) -> dict[str, Any]:
     try:
         return call()
@@ -108,9 +126,9 @@ def _invoke(call: Any) -> dict[str, Any]:
 @router.post("/scan-host-key", response_model=ScanHostKeyResponse)
 async def scan_host_key(
     http_request: Request,
+    deadline: RequestDeadlineDependency,
     service: BootstrapServiceDependency,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
     request = await _read_request_model(
         http_request,
         ScanHostKeyRequest,
@@ -141,9 +159,9 @@ async def scan_host_key(
 )
 async def bootstrap(
     http_request: Request,
+    deadline: RequestDeadlineDependency,
     service: BootstrapServiceDependency,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
     request = await _read_request_model(
         http_request,
         BootstrapRequest,
@@ -208,41 +226,34 @@ def _remaining(deadline: float) -> float:
 
 
 async def _invoke_with_deadline(call: Any, deadline: float) -> dict[str, Any]:
-    loop = asyncio.get_running_loop()
-    completed: asyncio.Future[dict[str, Any]] = loop.create_future()
-
-    def publish(value: dict[str, Any] | None, error: BaseException | None) -> None:
-        if completed.done():
-            return
-        if error is not None:
-            completed.set_exception(error)
-        else:
-            assert value is not None
-            completed.set_result(value)
-
-    def invoke() -> None:
-        try:
-            value = call()
-            error = None
-        except BaseException as caught:
-            value = None
-            error = caught
-        try:
-            loop.call_soon_threadsafe(publish, value, error)
-        except RuntimeError:
-            pass
-
-    threading.Thread(
-        target=invoke,
-        name="visiox-edge-bootstrap-api",
-        daemon=True,
-    ).start()
+    try:
+        wait_timeout = _wait_timeout(deadline)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=_REQUEST_TIMEOUT_DETAIL,
+        ) from None
+    if not _BACKGROUND_CAPACITY.acquire(blocking=False):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_SERVICE_BUSY_DETAIL,
+        )
+    try:
+        future = _BACKGROUND_EXECUTOR.submit(call)
+    except Exception:
+        _BACKGROUND_CAPACITY.release()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_SERVICE_BUSY_DETAIL,
+        ) from None
+    future.add_done_callback(lambda _: _BACKGROUND_CAPACITY.release())
     try:
         return await asyncio.wait_for(
-            completed,
-            timeout=_wait_timeout(deadline),
+            asyncio.wrap_future(future),
+            timeout=wait_timeout,
         )
     except TimeoutError:
+        future.cancel()
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=_REQUEST_TIMEOUT_DETAIL,
@@ -257,16 +268,24 @@ def _wait_timeout(deadline: float) -> float:
 
 
 @router.post("/{id}/test-connection", response_model=EdgeNodeOperationResponse)
-def test_connection(
+async def test_connection(
     id: str,
+    deadline: RequestDeadlineDependency,
     service: BootstrapServiceDependency,
 ) -> dict[str, Any]:
-    return _invoke(lambda: service.test_connection(node_id=id))
+    return await _invoke_with_deadline(
+        lambda: _invoke(lambda: service.test_connection(node_id=id, deadline=deadline)),
+        deadline,
+    )
 
 
 @router.post("/{id}/rotate-key", response_model=EdgeNodeOperationResponse)
-def rotate_key(
+async def rotate_key(
     id: str,
+    deadline: RequestDeadlineDependency,
     service: BootstrapServiceDependency,
 ) -> dict[str, Any]:
-    return _invoke(lambda: service.rotate_key(node_id=id))
+    return await _invoke_with_deadline(
+        lambda: _invoke(lambda: service.rotate_key(node_id=id, deadline=deadline)),
+        deadline,
+    )

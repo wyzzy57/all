@@ -250,11 +250,21 @@ class EdgeBootstrapService:
             deadline=deadline,
         )
 
-    def test_connection(self, *, node_id: str) -> dict[str, Any]:
-        return self._send("test_connection", node_id=node_id)
+    def test_connection(
+        self,
+        *,
+        node_id: str,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        return self._send("test_connection", node_id=node_id, deadline=deadline)
 
-    def rotate_key(self, *, node_id: str) -> dict[str, Any]:
-        return self._send("rotate_key", node_id=node_id)
+    def rotate_key(
+        self,
+        *,
+        node_id: str,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        return self._send("rotate_key", node_id=node_id, deadline=deadline)
 
     def _send(
         self,
