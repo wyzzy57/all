@@ -11,6 +11,7 @@ from visiox_api.routes.agent_enrollment import router as agent_enrollment_router
 from visiox_api.routes.base_models import router as base_models_router
 from visiox_api.routes.dataset_samples import router as dataset_samples_router
 from visiox_api.routes.datasets import router as datasets_router
+from visiox_api.routes.edge_ssh import router as edge_ssh_router
 from visiox_api.routes.label_projects import router as label_projects_router
 from visiox_api.routes.nodes import router as nodes_router
 from visiox_api.routes.pipeline_evaluation import router as pipeline_evaluation_router
@@ -96,6 +97,7 @@ def create_app() -> FastAPI:
     app.include_router(nodes_router)
     app.include_router(base_models_router)
     app.include_router(datasets_router)
+    app.include_router(edge_ssh_router)
     app.include_router(dataset_samples_router)
     app.include_router(label_projects_router)
     app.include_router(pipelines_router)
