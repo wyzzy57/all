@@ -1,0 +1,47 @@
+{
+  "os_release": {
+    "id": "ubuntu",
+    "version_id": "22.04",
+    "pretty_name": "Ubuntu 22.04.4 LTS"
+  },
+  "uname": {
+    "architecture": "aarch64",
+    "kernel_release": "5.15.122-tegra"
+  },
+  "cpu": {
+    "logical_cores": 12
+  },
+  "memory": {
+    "total_kib": 31997508
+  },
+  "docker": {
+    "available": true,
+    "version": "26.1.3",
+    "runtimes": ["io.containerd.runc.v2", "nvidia", "runc"],
+    "default_runtime": "runc"
+  },
+  "nvidia": {
+    "driver_version": "540.4.0",
+    "cuda_version": "12.2",
+    "gpus": [
+      {
+        "name": "NVIDIA Jetson AGX Orin",
+        "uuid": "GPU-jetson-fixture",
+        "memory_total_mib": 31936,
+        "compute_capability": "8.7"
+      }
+    ]
+  },
+  "jetson": {
+    "model": "NVIDIA Jetson AGX Orin Developer Kit",
+    "compatible": "nvidia,p3737-0000+p3701-0005",
+    "nv_tegra_release": "# R36 (release), REVISION: 3.0, GCID: 35550185",
+    "packages": {
+      "cuda-cudart-12-2": "12.2.140-1",
+      "libcudnn9-cuda-12": "9.0.0.312-1",
+      "libnvinfer10": "10.0.1.6-1+cuda12.2",
+      "nvidia-jetpack": "6.0+b106",
+      "nvidia-l4t-core": "36.3.0-20240506102626"
+    }
+  }
+}

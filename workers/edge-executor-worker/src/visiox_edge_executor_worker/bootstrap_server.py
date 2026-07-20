@@ -6,7 +6,6 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 import errno
 import hmac
-from importlib import resources
 import ipaddress
 import json
 import math
@@ -31,6 +30,8 @@ from visiox_db.models import ComputeNode, EdgeSshCredential
 from visiox_db.session import create_session_factory
 
 from .crypto import EncryptedSecret
+from .inventory import parse_inventory
+from .scripts import load_packaged_script
 from .ssh import HostKeyMismatchError, ScannedHostKey, scan_host_key
 from .startup import EdgeExecutorSecurityContext, initialize_security
 
@@ -40,6 +41,7 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 _SSH_USER = "visiox-edge"
 _SSH_PLATFORM_KIND = "ssh_edge"
 _REMOTE_SCRIPT_NAME = "bootstrap_user.sh"
+_INVENTORY_SCRIPT_NAME = "probe_inventory.sh"
 _REMOTE_DATA_NAME = "request.json"
 _SUDO_PREFLIGHT_COMMAND = "command -v sudo >/dev/null 2>&1 && sudo -n true"
 _AF_UNIX = getattr(socket, "AF_UNIX", 1)
@@ -283,6 +285,7 @@ class BootstrapOperations:
         *,
         host_key_scanner: Callable[[str, int, float], ScannedHostKey] = scan_host_key,
         bootstrap_script: bytes | None = None,
+        inventory_script: bytes | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._security = security
@@ -291,9 +294,12 @@ class BootstrapOperations:
         self._bootstrap_script = (
             bootstrap_script
             if bootstrap_script is not None
-            else resources.files("visiox_edge_executor_worker")
-            .joinpath("remote", _REMOTE_SCRIPT_NAME)
-            .read_bytes()
+            else load_packaged_script(_REMOTE_SCRIPT_NAME)
+        )
+        self._inventory_script = (
+            inventory_script
+            if inventory_script is not None
+            else load_packaged_script(_INVENTORY_SCRIPT_NAME)
         )
         self._clock = clock
         self._locks = _KeyedLockPool()
@@ -324,6 +330,8 @@ class BootstrapOperations:
                 return self._bootstrap(request_id, request, request_deadline)
             if operation == "test_connection":
                 return self._test_connection(request_id, request, request_deadline)
+            if operation == "probe":
+                return self._probe(request_id, request, request_deadline)
             if operation == "rotate_key":
                 return self._rotate_key(request_id, request, request_deadline)
             raise BootstrapOperationError("INVALID_REQUEST", "Bootstrap request is invalid")
@@ -341,6 +349,12 @@ class BootstrapOperations:
                 cleanup_required=error.cleanup_required,
             )
         except Exception:
+            if operation == "probe":
+                return self._error(
+                    request_id,
+                    "PROBE_FAILED",
+                    "Edge inventory probe failed",
+                )
             return self._error(
                 request_id,
                 "BOOTSTRAP_FAILED",
@@ -654,6 +668,38 @@ class BootstrapOperations:
                 ssh_session.close()
         return {"request_id": request_id, "status": "ok", "node_id": node_id}
 
+    def _probe(
+        self,
+        request_id: str,
+        request: dict[str, Any],
+        deadline: float,
+    ) -> dict[str, Any]:
+        self._require_keys(request, {"request_id", "operation", "node_id"})
+        node_id = _required_string(request, "node_id")
+        with self._locks.acquire({f"node:{node_id}"}, deadline, clock=self._clock):
+            with self._session_factory() as session:
+                credential = self._credential_or_error(session, node_id)
+                private_key = self._decrypt(credential)
+                ssh_session = self._security.ssh_client.connect(
+                    host=credential.ssh_host,
+                    port=credential.ssh_port,
+                    username=credential.ssh_user,
+                    private_key=private_key,
+                    expected_fingerprint=credential.host_key_fingerprint,
+                    timeout_seconds=self._operation_timeout(deadline),
+                )
+                try:
+                    output = self._run_inventory_script(ssh_session, deadline=deadline)
+                    snapshot = parse_inventory(output)
+                finally:
+                    ssh_session.close()
+        return {
+            "request_id": request_id,
+            "status": "ok",
+            "node_id": node_id,
+            "inventory": snapshot.model_dump(mode="json"),
+        }
+
     def _rotate_key(
         self,
         request_id: str,
@@ -838,6 +884,46 @@ class BootstrapOperations:
                     "REMOTE_SETUP_FAILED", "Remote SSH setup failed"
                 )
             completed = True
+        finally:
+            try:
+                ssh_session.cleanup_private_directory(
+                    workspace,
+                    remote_paths,
+                    timeout_seconds=self._operation_timeout(deadline),
+                )
+            except Exception:
+                if completed:
+                    raise
+
+    def _run_inventory_script(self, ssh_session: Any, *, deadline: float) -> bytes:
+        workspace = ssh_session.create_private_directory(
+            timeout_seconds=self._operation_timeout(deadline)
+        )
+        script_path = str(PurePosixPath(workspace.path) / _INVENTORY_SCRIPT_NAME)
+        remote_paths = (script_path,)
+        completed = False
+        try:
+            ssh_session.upload_bytes_exclusive(
+                self._inventory_script,
+                script_path,
+                expected_owner_uid=workspace.owner_uid,
+                timeout_seconds=self._operation_timeout(deadline),
+            )
+            ssh_session.validate_remote_file(
+                script_path,
+                expected_owner_uid=workspace.owner_uid,
+                timeout_seconds=self._operation_timeout(deadline),
+            )
+            result = ssh_session.run(
+                f"/bin/bash {shlex.quote(script_path)}",
+                timeout_seconds=self._operation_timeout(deadline),
+            )
+            if result.exit_status != 0:
+                raise BootstrapOperationError(
+                    "PROBE_FAILED", "Edge inventory probe failed"
+                )
+            completed = True
+            return result.stdout
         finally:
             try:
                 ssh_session.cleanup_private_directory(

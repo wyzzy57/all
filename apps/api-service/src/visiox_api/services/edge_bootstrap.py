@@ -22,6 +22,7 @@ _REJECTION_MESSAGES = {
     "SSH_HOST_IN_USE": "SSH host and port are already assigned to another node",
     "REMOTE_SETUP_FAILED": "Remote SSH setup failed",
     "SUDO_UNAVAILABLE": "Passwordless sudo is required for SSH bootstrap",
+    "PROBE_FAILED": "Edge inventory probe failed",
     "REQUEST_TIMEOUT": "Edge bootstrap request timed out",
     "BOOTSTRAP_CLEANUP_FAILED": "Edge node bootstrap cleanup failed",
     "ROTATE_CLEANUP_FAILED": "SSH key rotation cleanup failed",
@@ -205,6 +206,17 @@ class EdgeBootstrapChannel:
                 for name in ("host_key_type", "fingerprint")
             ):
                 raise BootstrapChannelError("Edge bootstrap channel failed")
+        elif operation == "probe":
+            if set(response) != {
+                "request_id",
+                "status",
+                "node_id",
+                "inventory",
+            } or not (
+                isinstance(response.get("node_id"), str)
+                and isinstance(response.get("inventory"), dict)
+            ):
+                raise BootstrapChannelError("Edge bootstrap channel failed")
         elif operation in {"bootstrap", "test_connection", "rotate_key"}:
             if set(response) != {"request_id", "status", "node_id"} or not isinstance(
                 response.get("node_id"), str
@@ -265,6 +277,14 @@ class EdgeBootstrapService:
         deadline: float | None = None,
     ) -> dict[str, Any]:
         return self._send("rotate_key", node_id=node_id, deadline=deadline)
+
+    def probe(
+        self,
+        *,
+        node_id: str,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        return self._send("probe", node_id=node_id, deadline=deadline)
 
     def _send(
         self,

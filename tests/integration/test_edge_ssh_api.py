@@ -363,6 +363,7 @@ def test_api_openapi_exposes_exact_edge_ssh_routes() -> None:
     assert edge_paths == [
         "/edge-nodes/bootstrap",
         "/edge-nodes/scan-host-key",
+        "/edge-nodes/{id}/probe",
         "/edge-nodes/{id}/rotate-key",
         "/edge-nodes/{id}/test-connection",
     ]

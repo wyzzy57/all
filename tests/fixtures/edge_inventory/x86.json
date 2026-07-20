@@ -1,0 +1,45 @@
+{
+  "os_release": {
+    "id": "ubuntu",
+    "version_id": "24.04",
+    "pretty_name": "Ubuntu 24.04 LTS"
+  },
+  "uname": {
+    "architecture": "x86_64",
+    "kernel_release": "6.8.0-40-generic"
+  },
+  "cpu": {
+    "logical_cores": 24
+  },
+  "memory": {
+    "total_kib": 65790112
+  },
+  "docker": {
+    "available": true,
+    "version": "27.1.1",
+    "runtimes": ["io.containerd.runc.v2", "nvidia", "runc"],
+    "default_runtime": "runc"
+  },
+  "nvidia": {
+    "driver_version": "550.90.07",
+    "cuda_version": "12.4",
+    "gpus": [
+      {
+        "name": "NVIDIA RTX 4090",
+        "uuid": "GPU-x86-fixture",
+        "memory_total_mib": 24564,
+        "compute_capability": "8.9"
+      }
+    ]
+  },
+  "jetson": {
+    "model": null,
+    "compatible": null,
+    "nv_tegra_release": null,
+    "packages": {
+      "cuda-cudart-12-4": "12.4.127-1",
+      "libcudnn9-cuda-12": "9.1.1.17-1",
+      "libnvinfer10": "10.2.0.19-1+cuda12.5"
+    }
+  }
+}
