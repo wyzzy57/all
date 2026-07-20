@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 import signal
+import subprocess
+import sys
 import threading
+import textwrap
 import time
 from types import SimpleNamespace
 
@@ -453,6 +457,152 @@ def test_blocking_dispatch_keeps_signal_shutdown_and_cleanup_responsive() -> Non
     assert handler_released is False
     assert events.count("server-stop") >= 1
     assert events == [*filter(lambda item: item == "server-stop", events), "redis-close"]
+
+
+def test_blocking_work_pool_returns_results_propagates_errors_and_stops_accepting() -> None:
+    from visiox_edge_executor_worker.runner import BlockingWorkPool
+
+    def fail() -> None:
+        raise ValueError("fixed failure")
+
+    async def exercise() -> None:
+        pool = BlockingWorkPool(max_workers=1)
+        assert await pool.run(lambda: 42) == 42
+        with pytest.raises(ValueError, match="fixed failure"):
+            await pool.run(fail)
+        pool.stop_accepting()
+        with pytest.raises(RuntimeError, match="not accepting"):
+            await pool.run(lambda: 7)
+        await pool.shutdown(grace_seconds=0.01)
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_waiter_does_not_release_blocking_work_backpressure() -> None:
+    from visiox_edge_executor_worker.runner import BlockingWorkPool
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+
+    def first() -> None:
+        first_started.set()
+        release_first.wait(timeout=2)
+
+    def second() -> str:
+        second_started.set()
+        return "second-complete"
+
+    async def exercise() -> None:
+        pool = BlockingWorkPool(max_workers=1)
+        first_task = asyncio.create_task(pool.run(first))
+        assert await asyncio.to_thread(first_started.wait, 1)
+        first_task.cancel()
+        await asyncio.gather(first_task, return_exceptions=True)
+
+        second_task = asyncio.create_task(pool.run(second))
+        await asyncio.sleep(0.02)
+        assert second_started.is_set() is False
+        release_first.set()
+        assert await asyncio.wait_for(second_task, timeout=1) == "second-complete"
+        await pool.shutdown(grace_seconds=0.01)
+
+    asyncio.run(exercise())
+
+
+def test_stuck_blocking_work_cannot_hold_worker_process_past_shutdown_grace() -> None:
+    child = textwrap.dedent(
+        """
+        import asyncio
+        import threading
+        import time
+        from types import SimpleNamespace
+
+        from visiox_edge_executor_worker.runner import (
+            BlockingWorkPool,
+            EdgeExecutorApplication,
+        )
+
+        started = threading.Event()
+        never_release = threading.Event()
+        server_stopped = threading.Event()
+        pool = BlockingWorkPool(max_workers=1)
+
+        class Reconciler:
+            def reconcile_startup(self, *, stop_requested):
+                return 0
+
+        class Queue:
+            async def ensure_consumer_group(self):
+                return None
+
+            async def run_forever(self, *, group_ready=False):
+                def block_forever():
+                    started.set()
+                    never_release.wait()
+                await pool.run(block_forever)
+
+            def stop(self):
+                return None
+
+        class Server:
+            def serve_forever(self):
+                server_stopped.wait()
+
+            def stop(self):
+                server_stopped.set()
+
+        class Redis:
+            async def aclose(self):
+                return None
+
+        async def main():
+            application = EdgeExecutorApplication(
+                dispatcher=SimpleNamespace(),
+                reconciler=Reconciler(),
+                queue=Queue(),
+                bootstrap_server=Server(),
+                redis_client=Redis(),
+                blocking_pool=pool,
+                shutdown_grace_seconds=0.05,
+            )
+            run_task = asyncio.create_task(application.run())
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+            began = time.monotonic()
+            application.request_shutdown()
+            await run_task
+            elapsed = time.monotonic() - began
+            if elapsed > 0.30:
+                raise SystemExit(f"shutdown exceeded grace tolerance: {elapsed}")
+            print("bounded-process-exit", flush=True)
+
+        asyncio.run(main())
+        """
+    )
+
+    child_environment = dict(os.environ)
+    child_environment["PYTHONPATH"] = os.pathsep.join(
+        str(REPOSITORY_ROOT / path)
+        for path in (
+            "packages/visiox-common/src",
+            "packages/visiox-db/src",
+            "packages/visiox-messaging/src",
+            "workers/edge-executor-worker/src",
+        )
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", child],
+        cwd=REPOSITORY_ROOT,
+        env=child_environment,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "bounded-process-exit"
 
 
 def test_application_cleanup_stops_queue_socket_and_redis() -> None:

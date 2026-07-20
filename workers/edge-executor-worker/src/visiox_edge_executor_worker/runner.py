@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import field
 from functools import partial
 import json
 import logging
 import os
+import queue as thread_queue
 import signal
 import socket
 import threading
@@ -44,26 +44,135 @@ BLOCKING_WORKERS = 4
 SHUTDOWN_GRACE_SECONDS = 5.0
 
 
+@dataclass(frozen=True)
+class _BlockingCall:
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future[Any]
+    function: Callable[[], Any]
+
+
 class BlockingWorkPool:
     def __init__(self, *, max_workers: int = BLOCKING_WORKERS) -> None:
         if max_workers < 1:
             raise ValueError("blocking work pool requires at least one worker")
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="edge-blocking",
-        )
+        self._max_workers = max_workers
         self._slots = asyncio.Semaphore(max_workers)
+        self._calls: thread_queue.Queue[_BlockingCall | None] = thread_queue.Queue()
+        self._workers: list[threading.Thread] = []
+        self._worker_lock = threading.Lock()
+        self._accepting = threading.Event()
+        self._accepting.set()
+        self._closed = threading.Event()
+        self._inflight: set[asyncio.Future[Any]] = set()
 
     async def run(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-        async with self._slots:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                self._executor,
-                partial(function, *args, **kwargs),
+        if not self._accepting.is_set():
+            raise RuntimeError("blocking work pool is not accepting work")
+        await self._slots.acquire()
+        if not self._accepting.is_set():
+            self._slots.release()
+            raise RuntimeError("blocking work pool is not accepting work")
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._inflight.add(future)
+        self._ensure_worker()
+        self._calls.put_nowait(
+            _BlockingCall(
+                loop=loop,
+                future=future,
+                function=partial(function, *args, **kwargs),
             )
+        )
+        return await asyncio.shield(future)
+
+    def stop_accepting(self) -> None:
+        self._accepting.clear()
+
+    async def shutdown(self, *, grace_seconds: float) -> None:
+        self.stop_accepting()
+        if grace_seconds < 0:
+            raise ValueError("shutdown grace must not be negative")
+        inflight = tuple(self._inflight)
+        if inflight:
+            await asyncio.wait(inflight, timeout=grace_seconds)
+        self.close()
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self.stop_accepting()
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        for future in tuple(self._inflight):
+            if not future.done():
+                future.cancel()
+        for _ in self._workers:
+            self._calls.put_nowait(None)
+
+    def _ensure_worker(self) -> None:
+        with self._worker_lock:
+            if len(self._workers) >= self._max_workers:
+                return
+            worker = threading.Thread(
+                target=self._worker,
+                name=f"edge-blocking-{len(self._workers) + 1}",
+                daemon=True,
+            )
+            self._workers.append(worker)
+            worker.start()
+
+    def _worker(self) -> None:
+        while True:
+            call = self._calls.get()
+            if call is None:
+                return
+            if self._closed.is_set() or call.future.cancelled():
+                self._notify_completion(call, cancelled=True)
+                continue
+            try:
+                result = call.function()
+            except BaseException as error:
+                self._notify_completion(call, error=error)
+            else:
+                self._notify_completion(call, result=result)
+
+    def _notify_completion(
+        self,
+        call: _BlockingCall,
+        *,
+        result: Any = None,
+        error: BaseException | None = None,
+        cancelled: bool = False,
+    ) -> None:
+        try:
+            call.loop.call_soon_threadsafe(
+                self._complete,
+                call.future,
+                result,
+                error,
+                cancelled,
+            )
+        except RuntimeError:
+            # The daemon may finish after the event loop and process have shut down.
+            return
+
+    def _complete(
+        self,
+        future: asyncio.Future[Any],
+        result: Any,
+        error: BaseException | None,
+        cancelled: bool,
+    ) -> None:
+        self._inflight.discard(future)
+        self._slots.release()
+        if future.done():
+            return
+        if cancelled:
+            future.cancel()
+        elif error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(result)
 
 
 class EdgeOperationHandler(Protocol):
@@ -336,18 +445,21 @@ class EdgeExecutorApplication:
         finally:
             self.queue.stop()
             self.bootstrap_server.stop()
+            deadline = asyncio.get_running_loop().time() + self.shutdown_grace_seconds
+            await self.blocking_pool.shutdown(
+                grace_seconds=self.shutdown_grace_seconds,
+            )
             pending = {task for task in tasks if not task.done()}
             if pending:
                 _, pending = await asyncio.wait(
                     pending,
-                    timeout=self.shutdown_grace_seconds,
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
                 )
             for task in pending:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             shutdown_task.cancel()
             await asyncio.gather(shutdown_task, return_exceptions=True)
-            self.blocking_pool.close()
             close = getattr(self.redis_client, "aclose", None)
             if close is not None:
                 await close()
@@ -355,6 +467,7 @@ class EdgeExecutorApplication:
     def request_shutdown(self) -> None:
         self._shutdown_requested.set()
         self._shutdown_event.set()
+        self.blocking_pool.stop_accepting()
         self.queue.stop()
         self.bootstrap_server.stop()
 
