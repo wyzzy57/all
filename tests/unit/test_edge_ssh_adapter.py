@@ -1,6 +1,9 @@
 import base64
 import hashlib
+import os
+from pathlib import Path
 import socket as socket_module
+import stat
 import threading
 import time
 
@@ -9,6 +12,7 @@ import pytest
 
 from visiox_edge_executor_worker.ssh import (
     HostKeyMismatchError,
+    RemotePrivateDirectory,
     SftpTransferError,
     SftpTransferTimeoutError,
     SshAuthenticationError,
@@ -260,6 +264,57 @@ class FakeSftpClient:
         self.closed = True
 
 
+class LocalFilesystemSftp:
+    """Exercise Paramiko-style SFTP calls against real local filesystem semantics."""
+
+    def __init__(self, channel: FakeChannel, home: Path) -> None:
+        self.channel = channel
+        self.home = home
+        self.closed = False
+
+    def normalize(self, path: str) -> str:
+        assert path == "."
+        return self.home.as_posix()
+
+    def lstat(self, path: str):
+        return os.lstat(path)
+
+    def mkdir(self, path: str, mode: int) -> None:
+        os.mkdir(path, mode)
+
+    def chmod(self, path: str, mode: int) -> None:
+        os.chmod(path, mode)
+
+    def file(self, path: str, mode: str):
+        return open(path, mode + "b")
+
+    def remove(self, path: str) -> None:
+        os.remove(path)
+
+    def rmdir(self, path: str) -> None:
+        os.rmdir(path)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ExistingFileSftp:
+    def __init__(self, channel: FakeChannel) -> None:
+        self.channel = channel
+        self.removed: list[str] = []
+        self.closed = False
+
+    def file(self, path: str, mode: str):
+        assert mode == "x"
+        raise FileExistsError(path)
+
+    def remove(self, path: str) -> None:
+        self.removed.append(path)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _fingerprint(key: FakeHostKey) -> str:
     digest = hashlib.sha256(key.asbytes()).digest()
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
@@ -348,6 +403,34 @@ def test_scan_host_key_returns_a_structured_sha256_fingerprint() -> None:
     assert scanned.host_key_type == "ssh-ed25519"
     assert scanned.fingerprint == _fingerprint(remote_key)
     assert fake_socket.closed
+
+
+def test_authenticated_connect_accepts_a_caller_total_deadline() -> None:
+    remote_key = FakeHostKey("ssh-ed25519", b"host-key-a")
+    fake_socket = FakeSocket()
+    transport = FakeTransport(fake_socket, remote_key)
+    socket_timeouts: list[float] = []
+    client = StrictSshClient(
+        connect_timeout_seconds=10,
+        auth_timeout_seconds=10,
+        banner_timeout_seconds=10,
+        socket_factory=lambda address, timeout: socket_timeouts.append(timeout) or fake_socket,
+        transport_factory=lambda opened_socket: transport,
+    )
+
+    session = client.connect(
+        host="edge.example",
+        port=22,
+        username="edge",
+        private_key=object(),
+        expected_fingerprint=_fingerprint(remote_key),
+        timeout_seconds=0.5,
+    )
+    session.close()
+
+    assert socket_timeouts and 0 < socket_timeouts[0] <= 0.5
+    assert 0 < transport.start_timeout <= 0.5
+    assert 0 < transport.auth_timeout <= 0.5
 
 
 @pytest.mark.parametrize("operation", ["scan", "connect"])
@@ -678,6 +761,97 @@ def test_sftp_client_construction_failure_closes_channel() -> None:
         session.upload_bytes(b"payload", "/tmp/payload", timeout_seconds=1)
 
     assert channel.closed
+
+
+def test_exclusive_upload_never_removes_a_preexisting_remote_file() -> None:
+    channel = FakeChannel()
+    existing_sftp = ExistingFileSftp(channel)
+    session, _, _ = _connected_session(
+        channel=channel,
+        sftp_client_factory=lambda opened_channel: existing_sftp,
+    )
+
+    with pytest.raises(SftpTransferError, match=r"^SFTP upload failed$"):
+        session.upload_bytes_exclusive(
+            b"replacement",
+            "/home/operator/.visiox-safe/request.json",
+            expected_owner_uid=1000,
+            timeout_seconds=2,
+        )
+
+    assert existing_sftp.removed == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode semantics required")
+def test_private_sftp_workspace_uses_random_directory_exclusive_files_and_strict_modes(
+    tmp_path: Path,
+) -> None:
+    channel = FakeChannel()
+    session, _, _ = _connected_session(
+        channel=channel,
+        sftp_client_factory=lambda opened_channel: LocalFilesystemSftp(opened_channel, tmp_path),
+    )
+
+    workspace = session.create_private_directory(timeout_seconds=2)
+    remote_file = f"{workspace.path}/bootstrap_user.sh"
+    session.upload_bytes_exclusive(
+        b"payload",
+        remote_file,
+        expected_owner_uid=workspace.owner_uid,
+        timeout_seconds=2,
+    )
+    session.validate_remote_file(
+        remote_file,
+        expected_owner_uid=workspace.owner_uid,
+        timeout_seconds=2,
+    )
+
+    assert isinstance(workspace, RemotePrivateDirectory)
+    assert Path(workspace.path).parent == tmp_path
+    assert Path(workspace.path).name.startswith(".visiox-")
+    assert len(Path(workspace.path).name.removeprefix(".visiox-")) == 32
+    assert stat.S_IMODE(os.lstat(workspace.path).st_mode) == 0o700
+    assert stat.S_IMODE(os.lstat(remote_file).st_mode) == 0o600
+    with pytest.raises(SftpTransferError, match=r"^SFTP upload failed$"):
+        session.upload_bytes_exclusive(
+            b"replacement",
+            remote_file,
+            expected_owner_uid=workspace.owner_uid,
+            timeout_seconds=2,
+        )
+    assert Path(remote_file).read_bytes() == b"payload"
+
+    session.cleanup_private_directory(
+        workspace,
+        (remote_file,),
+        timeout_seconds=2,
+    )
+    assert not Path(workspace.path).exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode semantics required")
+def test_remote_file_validation_rejects_group_or_world_writable_file(tmp_path: Path) -> None:
+    channel = FakeChannel()
+    session, _, _ = _connected_session(
+        channel=channel,
+        sftp_client_factory=lambda opened_channel: LocalFilesystemSftp(opened_channel, tmp_path),
+    )
+    workspace = session.create_private_directory(timeout_seconds=2)
+    remote_file = f"{workspace.path}/request.json"
+    session.upload_bytes_exclusive(
+        b"{}",
+        remote_file,
+        expected_owner_uid=workspace.owner_uid,
+        timeout_seconds=2,
+    )
+    os.chmod(remote_file, 0o620)
+
+    with pytest.raises(SftpTransferError, match=r"^SFTP validation failed$"):
+        session.validate_remote_file(
+            remote_file,
+            expected_owner_uid=workspace.owner_uid,
+            timeout_seconds=2,
+        )
 
 
 def test_exec_request_wait_obeys_wall_clock_deadline_and_permanently_closes_session() -> None:

@@ -1,7 +1,10 @@
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from visiox_api.services.edge_bootstrap import (
     BootstrapChannelError,
@@ -17,6 +20,9 @@ router = APIRouter(
     tags=["edge-nodes"],
     dependencies=[Depends(require_management_proxy)],
 )
+
+MAX_BOOTSTRAP_HTTP_BODY_BYTES = 64 * 1024
+_INVALID_BOOTSTRAP_DETAIL = "Bootstrap request is invalid"
 
 
 class ScanHostKeyRequest(BaseModel):
@@ -65,14 +71,26 @@ def _invoke(call: Any) -> dict[str, Any]:
     try:
         return call()
     except BootstrapRequestRejected as error:
-        status_code = (
-            status.HTTP_409_CONFLICT
-            if error.code == "HOST_KEY_MISMATCH"
-            else status.HTTP_502_BAD_GATEWAY
-        )
+        if error.code in {
+            "HOST_KEY_MISMATCH",
+            "NODE_ALREADY_BOOTSTRAPPED",
+            "NODE_NAME_CONFLICT",
+            "SSH_HOST_IN_USE",
+        }:
+            status_code = status.HTTP_409_CONFLICT
+        elif error.code == "REQUEST_TIMEOUT":
+            status_code = status.HTTP_504_GATEWAY_TIMEOUT
+        else:
+            status_code = status.HTTP_502_BAD_GATEWAY
+        detail: dict[str, Any] = {
+            "error_code": error.code,
+            "error_message": error.message,
+        }
+        if error.cleanup_required:
+            detail["cleanup_required"] = True
         raise HTTPException(
             status_code=status_code,
-            detail={"error_code": error.code, "error_message": error.message},
+            detail=detail,
         ) from None
     except BootstrapChannelError:
         raise HTTPException(
@@ -99,24 +117,45 @@ def scan_host_key(
     response_model=EdgeNodeOperationResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def bootstrap(
-    request: BootstrapRequest,
+async def bootstrap(
+    http_request: Request,
     service: BootstrapServiceDependency,
 ) -> dict[str, Any]:
+    request = await _read_bootstrap_request(http_request)
     password = request.password.get_secret_value()
     try:
-        return _invoke(
-            lambda: service.bootstrap(
-                host=request.host,
-                port=request.port,
-                administrator=request.administrator,
-                password=password,
-                confirmed_fingerprint=request.confirmed_fingerprint,
-                node_name=request.node_name,
+        return await run_in_threadpool(
+            lambda: _invoke(
+                lambda: service.bootstrap(
+                    host=request.host,
+                    port=request.port,
+                    administrator=request.administrator,
+                    password=password,
+                    confirmed_fingerprint=request.confirmed_fingerprint,
+                    node_name=request.node_name,
+                )
             )
         )
     finally:
         password = ""
+
+
+async def _read_bootstrap_request(http_request: Request) -> BootstrapRequest:
+    body = bytearray()
+    try:
+        async for chunk in http_request.stream():
+            if len(body) + len(chunk) > MAX_BOOTSTRAP_HTTP_BODY_BYTES:
+                raise ValueError
+            body.extend(chunk)
+        value = json.loads(bytes(body))
+        if not isinstance(value, dict):
+            raise ValueError
+        return BootstrapRequest.model_validate(value)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=_INVALID_BOOTSTRAP_DETAIL,
+        ) from None
 
 
 @router.post("/{id}/test-connection", response_model=EdgeNodeOperationResponse)

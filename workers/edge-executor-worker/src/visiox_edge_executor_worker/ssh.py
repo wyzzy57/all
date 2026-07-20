@@ -3,7 +3,11 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import io
+from pathlib import PurePosixPath
+import posixpath
+import secrets
 import socket
+import stat
 import threading
 import time
 from typing import Any, Callable
@@ -68,6 +72,12 @@ class CommandResult:
 class SftpTransferResult:
     remote_path: str
     bytes_transferred: int
+
+
+@dataclass(frozen=True)
+class RemotePrivateDirectory:
+    path: str
+    owner_uid: int | None
 
 
 @dataclass
@@ -170,13 +180,22 @@ def scan_host_key(
     transport_factory: Callable[[Any], Any] = paramiko.Transport,
 ) -> ScannedHostKey:
     """Read a remote host key without attempting any user authentication."""
-    timeout = _validate_timeout(timeout)
-    opened_socket = socket_factory((host, port), timeout)
+    deadline = _deadline(timeout)
+    opened_socket = socket_factory(
+        (host, port),
+        _remaining(deadline, TimeoutError, "SSH host-key scan timed out"),
+    )
     transport = None
     try:
         transport = transport_factory(opened_socket)
-        transport.banner_timeout = timeout
-        transport.start_client(timeout=timeout)
+        transport.banner_timeout = _remaining(
+            deadline,
+            TimeoutError,
+            "SSH host-key scan timed out",
+        )
+        transport.start_client(
+            timeout=_remaining(deadline, TimeoutError, "SSH host-key scan timed out")
+        )
         return _scanned_host_key(transport.get_remote_server_key())
     finally:
         _close_transport_and_socket(transport, opened_socket)
@@ -216,6 +235,7 @@ class StrictSshClient:
         username: str,
         private_key: paramiko.PKey | bytes,
         expected_fingerprint: str,
+        timeout_seconds: float | None = None,
     ) -> "StrictSshSession":
         def authenticate(transport: Any) -> None:
             transport.auth_publickey(username, _load_private_key(private_key))
@@ -225,6 +245,7 @@ class StrictSshClient:
             port=port,
             expected_fingerprint=expected_fingerprint,
             authenticate=authenticate,
+            timeout_seconds=timeout_seconds,
         )
 
     def connect_password(
@@ -235,6 +256,7 @@ class StrictSshClient:
         username: str,
         password: str,
         expected_fingerprint: str,
+        timeout_seconds: float | None = None,
     ) -> "StrictSshSession":
         def authenticate(transport: Any) -> None:
             transport.auth_password(username, password)
@@ -244,6 +266,7 @@ class StrictSshClient:
             port=port,
             expected_fingerprint=expected_fingerprint,
             authenticate=authenticate,
+            timeout_seconds=timeout_seconds,
         )
 
     def _connect_authenticated(
@@ -253,14 +276,36 @@ class StrictSshClient:
         port: int,
         expected_fingerprint: str,
         authenticate: Callable[[Any], None],
+        timeout_seconds: float | None,
     ) -> "StrictSshSession":
-        opened_socket = self._socket_factory((host, port), self._connect_timeout_seconds)
+        deadline = _deadline(timeout_seconds) if timeout_seconds is not None else None
+
+        def phase_timeout(configured: float, message: str) -> float:
+            if deadline is None:
+                return configured
+            return min(configured, _remaining(deadline, TimeoutError, message))
+
+        opened_socket = self._socket_factory(
+            (host, port),
+            phase_timeout(self._connect_timeout_seconds, "SSH connection timed out"),
+        )
         transport = None
         try:
             transport = self._transport_factory(opened_socket)
-            transport.banner_timeout = self._banner_timeout_seconds
-            transport.auth_timeout = self._auth_timeout_seconds
-            transport.start_client(timeout=self._connect_timeout_seconds)
+            transport.banner_timeout = phase_timeout(
+                self._banner_timeout_seconds,
+                "SSH connection timed out",
+            )
+            transport.auth_timeout = phase_timeout(
+                self._auth_timeout_seconds,
+                "SSH authentication timed out",
+            )
+            transport.start_client(
+                timeout=phase_timeout(
+                    self._connect_timeout_seconds,
+                    "SSH connection timed out",
+                )
+            )
             actual_fingerprint = _fingerprint_sha256(transport.get_remote_server_key())
             if not hmac.compare_digest(actual_fingerprint, expected_fingerprint):
                 raise HostKeyMismatchError("SSH host key did not match the configured fingerprint")
@@ -433,6 +478,205 @@ class StrictSshSession:
                 self.close()
                 raise SftpTransferTimeoutError("SFTP upload timed out") from None
             raise SftpTransferError("SFTP upload failed") from None
+
+    def create_private_directory(self, *, timeout_seconds: float) -> RemotePrivateDirectory:
+        return self._bounded_sftp_operation(
+            self._create_private_directory,
+            timeout_seconds=timeout_seconds,
+            timeout_message="SFTP directory creation timed out",
+            error_message="SFTP directory creation failed",
+        )
+
+    def _create_private_directory(self, sftp: Any, deadline: float) -> RemotePrivateDirectory:
+        home = sftp.normalize(".")
+        _remaining(deadline, SftpTransferTimeoutError, "SFTP directory creation timed out")
+        home_attributes = sftp.lstat(home)
+        owner_uid = getattr(home_attributes, "st_uid", None)
+        directory = posixpath.join(home, f".visiox-{secrets.token_hex(16)}")
+        sftp.mkdir(directory, mode=0o700)
+        sftp.chmod(directory, 0o700)
+        attributes = sftp.lstat(directory)
+        if (
+            not stat.S_ISDIR(attributes.st_mode)
+            or stat.S_IMODE(attributes.st_mode) != 0o700
+            or (
+                owner_uid is not None
+                and getattr(attributes, "st_uid", None) is not None
+                and attributes.st_uid != owner_uid
+            )
+        ):
+            raise SftpTransferError("SFTP directory creation failed")
+        return RemotePrivateDirectory(path=directory, owner_uid=owner_uid)
+
+    def upload_bytes_exclusive(
+        self,
+        data: bytes,
+        remote_path: str,
+        *,
+        expected_owner_uid: int | None,
+        timeout_seconds: float,
+    ) -> SftpTransferResult:
+        def upload(sftp: Any, deadline: float) -> SftpTransferResult:
+            opened_file = None
+            created = False
+            try:
+                opened_file = sftp.file(remote_path, "x")
+                created = True
+                sftp.chmod(remote_path, 0o600)
+                self._validate_remote_file_attributes(
+                    sftp.lstat(remote_path),
+                    expected_owner_uid=expected_owner_uid,
+                    error_message="SFTP upload failed",
+                )
+                _remaining(deadline, SftpTransferTimeoutError, "SFTP upload timed out")
+                opened_file.write(data)
+                if hasattr(opened_file, "flush"):
+                    opened_file.flush()
+                _remaining(deadline, SftpTransferTimeoutError, "SFTP upload timed out")
+                self._validate_remote_file_attributes(
+                    sftp.lstat(remote_path),
+                    expected_owner_uid=expected_owner_uid,
+                    error_message="SFTP upload failed",
+                )
+                return SftpTransferResult(
+                    remote_path=remote_path,
+                    bytes_transferred=len(data),
+                )
+            except Exception:
+                if opened_file is not None:
+                    _close_quietly(opened_file)
+                    opened_file = None
+                if created:
+                    try:
+                        sftp.remove(remote_path)
+                    except Exception:
+                        pass
+                raise
+            finally:
+                _close_quietly(opened_file)
+
+        return self._bounded_sftp_operation(
+            upload,
+            timeout_seconds=timeout_seconds,
+            timeout_message="SFTP upload timed out",
+            error_message="SFTP upload failed",
+        )
+
+    def validate_remote_file(
+        self,
+        remote_path: str,
+        *,
+        expected_owner_uid: int | None,
+        timeout_seconds: float,
+    ) -> None:
+        def validate(sftp: Any, deadline: float) -> None:
+            attributes = sftp.lstat(remote_path)
+            _remaining(deadline, SftpTransferTimeoutError, "SFTP validation timed out")
+            self._validate_remote_file_attributes(
+                attributes,
+                expected_owner_uid=expected_owner_uid,
+                error_message="SFTP validation failed",
+            )
+
+        self._bounded_sftp_operation(
+            validate,
+            timeout_seconds=timeout_seconds,
+            timeout_message="SFTP validation timed out",
+            error_message="SFTP validation failed",
+        )
+
+    def cleanup_private_directory(
+        self,
+        directory: RemotePrivateDirectory,
+        remote_paths: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        directory_path = PurePosixPath(directory.path)
+        if any(PurePosixPath(path).parent != directory_path for path in remote_paths):
+            raise ValueError("cleanup paths must be direct children of the private directory")
+
+        def cleanup(sftp: Any, deadline: float) -> None:
+            for remote_path in remote_paths:
+                try:
+                    sftp.remove(remote_path)
+                except OSError:
+                    pass
+                _remaining(deadline, SftpTransferTimeoutError, "SFTP cleanup timed out")
+            sftp.rmdir(directory.path)
+
+        self._bounded_sftp_operation(
+            cleanup,
+            timeout_seconds=timeout_seconds,
+            timeout_message="SFTP cleanup timed out",
+            error_message="SFTP cleanup failed",
+        )
+
+    def _bounded_sftp_operation(
+        self,
+        operation: Callable[[Any, float], Any],
+        *,
+        timeout_seconds: float,
+        timeout_message: str,
+        error_message: str,
+    ) -> Any:
+        self._ensure_open()
+        deadline = _deadline(timeout_seconds)
+
+        def invoke() -> Any:
+            channel = None
+            sftp = None
+            try:
+                channel = self._transport.open_session(
+                    timeout=_remaining(deadline, SftpTransferTimeoutError, timeout_message)
+                )
+                channel.settimeout(_remaining(deadline, SftpTransferTimeoutError, timeout_message))
+                channel.invoke_subsystem("sftp")
+                channel.settimeout(_remaining(deadline, SftpTransferTimeoutError, timeout_message))
+                sftp = self._sftp_client_factory(channel)
+                return operation(sftp, deadline)
+            finally:
+                _close_quietly(sftp)
+                _close_quietly(channel)
+
+        try:
+            return _run_with_deadline(
+                invoke,
+                deadline=deadline,
+                timeout_error=SftpTransferTimeoutError,
+                timeout_message=timeout_message,
+                on_timeout=self.close,
+            )
+        except SshSessionClosedError:
+            raise
+        except SftpTransferTimeoutError:
+            self.close()
+            raise SftpTransferTimeoutError(timeout_message) from None
+        except Exception as error:
+            if _is_timeout_error(error):
+                self.close()
+                raise SftpTransferTimeoutError(timeout_message) from None
+            raise SftpTransferError(error_message) from None
+
+    @staticmethod
+    def _validate_remote_file_attributes(
+        attributes: Any,
+        *,
+        expected_owner_uid: int | None,
+        error_message: str,
+    ) -> None:
+        actual_uid = getattr(attributes, "st_uid", None)
+        if (
+            not stat.S_ISREG(attributes.st_mode)
+            or stat.S_IMODE(attributes.st_mode) != 0o600
+            or attributes.st_mode & 0o022
+            or (
+                expected_owner_uid is not None
+                and actual_uid is not None
+                and actual_uid != expected_owner_uid
+            )
+        ):
+            raise SftpTransferError(error_message)
 
     def _upload_bytes(
         self,

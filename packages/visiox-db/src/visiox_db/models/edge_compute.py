@@ -101,6 +101,13 @@ Index("ix_node_events_node_sequence", NodeEvent.node_id, NodeEvent.sequence)
 
 class EdgeSshCredential(IdMixin, TimestampMixin, Base):
     __tablename__ = "edge_ssh_credentials"
+    __table_args__ = (
+        UniqueConstraint(
+            "ssh_host",
+            "ssh_port",
+            name="uq_edge_ssh_credentials_host_port",
+        ),
+    )
 
     node_id: Mapped[str] = mapped_column(ForeignKey("compute_nodes.id"), unique=True, nullable=False)
     ssh_host: Mapped[str] = mapped_column(String(255), nullable=False)

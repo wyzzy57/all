@@ -49,6 +49,11 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id", name="pk_edge_ssh_credentials"),
         sa.ForeignKeyConstraint(["node_id"], ["compute_nodes.id"], name="fk_edge_ssh_credentials_node_id_compute_nodes"),
         sa.UniqueConstraint("node_id", name="uq_edge_ssh_credentials_node_id"),
+        sa.UniqueConstraint(
+            "ssh_host",
+            "ssh_port",
+            name="uq_edge_ssh_credentials_host_port",
+        ),
     )
 
     op.create_table(

@@ -37,6 +37,9 @@ dev = [
   "ruff>=0.8,<1.0",
 ]
 
+[project.scripts]
+visiox-edge-bootstrap-server = "visiox_edge_executor_worker.bootstrap_server:main"
+
 [tool.hatch.build.targets.wheel]
 packages = [
   "apps/api-service/src/visiox_api",

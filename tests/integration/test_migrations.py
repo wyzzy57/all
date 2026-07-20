@@ -163,9 +163,12 @@ def test_ssh_edge_runtime_upgrade_from_current_head_and_downgrade_back(tmp_path)
         "deployment_instances",
         "distributed_training_runs",
     }.issubset(inspector.get_table_names())
-    assert "node_id" in {
-        column for constraint in inspector.get_unique_constraints("edge_ssh_credentials") for column in constraint["column_names"]
+    credential_unique_columns = {
+        tuple(constraint["column_names"])
+        for constraint in inspector.get_unique_constraints("edge_ssh_credentials")
     }
+    assert ("node_id",) in credential_unique_columns
+    assert ("ssh_host", "ssh_port") in credential_unique_columns
     assert "idempotency_key" in {
         column for constraint in inspector.get_unique_constraints("remote_executions") for column in constraint["column_names"]
     }

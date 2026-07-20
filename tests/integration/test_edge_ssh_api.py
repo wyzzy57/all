@@ -1,13 +1,12 @@
 from typing import Any
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import Session, sessionmaker
+import logging
+
+import pytest
 
 from visiox_api.main import create_app
 from visiox_api.routes.edge_ssh import get_edge_bootstrap_service
-from visiox_db.base import Base
-from visiox_db.models import NodeEvent, Task
 
 
 BOOTSTRAP_REQUEST = {
@@ -45,12 +44,6 @@ class FakeBootstrapService:
         return {"status": "ok", "node_id": node_id}
 
 
-def _session_factory() -> sessionmaker[Session]:
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
-    Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-
-
 def _client(fake_service: FakeBootstrapService) -> TestClient:
     app = create_app()
     app.dependency_overrides[get_edge_bootstrap_service] = lambda: fake_service
@@ -71,10 +64,9 @@ def test_scan_host_key_route_never_accepts_or_forwards_password() -> None:
     assert "must-not-pass" not in response.text
 
 
-def test_bootstrap_request_never_persists_password_to_task_event_or_response() -> None:
+def test_bootstrap_request_forwards_password_only_to_private_worker_service() -> None:
     service = FakeBootstrapService()
     client = _client(service)
-    session_factory = _session_factory()
 
     response = client.post("/edge-nodes/bootstrap", json=BOOTSTRAP_REQUEST)
 
@@ -82,9 +74,68 @@ def test_bootstrap_request_never_persists_password_to_task_event_or_response() -
     assert response.json() == {"status": "ok", "node_id": "node-1"}
     assert "one-time-password" not in response.text
     assert service.calls[0][0] == "bootstrap"
-    with session_factory() as session:
-        assert session.scalar(select(func.count()).select_from(Task)) == 0
-        assert session.scalar(select(func.count()).select_from(NodeEvent)) == 0
+    assert service.calls[0][1]["password"] == "one-time-password"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {**BOOTSTRAP_REQUEST, "password": {"secret": "object-secret"}},
+        {**BOOTSTRAP_REQUEST, "password": 12345},
+        {**BOOTSTRAP_REQUEST, "extra": "extra-secret"},
+        [BOOTSTRAP_REQUEST],
+    ],
+    ids=["object-password", "wrong-password-type", "extra-field", "non-object"],
+)
+def test_bootstrap_validation_returns_fixed_redacted_422(
+    body: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = FakeBootstrapService()
+    client = _client(service)
+    caplog.set_level(logging.DEBUG)
+
+    response = client.post("/edge-nodes/bootstrap", json=body)
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Bootstrap request is invalid"}
+    combined = response.text + caplog.text
+    for secret in ("object-secret", "extra-secret", "12345", "one-time-password"):
+        assert secret not in combined
+    assert "input" not in response.text
+    assert service.calls == []
+
+
+def test_bootstrap_malformed_json_returns_fixed_redacted_422() -> None:
+    service = FakeBootstrapService()
+    client = _client(service)
+
+    response = client.post(
+        "/edge-nodes/bootstrap",
+        content=b'{"password":"malformed-secret"',
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Bootstrap request is invalid"}
+    assert "malformed-secret" not in response.text
+    assert service.calls == []
+
+
+def test_bootstrap_oversized_body_returns_fixed_redacted_422() -> None:
+    service = FakeBootstrapService()
+    client = _client(service)
+
+    response = client.post(
+        "/edge-nodes/bootstrap",
+        content=b'{"password":"' + (b"oversized-secret" * 5000) + b'"}',
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Bootstrap request is invalid"}
+    assert "oversized-secret" not in response.text
+    assert service.calls == []
 
 
 def test_connection_and_rotate_routes_forward_only_node_identifier() -> None:

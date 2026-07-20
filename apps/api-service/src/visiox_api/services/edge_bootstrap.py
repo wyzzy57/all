@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import socket
 import struct
+import time
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -16,10 +17,17 @@ _REJECTION_MESSAGES = {
     "INVALID_REQUEST": "Bootstrap request is invalid",
     "HOST_KEY_MISMATCH": "SSH host fingerprint changed",
     "NODE_NOT_FOUND": "Edge node was not found",
+    "NODE_ALREADY_BOOTSTRAPPED": "Edge node is already bootstrapped; use rotate-key",
+    "NODE_NAME_CONFLICT": "Node name is already in use",
+    "SSH_HOST_IN_USE": "SSH host and port are already assigned to another node",
     "REMOTE_SETUP_FAILED": "Remote SSH setup failed",
+    "SUDO_UNAVAILABLE": "Passwordless sudo is required for SSH bootstrap",
+    "REQUEST_TIMEOUT": "Edge bootstrap request timed out",
+    "BOOTSTRAP_CLEANUP_FAILED": "Edge node bootstrap cleanup failed",
     "ROTATE_CLEANUP_FAILED": "SSH key rotation cleanup failed",
     "BOOTSTRAP_FAILED": "Edge node bootstrap failed",
 }
+_CLIENT_DEADLINE_FIELD = "_deadline_monotonic"
 
 
 class BootstrapChannelError(Exception):
@@ -27,10 +35,11 @@ class BootstrapChannelError(Exception):
 
 
 class BootstrapRequestRejected(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, cleanup_required: bool = False) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.cleanup_required = cleanup_required
 
 
 def _encode(message: dict[str, Any]) -> bytes:
@@ -48,10 +57,28 @@ def _encode(message: dict[str, Any]) -> bytes:
     return struct.pack(">I", len(payload)) + payload
 
 
-def _read_exact(connection: Any, size: int) -> bytes:
+def _remaining(deadline: float, clock: Callable[[], float]) -> float:
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise BootstrapChannelError("Edge bootstrap request timed out")
+    return remaining
+
+
+def _set_timeout(connection: Any, deadline: float, clock: Callable[[], float]) -> None:
+    connection.settimeout(_remaining(deadline, clock))
+
+
+def _read_exact(
+    connection: Any,
+    size: int,
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+) -> bytes:
     chunks: list[bytes] = []
     try:
         while size:
+            _set_timeout(connection, deadline, clock)
             chunk = connection.recv(size)
             if not chunk:
                 raise BootstrapChannelError("Edge bootstrap channel failed")
@@ -62,12 +89,24 @@ def _read_exact(connection: Any, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def _decode(connection: Any) -> dict[str, Any]:
-    length = struct.unpack(">I", _read_exact(connection, 4))[0]
+def _decode(
+    connection: Any,
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+) -> dict[str, Any]:
+    length = struct.unpack(
+        ">I", _read_exact(connection, 4, deadline=deadline, clock=clock)
+    )[0]
     if length == 0 or length > MAX_FRAME_BYTES:
         raise BootstrapChannelError("Edge bootstrap channel failed")
     try:
-        text = _read_exact(connection, length).decode("utf-8")
+        text = _read_exact(
+            connection,
+            length,
+            deadline=deadline,
+            clock=clock,
+        ).decode("utf-8")
         value, end = json.JSONDecoder().raw_decode(text)
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise BootstrapChannelError("Edge bootstrap channel failed") from None
@@ -82,24 +121,31 @@ class EdgeBootstrapChannel:
         socket_path: Path,
         *,
         socket_factory: Callable[[], Any] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._socket_path = socket_path
         self._socket_factory = socket_factory or (
             lambda: socket.socket(_AF_UNIX, socket.SOCK_STREAM)
         )
+        self._clock = clock
 
     def request(self, request: dict[str, Any]) -> dict[str, Any]:
         request_id = request.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             raise BootstrapChannelError("Edge bootstrap channel failed")
-        frame = _encode(request)
+        deadline = self._clock() + REQUEST_TIMEOUT_SECONDS
+        wire_request = {**request, _CLIENT_DEADLINE_FIELD: deadline}
+        frame = _encode(wire_request)
         connection = self._socket_factory()
         try:
-            connection.settimeout(REQUEST_TIMEOUT_SECONDS)
+            _set_timeout(connection, deadline, self._clock)
             connection.connect(str(self._socket_path))
+            _set_timeout(connection, deadline, self._clock)
             connection.sendall(frame)
+            _set_timeout(connection, deadline, self._clock)
             connection.shutdown(socket.SHUT_WR)
-            response = _decode(connection)
+            response = _decode(connection, deadline=deadline, clock=self._clock)
+            _set_timeout(connection, deadline, self._clock)
             if connection.recv(1) != b"":
                 raise BootstrapChannelError("Edge bootstrap channel failed")
         except BootstrapChannelError:
@@ -113,17 +159,25 @@ class EdgeBootstrapChannel:
         if response.get("request_id") != request_id:
             raise BootstrapChannelError("Edge bootstrap channel failed")
         if response.get("status") == "error":
-            if set(response) != {
+            expected_fields = {
                 "request_id",
                 "status",
                 "error_code",
                 "error_message",
-            }:
+            }
+            cleanup_required = response.get("cleanup_required", False)
+            if cleanup_required is True:
+                expected_fields.add("cleanup_required")
+            if set(response) != expected_fields:
                 raise BootstrapChannelError("Edge bootstrap channel failed")
             code = response.get("error_code")
             if not isinstance(code, str) or code not in _REJECTION_MESSAGES:
                 raise BootstrapChannelError("Edge bootstrap channel failed")
-            raise BootstrapRequestRejected(code, _REJECTION_MESSAGES[code])
+            raise BootstrapRequestRejected(
+                code,
+                _REJECTION_MESSAGES[code],
+                cleanup_required=cleanup_required is True,
+            )
         if response.get("status") != "ok":
             raise BootstrapChannelError("Edge bootstrap channel failed")
         operation = request.get("operation")
