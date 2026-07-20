@@ -8,10 +8,9 @@ from typing import Literal
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from visiox_common.tasks import TaskCommand, TaskType
 from visiox_db.models import RemoteExecution
 
-from .redaction import redact, redact_uri
+from .redaction import redact_uri, sanitize_error
 
 
 ExecutionStatus = Literal["succeeded", "failed", "canceled"]
@@ -70,17 +69,6 @@ class ExecutionResult:
         )
 
 
-_RESOURCE_COLUMN_BY_TASK_TYPE = {
-    TaskType.EDGE_PROBE: "node_id",
-    TaskType.EDGE_DEPLOY: "deployment_service_id",
-    TaskType.EDGE_STOP_DEPLOYMENT: "deployment_service_id",
-    TaskType.EDGE_ROLLBACK: "deployment_service_id",
-    TaskType.EDGE_TRAIN: "training_job_id",
-    TaskType.EDGE_STOP_TRAINING: "training_job_id",
-    TaskType.EDGE_RESUME_TRAINING: "training_job_id",
-}
-
-
 class RemoteExecutionRepository:
     def __init__(self, session_factory: Callable[[], Session]) -> None:
         self._session_factory = session_factory
@@ -88,18 +76,6 @@ class RemoteExecutionRepository:
     def load(self, execution_id: str) -> RemoteExecution | None:
         with self._session_factory() as session:
             return session.get(RemoteExecution, execution_id)
-
-    def load_for_command(self, command: TaskCommand) -> RemoteExecution | None:
-        task_type = TaskType(command.task_type)
-        resource_column = _RESOURCE_COLUMN_BY_TASK_TYPE[task_type]
-        resource_id = command.resource_refs[resource_column]
-        statement = select(RemoteExecution).where(RemoteExecution.task_id == command.task_id)
-        statement = statement.where(getattr(RemoteExecution, resource_column) == resource_id)
-        with self._session_factory() as session:
-            executions = list(session.scalars(statement.limit(2)))
-        if len(executions) > 1:
-            raise RemoteExecutionStateError("edge command resolves to multiple remote executions")
-        return executions[0] if executions else None
 
     def claim(
         self,
@@ -137,13 +113,14 @@ class RemoteExecutionRepository:
     def finalize(self, execution_id: str, result: ExecutionResult) -> RemoteExecution:
         if result.status not in TERMINAL_EXECUTION_STATUSES:
             raise ValueError("remote execution result must be terminal")
+        error_code, error_message = sanitize_error(result.error_code, result.error_message)
         values = {
             "status": result.status,
             "phase": result.phase,
             "exit_code": result.exit_code,
             "redacted_log_uri": redact_uri(result.redacted_log_uri),
-            "error_code": _safe_error_code(result.error_code),
-            "error_message": redact(result.error_message) if result.error_message else None,
+            "error_code": error_code,
+            "error_message": error_message,
             "finished_at": datetime.now(UTC),
         }
         statement = (
@@ -166,6 +143,38 @@ class RemoteExecutionRepository:
                 return execution
             raise RemoteExecutionStateError("remote execution is not running")
 
+    def recover(
+        self,
+        execution_id: str,
+        *,
+        phase: str,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> RemoteExecution:
+        sanitized_code, sanitized_message = sanitize_error(error_code, error_message)
+        statement = (
+            update(RemoteExecution)
+            .where(RemoteExecution.id == execution_id, RemoteExecution.status == "running")
+            .values(
+                status="queued",
+                phase=phase,
+                started_at=None,
+                finished_at=None,
+                exit_code=None,
+                error_code=sanitized_code,
+                error_message=sanitized_message,
+            )
+        )
+        with self._session_factory() as session:
+            result = session.execute(statement)
+            if result.rowcount != 1:
+                session.rollback()
+                raise RemoteExecutionStateError("remote execution is not running")
+            session.commit()
+            execution = session.get(RemoteExecution, execution_id)
+            assert execution is not None
+            return execution
+
     def list_reconcilable(self) -> list[RemoteExecution]:
         statement = (
             select(RemoteExecution)
@@ -174,14 +183,3 @@ class RemoteExecutionRepository:
         )
         with self._session_factory() as session:
             return list(session.scalars(statement))
-
-
-def _safe_error_code(value: str | None) -> str | None:
-    if value is None:
-        return None
-    sanitized = re_sub_error_code(value)
-    return sanitized[:80] or "EDGE_OPERATION_FAILED"
-
-
-def re_sub_error_code(value: str) -> str:
-    return "".join(character if character.isalnum() or character == "_" else "_" for character in value.upper())

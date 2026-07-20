@@ -147,13 +147,8 @@ def test_post_tasks_rejects_every_edge_task_type_without_persisting(
     stream_producer: FakeStreamProducer,
 ):
     valid_refs = {
-        TaskType.EDGE_PROBE: {"node_id": "node-1"},
-        TaskType.EDGE_DEPLOY: {"deployment_service_id": "service-1"},
-        TaskType.EDGE_STOP_DEPLOYMENT: {"deployment_service_id": "service-1"},
-        TaskType.EDGE_ROLLBACK: {"deployment_service_id": "service-1"},
-        TaskType.EDGE_TRAIN: {"training_job_id": "job-1"},
-        TaskType.EDGE_STOP_TRAINING: {"training_job_id": "job-1"},
-        TaskType.EDGE_RESUME_TRAINING: {"training_job_id": "job-1"},
+        task_type: {"remote_execution_id": "exec-1"}
+        for task_type in EDGE_EXECUTOR_TASK_TYPES
     }
     with session_factory() as session:
         before = session.scalar(select(func.count()).select_from(Task))

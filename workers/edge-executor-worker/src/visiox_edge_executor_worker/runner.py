@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+import signal
 import socket
 from typing import Any, Protocol
 
@@ -19,6 +20,7 @@ from visiox_db.models import RemoteExecution
 from visiox_db.session import create_session_factory
 
 from .bootstrap_server import BootstrapServer
+from .reconciliation import RemoteRuntimeReconciler
 from .startup import EdgeExecutorSecurityContext, initialize_security
 from .state import (
     ExecutionResult,
@@ -31,30 +33,17 @@ from .state import (
 LOGGER = logging.getLogger(__name__)
 CONSUMER_GROUP = "edge-executor-workers"
 DEFAULT_RECLAIM_IDLE_MS = 60_000
-
-
-class DockerLabels:
-    MANAGED = "com.visiox.managed"
-    REMOTE_EXECUTION_ID = "com.visiox.remote-execution-id"
-    NODE_ID = "com.visiox.node-id"
-    RESOURCE_TYPE = "com.visiox.resource-type"
-    RESOURCE_ID = "com.visiox.resource-id"
+RETRY_ATTEMPTS = 5
+RETRY_INITIAL_SECONDS = 0.25
+RETRY_MAX_SECONDS = 4.0
 
 
 class EdgeOperationHandler(Protocol):
     def execute(self, execution: RemoteExecution) -> ExecutionResult: ...
 
-    def reconcile(
-        self,
-        execution: RemoteExecution,
-        docker_labels: dict[str, str],
-    ) -> ExecutionResult | None: ...
-
 
 class ExecutionRepository(Protocol):
     def load(self, execution_id: str) -> RemoteExecution | None: ...
-
-    def load_for_command(self, command: TaskCommand) -> RemoteExecution | None: ...
 
     def claim(
         self,
@@ -65,27 +54,12 @@ class ExecutionRepository(Protocol):
 
     def finalize(self, execution_id: str, result: ExecutionResult) -> RemoteExecution: ...
 
-    def list_reconcilable(self) -> list[RemoteExecution]: ...
-
 
 @dataclass(frozen=True)
 class DispatchOutcome:
     execution_id: str
     status: str
     durable_terminal: bool
-
-
-def docker_labels_for_execution(execution: RemoteExecution) -> dict[str, str]:
-    labels = {
-        DockerLabels.MANAGED: "true",
-        DockerLabels.REMOTE_EXECUTION_ID: execution.id,
-        DockerLabels.NODE_ID: execution.node_id,
-    }
-    if execution.resource_type is not None:
-        labels[DockerLabels.RESOURCE_TYPE] = execution.resource_type
-    if execution.resource_id is not None:
-        labels[DockerLabels.RESOURCE_ID] = execution.resource_id
-    return labels
 
 
 class EdgeExecutionDispatcher:
@@ -140,32 +114,8 @@ class EdgeExecutionDispatcher:
             finalized.status in TERMINAL_EXECUTION_STATUSES,
         )
 
-    def reconcile_startup(self) -> int:
-        finalized_count = 0
-        for execution in self._repository.list_reconcilable():
-            handler = self._handlers.get(execution.operation)
-            if handler is None:
-                continue
-            try:
-                result = handler.reconcile(
-                    execution,
-                    docker_labels_for_execution(execution),
-                )
-            except Exception:
-                LOGGER.error("edge startup reconciliation failed; details were suppressed")
-                continue
-            if result is None:
-                continue
-            finalized = self._repository.finalize(execution.id, result)
-            if finalized.status in TERMINAL_EXECUTION_STATUSES:
-                finalized_count += 1
-        return finalized_count
-
     def _load_execution(self, command: TaskCommand) -> RemoteExecution | None:
-        execution_id = command.resource_refs.get("remote_execution_id")
-        if execution_id is not None:
-            return self._repository.load(execution_id)
-        return self._repository.load_for_command(command)
+        return self._repository.load(command.resource_refs["remote_execution_id"])
 
 
 def decode_task_command(fields: Mapping[Any, Any]) -> TaskCommand:
@@ -190,6 +140,7 @@ class EdgeExecutorQueue:
         stream_name: str,
         consumer_name: str,
         reclaim_idle_ms: int = DEFAULT_RECLAIM_IDLE_MS,
+        sleep: Callable[[float], Any] = asyncio.sleep,
     ) -> None:
         self._redis = redis_client
         self._dispatcher = dispatcher
@@ -198,18 +149,30 @@ class EdgeExecutorQueue:
         self._reclaim_idle_ms = reclaim_idle_ms
         self._reclaim_cursor = "0-0"
         self._stopping = asyncio.Event()
+        self._sleep = sleep
 
     async def ensure_consumer_group(self) -> None:
-        try:
-            await self._redis.xgroup_create(
-                self._stream_name,
-                CONSUMER_GROUP,
-                id="0-0",
-                mkstream=True,
-            )
-        except ResponseError as error:
-            if "BUSYGROUP" not in str(error):
-                raise
+        delay = RETRY_INITIAL_SECONDS
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                await self._redis.xgroup_create(
+                    self._stream_name,
+                    CONSUMER_GROUP,
+                    id="0-0",
+                    mkstream=True,
+                )
+                return
+            except ResponseError as error:
+                if "BUSYGROUP" in str(error):
+                    return
+                if attempt == RETRY_ATTEMPTS - 1:
+                    raise
+            except Exception:
+                if attempt == RETRY_ATTEMPTS - 1:
+                    raise
+            LOGGER.error("Redis consumer group is not ready; details were suppressed")
+            await self._sleep(delay)
+            delay = min(delay * 2, RETRY_MAX_SECONDS)
 
     async def process_message(
         self,
@@ -268,10 +231,21 @@ class EdgeExecutorQueue:
                 processed += int(await self.process_message(message_id, fields))
         return processed
 
-    async def run_forever(self) -> None:
-        await self.ensure_consumer_group()
+    async def run_forever(self, *, group_ready: bool = False) -> None:
+        if not group_ready:
+            await self.ensure_consumer_group()
+        delay = RETRY_INITIAL_SECONDS
         while not self._stopping.is_set():
-            await self.run_once()
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.error("edge queue poll failed; details were suppressed")
+                await self._sleep(delay)
+                delay = min(delay * 2, RETRY_MAX_SECONDS)
+            else:
+                delay = RETRY_INITIAL_SECONDS
 
     def stop(self) -> None:
         self._stopping.set()
@@ -280,15 +254,17 @@ class EdgeExecutorQueue:
 @dataclass
 class EdgeExecutorApplication:
     dispatcher: EdgeExecutionDispatcher
+    reconciler: RemoteRuntimeReconciler
     queue: EdgeExecutorQueue
     bootstrap_server: BootstrapServer
     redis_client: Any
+    sleep: Callable[[float], Any] = asyncio.sleep
 
     async def run(self) -> None:
-        self.dispatcher.reconcile_startup()
+        await self._reconcile_with_retry()
         await self.queue.ensure_consumer_group()
         server_task = asyncio.create_task(asyncio.to_thread(self.bootstrap_server.serve_forever))
-        queue_task = asyncio.create_task(self.queue.run_forever())
+        queue_task = asyncio.create_task(self.queue.run_forever(group_ready=True))
         tasks = {server_task, queue_task}
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -304,6 +280,23 @@ class EdgeExecutorApplication:
             if close is not None:
                 await close()
 
+    def request_shutdown(self) -> None:
+        self.queue.stop()
+        self.bootstrap_server.stop()
+
+    async def _reconcile_with_retry(self) -> None:
+        delay = RETRY_INITIAL_SECONDS
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                await asyncio.to_thread(self.reconciler.reconcile_startup)
+                return
+            except Exception:
+                if attempt == RETRY_ATTEMPTS - 1:
+                    raise
+                LOGGER.error("database reconciliation is not ready; details were suppressed")
+                await self.sleep(delay)
+                delay = min(delay * 2, RETRY_MAX_SECONDS)
+
 
 def build_application(
     settings: Settings,
@@ -316,6 +309,7 @@ def build_application(
     session_factory = create_session_factory()
     repository = RemoteExecutionRepository(session_factory)
     dispatcher = EdgeExecutionDispatcher(repository, handlers or {})
+    reconciler = RemoteRuntimeReconciler(session_factory, repository, security)
     redis_client: Redis = redis_factory(settings.redis_url)
     queue = EdgeExecutorQueue(
         redis_client,
@@ -330,6 +324,7 @@ def build_application(
     )
     return EdgeExecutorApplication(
         dispatcher=dispatcher,
+        reconciler=reconciler,
         queue=queue,
         bootstrap_server=bootstrap_server,
         redis_client=redis_client,
@@ -346,10 +341,31 @@ def _decode_text(value: Any) -> str:
     return str(value)
 
 
+def install_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    application: EdgeExecutorApplication,
+) -> None:
+    for signal_number in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(signal_number, application.request_shutdown)
+        except NotImplementedError:
+            signal.signal(
+                signal_number,
+                lambda *_args, app=application: loop.call_soon_threadsafe(
+                    app.request_shutdown
+                ),
+            )
+
+
+async def _run_main() -> None:
+    application = build_application(get_settings())
+    install_signal_handlers(asyncio.get_running_loop(), application)
+    await application.run()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    application = build_application(get_settings())
-    asyncio.run(application.run())
+    asyncio.run(_run_main())
 
 
 if __name__ == "__main__":

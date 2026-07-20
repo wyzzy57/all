@@ -1,4 +1,6 @@
-from visiox_edge_executor_worker.redaction import redact, redact_uri
+import pytest
+
+from visiox_edge_executor_worker.redaction import redact, redact_uri, sanitize_error
 
 
 def test_redactor_removes_credentials_and_signed_urls() -> None:
@@ -31,3 +33,37 @@ def test_redacted_log_uri_drops_query_fragment_and_userinfo() -> None:
 
 def test_redactor_handles_bytes_without_echoing_binary_data() -> None:
     assert redact(b"password=secret\xff") == "[REDACTED BINARY DATA]"
+
+
+@pytest.mark.parametrize(
+    ("value", "sensitive"),
+    [
+        ("Authorization: Token token-secret", "token-secret"),
+        ("Proxy-Authorization: Basic basic-secret", "basic-secret"),
+        ("X-Api-Key: api-secret", "api-secret"),
+        ("api_key=api-secret", "api-secret"),
+        ("client_secret: client-secret", "client-secret"),
+        ("deploy --password cli-secret", "cli-secret"),
+        ("deploy --password=cli-secret", "cli-secret"),
+        ("deploy --token cli-secret", "cli-secret"),
+        ("https://blob.test/model?sig=azure-secret&se=2099", "azure-secret"),
+        ("https://s3.test/x?X-Amz-Security-Token=aws-secret", "aws-secret"),
+        ("redis://user:uri-secret@cache.test/0", "uri-secret"),
+        ("registry_password=registry-secret", "registry-secret"),
+        ('{"username":"robot","password":"json-secret"}', "json-secret"),
+        ("PRIVATE-TOKEN: git-secret", "git-secret"),
+    ],
+)
+def test_redactor_blocks_common_credential_bypasses(value: str, sensitive: str) -> None:
+    assert sensitive.casefold() not in redact(value).casefold()
+
+
+def test_structured_error_sanitizer_replaces_sensitive_codes_and_messages() -> None:
+    code, message = sanitize_error(
+        "client_secret=code-secret",
+        "Authorization: Token message-secret",
+    )
+
+    assert code == "EDGE_OPERATION_FAILED"
+    assert "code-secret" not in code.casefold()
+    assert "message-secret" not in message.casefold()

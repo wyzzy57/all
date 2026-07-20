@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -24,7 +25,7 @@ from visiox_db.models import (
     TrainingJob,
     TrainingPipeline,
 )
-from visiox_messaging.streams import STREAM_BY_TASK_TYPE
+from visiox_messaging.streams import RedisStreamProducer, STREAM_BY_TASK_TYPE
 
 
 def test_ssh_edge_models_persist_runtime_state_and_enforce_unique_keys():
@@ -108,7 +109,7 @@ def test_edge_task_types_use_identifier_only_stream_payload():
     command = TaskCommand(
         task_id="task-1",
         task_type=TaskType.EDGE_DEPLOY,
-        resource_refs={"deployment_service_id": "service-1"},
+        resource_refs={"remote_execution_id": "exec-1"},
     )
     fields = command.to_stream_fields()
 
@@ -124,19 +125,14 @@ def test_edge_task_types_use_identifier_only_stream_payload():
     assert {STREAM_BY_TASK_TYPE[task_type] for task_type in EDGE_EXECUTOR_TASK_TYPES} == {
         "stream:edge_executor.commands"
     }
-    assert json.loads(fields["resource_refs"]) == {"deployment_service_id": "service-1"}
+    assert json.loads(fields["resource_refs"]) == {"remote_execution_id": "exec-1"}
     assert json.loads(fields["payload"]) == {}
 
 
 def test_each_edge_task_type_has_an_exact_required_resource_ref():
     expected_refs = {
-        TaskType.EDGE_PROBE: {"node_id": "node-1"},
-        TaskType.EDGE_DEPLOY: {"deployment_service_id": "service-1"},
-        TaskType.EDGE_STOP_DEPLOYMENT: {"deployment_service_id": "service-1"},
-        TaskType.EDGE_ROLLBACK: {"deployment_service_id": "service-1"},
-        TaskType.EDGE_TRAIN: {"training_job_id": "job-1"},
-        TaskType.EDGE_STOP_TRAINING: {"training_job_id": "job-1"},
-        TaskType.EDGE_RESUME_TRAINING: {"training_job_id": "job-1"},
+        task_type: {"remote_execution_id": "exec-1"}
+        for task_type in EDGE_EXECUTOR_TASK_TYPES
     }
 
     assert EDGE_EXECUTOR_RESOURCE_REFS == {
@@ -147,16 +143,44 @@ def test_each_edge_task_type_has_an_exact_required_resource_ref():
         assert command.resource_refs == resource_refs
 
 
+def test_dedicated_edge_enqueue_serializes_only_remote_execution_id() -> None:
+    class FakeRedis:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def xadd(self, stream_name, fields):
+            self.calls.append((stream_name, fields))
+            return b"1-0"
+
+    redis_client = FakeRedis()
+    producer = RedisStreamProducer(redis_client)
+
+    message_id = asyncio.run(
+        producer.enqueue_edge_execution(
+            task_id="task-1",
+            task_type=TaskType.EDGE_DEPLOY,
+            remote_execution_id="exec-1",
+        )
+    )
+
+    assert message_id == "1-0"
+    stream_name, fields = redis_client.calls[0]
+    assert stream_name == "stream:edge_executor.commands"
+    assert json.loads(fields["resource_refs"]) == {"remote_execution_id": "exec-1"}
+    assert json.loads(fields["payload"]) == {}
+
+
 @pytest.mark.parametrize(
     ("resource_refs", "payload"),
     [
         ({"password_id": "super-secret"}, {}),
-        ({"deployment_service_id": "https://storage.test/model?X-Amz-Signature=secret"}, {}),
-        ({"deployment_service_id": "-----BEGIN PRIVATE KEY-----"}, {}),
-        ({"deployment_service_id": "service 1"}, {}),
+        ({"remote_execution_id": "https://storage.test/model?X-Amz-Signature=secret"}, {}),
+        ({"remote_execution_id": "-----BEGIN PRIVATE KEY-----"}, {}),
+        ({"remote_execution_id": "exec 1"}, {}),
         ({}, {}),
-        ({"deployment_service_id": "service-1", "node_id": "node-1"}, {}),
-        ({"deployment_service_id": "service-1"}, {"password": "not-allowed"}),
+        ({"remote_execution_id": "exec-1", "node_id": "node-1"}, {}),
+        ({"deployment_service_id": "service-1"}, {}),
+        ({"remote_execution_id": "exec-1"}, {"password": "not-allowed"}),
     ],
 )
 def test_edge_task_commands_reject_sensitive_invalid_missing_or_extra_refs(resource_refs, payload):
@@ -172,21 +196,21 @@ def test_edge_task_commands_reject_sensitive_invalid_missing_or_extra_refs(resou
 @pytest.mark.parametrize(
     ("resource_refs", "payload", "sensitive_value"),
     [
-        ({"deployment_service_id": "service-1"}, {"password": "super-secret"}, "super-secret"),
+        ({"remote_execution_id": "exec-1"}, {"password": "super-secret"}, "super-secret"),
         (
-            {"deployment_service_id": "https://storage.test/model?X-Amz-Signature=signed-secret"},
+            {"remote_execution_id": "https://storage.test/model?X-Amz-Signature=signed-secret"},
             {},
             "signed-secret",
         ),
-        ({"deployment_service_id": "-----BEGIN PRIVATE KEY-----"}, {}, "PRIVATE KEY"),
-        ({"deployment_service_id": "service-bearer-token"}, {}, "bearer-token"),
+        ({"remote_execution_id": "-----BEGIN PRIVATE KEY-----"}, {}, "PRIVATE KEY"),
+        ({"remote_execution_id": "exec-bearer-token"}, {}, "bearer-token"),
     ],
 )
 def test_edge_task_serialization_revalidates_mutated_current_state(resource_refs, payload, sensitive_value):
     command = TaskCommand(
         task_id="task-1",
         task_type=TaskType.EDGE_DEPLOY,
-        resource_refs={"deployment_service_id": "service-1"},
+        resource_refs={"remote_execution_id": "exec-1"},
     )
     command.resource_refs = resource_refs
     command.payload = payload

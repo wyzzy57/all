@@ -43,19 +43,12 @@ EDGE_EXECUTOR_TASK_TYPES = {
 }
 
 EDGE_EXECUTOR_RESOURCE_REFS: dict[TaskType, frozenset[str]] = {
-    TaskType.EDGE_PROBE: frozenset({"node_id"}),
-    TaskType.EDGE_DEPLOY: frozenset({"deployment_service_id"}),
-    TaskType.EDGE_STOP_DEPLOYMENT: frozenset({"deployment_service_id"}),
-    TaskType.EDGE_ROLLBACK: frozenset({"deployment_service_id"}),
-    TaskType.EDGE_TRAIN: frozenset({"training_job_id"}),
-    TaskType.EDGE_STOP_TRAINING: frozenset({"training_job_id"}),
-    TaskType.EDGE_RESUME_TRAINING: frozenset({"training_job_id"}),
+    task_type: frozenset({"remote_execution_id"})
+    for task_type in EDGE_EXECUTOR_TASK_TYPES
 }
 
 _RESOURCE_REF_PREFIXES = {
-    "node_id": "node",
-    "deployment_service_id": "service",
-    "training_job_id": "job",
+    "remote_execution_id": "exec",
 }
 _UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"
 _SENSITIVE_ID_MARKERS = ("password", "private", "credential", "secret", "token", "bearer", "signature", "x-amz")

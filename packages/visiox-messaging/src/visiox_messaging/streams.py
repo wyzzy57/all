@@ -22,6 +22,23 @@ class RedisStreamProducer:
         message_id = await self._redis.xadd(stream_name, command.to_stream_fields())
         return message_id.decode() if isinstance(message_id, bytes) else str(message_id)
 
+    async def enqueue_edge_execution(
+        self,
+        *,
+        task_id: str,
+        task_type: TaskType,
+        remote_execution_id: str,
+    ) -> str:
+        if task_type not in EDGE_EXECUTOR_TASK_TYPES:
+            raise ValueError("dedicated Edge enqueue requires an Edge task type")
+        return await self.enqueue(
+            TaskCommand(
+                task_id=task_id,
+                task_type=task_type,
+                resource_refs={"remote_execution_id": remote_execution_id},
+            )
+        )
+
 
 class RedisStreamConsumer:
     def __init__(self, redis_client: Any) -> None:

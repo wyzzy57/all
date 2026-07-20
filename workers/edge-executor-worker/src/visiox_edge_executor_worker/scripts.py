@@ -2,7 +2,9 @@ from importlib import resources
 from pathlib import Path
 
 
-_PACKAGED_SCRIPTS = frozenset({"bootstrap_user.sh", "probe_inventory.sh"})
+_PACKAGED_SCRIPTS = frozenset(
+    {"bootstrap_user.sh", "inspect_runtime.sh", "probe_inventory.sh"}
+)
 
 
 def load_packaged_script(name: str) -> bytes:

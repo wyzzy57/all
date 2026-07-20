@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+import signal
 from types import SimpleNamespace
 
 import pytest
@@ -17,10 +18,11 @@ from visiox_db.models import RemoteExecution
 from visiox_db.session import create_session_factory
 from visiox_edge_executor_worker.runner import (
     CONSUMER_GROUP,
-    DockerLabels,
     EdgeExecutionDispatcher,
     EdgeExecutorQueue,
     build_application,
+    decode_task_command,
+    install_signal_handlers,
 )
 from visiox_edge_executor_worker.state import (
     ExecutionResult,
@@ -69,15 +71,11 @@ class RecordingRepository:
 class SuccessfulHandler:
     def __init__(self) -> None:
         self.executed_ids: list[str] = []
-        self.reconciled_labels: list[dict[str, str]] = []
 
     def execute(self, execution) -> ExecutionResult:
         self.executed_ids.append(execution.id)
         return ExecutionResult.succeeded(exit_code=0, phase="complete")
 
-    def reconcile(self, execution, labels: dict[str, str]) -> ExecutionResult | None:
-        self.reconciled_labels.append(labels)
-        return ExecutionResult.succeeded(exit_code=0, phase="reconciled")
 
 
 class FakeRedis:
@@ -93,7 +91,7 @@ def _stream_fields() -> dict[str, str]:
     return TaskCommand(
         task_id="task-1",
         task_type=TaskType.EDGE_PROBE,
-        resource_refs={"node_id": "node-1"},
+        resource_refs={"remote_execution_id": "exec-1"},
     ).to_stream_fields()
 
 
@@ -101,10 +99,12 @@ def test_dispatch_loads_operation_by_id_not_payload() -> None:
     repository = RecordingRepository()
     handler = SuccessfulHandler()
     dispatcher = EdgeExecutionDispatcher(repository, {"deploy": handler})
-    command = SimpleNamespace(
-        task_id="task-1",
-        resource_refs={"remote_execution_id": "exec-1"},
-        payload={"remote_execution_id": "exec-from-payload"},
+    command = decode_task_command(
+        TaskCommand(
+            task_id="task-1",
+            task_type=TaskType.EDGE_DEPLOY,
+            resource_refs={"remote_execution_id": "exec-1"},
+        ).to_stream_fields()
     )
 
     outcome = dispatcher.dispatch(command)
@@ -121,14 +121,14 @@ def test_dispatch_failure_does_not_log_or_persist_exception_secrets(caplog) -> N
         def execute(self, execution):
             raise RuntimeError("Authorization: Bearer secret password=secret")
 
-        def reconcile(self, execution, labels):
-            return None
 
     dispatcher = EdgeExecutionDispatcher(repository, {"deploy": FailingHandler()})
-    command = SimpleNamespace(
-        task_id="task-1",
-        resource_refs={"remote_execution_id": "exec-1"},
-        payload={},
+    command = decode_task_command(
+        TaskCommand(
+            task_id="task-1",
+            task_type=TaskType.EDGE_DEPLOY,
+            resource_refs={"remote_execution_id": "exec-1"},
+        ).to_stream_fields()
     )
 
     with caplog.at_level(logging.ERROR):
@@ -249,25 +249,191 @@ def test_pending_reclaim_scan_continues_from_redis_cursor() -> None:
     assert redis_client.start_ids == ["0-0", "5-0"]
 
 
-def test_startup_reconciliation_uses_stable_visiox_docker_labels() -> None:
-    repository = RecordingRepository()
-    repository.execution.status = "running"
-    handler = SuccessfulHandler()
-    dispatcher = EdgeExecutionDispatcher(repository, {"deploy": handler})
+def test_consumer_group_creation_retries_with_bounded_exponential_backoff() -> None:
+    class StartingRedis(FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
 
-    reconciled = dispatcher.reconcile_startup()
+        async def xgroup_create(self, *args, **kwargs):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise ConnectionError("redis password=secret")
 
-    assert reconciled == 1
-    assert handler.reconciled_labels == [
-        {
-            DockerLabels.MANAGED: "true",
-            DockerLabels.REMOTE_EXECUTION_ID: "exec-1",
-            DockerLabels.NODE_ID: "node-1",
-            DockerLabels.RESOURCE_TYPE: "deployment_service",
-            DockerLabels.RESOURCE_ID: "service-1",
-        }
-    ]
-    assert repository.finalized[0][1].phase == "reconciled"
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    redis_client = StartingRedis()
+    queue = EdgeExecutorQueue(
+        redis_client,
+        SimpleNamespace(),
+        stream_name="edge-stream",
+        consumer_name="worker-1",
+        sleep=record_sleep,
+    )
+
+    asyncio.run(queue.ensure_consumer_group())
+
+    assert redis_client.attempts == 3
+    assert sleeps == [0.25, 0.5]
+
+
+def test_task_loop_recovers_after_transient_redis_failure() -> None:
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    queue = EdgeExecutorQueue(
+        FakeRedis(),
+        SimpleNamespace(),
+        stream_name="edge-stream",
+        consumer_name="worker-1",
+        sleep=record_sleep,
+    )
+    attempts = 0
+
+    async def run_once(*, count: int = 10, block_ms: int = 1000) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("redis token=secret")
+        queue.stop()
+        return 0
+
+    queue.run_once = run_once
+
+    asyncio.run(queue.run_forever(group_ready=True))
+
+    assert attempts == 2
+    assert sleeps == [0.25]
+
+
+def test_signal_callbacks_request_shutdown() -> None:
+    callbacks = {}
+
+    class Loop:
+        def add_signal_handler(self, signal_number, callback):
+            callbacks[signal_number] = callback
+
+    class Application:
+        def __init__(self) -> None:
+            self.shutdown_requests = 0
+
+        def request_shutdown(self) -> None:
+            self.shutdown_requests += 1
+
+    application = Application()
+
+    install_signal_handlers(Loop(), application)
+    callbacks[signal.SIGTERM]()
+    callbacks[signal.SIGINT]()
+
+    assert application.shutdown_requests == 2
+
+
+def test_application_cleanup_stops_queue_socket_and_redis() -> None:
+    events: list[str] = []
+
+    class Reconciler:
+        def reconcile_startup(self):
+            events.append("reconcile")
+
+    class Queue:
+        async def ensure_consumer_group(self):
+            events.append("group")
+
+        async def run_forever(self, *, group_ready=False):
+            events.append(f"queue:{group_ready}")
+
+        def stop(self):
+            events.append("queue-stop")
+
+    class Server:
+        def serve_forever(self):
+            events.append("server")
+
+        def stop(self):
+            events.append("server-stop")
+
+    class Redis:
+        async def aclose(self):
+            events.append("redis-close")
+
+    from visiox_edge_executor_worker.runner import EdgeExecutorApplication
+
+    application = EdgeExecutorApplication(
+        dispatcher=SimpleNamespace(),
+        reconciler=Reconciler(),
+        queue=Queue(),
+        bootstrap_server=Server(),
+        redis_client=Redis(),
+    )
+
+    asyncio.run(application.run())
+
+    assert "reconcile" in events
+    assert "group" in events
+    assert "queue:True" in events
+    assert "queue-stop" in events
+    assert "server-stop" in events
+    assert "redis-close" in events
+
+
+def test_application_retries_database_reconciliation_before_starting_listeners() -> None:
+    events: list[str] = []
+
+    class Reconciler:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def reconcile_startup(self):
+            self.attempts += 1
+            events.append(f"db:{self.attempts}")
+            if self.attempts < 3:
+                raise ConnectionError("postgres password=secret")
+
+    class Queue:
+        async def ensure_consumer_group(self):
+            events.append("group")
+
+        async def run_forever(self, *, group_ready=False):
+            events.append("queue")
+
+        def stop(self):
+            pass
+
+    class Server:
+        def serve_forever(self):
+            events.append("server")
+
+        def stop(self):
+            pass
+
+    class Redis:
+        async def aclose(self):
+            pass
+
+    async def record_sleep(delay: float) -> None:
+        events.append(f"sleep:{delay}")
+
+    from visiox_edge_executor_worker.runner import EdgeExecutorApplication
+
+    application = EdgeExecutorApplication(
+        dispatcher=SimpleNamespace(),
+        reconciler=Reconciler(),
+        queue=Queue(),
+        bootstrap_server=Server(),
+        redis_client=Redis(),
+        sleep=record_sleep,
+    )
+
+    asyncio.run(application.run())
+
+    assert events[:5] == ["db:1", "sleep:0.25", "db:2", "sleep:0.5", "db:3"]
+    assert events.index("db:3") < events.index("group")
 
 
 def test_security_initializes_before_redis_or_socket_runtime_is_created(tmp_path) -> None:
@@ -297,7 +463,9 @@ def test_security_initializes_before_redis_or_socket_runtime_is_created(tmp_path
 
 def test_stream_fields_decode_through_task_command() -> None:
     fields = _stream_fields()
-    assert json.loads(fields["resource_refs"]) == {"node_id": "node-1"}
+    command = decode_task_command(fields)
+    assert json.loads(fields["resource_refs"]) == {"remote_execution_id": "exec-1"}
+    assert command.resource_refs == {"remote_execution_id": "exec-1"}
 
 
 def test_compose_and_startup_files_keep_edge_master_key_worker_only() -> None:
@@ -308,6 +476,15 @@ def test_compose_and_startup_files_keep_edge_master_key_worker_only() -> None:
     api = services["api-service"]
 
     assert worker["deploy"]["replicas"] == 1
+    assert worker["restart"] == "unless-stopped"
+    assert worker["depends_on"]["postgres"]["condition"] == "service_healthy"
+    assert worker["depends_on"]["redis"]["condition"] == "service_healthy"
+    assert compose["services"]["postgres"]["healthcheck"]["test"][0] == "CMD-SHELL"
+    assert compose["services"]["redis"]["healthcheck"]["test"] == [
+        "CMD",
+        "redis-cli",
+        "ping",
+    ]
     assert worker["command"] == ["python", "-m", "visiox_edge_executor_worker.runner"]
     assert worker["environment"]["VISIOX_EDGE_BOOTSTRAP_SOCKET"] == (
         "/run/visiox-edge/edge-bootstrap.sock"
@@ -348,3 +525,10 @@ def test_compose_and_startup_files_keep_edge_master_key_worker_only() -> None:
     assert "WriteAllText" not in script
     assert "Convert]::ToBase64String" not in script
     assert "exit 0" not in script
+    assert "SetAccessRuleProtection($true, $false)" in script
+    assert "DirectorySecurity" in script
+    assert "FileSecurity" in script
+    assert "Set-Acl" in script
+    assert '"700"' in script
+    assert '"600"' in script
+    assert "/bin/chmod" in script
