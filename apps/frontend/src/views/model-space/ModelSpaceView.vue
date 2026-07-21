@@ -164,7 +164,12 @@
           <button :class="{ active: detailTab === 'logs' }" type="button" @click="openDetailTab('logs')">日志详情</button>
           <button type="button" @click="openTrainingVisualization">可视化训练</button>
           <button :class="{ active: detailTab === 'experience' }" type="button" @click="detailTab = 'experience'">在线体验</button>
-          <button :class="{ active: detailTab === 'deploy' }" type="button" @click="detailTab = 'deploy'">部署</button>
+          <button
+            :class="{ active: detailTab === 'deploy' }"
+            type="button"
+            data-testid="detail-tab-deploy"
+            @click="openDetailTab('deploy')"
+          >部署</button>
           <button
             :class="{ active: detailTab === 'evaluate' }"
             type="button"
@@ -266,21 +271,84 @@
           </section>
 
           <template v-if="deployMode === 'online'">
-            <label class="deploy-field">
-              <span class="required-label">选择环境：</span>
-              <el-select v-model="deployForm.environment" placeholder="请选择环境">
-                <el-option
-                  v-for="environment in deploymentEnvironmentOptions"
-                  :key="environment.value"
-                  :label="environment.label"
-                  :value="environment.value"
-                />
-              </el-select>
-            </label>
+            <section class="edge-resource-section" aria-label="边缘资源选择">
+              <h3>选择边缘资源</h3>
+              <span class="legacy-environment-label">选择环境：</span>
+              <p v-if="edgeResourcesLoading">正在读取资源池与节点...</p>
+              <p v-else-if="edgeResourceError" class="deploy-error">{{ edgeResourceError }}</p>
+              <template v-else>
+                <div class="edge-choice-row">
+                  <span class="required-label">资源池：</span>
+                  <button
+                    v-for="pool in enabledResourcePools"
+                    :key="pool.id"
+                    class="edge-choice"
+                    :class="{ selected: deployForm.poolId === pool.id }"
+                    type="button"
+                    @click="selectDeploymentPool(pool.id)"
+                  >
+                    <strong>{{ pool.name }}</strong>
+                    <small>{{ platformLabel(pool.kind) }} · {{ poolCompatibility(pool) }}</small>
+                  </button>
+                </div>
+                <div class="edge-choice-row">
+                  <span class="required-label">边缘节点：</span>
+                  <button
+                    v-for="node in deploymentNodeOptions"
+                    :key="node.id"
+                    class="edge-choice node-choice"
+                    :class="{ selected: deployForm.nodeId === node.id }"
+                    type="button"
+                    @click="selectDeploymentNode(node.id)"
+                  >
+                    <strong>{{ node.name }}</strong>
+                    <small>{{ node.status === "online" ? "在线" : node.status }} · {{ nodeResourceSummary(node) }}</small>
+                  </button>
+                </div>
+              </template>
+            </section>
+
+            <section class="optimization-section">
+              <h3>推理优化</h3>
+              <div class="optimization-modes">
+                <button
+                  type="button"
+                  :class="{ active: deployForm.optimizationMode === 'auto' }"
+                  data-testid="optimization-auto"
+                  @click="deployForm.optimizationMode = 'auto'"
+                >
+                  <strong>自动优化</strong>
+                  <span>根据节点能力自动选择 TensorRT FP16</span>
+                </button>
+                <button
+                  type="button"
+                  :class="{ active: deployForm.optimizationMode === 'manual' }"
+                  data-testid="optimization-manual"
+                  @click="deployForm.optimizationMode = 'manual'"
+                >
+                  <strong>手动配置</strong>
+                  <span>覆盖格式、精度与输入尺寸</span>
+                </button>
+              </div>
+              <div v-if="deployForm.optimizationMode === 'auto'" class="optimization-summary">
+                <strong>推荐方案</strong><span>TensorRT FP16</span>
+              </div>
+              <div v-else class="manual-optimization-grid">
+                <label><span>导出格式</span><select v-model="deployForm.format"><option value="pt">PyTorch</option><option value="onnx">ONNX</option><option value="engine">TensorRT</option></select></label>
+                <label><span>推理精度</span><select v-model="deployForm.precision"><option value="fp32">FP32</option><option value="fp16">FP16</option><option value="int8">INT8</option></select></label>
+                <label><span>输入尺寸</span><input v-model.number="deployForm.inputSize" type="number" min="32" step="32" /></label>
+                <label><span>INT8 校准数据集</span><input v-model="deployForm.calibrationDatasetUri" placeholder="minio://datasets/calibration" /></label>
+              </div>
+            </section>
+
+            <div class="deployment-artifact-grid">
+              <label><span class="required-label">镜像摘要：</span><input v-model="deployForm.imageDigest" placeholder="sha256:..." /></label>
+              <label><span class="required-label">模型校验和：</span><input v-model="deployForm.modelChecksum" placeholder="64 位 SHA-256" /></label>
+            </div>
             <div class="env-note">
               <strong>环境分配：</strong>
-              <span>{{ selectedDeploymentEnvironment?.resource || "请先选择环境" }}</span>
-              <template v-if="selectedDeploymentEnvironment">
+              <span>{{ selectedDeploymentNode ? nodeResourceSummary(selectedDeploymentNode) : "请先选择在线节点" }}</span>
+              <template v-if="selectedDeploymentNode">
                 <el-input v-model="deployForm.instanceName" class="instance-name-input" placeholder="请输入实例名称" maxlength="160" />
                 <span>实例名称</span>
               </template>
@@ -861,6 +929,8 @@ import {
   type TrainedModelRecord,
   type TrainingJobRecord,
   type TrainingPipelineRecord,
+  type ComputeNodeRecord,
+  type ResourcePoolRecord,
 } from "@/api/client";
 import type { ExperienceInferenceRequest } from "@/components/ServiceExperiencePanel.vue";
 import ServiceExperiencePanel from "@/components/ServiceExperiencePanel.vue";
@@ -1075,6 +1145,10 @@ const resultFilesDialogVisible = ref(false);
 const resultFilesLoading = ref(false);
 const resultFiles = ref<TrainingArtifactRecord[]>([]);
 const deploying = ref(false);
+const resourcePools = ref<ResourcePoolRecord[]>([]);
+const computeNodes = ref<ComputeNodeRecord[]>([]);
+const edgeResourcesLoading = ref(false);
+const edgeResourceError = ref("");
 const splitEnabled = ref(true);
 const configMode = ref(false);
 const configText = ref("");
@@ -1121,6 +1195,15 @@ const deployForm = reactive({
   weight: "official",
   environment: "",
   instanceName: "",
+  poolId: "",
+  nodeId: "",
+  optimizationMode: "auto" as "auto" | "manual",
+  format: "engine" as "pt" | "onnx" | "engine",
+  precision: "fp16" as "fp32" | "fp16" | "int8",
+  inputSize: 640,
+  calibrationDatasetUri: "",
+  imageDigest: "",
+  modelChecksum: "",
 });
 
 const evaluationForm = reactive({
@@ -1278,21 +1361,21 @@ const detailInferenceModelOptions = computed<WeightOption[]>(() => {
   return [...trainedWeightOptions.value, { label: "官方/基础权重", value: "base" }];
 });
 const inferenceEnvironmentOptions = ["cpu", "0", "gpu-node-1", "gpu-node-2"];
-const deploymentEnvironmentOptions = [
-  { value: "cpu", label: "CPU", resource: "CPU 共享资源" },
-  { value: "gpu-node-1", label: "gpu节点_1", resource: "gpu节点_1 显卡1（3698.5M/12288.0M）" },
-  { value: "gpu-node-2", label: "gpu节点_2", resource: "gpu节点_2 显卡0（8192.0M/24576.0M）" },
-];
-const selectedDeploymentEnvironment = computed(() =>
-  deploymentEnvironmentOptions.find((environment) => environment.value === deployForm.environment),
+const enabledResourcePools = computed(() => resourcePools.value.filter((pool) => pool.enabled));
+const deploymentNodeOptions = computed(() =>
+  computeNodes.value.filter((node) => node.status === "online" && node.resource_pool_id === deployForm.poolId),
 );
+const selectedDeploymentNode = computed(() => computeNodes.value.find((node) => node.id === deployForm.nodeId));
 const canDeploy = computed(() =>
   Boolean(
     deployForm.serviceName.trim() &&
       deployForm.model &&
       deployForm.weight &&
-      deployForm.environment &&
-      deployForm.instanceName.trim(),
+      deployForm.nodeId &&
+      deployForm.instanceName.trim() &&
+      deployForm.imageDigest.trim() &&
+      deployForm.modelChecksum.trim() &&
+      selectedDeployTrainedModel.value,
   ),
 );
 const detailWeightOptions = computed(() => {
@@ -1300,9 +1383,11 @@ const detailWeightOptions = computed(() => {
   return options.length > 0 ? options : [{ label: "best.pt", value: "best.pt" }];
 });
 const deployWeightOptions = computed(() => [
-  { label: "官方预训练模型", value: "official" },
   ...detailWeightOptions.value,
 ]);
+const selectedDeployTrainedModel = computed(() =>
+  detailReadyTrainedModels.value.find((model) => model.id === deployWeightOptions.value.find((option) => option.value === deployForm.weight)?.modelId),
+);
 const evaluationDatasetOptions = computed(() => {
   return evaluationDatasetsByStatus(evaluationDatasetTab.value);
 });
@@ -1432,6 +1517,8 @@ watch([filteredPipelines, pageSize], () => {
 watch(configMode, (enabled) => {
   if (enabled) configText.value = buildConfigText();
 });
+
+watch(() => deployForm.weight, syncDeploymentArtifactMetadata);
 
 watch(
   () => evaluationForm.dataset,
@@ -1564,9 +1651,18 @@ function openPipelineDetail(pipeline: TrainingPipelineRecord) {
   deployMode.value = "online";
   deployForm.serviceName = `${pipeline.name}-service`;
   deployForm.model = detailModelName.value === "-" ? "" : detailModelName.value;
-  deployForm.weight = "official";
+  deployForm.weight = detailWeightOptions.value[0]?.value ?? "";
   deployForm.environment = "";
-  deployForm.instanceName = "";
+  deployForm.instanceName = `${pipeline.name}-01`;
+  deployForm.poolId = "";
+  deployForm.nodeId = "";
+  deployForm.optimizationMode = "auto";
+  deployForm.format = "engine";
+  deployForm.precision = "fp16";
+  deployForm.inputSize = 640;
+  deployForm.calibrationDatasetUri = "";
+  deployForm.imageDigest = "";
+  deployForm.modelChecksum = "";
   evaluationForm.dataset = "val";
   evaluationForm.customDatasetId = "";
   evaluationForm.weight = "";
@@ -1577,12 +1673,14 @@ function openPipelineDetail(pipeline: TrainingPipelineRecord) {
   evaluationHistoryLoading.value = false;
   detailLogText.value = "";
   viewMode.value = "detail";
+  syncDeploymentArtifactMetadata();
 }
 
 function openDetailTab(tab: DetailTab) {
   detailTab.value = tab;
   if (tab === "logs") void loadDetailLog();
   if (tab === "evaluate") void loadEvaluationHistory();
+  if (tab === "deploy") void loadEdgeResources();
 }
 
 function openTrainingVisualization() {
@@ -1615,32 +1713,128 @@ function exportOfflineModel() {
 
 async function startDeployment() {
   const pipeline = detailPipeline.value;
-  const environment = selectedDeploymentEnvironment.value;
-  if (!pipeline || !environment || !canDeploy.value) {
+  const node = selectedDeploymentNode.value;
+  const trainedModel = selectedDeployTrainedModel.value;
+  if (!pipeline || !node || !trainedModel || !canDeploy.value) {
     ElMessage.warning("请完整填写部署配置");
     return;
   }
-  const selectedWeight = deployWeightOptions.value.find((option) => option.value === deployForm.weight);
+  const gpuUuids = deploymentGpuUuids(node);
   deploying.value = true;
   try {
     await api.createService({
       name: deployForm.serviceName.trim(),
       pipeline_id: pipeline.id,
-      ...(selectedWeight?.modelId ? { trained_model_id: selectedWeight.modelId } : {}),
+      trained_model_id: trainedModel.id,
       model_name: deployForm.model,
       model_weight: deployForm.weight,
-      environment: deployForm.environment,
+      environment: node.id,
       instance_name: deployForm.instanceName.trim(),
-      resource_summary: environment.resource,
-      config: { task: pipeline.task, pipeline_name: pipeline.name },
+      resource_summary: `${node.name} · ${nodeResourceSummary(node)}`,
+      node_id: node.id,
+      image_digest: deployForm.imageDigest.trim(),
+      model_checksum: deployForm.modelChecksum.trim(),
+      format: deployForm.optimizationMode === "auto" ? "auto" : deployForm.format,
+      precision: deployForm.optimizationMode === "auto" ? "auto" : deployForm.precision,
+      input_shape: [1, 3, deployForm.inputSize, deployForm.inputSize],
+      gpu_uuids: gpuUuids,
+      ...(deployForm.precision === "int8" && deployForm.calibrationDatasetUri.trim()
+        ? { calibration_dataset_uri: deployForm.calibrationDatasetUri.trim() }
+        : {}),
+      config: {
+        task: pipeline.task,
+        pipeline_name: pipeline.name,
+        resource_pool_id: deployForm.poolId,
+        optimization_mode: deployForm.optimizationMode,
+      },
     });
-    ElMessage.success("服务部署成功");
+    ElMessage.success("部署任务已提交");
     await router.push("/services");
   } catch (error) {
     ElMessage.error(getErrorMessage(error, "服务部署失败"));
   } finally {
     deploying.value = false;
   }
+}
+
+async function loadEdgeResources() {
+  edgeResourcesLoading.value = true;
+  edgeResourceError.value = "";
+  try {
+    const [poolResult, nodeResult] = await Promise.all([api.listResourcePools(), api.listNodes()]);
+    resourcePools.value = poolResult.items;
+    computeNodes.value = nodeResult.items;
+    const firstPool = enabledResourcePools.value.find((pool) =>
+      computeNodes.value.some((node) => node.resource_pool_id === pool.id && node.status === "online"),
+    );
+    if (!deployForm.poolId && firstPool) selectDeploymentPool(firstPool.id);
+  } catch (error) {
+    edgeResourceError.value = getErrorMessage(error, "边缘资源加载失败");
+  } finally {
+    edgeResourcesLoading.value = false;
+  }
+}
+
+function selectDeploymentPool(poolId: string) {
+  deployForm.poolId = poolId;
+  const firstNode = computeNodes.value.find((node) => node.resource_pool_id === poolId && node.status === "online");
+  deployForm.nodeId = firstNode?.id ?? "";
+  deployForm.environment = firstNode?.id ?? "";
+  syncDeploymentArtifactMetadata();
+}
+
+function selectDeploymentNode(nodeId: string) {
+  deployForm.nodeId = nodeId;
+  deployForm.environment = nodeId;
+}
+
+function syncDeploymentArtifactMetadata() {
+  if (!deployForm.weight) deployForm.weight = detailWeightOptions.value[0]?.value ?? "";
+  const model = selectedDeployTrainedModel.value;
+  if (!model) return;
+  deployForm.modelChecksum = metricString(model.metrics, ["checksum", "sha256", "artifact_checksum"]);
+  deployForm.imageDigest = metricString(model.metrics, ["deployment_image_digest", "image_digest"]);
+}
+
+function metricString(metrics: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = metrics[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function deploymentGpuUuids(node: ComputeNodeRecord) {
+  const direct = node.capabilities.gpu_uuids;
+  if (Array.isArray(direct)) return direct.filter((value): value is string => typeof value === "string");
+  const gpus = node.resources.gpus;
+  if (!Array.isArray(gpus)) return [];
+  return gpus
+    .map((gpu) => (gpu && typeof gpu === "object" ? (gpu as Record<string, unknown>).uuid : undefined))
+    .filter((value): value is string => typeof value === "string");
+}
+
+function nodeResourceSummary(node: ComputeNodeRecord) {
+  const gpu = String(node.resources.gpu_name ?? node.resources.gpu_model ?? node.platform_kind);
+  const free = Number(node.resources.gpu_memory_free_mb ?? 0);
+  const total = Number(node.resources.gpu_memory_total_mb ?? 0);
+  return total > 0 ? `${gpu}（${free || "-"} / ${total} MB）` : gpu;
+}
+
+function platformLabel(kind: string) {
+  if (kind === "x86_nvidia") return "x86 NVIDIA GPU";
+  if (kind === "jetson") return "NVIDIA Jetson";
+  return kind;
+}
+
+function poolCompatibility(pool: ResourcePoolRecord) {
+  const policy = pool.compatibility_policy;
+  const values = [
+    policy.cuda_major ? `CUDA ${policy.cuda_major}` : "",
+    policy.tensorrt_major ? `TensorRT ${policy.tensorrt_major}` : "",
+    policy.compute_capability ? `SM ${policy.compute_capability}` : "",
+  ].filter(Boolean);
+  return values.join(" · ") || "兼容资源池";
 }
 
 function openEvaluationSubtab(tab: "pipeline" | "history") {
@@ -3575,6 +3769,143 @@ function getErrorMessage(error: unknown, fallback: string) {
 .offline-model-row > span {
   text-align: right;
   white-space: nowrap;
+}
+
+.edge-resource-section,
+.optimization-section {
+  max-width: 940px;
+  margin: 28px 0;
+}
+
+.edge-resource-section h3,
+.optimization-section h3 {
+  margin: 0 0 14px;
+  font-size: 18px;
+}
+
+.edge-resource-section > p,
+.deploy-error {
+  color: #667085;
+}
+
+.legacy-environment-label {
+  display: block;
+  margin: 0 0 8px;
+  color: #344054;
+  font-size: 14px;
+}
+
+.deploy-error {
+  color: #d92d20;
+}
+
+.edge-choice-row {
+  display: grid;
+  grid-template-columns: 118px repeat(2, minmax(240px, 1fr));
+  align-items: stretch;
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.edge-choice-row > span {
+  align-self: center;
+  text-align: right;
+}
+
+.edge-choice {
+  display: grid;
+  gap: 7px;
+  min-height: 72px;
+  border: 1px solid #dfe5ef;
+  border-radius: 4px;
+  background: #fff;
+  color: #344054;
+  cursor: pointer;
+  padding: 12px 14px;
+  text-align: left;
+}
+
+.edge-choice.selected {
+  border-color: #1763ff;
+  box-shadow: 0 0 0 1px #1763ff inset;
+}
+
+.edge-choice small {
+  color: #667085;
+  line-height: 1.4;
+}
+
+.optimization-modes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.optimization-modes button {
+  display: grid;
+  gap: 8px;
+  min-height: 76px;
+  border: 1px solid #dfe5ef;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  padding: 14px 16px;
+  text-align: left;
+}
+
+.optimization-modes button.active {
+  border-color: #1763ff;
+  background: #f7faff;
+}
+
+.optimization-modes span,
+.optimization-summary {
+  color: #667085;
+  font-size: 13px;
+}
+
+.optimization-summary {
+  display: flex;
+  gap: 14px;
+  margin-top: 12px;
+  border-left: 3px solid #1763ff;
+  background: #f5f8ff;
+  padding: 10px 12px;
+}
+
+.optimization-summary span {
+  color: #1763ff;
+}
+
+.manual-optimization-grid,
+.deployment-artifact-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.manual-optimization-grid label,
+.deployment-artifact-grid label {
+  display: grid;
+  gap: 7px;
+  color: #344054;
+  font-size: 14px;
+}
+
+.manual-optimization-grid input,
+.manual-optimization-grid select,
+.deployment-artifact-grid input {
+  min-height: 38px;
+  border: 1px solid #d0d5dd;
+  border-radius: 4px;
+  background: #fff;
+  padding: 0 10px;
+}
+
+.deployment-artifact-grid {
+  max-width: 940px;
+  margin: 22px 0;
 }
 
 .env-note {

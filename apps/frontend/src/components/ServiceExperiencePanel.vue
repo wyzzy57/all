@@ -187,11 +187,11 @@ function selectExample(id: string) {
 async function runExperience() {
   errorMessage.value = "";
   if (props.runInference) {
-    if (!selectedModelWeight.value) {
+    if (props.showInferenceControls && !selectedModelWeight.value) {
       errorMessage.value = "请选择模型方案";
       return;
     }
-    if (!selectedEnvironment.value.trim()) {
+    if (props.showInferenceControls && !selectedEnvironment.value.trim()) {
       errorMessage.value = "请选择环境";
       return;
     }

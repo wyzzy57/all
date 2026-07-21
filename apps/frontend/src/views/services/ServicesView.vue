@@ -9,14 +9,13 @@
             <el-option label="时间正序" value="oldest" />
           </el-select>
           <el-input v-model="keyword" class="search-input" placeholder="搜索">
-            <template #suffix>
-              <el-icon><Search /></el-icon>
-            </template>
+            <template #suffix><el-icon><Search /></el-icon></template>
           </el-input>
         </div>
       </header>
 
-      <div class="service-grid">
+      <el-empty v-if="filteredServices.length === 0" description="暂无服务" />
+      <div v-else class="service-grid">
         <article
           v-for="service in filteredServices"
           :key="service.id"
@@ -27,14 +26,15 @@
           @click="openService(service)"
           @keydown.enter.prevent="openService(service)"
         >
-          <h2>{{ service.name }}</h2>
+          <div class="card-heading">
+            <h2>{{ service.name }}</h2>
+            <span v-if="isActive(service.status)" class="live-dot" aria-label="部署任务执行中"></span>
+          </div>
           <time>{{ service.createdAt }}</time>
-          <p>产线名称:<span>{{ service.pipelineName }}</span></p>
+          <p>产线名称：<span>{{ service.pipelineName }}</span></p>
+          <p class="phase-line">{{ phaseText(service.phase) }} · {{ healthText(service.healthStatus) }}</p>
           <footer>
-            <span class="service-status" :class="service.status">
-              <el-icon><CircleCheck v-if="service.status === 'running'" /><CircleClose v-else /></el-icon>
-              {{ statusText(service.status) }}
-            </span>
+            <span class="service-status" :class="statusTone(service.status)">{{ statusText(service.status) }}</span>
             <button
               type="button"
               class="delete-service"
@@ -42,16 +42,15 @@
               aria-label="删除服务"
               :data-testid="`delete-service-${service.id}`"
               @click.stop="deleteService(service)"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M9 3h6l1 2h4v2H4V5h4l1-2Z" />
-                <path d="M6 9h12l-1 11H7L6 9Zm4 2v7h2v-7h-2Zm4 0v7h2v-7h-2Z" />
-              </svg>
-            </button>
+            ><Delete /></button>
             <i></i>
-            <button type="button" class="text-action warning" @click.stop="toggleService(service)">
-              {{ service.status === "running" ? "中止" : "重启" }}
-            </button>
+            <button
+              type="button"
+              class="text-action warning"
+              :disabled="!canStop(service.status)"
+              :data-testid="`stop-service-${service.id}`"
+              @click.stop="stopService(service)"
+            >停止</button>
             <i></i>
             <button type="button" class="text-action" @click.stop="openService(service, 'logs')">查看日志</button>
           </footer>
@@ -69,19 +68,25 @@
     </template>
 
     <template v-else>
-      <button class="back-link" type="button" @click="backToList">
-        <el-icon><ArrowLeft /></el-icon>
-        返回产线列表
-      </button>
-
+      <button class="back-link" type="button" @click="backToList"><ArrowLeft />返回产线列表</button>
       <header class="detail-header">
         <div>
           <h1>{{ selectedService.name }}</h1>
-          <p>所属产线：<span>{{ selectedService.pipelineName }}</span><a href="#">点击前往</a></p>
+          <p>所属产线：<span>{{ selectedService.pipelineName }}</span></p>
         </div>
-        <div v-if="activeTab === 'experience'" class="endpoint-box">
-          <button type="button"><el-icon><Setting /></el-icon>关闭数据标注</button>
-          <span>{{ selectedService.endpoint }}</span>
+        <div class="detail-actions">
+          <button
+            type="button"
+            :disabled="!canStop(selectedService.status) || actionRunning"
+            :data-testid="`stop-service-${selectedService.id}`"
+            @click="stopService(selectedService)"
+          ><VideoPause />停止</button>
+          <button
+            type="button"
+            :disabled="actionRunning || isActive(selectedService.status)"
+            :data-testid="`rollback-service-${selectedService.id}`"
+            @click="rollbackService(selectedService)"
+          ><RefreshLeft />回滚</button>
         </div>
       </header>
 
@@ -91,143 +96,118 @@
       </nav>
 
       <section v-if="activeTab === 'basic'" class="basic-panel">
-        <div class="status-row">
-          <span>服务状态:</span>
-          <strong :class="selectedService.status">{{ statusText(selectedService.status) }}</strong>
-          <button class="icon-action" type="button" title="删除" aria-label="删除服务" @click="deleteService(selectedService)">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M9 3h6l1 2h4v2H4V5h4l1-2Z" />
-              <path d="M6 9h12l-1 11H7L6 9Zm4 2v7h2v-7h-2Zm4 0v7h2v-7h-2Z" />
-            </svg>
-          </button>
+        <div class="lifecycle-banner" :class="statusTone(selectedService.status)">
+          <div>
+            <span>服务状态</span>
+            <strong>{{ statusText(selectedService.status) }}</strong>
+          </div>
+          <ol class="phase-track" aria-label="部署进度">
+            <li
+              v-for="phase in deploymentPhases"
+              :key="phase.value"
+              :class="{ complete: phaseIndex(selectedService.phase) >= phase.index, current: selectedService.phase === phase.value }"
+            >{{ phase.label }}</li>
+          </ol>
         </div>
-        <div class="metric-row">
-          <div><strong>环境类型</strong><span>{{ selectedService.environment }}</span></div>
-          <div><strong>创建时间</strong><span>{{ selectedService.createdAt }}</span></div>
-          <div><strong>调用次数</strong><span>{{ selectedService.calls }}</span></div>
-          <div><strong>运行时长</strong><span>{{ selectedService.duration }}</span></div>
+
+        <div class="metric-grid">
+          <div><span>健康状态</span><strong :class="healthTone(selectedService.healthStatus)">{{ healthText(selectedService.healthStatus) }}</strong></div>
+          <div><span>边缘节点</span><strong>{{ selectedService.nodeId || "-" }}</strong></div>
+          <div><span>容器</span><strong>{{ shortContainerId(selectedService.containerId) }}</strong></div>
+          <div><span>运行引擎</span><strong>{{ selectedService.engine || "等待部署" }}</strong></div>
+          <div><span>服务端点</span><strong>{{ selectedService.endpoint || "-" }}</strong></div>
+          <div><span>创建时间</span><strong>{{ selectedService.createdAt }}</strong></div>
         </div>
+
+        <el-alert
+          v-if="selectedService.errorMessage"
+          type="error"
+          :title="selectedService.errorMessage"
+          :description="selectedService.errorCode || undefined"
+          show-icon
+          :closable="false"
+        />
+
         <div class="detail-subtabs">
           <button :class="{ active: detailSubtab === 'example' }" type="button" @click="detailSubtab = 'example'">调用示例</button>
-          <button :class="{ active: detailSubtab === 'logs' }" type="button" @click="detailSubtab = 'logs'">日志</button>
+          <button :class="{ active: detailSubtab === 'logs' }" type="button" @click="openLogs">日志</button>
         </div>
-        <pre class="code-panel">{{ detailSubtab === "example" ? selectedService.exampleCode : selectedService.logs }}</pre>
+        <pre v-if="detailSubtab === 'example'" class="code-panel">{{ selectedService.exampleCode }}</pre>
+        <div v-else class="log-panel">
+          <div class="log-toolbar">
+            <span>脱敏执行日志</span>
+            <button type="button" :disabled="logLoading" @click="loadServiceLog()">{{ logLoading ? "刷新中" : "刷新" }}</button>
+          </div>
+          <pre>{{ selectedService.logs }}</pre>
+        </div>
       </section>
 
-      <section v-else class="experience-panel">
-        <aside class="test-images">
-          <h2>选择测试图像</h2>
-          <img class="selected-test-image" :src="selectedExample.image" :alt="selectedExample.name" />
-          <div class="thumb-grid">
-            <button
-              v-for="example in allTestExamples"
-              :key="example.id"
-              :class="{ active: selectedExampleId === example.id }"
-              type="button"
-              @click="selectedExampleId = example.id"
-            >
-              <img :src="example.thumb" :alt="example.name" />
-            </button>
-            <label class="upload-example" for="service-example-upload">
-              <input
-                id="service-example-upload"
-                type="file"
-                accept="image/jpeg,image/png,image/tiff,image/bmp"
-                @change="handleExampleUpload"
-              />
-              <span aria-hidden="true">↥</span>
-            </label>
-          </div>
-          <p>支持用户上传测试图像（.jpeg /.jpg /.png /.tiff /.tif /.bmp /.pdf文件格式），文件体积不超过10MB。</p>
-          <div class="experience-actions">
-            <button type="button" class="primary-action" :disabled="experienceRunning" @click="runExperience">
-              {{ experienceRunning ? "运行中..." : "运行" }}
-            </button>
-            <button type="button" class="secondary-action" @click="resetExperience">重置</button>
-          </div>
-        </aside>
-        <main class="result-panel">
-          <div class="result-header">
-            <span>运行结果</span>
-            <div>
-              <button :class="{ active: resultMode === 'image' }" type="button" @click="resultMode = 'image'">图片</button>
-              <button :class="{ active: resultMode === 'json' }" type="button" @click="resultMode = 'json'">JSON</button>
-            </div>
-          </div>
-          <div class="result-body">
-            <img v-if="resultMode === 'image'" :src="resultImage" alt="运行结果" />
-            <pre v-else>{{ resultJson }}</pre>
-          </div>
-        </main>
-      </section>
+      <ServiceExperiencePanel
+        v-else
+        :service-name="selectedService.name"
+        :run-inference="runServiceInference"
+      />
     </template>
   </section>
 </template>
 
 <script setup lang="ts">
-import { ArrowLeft, CircleCheck, CircleClose, Search, Setting } from "@element-plus/icons-vue";
+import { ArrowLeft, Delete, RefreshLeft, Search, VideoPause } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
-import { api, type DeploymentServiceRecord, type PipelinePredictResponse } from "@/api/client";
+import { api, type DeploymentServiceRecord } from "@/api/client";
+import ServiceExperiencePanel, {
+  type ExperienceInferenceRequest,
+  type ExperienceInferenceResponse,
+} from "@/components/ServiceExperiencePanel.vue";
 
-type ServiceStatus = "running" | "stopped" | "deploying";
 type ServiceTab = "basic" | "experience";
 type DetailSubtab = "example" | "logs";
-type ResultMode = "image" | "json";
-
-type TestExample = {
-  id: string;
-  name: string;
-  image: string;
-  thumb: string;
-};
 
 type ServiceRecord = {
   id: string;
   name: string;
   pipelineName: string;
   createdAt: string;
-  status: ServiceStatus;
+  status: string;
   environment: string;
   calls: number;
-  duration: string;
   endpoint: string;
   exampleCode: string;
   logs: string;
+  nodeId: string;
+  containerId: string;
+  engine: string;
+  healthStatus: string;
+  phase: string;
+  logUri: string;
+  errorCode: string;
+  errorMessage: string;
 };
 
 const route = useRoute();
 const router = useRouter();
-
 const services = ref<ServiceRecord[]>([]);
-
 const keyword = ref("");
 const sortMode = ref("newest");
 const pageSize = ref(20);
 const activeTab = ref<ServiceTab>("basic");
 const detailSubtab = ref<DetailSubtab>("example");
-const selectedExampleId = ref("anime-group");
-const resultMode = ref<ResultMode>("image");
-const experienceRunning = ref(false);
-const inferenceResult = ref<PipelinePredictResponse | null>(null);
-const uploadedExamples = ref<TestExample[]>([]);
+const actionRunning = ref(false);
+const logLoading = ref(false);
+let pollTimer: number | undefined;
 
-onMounted(() => {
-  void loadServices();
-});
-
-const sampleExamples: TestExample[] = [
-  { id: "anime-group", name: "????", image: "/service-examples/anime-group.png", thumb: "/service-examples/anime-group.png" },
-  { id: "pandas", name: "??", image: "/service-examples/pandas.png", thumb: "/service-examples/pandas.png" },
-  { id: "document-flow", name: "????", image: "/service-examples/document-flow.png", thumb: "/service-examples/document-flow.png" },
-  { id: "snowboard", name: "??", image: "/service-examples/snowboard.png", thumb: "/service-examples/snowboard.png" },
-  { id: "cats", name: "??", image: "/service-examples/cats.png", thumb: "/service-examples/cats.png" },
-  { id: "living-room", name: "??", image: "/service-examples/living-room.png", thumb: "/service-examples/living-room.png" },
-  { id: "drinks", name: "??", image: "/service-examples/drinks.png", thumb: "/service-examples/drinks.png" },
-  { id: "city-traffic", name: "????", image: "/service-examples/city-traffic.png", thumb: "/service-examples/city-traffic.png" },
-  { id: "fruit-basket", name: "??", image: "/service-examples/fruit-basket.png", thumb: "/service-examples/fruit-basket.png" },
+const deploymentPhases = [
+  { value: "queued", label: "排队", index: 0 },
+  { value: "connecting", label: "连接", index: 1 },
+  { value: "probing", label: "探测", index: 2 },
+  { value: "preparing", label: "准备", index: 3 },
+  { value: "optimizing", label: "优化", index: 4 },
+  { value: "starting", label: "启动", index: 5 },
+  { value: "warming_up", label: "预热", index: 6 },
+  { value: "running", label: "运行", index: 7 },
 ];
 
 const selectedService = computed(() => {
@@ -238,76 +218,38 @@ const selectedService = computed(() => {
 const filteredServices = computed(() => {
   const term = keyword.value.trim().toLowerCase();
   const rows = services.value.filter((service) =>
-    !term || [service.name, service.pipelineName, service.status].join(" ").toLowerCase().includes(term),
+    !term || [service.name, service.pipelineName, service.status, service.phase].join(" ").toLowerCase().includes(term),
   );
   return [...rows].sort((left, right) =>
-    sortMode.value === "oldest"
-      ? left.createdAt.localeCompare(right.createdAt)
-      : right.createdAt.localeCompare(left.createdAt),
+    sortMode.value === "oldest" ? left.createdAt.localeCompare(right.createdAt) : right.createdAt.localeCompare(left.createdAt),
   );
 });
 
-const allTestExamples = computed(() => [...sampleExamples, ...uploadedExamples.value]);
-const selectedExample = computed(() => allTestExamples.value.find((item) => item.id === selectedExampleId.value) ?? sampleExamples[0]);
+onMounted(() => {
+  void loadServices();
+  pollTimer = window.setInterval(pollActiveServices, 2500);
+});
 
-const resultImage = computed(() => inferenceResult.value?.result_image ?? selectedExample.value.image);
-const resultJson = computed(() =>
-  inferenceResult.value
-    ? JSON.stringify(inferenceResult.value, null, 2)
-    : JSON.stringify(
-        {
-          service: selectedService.value?.name,
-          image: selectedExample.value.name,
-          detections: [
-            { label: "0", score: 0.68, box: [120, 42, 640, 358] },
-            { label: "1", score: 0.64, box: [620, 262, 690, 344] },
-          ],
-        },
-        null,
-        2,
-      ),
-);
+onUnmounted(() => {
+  if (pollTimer !== undefined) window.clearInterval(pollTimer);
+});
 
 watch(
   () => route.params.serviceId,
   () => {
     activeTab.value = "basic";
     detailSubtab.value = "example";
-    resultMode.value = "image";
-    inferenceResult.value = null;
   },
 );
 
 function openService(service: ServiceRecord, subtab: DetailSubtab = "example") {
   detailSubtab.value = subtab;
   void router.push(`/services/${service.id}`);
+  if (subtab === "logs") void loadServiceLog(service);
 }
 
 function backToList() {
   void router.push("/services");
-}
-
-async function toggleService(service: ServiceRecord) {
-  const nextStatus = service.status === "running" ? "stopped" : "running";
-  try {
-    const updated = await api.updateService(service.id, { status: nextStatus });
-    service.status = updated.status;
-  } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : "服务状态更新失败");
-  }
-}
-
-async function deleteService(service: ServiceRecord) {
-  try {
-    await api.deleteService(service.id);
-  } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : "服务删除失败");
-    return;
-  }
-  services.value = services.value.filter((item) => item.id !== service.id);
-  if (selectedService.value?.id === service.id) {
-    backToList();
-  }
 }
 
 async function loadServices() {
@@ -315,8 +257,95 @@ async function loadServices() {
     const response = await api.listServices({ limit: 200, offset: 0 });
     services.value = response.items.map(serviceFromApi);
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : "服务列表加载失败");
+    ElMessage.error(errorMessage(error, "服务列表加载失败"));
   }
+}
+
+async function pollActiveServices() {
+  const targets = services.value.filter((service) => isActive(service.status));
+  await Promise.all(
+    targets.map(async (service) => {
+      try {
+        mergeService(await api.getService(service.id));
+      } catch {
+        // A transient polling failure must not interrupt the next refresh cycle.
+      }
+    }),
+  );
+}
+
+function mergeService(record: DeploymentServiceRecord) {
+  const next = serviceFromApi(record);
+  const index = services.value.findIndex((service) => service.id === next.id);
+  if (index >= 0) {
+    const previous = services.value[index];
+    if (previous.logUri === next.logUri && previous.logs !== "正在读取日志...") next.logs = previous.logs;
+    services.value[index] = next;
+  }
+  else services.value.push(next);
+}
+
+async function stopService(service: ServiceRecord) {
+  actionRunning.value = true;
+  try {
+    mergeService(await api.stopService(service.id));
+    ElMessage.success("停止任务已提交");
+  } catch (error) {
+    ElMessage.error(errorMessage(error, "停止服务失败"));
+  } finally {
+    actionRunning.value = false;
+  }
+}
+
+async function rollbackService(service: ServiceRecord) {
+  actionRunning.value = true;
+  try {
+    mergeService(await api.rollbackService(service.id));
+    ElMessage.success("回滚任务已提交");
+  } catch (error) {
+    ElMessage.error(errorMessage(error, "回滚服务失败"));
+  } finally {
+    actionRunning.value = false;
+  }
+}
+
+async function deleteService(service: ServiceRecord) {
+  try {
+    await api.deleteService(service.id);
+    services.value = services.value.filter((item) => item.id !== service.id);
+    if (selectedService.value?.id === service.id) backToList();
+  } catch (error) {
+    ElMessage.error(errorMessage(error, "服务删除失败"));
+  }
+}
+
+function openLogs() {
+  detailSubtab.value = "logs";
+  void loadServiceLog();
+}
+
+async function loadServiceLog(service = selectedService.value) {
+  if (!service) return;
+  if (!service.logUri) {
+    service.logs = service.errorMessage || `${phaseText(service.phase)}，暂未生成执行日志。`;
+    return;
+  }
+  logLoading.value = true;
+  try {
+    service.logs = await api.readServiceLog(service.logUri);
+  } catch (error) {
+    service.logs = errorMessage(error, "日志读取失败");
+  } finally {
+    logLoading.value = false;
+  }
+}
+
+async function runServiceInference(request: ExperienceInferenceRequest): Promise<ExperienceInferenceResponse> {
+  const service = selectedService.value;
+  if (!service) throw new Error("服务不存在");
+  const result = await api.predictServiceImage(service.id, request.file);
+  service.calls += 1;
+  return result;
 }
 
 function serviceFromApi(service: DeploymentServiceRecord): ServiceRecord {
@@ -330,519 +359,133 @@ function serviceFromApi(service: DeploymentServiceRecord): ServiceRecord {
     status: service.status,
     environment: service.resource_summary || service.environment,
     calls: service.calls,
-    duration: "刚刚创建",
     endpoint: service.endpoint,
-    exampleCode: `# POST ${service.endpoint}\n# model_weight=${service.model_weight}\n# instance=${service.instance_name}`,
-    logs: `[INFO] ${createdAt} service ${service.name} deployed\n[INFO] environment: ${service.environment}\n[INFO] instance: ${service.instance_name}`,
+    exampleCode: `curl -X POST "${service.endpoint || `/services/${service.id}/predict/image`}" \\\n  -F "file=@test.jpg"`,
+    logs: "正在读取日志...",
+    nodeId: service.node_id || "",
+    containerId: service.container_id || "",
+    engine: service.engine || "",
+    healthStatus: service.health_status || "pending",
+    phase: service.phase || service.status,
+    logUri: service.log_uri || "",
+    errorCode: service.error_code || "",
+    errorMessage: service.error_message || "",
   };
 }
 
-function statusText(status: ServiceStatus) {
-  if (status === "running") return "运行中";
-  if (status === "deploying") return "部署中";
-  return "已终止";
+function isActive(status: string) {
+  return ["queued", "deploying", "connecting", "probing", "preparing", "optimizing", "starting", "warming_up", "upgrade_queued", "stopping", "rollback_queued"].includes(status);
 }
 
-async function runExperience() {
-  const service = selectedService.value;
-  if (!service) return;
-  experienceRunning.value = true;
-  try {
-    const response = await fetch(selectedExample.value.image);
-    if (!response.ok) throw new Error("测试图片读取失败");
-    const blob = await response.blob();
-    const filename = selectedExample.value.name || "test-image.png";
-    inferenceResult.value = await api.predictServiceImage(service.id, new File([blob], filename, { type: blob.type || "image/png" }));
-    resultMode.value = "image";
-    service.calls += 1;
-  } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : "服务推理失败");
-  } finally {
-    experienceRunning.value = false;
-  }
+function canStop(status: string) {
+  return status === "running" || isActive(status);
 }
 
-function resetExperience() {
-  inferenceResult.value = null;
-  resultMode.value = "image";
-  selectedExampleId.value = sampleExamples[0].id;
-}
-
-function handleExampleUpload(event: Event) {
-  const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
-  if (!file) return;
-
-  const imageUrl = URL.createObjectURL(file);
-  const uploadedExample = {
-    id: `upload-${Date.now()}`,
-    name: file.name,
-    image: imageUrl,
-    thumb: imageUrl,
+function statusText(status: string) {
+  const labels: Record<string, string> = {
+    queued: "部署排队中", deploying: "部署中", connecting: "连接中", probing: "环境探测中",
+    preparing: "准备资源中", optimizing: "模型优化中", starting: "启动中", warming_up: "预热中",
+    running: "运行中", stopping: "停止排队中", stopped: "已停止", rollback_queued: "回滚排队中",
+    upgrade_queued: "升级排队中", failed: "运行失败",
   };
-  uploadedExamples.value = [...uploadedExamples.value, uploadedExample];
-  selectedExampleId.value = uploadedExample.id;
-  inferenceResult.value = null;
-  resultMode.value = "image";
-  input.value = "";
+  return labels[status] || status || "未知";
 }
 
+function phaseText(phase: string) {
+  return statusText(phase);
+}
+
+function healthText(health: string) {
+  const labels: Record<string, string> = { pending: "等待检查", starting: "启动中", healthy: "健康", unhealthy: "异常", stopped: "已停止" };
+  return labels[health] || health || "未知";
+}
+
+function statusTone(status: string) {
+  if (status === "running") return "success";
+  if (status === "failed") return "danger";
+  if (status === "stopped") return "neutral";
+  return "progress";
+}
+
+function healthTone(health: string) {
+  return health === "healthy" ? "healthy" : health === "unhealthy" ? "unhealthy" : "pending";
+}
+
+function phaseIndex(phase: string) {
+  return deploymentPhases.find((item) => item.value === phase)?.index ?? -1;
+}
+
+function shortContainerId(id: string) {
+  return id ? id.slice(0, 14) : "-";
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
 </script>
 
 <style scoped>
-.services-view {
-  min-height: 100%;
-  color: #111827;
-}
-
-.services-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-  margin-bottom: 48px;
-}
-
-.services-header h1,
-.detail-header h1 {
-  margin: 0;
-  font-size: 24px;
-  font-weight: 700;
-}
-
-.services-tools {
-  display: flex;
-  gap: 16px;
-}
-
-.sort-select {
-  width: 120px;
-}
-
-.search-input {
-  width: 280px;
-}
-
-.service-grid {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 20px 16px;
-}
-
-.service-card {
-  min-height: 150px;
-  border: 1px solid #dfe5ef;
-  border-radius: 4px;
-  background: #fff;
-  padding: 22px 22px 16px;
-  cursor: pointer;
-}
-
-.service-card:hover {
-  border-color: #2f7df6;
-}
-
-.service-card h2 {
-  margin: 0 0 14px;
-  font-size: 16px;
-}
-
-.service-card time,
-.service-card p {
-  color: #475467;
-  font-size: 14px;
-}
-
-.service-card p {
-  margin: 22px 0;
-}
-
-.service-card footer {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.service-card footer i {
-  width: 1px;
-  height: 16px;
-  background: #dfe5ef;
-}
-
-.service-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  border-radius: 16px;
-  padding: 6px 10px;
-  font-size: 13px;
-}
-
-.service-status.running {
-  background: #dcfce7;
-  color: #059669;
-}
-
-.service-status.deploying {
-  background: #f3e8ff;
-  color: #8b5cf6;
-}
-
-.service-status.stopped {
-  background: #dbeafe;
-  color: #1763ff;
-}
-
-.icon-action,
-.delete-service,
-.text-action,
-.back-link,
-.detail-tabs button,
-.detail-subtabs button {
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-}
-
-.icon-action,
-.delete-service {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  color: #667085;
-  font-size: 18px;
-  flex: 0 0 28px;
-}
-
-.delete-service {
-  color: #475467;
-  font-size: 18px;
-}
-
-.icon-action svg,
-.delete-service svg {
-  width: 18px;
-  height: 18px;
-  display: block;
-  fill: currentColor;
-}
-
-.icon-action:hover,
-.delete-service:hover {
-  color: #111827;
-}
-
-.text-action {
-  color: #1763ff;
-  font-size: 14px;
-}
-
-.text-action.warning {
-  color: #ff7a1a;
-}
-
-.service-pagination {
-  position: fixed;
-  right: 22px;
-  bottom: 24px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-
-.service-pagination button {
-  border: 0;
-  border-radius: 4px;
-  background: #eef5ff;
-  color: #1763ff;
-  padding: 8px 12px;
-}
-
-.page-size {
-  width: 112px;
-}
-
-.back-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 46px;
-}
-
-.detail-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 20px;
-  margin-bottom: 36px;
-}
-
-.detail-header p {
-  margin: 18px 0 0;
-  color: #667085;
-}
-
-.detail-header a {
-  margin-left: 24px;
-  color: #1763ff;
-}
-
-.endpoint-box {
-  display: grid;
-  gap: 10px;
-  justify-items: end;
-  color: #98a2b3;
-}
-
-.endpoint-box button {
-  border: 1px solid #cfd8e6;
-  background: #f8fbff;
-  padding: 9px 24px;
-}
-
-.detail-tabs {
-  display: flex;
-  gap: 34px;
-  border-bottom: 1px solid #dfe5ef;
-}
-
-.detail-tabs button {
-  padding: 0 0 18px;
-  color: #344054;
-  font-size: 16px;
-}
-
-.detail-tabs button.active {
-  border-bottom: 3px solid #1763ff;
-  color: #1763ff;
-  font-weight: 700;
-}
-
-.basic-panel,
-.experience-panel {
-  padding: 28px 40px;
-}
-
-.status-row {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  margin-bottom: 24px;
-}
-
-.status-row strong.running {
-  color: #059669;
-}
-
-.status-row strong.stopped {
-  color: #1763ff;
-}
-
-.metric-row {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin: 22px 0 34px;
-}
-
-.metric-row div {
-  display: grid;
-  gap: 18px;
-  text-align: center;
-}
-
-.metric-row div + div {
-  border-left: 1px solid #dfe5ef;
-}
-
-.metric-row strong {
-  font-size: 16px;
-}
-
-.metric-row span {
-  color: #344054;
-}
-
-.detail-subtabs {
-  display: flex;
-  margin: 0 0 18px 40px;
-}
-
-.detail-subtabs button {
-  min-width: 180px;
-  border: 1px solid #dfe5ef;
-  padding: 12px;
-}
-
-.detail-subtabs button.active {
-  background: #eff6ff;
-  color: #1763ff;
-  font-weight: 700;
-}
-
-.code-panel {
-  min-height: 360px;
-  overflow: auto;
-  border: 1px solid #dfe5ef;
-  background: #f6f8fc;
-  padding: 42px 32px;
-  color: #344054;
-  font-family: Consolas, monospace;
-  font-size: 14px;
-  line-height: 1.6;
-}
-
-.experience-panel {
-  display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
-  gap: 24px;
-}
-
-.test-images {
-  border-right: 1px solid #98a2b3;
-  padding-right: 22px;
-}
-
-.test-images h2,
-.result-header span {
-  margin: 0 0 14px;
-  font-size: 16px;
-  font-weight: 500;
-}
-
-.selected-test-image {
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  object-fit: cover;
-}
-
-.thumb-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
-  margin: 12px 0;
-}
-
-.thumb-grid button {
-  border: 1px solid transparent;
-  border-radius: 4px;
-  background: #f4f7fb;
-  padding: 0;
-}
-
-.upload-example {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  aspect-ratio: 1 / 1;
-  border: 1px dashed #d0d5dd;
-  border-radius: 4px;
-  background: #fff;
-  color: #344054;
-  cursor: pointer;
-  font-size: 28px;
-}
-
-.upload-example input {
-  display: none;
-}
-
-.upload-example:hover {
-  border-color: #1763ff;
-  color: #1763ff;
-  background: #f5f9ff;
-}
-
-.thumb-grid button.active {
-  border-color: #1763ff;
-  box-shadow: 0 0 0 1px #1763ff inset;
-}
-
-.thumb-grid img {
-  display: block;
-  width: 100%;
-  aspect-ratio: 1 / 1;
-  object-fit: cover;
-}
-
-.test-images p {
-  color: #667085;
-  font-size: 13px;
-  line-height: 1.6;
-}
-
-.experience-actions {
-  display: flex;
-  gap: 66px;
-  margin-top: 26px;
-}
-
-.primary-action,
-.secondary-action {
-  min-width: 118px;
-  border-radius: 4px;
-  padding: 10px 26px;
-}
-
-.primary-action {
-  border: 1px solid #1763ff;
-  background: #1763ff;
-  color: #fff;
-}
-
-.secondary-action {
-  border: 1px solid #d0d5dd;
-  background: #fff;
-}
-
-.result-header {
-  display: flex;
-  justify-content: space-between;
-  margin-bottom: 10px;
-}
-
-.result-header div {
-  display: flex;
-}
-
-.result-header button {
-  min-width: 120px;
-  border: 1px solid #dfe5ef;
-  background: #fff;
-  padding: 10px;
-}
-
-.result-header button.active {
-  background: #eff6ff;
-  color: #1763ff;
-}
-
-.result-body {
-  min-height: 580px;
-  border: 1px solid #dfe5ef;
-  display: grid;
-  place-items: center;
-  overflow: auto;
-}
-
-.result-body img {
-  max-height: 560px;
-  max-width: 94%;
-  object-fit: contain;
-}
-
-.result-body pre {
-  justify-self: stretch;
-  align-self: stretch;
-  margin: 0;
-  padding: 24px;
-  background: #f6f8fc;
-}
-
-@media (max-width: 1400px) {
-  .service-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-}
+.services-view { min-height: 100%; color: #111827; }
+.services-header, .detail-header, .card-heading, .detail-actions, .service-card footer, .back-link, .log-toolbar { display: flex; align-items: center; }
+.services-header, .detail-header, .log-toolbar { justify-content: space-between; }
+.services-header { margin-bottom: 32px; }
+.services-header h1, .detail-header h1 { margin: 0; font-size: 24px; }
+.services-tools, .detail-actions { display: flex; gap: 12px; }
+.sort-select { width: 130px; } .search-input { width: 280px; }
+.service-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+.service-card { min-height: 190px; border: 1px solid #dfe5ef; border-radius: 4px; background: #fff; padding: 20px; cursor: pointer; }
+.service-card:hover { border-color: #1763ff; }
+.card-heading { justify-content: space-between; gap: 12px; }
+.service-card h2 { margin: 0; font-size: 16px; }
+.service-card time, .service-card p { color: #667085; font-size: 13px; }
+.service-card p { margin: 18px 0 8px; } .service-card .phase-line { margin: 0 0 18px; }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: #1763ff; box-shadow: 0 0 0 4px #e8f0ff; }
+.service-card footer { gap: 9px; }
+.service-card footer i { width: 1px; height: 16px; background: #dfe5ef; }
+.service-status { border-radius: 14px; padding: 5px 9px; font-size: 12px; }
+.service-status.success, .lifecycle-banner.success { background: #ecfdf3; color: #067647; }
+.service-status.progress, .lifecycle-banner.progress { background: #f4f0ff; color: #6941c6; }
+.service-status.danger, .lifecycle-banner.danger { background: #fef3f2; color: #b42318; }
+.service-status.neutral, .lifecycle-banner.neutral { background: #f2f4f7; color: #475467; }
+button { font: inherit; }
+.delete-service, .text-action, .back-link { border: 0; background: transparent; cursor: pointer; }
+.delete-service { width: 24px; height: 24px; padding: 3px; color: #667085; }
+.delete-service :deep(svg) { width: 17px; }
+.text-action { color: #1763ff; } .text-action.warning { color: #d92d20; }
+.text-action:disabled { color: #b7c0ce; cursor: not-allowed; }
+.service-pagination { display: flex; justify-content: flex-end; align-items: center; gap: 14px; margin-top: 24px; }
+.service-pagination > button { border: 0; border-radius: 4px; background: #eef5ff; color: #1763ff; padding: 8px 12px; }
+.page-size { width: 112px; }
+.back-link { gap: 6px; margin-bottom: 28px; color: #344054; }
+.back-link :deep(svg) { width: 16px; }
+.detail-header { margin-bottom: 28px; }
+.detail-header p { color: #667085; }
+.detail-actions button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #d0d5dd; border-radius: 4px; background: #fff; padding: 8px 14px; cursor: pointer; }
+.detail-actions button:disabled { color: #98a2b3; cursor: not-allowed; }
+.detail-actions :deep(svg) { width: 16px; }
+.detail-tabs { display: flex; gap: 32px; border-bottom: 1px solid #dfe5ef; }
+.detail-tabs button { border: 0; border-bottom: 3px solid transparent; background: transparent; padding: 0 0 14px; cursor: pointer; }
+.detail-tabs button.active { border-bottom-color: #1763ff; color: #1763ff; font-weight: 700; }
+.basic-panel { padding: 28px 0; }
+.lifecycle-banner { display: grid; gap: 20px; border-radius: 4px; padding: 18px 22px; }
+.lifecycle-banner > div { display: flex; align-items: baseline; gap: 16px; }
+.lifecycle-banner strong { font-size: 18px; }
+.phase-track { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 0; margin: 0; padding: 0; list-style: none; }
+.phase-track li { position: relative; border-top: 2px solid #d0d5dd; color: #98a2b3; padding-top: 9px; font-size: 12px; text-align: center; }
+.phase-track li.complete { border-color: #1763ff; color: #1763ff; }
+.phase-track li.current { font-weight: 700; }
+.metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid #e4e7ec; margin: 22px 0; }
+.metric-grid div { display: grid; gap: 8px; min-height: 78px; border-right: 1px solid #e4e7ec; border-bottom: 1px solid #e4e7ec; padding: 14px 18px; }
+.metric-grid span { color: #667085; font-size: 13px; }
+.metric-grid strong { overflow-wrap: anywhere; font-size: 14px; }
+.healthy { color: #067647; } .unhealthy { color: #b42318; } .pending { color: #6941c6; }
+.detail-subtabs { display: flex; margin-top: 28px; }
+.detail-subtabs button { min-width: 160px; border: 1px solid #dfe5ef; background: #fff; padding: 11px; cursor: pointer; }
+.detail-subtabs button.active { background: #eff6ff; color: #1763ff; font-weight: 700; }
+.code-panel, .log-panel { min-height: 330px; border: 1px solid #dfe5ef; background: #f7f9fc; }
+.code-panel, .log-panel pre { margin: 0; padding: 28px; color: #344054; font-family: Consolas, monospace; line-height: 1.65; white-space: pre-wrap; }
+.log-toolbar { border-bottom: 1px solid #dfe5ef; padding: 12px 18px; }
+.log-toolbar button { border: 0; background: transparent; color: #1763ff; cursor: pointer; }
+@media (max-width: 1300px) { .service-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 900px) { .service-grid, .metric-grid { grid-template-columns: 1fr; } .phase-track { overflow-x: auto; grid-template-columns: repeat(8, 90px); } }
 </style>

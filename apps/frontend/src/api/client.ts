@@ -231,12 +231,74 @@ export type DeploymentServiceRecord = {
   instance_count: number;
   instance_name: string;
   resource_summary: string;
-  status: "running" | "stopped" | "deploying";
+  status: string;
   endpoint: string;
   calls: number;
   config: Record<string, unknown>;
+  instance_id?: string | null;
+  node_id?: string | null;
+  container_id?: string | null;
+  image_digest?: string | null;
+  model_checksum?: string | null;
+  engine?: string | null;
+  engine_digest?: string | null;
+  port?: number | null;
+  health_status?: string | null;
+  task_id?: string | null;
+  remote_execution_id?: string | null;
+  phase?: string | null;
+  log_uri?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type ResourcePoolRecord = {
+  id: string;
+  name: string;
+  kind: string;
+  selector: Record<string, unknown>;
+  compatibility_policy: Record<string, unknown>;
+  enabled: boolean;
+};
+
+export type ComputeNodeRecord = {
+  id: string;
+  name: string;
+  resource_pool_id?: string | null;
+  status: string;
+  architecture: string;
+  platform_kind: string;
+  capabilities: Record<string, unknown>;
+  resources: Record<string, unknown>;
+  fingerprint: Record<string, unknown>;
+  agent_version: string;
+  certificate_expires_at?: string | null;
+  last_seen_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ServiceCreatePayload = {
+  name: string;
+  pipeline_id: string;
+  trained_model_id: string;
+  model_name: string;
+  model_weight: string;
+  environment: string;
+  instance_name: string;
+  resource_summary: string;
+  node_id: string;
+  image_digest: string;
+  model_checksum: string;
+  port?: number;
+  format?: "auto" | "pt" | "onnx" | "engine";
+  precision?: "auto" | "fp32" | "fp16" | "int8";
+  input_shape?: [number, number, number, number];
+  gpu_uuids?: string[];
+  calibration_dataset_uri?: string;
+  config?: Record<string, unknown>;
 };
 
 export type TaskRecord = {
@@ -274,6 +336,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+async function requestText(url: string): Promise<string> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`日志读取失败（HTTP ${response.status}）`);
+  return response.text();
 }
 
 function readErrorDetail(text: string): string {
@@ -424,19 +492,18 @@ export const api = {
     }),
   listPipelineEvaluations: (pipelineId: string, params: { limit?: number; offset?: number } = {}) =>
     request<ListResponse<PipelineEvaluationResponse>>(`/pipelines/${pipelineId}/evaluations${query(params)}`),
-  createService: (payload: {
-    name: string;
-    pipeline_id: string;
-    trained_model_id?: string;
-    model_name: string;
-    model_weight: string;
-    environment: string;
-    instance_name: string;
-    resource_summary: string;
-    config?: Record<string, unknown>;
-  }) => request<DeploymentServiceRecord>("/services", { method: "POST", body: JSON.stringify(payload) }),
+  listResourcePools: () => request<{ items: ResourcePoolRecord[]; total: number }>("/resource-pools"),
+  listNodes: () => request<{ items: ComputeNodeRecord[]; total: number }>("/nodes"),
+  createService: (payload: ServiceCreatePayload) =>
+    request<DeploymentServiceRecord>("/services", { method: "POST", body: JSON.stringify(payload) }),
   listServices: (params: { status?: string; pipeline_id?: string; limit?: number; offset?: number } = {}) =>
     request<ListResponse<DeploymentServiceRecord>>(`/services${query(params)}`),
+  getService: (serviceId: string) => request<DeploymentServiceRecord>(`/services/${serviceId}`),
+  stopService: (serviceId: string) =>
+    request<DeploymentServiceRecord>(`/services/${serviceId}/stop`, { method: "POST" }),
+  rollbackService: (serviceId: string) =>
+    request<DeploymentServiceRecord>(`/services/${serviceId}/rollback`, { method: "POST" }),
+  readServiceLog: (logUri: string) => requestText(logUri),
   updateService: (serviceId: string, payload: { status: "running" | "stopped" }) =>
     request<DeploymentServiceRecord>(`/services/${serviceId}`, { method: "PATCH", body: JSON.stringify(payload) }),
   deleteService: (serviceId: string) => request<void>(`/services/${serviceId}`, { method: "DELETE" }),

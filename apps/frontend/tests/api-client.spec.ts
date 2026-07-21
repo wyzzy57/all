@@ -109,4 +109,28 @@ describe("api client", () => {
 
     await expect(api.createLabelProject("dataset-1")).rejects.toThrow("Label Studio 服务不可用");
   });
+
+  it("uses real edge resource and deployment lifecycle routes", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(() => mockJsonResponse({ items: [], total: 0 }));
+
+    await api.listResourcePools();
+    await api.listNodes();
+    await api.getService("service-1");
+    await api.stopService("service-1");
+    await api.rollbackService("service-1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/resource-pools", expect.anything());
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/nodes", expect.anything());
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/services/service-1", expect.anything());
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      "/services/service-1/stop",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      "/services/service-1/rollback",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
 });

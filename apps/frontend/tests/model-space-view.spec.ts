@@ -25,6 +25,8 @@ const apiMock = vi.hoisted(() => ({
   listPipelineEvaluations: vi.fn(),
   markTrainedModelWeight: vi.fn(),
   createService: vi.fn(),
+  listResourcePools: vi.fn(),
+  listNodes: vi.fn(),
 }));
 
 vi.mock("vue-router", () => ({
@@ -90,6 +92,27 @@ function mountView() {
         "el-switch": true,
       },
     },
+  });
+}
+
+function mockDeployablePipeline() {
+  apiMock.listPipelines.mockResolvedValueOnce({
+    items: [
+      {
+        id: "pipeline-1",
+        name: "3413",
+        task: "detect",
+        scale: "n",
+        status: "success",
+        base_model_id: "base-1",
+        dataset_id: "dataset-1",
+        params_template: {},
+        default_environment: { device: "0" },
+        is_favorite: false,
+        is_public: false,
+        created_at: "2026-07-03T10:43:14Z",
+      },
+    ],
   });
 }
 
@@ -223,6 +246,36 @@ describe("ModelSpaceView", () => {
       }),
     );
     apiMock.createService.mockResolvedValue({ id: "service-1", status: "running" });
+    apiMock.listResourcePools.mockResolvedValue({
+      items: [
+        {
+          id: "pool-x86",
+          name: "x86-nvidia-sm86",
+          kind: "x86_nvidia",
+          selector: {},
+          compatibility_policy: { cuda_major: 12, tensorrt_major: 10, compute_capability: "8.6" },
+          enabled: true,
+        },
+      ],
+      total: 1,
+    });
+    apiMock.listNodes.mockResolvedValue({
+      items: [
+        {
+          id: "node-a",
+          name: "边缘节点 A",
+          resource_pool_id: "pool-x86",
+          status: "online",
+          architecture: "x86_64",
+          platform_kind: "x86_nvidia",
+          capabilities: { gpu_uuids: ["GPU-a"] },
+          resources: { gpu_name: "RTX 4090", gpu_memory_total_mb: 24576, gpu_memory_free_mb: 22000 },
+          fingerprint: {},
+          agent_version: "ssh",
+        },
+      ],
+      total: 1,
+    });
   });
 
   it("opens result files and routes the selected job to native training visualization", async () => {
@@ -532,5 +585,73 @@ describe("ModelSpaceView", () => {
       "_blank",
       "noopener,noreferrer",
     );
+  });
+
+  it("loads real edge pools and nodes and submits automatic TensorRT optimization", async () => {
+    mockDeployablePipeline();
+    apiMock.listTrainedModels.mockResolvedValueOnce({
+      items: [
+        {
+          id: "model-best",
+          pipeline_id: "pipeline-1",
+          training_job_id: "job-1",
+          name: "best.pt",
+          version: "best.pt",
+          task: "detect",
+          artifact_uri: "minio://models/best.pt",
+          metrics: {
+            checksum: "a".repeat(64),
+            deployment_image_digest: `sha256:${"b".repeat(64)}`,
+          },
+          status: "ready",
+        },
+      ],
+    });
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="pipeline-card-pipeline-1"]').trigger("click");
+    await wrapper.get('[data-testid="detail-tab-deploy"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.listResourcePools).toHaveBeenCalledTimes(1);
+    expect(apiMock.listNodes).toHaveBeenCalledTimes(1);
+    expect(wrapper.text()).toContain("x86-nvidia-sm86");
+    expect(wrapper.text()).toContain("边缘节点 A");
+    expect(wrapper.text()).toContain("RTX 4090");
+    expect(wrapper.text()).toContain("自动优化");
+    expect(wrapper.text()).toContain("TensorRT FP16");
+
+    const startButton = wrapper.findAll("button").find((button) => button.text().includes("开始部署"));
+    expect(startButton).toBeDefined();
+    await startButton!.trigger("click");
+    await flushPromises();
+
+    expect(apiMock.createService).toHaveBeenCalledWith(
+      expect.objectContaining({
+        trained_model_id: "model-best",
+        node_id: "node-a",
+        image_digest: `sha256:${"b".repeat(64)}`,
+        model_checksum: "a".repeat(64),
+        format: "auto",
+        precision: "auto",
+        input_shape: [1, 3, 640, 640],
+        gpu_uuids: ["GPU-a"],
+      }),
+    );
+  });
+
+  it("reveals manual optimization controls", async () => {
+    mockDeployablePipeline();
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="pipeline-card-pipeline-1"]').trigger("click");
+    await wrapper.get('[data-testid="detail-tab-deploy"]').trigger("click");
+    await flushPromises();
+
+    await wrapper.get('[data-testid="optimization-manual"]').trigger("click");
+    expect(wrapper.text()).toContain("导出格式");
+    expect(wrapper.text()).toContain("推理精度");
+    expect(wrapper.text()).toContain("输入尺寸");
+    expect(wrapper.text()).toContain("INT8 校准数据集");
   });
 });
