@@ -23,6 +23,15 @@ npm run build --prefix apps/frontend
 
 See [docs/runbooks/local-mvp.md](docs/runbooks/local-mvp.md) for the local MVP runbook.
 
+## SSH/Docker Edge Runtime
+
+Visiox can bootstrap trusted Ubuntu NVIDIA x86 and Jetson nodes over strict
+SSH, deploy YOLO26 image inference with Docker/TensorRT, and record repeatable
+hardware-acceptance evidence. See the
+[SSH/Docker edge runtime runbook](docs/runbooks/ssh-docker-edge-runtime.md) for
+the security model, request templates, x86/Jetson commands, and JSON report
+rules. A report marked `pending` is not evidence that physical hardware passed.
+
 ## Node Agent
 
 M1 adds a Linux `amd64`/`arm64` Node Agent for one-time enrollment, resource
