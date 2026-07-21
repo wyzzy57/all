@@ -8,8 +8,11 @@ _PACKAGED_SCRIPTS = frozenset(
         "deploy_inference.sh",
         "inspect_deployment.sh",
         "inspect_runtime.sh",
+        "launch_rank.sh",
         "probe_inventory.sh",
+        "stage_training.sh",
         "stop_deployment.sh",
+        "stop_training.sh",
     }
 )
 

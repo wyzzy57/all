@@ -1,4 +1,5 @@
 from collections.abc import Generator
+import json
 from pathlib import Path
 
 import pytest
@@ -22,13 +23,19 @@ from visiox_common.tasks import TaskStatus, TaskType
 from visiox_db.models import (
     Annotation,
     BaseModel,
+    ComputeNode,
     Dataset,
     DatasetSample,
+    DistributedTrainingRun,
+    EdgeSshCredential,
+    RemoteExecution,
+    ResourcePool,
     Task,
     TrainedModel,
     TrainingJob,
     TrainingPipeline,
 )
+from visiox_edge_executor_worker.inventory import compatibility_key, compatibility_policy, parse_inventory
 from visiox_storage.client import InMemoryObjectStorageClient
 import visiox_training_worker.main as training_worker_main
 from visiox_training_worker.main import CommandResult, run_training_job
@@ -38,14 +45,23 @@ from visiox_training_worker.runner import SubprocessTrainingRunner, run_pending_
 class FakeStreamProducer:
     def __init__(self) -> None:
         self.commands = []
+        self.edge_commands: list[dict[str, object]] = []
 
     async def enqueue(self, command):
         self.commands.append(command)
         return "1-0"
 
+    async def enqueue_edge_execution(self, **command):
+        self.edge_commands.append(command)
+        return "2-0"
+
 
 class FailingStreamProducer:
     async def enqueue(self, command):
+        raise RuntimeError("redis unavailable")
+
+    async def enqueue_edge_execution(self, **command):
+        del command
         raise RuntimeError("redis unavailable")
 
 
@@ -239,6 +255,65 @@ def seed_training_ready_rows(
         storage.put_file("datasets", "train/sample.png", image_path)
 
     return base_model_id, dataset_id, sample_id
+
+
+def seed_distributed_pool(session_factory, *, name: str = "training-pool", node_count: int = 2) -> tuple[str, list[str]]:
+    snapshot = parse_inventory(
+        json.loads(Path("tests/fixtures/edge_inventory/x86.json").read_text(encoding="utf-8"))
+    )
+    key = compatibility_key(snapshot)
+    with session_factory() as session:
+        pool = ResourcePool(
+            name=name,
+            kind=snapshot.platform_kind,
+            selector=compatibility_policy(snapshot),
+            compatibility_policy=compatibility_policy(snapshot),
+            enabled=True,
+        )
+        session.add(pool)
+        session.flush()
+        nodes: list[ComputeNode] = []
+        for index in range(node_count):
+            node_snapshot = snapshot.model_copy(
+                update={
+                    "gpus": tuple(
+                        gpu.model_copy(update={"uuid": f"GPU-{name}-{index}-{gpu_index}"})
+                        for gpu_index, gpu in enumerate(snapshot.gpus)
+                    )
+                }
+            )
+            node = ComputeNode(
+                name=f"{name}-node-{index}",
+                resource_pool_id=pool.id,
+                status="online",
+                architecture=snapshot.architecture,
+                platform_kind=snapshot.platform_kind,
+                capabilities={"nvidia_gpu": True},
+                resources={"gpu_count": len(node_snapshot.gpus)},
+                fingerprint={
+                    "compatibility_key": key,
+                    "inventory_snapshot": node_snapshot.model_dump(mode="json"),
+                },
+                agent_version="ssh-edge-v1",
+            )
+            session.add(node)
+            session.flush()
+            session.add(
+                EdgeSshCredential(
+                    node_id=node.id,
+                    ssh_host=f"{name}-node-{index}.lan",
+                    ssh_port=22,
+                    ssh_user="visiox-edge",
+                    host_key_type="ssh-ed25519",
+                    host_key_fingerprint=f"SHA256:{name}-{index}",
+                    public_key=f"ssh-ed25519 {name}-{index}",
+                    encrypted_private_key=b"encrypted",
+                    encryption_nonce=b"nonce",
+                )
+            )
+            nodes.append(node)
+        session.commit()
+        return pool.id, [node.id for node in nodes]
 
 
 def create_pipeline(client: TestClient, base_model_id: str, dataset_id: str, **overrides):
@@ -491,6 +566,264 @@ def test_create_training_job_creates_task_and_enqueues_command(
     assert detail_response.json()["task_id"] == body["task_id"]
     with session_factory() as session:
         assert session.get(TrainingPipeline, pipeline_id).status == "running"
+
+
+def test_create_distributed_training_job_persists_plan_and_enqueues_id_only_edge_command(
+    client: TestClient,
+    session_factory,
+    stream_producer: FakeStreamProducer,
+):
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+
+    response = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "params": {"epochs": 2},
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 2,
+                "node_ids": list(reversed(node_ids)),
+                "training_image_digest": f"registry.example/visiox/training@sha256:{'a' * 64}",
+                "master_port": 29600,
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["distributed_run_id"]
+    assert body["remote_execution_id"]
+    assert stream_producer.commands == []
+    assert stream_producer.edge_commands == [
+        {
+            "task_id": body["task_id"],
+            "task_type": TaskType.EDGE_TRAIN,
+            "remote_execution_id": body["remote_execution_id"],
+        }
+    ]
+
+    with session_factory() as session:
+        job = session.get(TrainingJob, body["id"])
+        task = session.get(Task, body["task_id"])
+        run = session.get(DistributedTrainingRun, body["distributed_run_id"])
+        execution = session.get(RemoteExecution, body["remote_execution_id"])
+
+    assert job.task_id == task.id
+    assert task.task_type == TaskType.EDGE_TRAIN.value
+    assert task.payload["distributed_training_run_id"] == run.id
+    assert run.training_job_id == job.id
+    assert run.resource_pool_id == pool_id
+    assert run.node_ids == sorted(node_ids)
+    assert run.world_size == 2
+    assert run.master_port == 29600
+    assert run.training_image_digest == f"registry.example/visiox/training@sha256:{'a' * 64}"
+    assert [rank["node_rank"] for rank in run.ranks] == [0, 1]
+    assert execution.node_id == run.node_ids[0]
+    assert execution.operation == "train"
+    assert execution.training_job_id == job.id
+    assert execution.resource_id == run.id
+    detail = client.get(f"/training-jobs/{job.id}")
+    assert detail.status_code == 200
+    assert detail.json()["distributed_run_id"] == run.id
+    assert detail.json()["remote_execution_id"] == execution.id
+
+
+def test_distributed_training_rejects_unavailable_requested_node(
+    client: TestClient,
+    session_factory,
+):
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+    with session_factory() as session:
+        node = session.get(ComputeNode, node_ids[1])
+        node.status = "draining"
+        session.commit()
+
+    response = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 2,
+                "node_ids": node_ids,
+                "training_image_digest": f"registry.example/visiox/training@sha256:{'b' * 64}",
+            }
+        },
+    )
+
+    assert response.status_code == 409
+    assert "available" in response.json()["detail"].lower()
+    with session_factory() as session:
+        assert session.scalars(select(TrainingJob)).all() == []
+
+
+def test_distributed_training_requires_full_immutable_oci_image_reference(
+    client: TestClient,
+    session_factory,
+):
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+
+    response = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 2,
+                "node_ids": node_ids,
+                "training_image_digest": f"sha256:{'a' * 64}",
+            }
+        },
+    )
+
+    assert response.status_code == 422
+    assert "immutable image digest" in response.json()["detail"]
+
+
+def test_stop_distributed_training_creates_edge_stop_execution(
+    client: TestClient,
+    session_factory,
+    stream_producer: FakeStreamProducer,
+):
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+    created = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 2,
+                "node_ids": node_ids,
+                "training_image_digest": f"registry.example/visiox/training@sha256:{'c' * 64}",
+            }
+        },
+    ).json()
+    with session_factory() as session:
+        run = session.get(DistributedTrainingRun, created["distributed_run_id"])
+        job = session.get(TrainingJob, created["id"])
+        run.status = "running"
+        job.status = "running"
+        session.commit()
+
+    response = client.post(f"/training-jobs/{created['id']}/stop")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "stopping"
+    assert body["remote_execution_id"] != created["remote_execution_id"]
+    assert stream_producer.edge_commands[-1] == {
+        "task_id": body["task_id"],
+        "task_type": TaskType.EDGE_STOP_TRAINING,
+        "remote_execution_id": body["remote_execution_id"],
+    }
+    with session_factory() as session:
+        task = session.get(Task, body["task_id"])
+        run = session.get(DistributedTrainingRun, created["distributed_run_id"])
+        execution = session.get(RemoteExecution, body["remote_execution_id"])
+    assert task.task_type == TaskType.EDGE_STOP_TRAINING.value
+    assert run.status == "stopping"
+    assert execution.operation == "stop_training"
+    assert execution.resource_id == run.id
+
+
+def test_resume_distributed_training_uses_checkpoint_and_increments_attempt(
+    client: TestClient,
+    session_factory,
+    stream_producer: FakeStreamProducer,
+):
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+    created = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 2,
+                "node_ids": node_ids,
+                "training_image_digest": f"registry.example/visiox/training@sha256:{'d' * 64}",
+            }
+        },
+    ).json()
+    checkpoint_uri = f"minio://training/checkpoints/{created['id']}/last.pt"
+    checkpoint_checksum = "e" * 64
+    with session_factory() as session:
+        run = session.get(DistributedTrainingRun, created["distributed_run_id"])
+        job = session.get(TrainingJob, created["id"])
+        run.status = "stopped"
+        run.checkpoint_uri = checkpoint_uri
+        run.checkpoint_checksum = checkpoint_checksum
+        job.status = "stopped"
+        session.commit()
+
+    response = client.post(f"/training-jobs/{created['id']}/resume", json={})
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["distributed_run_id"] != created["distributed_run_id"]
+    assert stream_producer.edge_commands[-1] == {
+        "task_id": body["task_id"],
+        "task_type": TaskType.EDGE_RESUME_TRAINING,
+        "remote_execution_id": body["remote_execution_id"],
+    }
+    with session_factory() as session:
+        resumed = session.get(DistributedTrainingRun, body["distributed_run_id"])
+        execution = session.get(RemoteExecution, body["remote_execution_id"])
+    assert resumed.attempt == 2
+    assert resumed.resource_pool_id == pool_id
+    assert resumed.node_ids == sorted(node_ids)
+    assert resumed.checkpoint_uri == checkpoint_uri
+    assert resumed.checkpoint_checksum == checkpoint_checksum
+    assert execution.operation == "resume_training"
+
+
+def test_resume_distributed_training_rejects_pool_change(
+    client: TestClient,
+    session_factory,
+):
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory, name="original-pool")
+    other_pool_id, other_node_ids = seed_distributed_pool(session_factory, name="other-pool")
+    created = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 2,
+                "node_ids": node_ids,
+                "training_image_digest": f"registry.example/visiox/training@sha256:{'f' * 64}",
+            }
+        },
+    ).json()
+    with session_factory() as session:
+        run = session.get(DistributedTrainingRun, created["distributed_run_id"])
+        run.status = "failed"
+        run.checkpoint_uri = "minio://training/checkpoints/last.pt"
+        run.checkpoint_checksum = "1" * 64
+        session.commit()
+
+    response = client.post(
+        f"/training-jobs/{created['id']}/resume",
+        json={
+            "distributed": {
+                "resource_pool_id": other_pool_id,
+                "requested_gpus": 2,
+                "node_ids": other_node_ids,
+                "training_image_digest": f"registry.example/visiox/training@sha256:{'f' * 64}",
+            }
+        },
+    )
+
+    assert response.status_code == 409
+    assert "resource pool" in response.json()["detail"].lower()
 
 
 def test_cancel_training_task_marks_job_and_pipeline_canceled(

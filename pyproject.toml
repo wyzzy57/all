@@ -60,6 +60,9 @@ packages = [
 "workers/edge-executor-worker/remote/inspect_deployment.sh" = "visiox_edge_executor_worker/remote/inspect_deployment.sh"
 "workers/edge-executor-worker/remote/inspect_runtime.sh" = "visiox_edge_executor_worker/remote/inspect_runtime.sh"
 "workers/edge-executor-worker/remote/stop_deployment.sh" = "visiox_edge_executor_worker/remote/stop_deployment.sh"
+"workers/edge-executor-worker/remote/stage_training.sh" = "visiox_edge_executor_worker/remote/stage_training.sh"
+"workers/edge-executor-worker/remote/launch_rank.sh" = "visiox_edge_executor_worker/remote/launch_rank.sh"
+"workers/edge-executor-worker/remote/stop_training.sh" = "visiox_edge_executor_worker/remote/stop_training.sh"
 
 [tool.pytest.ini_options]
 pythonpath = [

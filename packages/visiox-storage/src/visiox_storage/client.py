@@ -20,6 +20,8 @@ class ObjectStorageClient(Protocol):
 
     def presigned_get_url(self, uri: str, *, expires: timedelta) -> str: ...
 
+    def presigned_put_url(self, uri: str, *, expires: timedelta) -> str: ...
+
 
 class MinioObjectStorageClient:
     def __init__(
@@ -76,6 +78,18 @@ class MinioObjectStorageClient:
             )
         )
 
+    def presigned_put_url(self, uri: str, *, expires: timedelta) -> str:
+        bucket, object_name = _parse_minio_uri(uri)
+        if not timedelta(0) < expires <= timedelta(hours=1):
+            raise ValueError("presigned URL expiry must be between zero and one hour")
+        return str(
+            self._client.presigned_put_object(
+                bucket,
+                object_name,
+                expires=expires,
+            )
+        )
+
 
 class InMemoryObjectStorageClient:
     def __init__(self) -> None:
@@ -104,6 +118,10 @@ class InMemoryObjectStorageClient:
         self.objects.pop((bucket, object_name), None)
 
     def presigned_get_url(self, uri: str, *, expires: timedelta) -> str:
+        del uri, expires
+        raise ValueError("in-memory objects cannot be presigned")
+
+    def presigned_put_url(self, uri: str, *, expires: timedelta) -> str:
         del uri, expires
         raise ValueError("in-memory objects cannot be presigned")
 

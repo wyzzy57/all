@@ -26,6 +26,7 @@ from visiox_storage.client import MinioObjectStorageClient
 
 from .bootstrap_server import BootstrapServer
 from .deployment import build_deployment_handlers
+from .distributed_execution import build_distributed_handlers
 from .reconciliation import RemoteRuntimeReconciler
 from .startup import EdgeExecutorSecurityContext, initialize_security
 from .state import (
@@ -539,6 +540,9 @@ def build_application(
             session_factory,
             security,
             storage,
+        )
+        configured_handlers.update(
+            build_distributed_handlers(session_factory, security, storage)
         )
     dispatcher = EdgeExecutionDispatcher(repository, configured_handlers)
     reconciler = RemoteRuntimeReconciler(session_factory, repository, security)

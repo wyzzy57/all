@@ -324,7 +324,13 @@ def log_epoch_observability(trainer: Any) -> None:
 def main() -> None:
     from ultralytics import YOLO, settings
 
-    settings.update({"mlflow": True, "tensorboard": True})
+    rank = int(os.getenv("RANK", "-1"))
+    settings.update(
+        {
+            "mlflow": rank in {-1, 0},
+            "tensorboard": rank in {-1, 0},
+        }
+    )
     overrides = parse_overrides(sys.argv[1:])
     model_path = str(overrides.pop("model"))
     task = overrides.pop("task", None)

@@ -16,8 +16,27 @@ from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
 from visiox_common.tasks import TaskCommand, TaskStatus, TaskType
-from visiox_db.models import Task, TrainedModel, TrainingJob, TrainingPipeline
+from visiox_db.base import new_id
+from visiox_db.models import (
+    ComputeNode,
+    DistributedTrainingRun,
+    EdgeSshCredential,
+    RemoteExecution,
+    ResourcePool,
+    Task,
+    TrainedModel,
+    TrainingJob,
+    TrainingPipeline,
+)
 from visiox_db.session import get_session
+from visiox_edge_executor_worker.deployment import validate_image_digest
+from visiox_edge_executor_worker.distributed import (
+    DistributedNode,
+    DistributedPlan,
+    IncompatibleResourcePoolError,
+    build_distributed_plan,
+)
+from visiox_edge_executor_worker.inventory import InventorySnapshot, compatibility_key
 from visiox_messaging.streams import RedisStreamProducer
 from visiox_storage.client import ObjectStorageClient
 from visiox_yolo26.training.params import (
@@ -31,9 +50,27 @@ from visiox_yolo26.training.prechecks import TrainingPrecheckError, validate_tra
 router = APIRouter(tags=["training-jobs"])
 
 
+class DistributedTrainingRequest(PydanticBaseModel):
+    resource_pool_id: str = Field(min_length=1, max_length=128)
+    requested_gpus: int = Field(ge=1)
+    node_ids: list[str] | None = None
+    training_image_digest: str = Field(min_length=1, max_length=512)
+    master_port: int = Field(default=29500, ge=1024, le=65535)
+
+
+class DistributedTrainingResumeRequest(PydanticBaseModel):
+    distributed: DistributedTrainingRequest | None = None
+    checkpoint_uri: str | None = Field(default=None, min_length=1, max_length=2048)
+    checkpoint_checksum: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-fA-F]{64,128}$",
+    )
+
+
 class TrainingJobCreateRequest(PydanticBaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     environment: dict[str, Any] = Field(default_factory=dict)
+    distributed: DistributedTrainingRequest | None = None
 
 
 class TrainingJobResponse(PydanticBaseModel):
@@ -50,6 +87,8 @@ class TrainingJobResponse(PydanticBaseModel):
     finished_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    distributed_run_id: str | None = None
+    remote_execution_id: str | None = None
 
 
 class TrainingJobListResponse(PydanticBaseModel):
@@ -92,11 +131,35 @@ async def _enqueue(producer: Any, command: TaskCommand) -> str:
     return str(result)
 
 
+async def _enqueue_edge_execution(
+    producer: Any,
+    *,
+    task_id: str,
+    task_type: TaskType,
+    remote_execution_id: str,
+) -> str:
+    result = producer.enqueue_edge_execution(
+        task_id=task_id,
+        task_type=task_type,
+        remote_execution_id=remote_execution_id,
+    )
+    if inspect.isawaitable(result):
+        return await result
+    return str(result)
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _job_response(job: TrainingJob, environment: dict[str, Any] | None = None, task: Task | None = None) -> TrainingJobResponse:
+def _job_response(
+    job: TrainingJob,
+    environment: dict[str, Any] | None = None,
+    task: Task | None = None,
+    *,
+    distributed_run_id: str | None = None,
+    remote_execution_id: str | None = None,
+) -> TrainingJobResponse:
     if environment is None and task is not None:
         payload = task.payload or {}
         env_payload = payload.get("environment")
@@ -115,6 +178,8 @@ def _job_response(job: TrainingJob, environment: dict[str, Any] | None = None, t
         finished_at=job.finished_at,
         created_at=job.created_at,
         updated_at=job.updated_at,
+        distributed_run_id=distributed_run_id,
+        remote_execution_id=remote_execution_id,
     )
 
 
@@ -146,6 +211,18 @@ async def create_training_job(
         environment = {**validate_training_environment(pipeline.default_environment), **validate_training_environment(request.environment)}
     except TrainingParamsError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+
+    if request.distributed is not None:
+        return await _create_distributed_training_job(
+            session=session,
+            producer=producer,
+            pipeline=pipeline,
+            resources=resources,
+            params=params,
+            environment=environment,
+            distributed=request.distributed,
+            response=response,
+        )
 
     job = TrainingJob(pipeline_id=pipeline.id, status="queued", params=params)
     task = Task(
@@ -200,6 +277,502 @@ async def create_training_job(
     return _job_response(job, environment, task)
 
 
+async def _create_distributed_training_job(
+    *,
+    session: Session,
+    producer: Any,
+    pipeline: TrainingPipeline,
+    resources: Any,
+    params: dict[str, Any],
+    environment: dict[str, Any],
+    distributed: DistributedTrainingRequest,
+    response: Response,
+) -> TrainingJobResponse:
+    plan, image_digest = _distributed_plan(session, distributed)
+    job_id = new_id()
+    task_id = new_id()
+    run_id = new_id()
+    execution_id = new_id()
+    ranks = _rank_payloads(plan)
+    job = TrainingJob(id=job_id, pipeline_id=pipeline.id, status="queued", params=params)
+    task = Task(
+        id=task_id,
+        task_type=TaskType.EDGE_TRAIN.value,
+        status=TaskStatus.QUEUED.value,
+        progress=0,
+        resource_type="training_job",
+        resource_id=job_id,
+        payload={
+            "pipeline_id": pipeline.id,
+            "training_job_id": job_id,
+            "distributed_training_run_id": run_id,
+            "dataset_id": resources.dataset.id,
+            "base_model_id": resources.base_model.id,
+            "params": params,
+            "environment": environment,
+        },
+    )
+    run = DistributedTrainingRun(
+        id=run_id,
+        training_job_id=job_id,
+        resource_pool_id=plan.resource_pool_id,
+        node_ids=[rank.node_id for rank in plan.nodes],
+        ranks=ranks,
+        master_addr=plan.master_addr,
+        master_port=plan.master_port,
+        world_size=plan.world_size,
+        rendezvous_backend=plan.rendezvous_backend,
+        training_image_digest=image_digest,
+        attempt=1,
+        status="queued",
+    )
+    execution = RemoteExecution(
+        id=execution_id,
+        node_id=plan.nodes[0].node_id,
+        task_id=task_id,
+        training_job_id=job_id,
+        resource_type="distributed_training_run",
+        resource_id=run_id,
+        operation="train",
+        phase="queued",
+        status="queued",
+        idempotency_key=f"train:{run_id}:1",
+    )
+    job.task_id = task_id
+    pipeline.status = "running"
+    session.add_all([job, task, run, execution, pipeline])
+    session.commit()
+    response.status_code = status.HTTP_201_CREATED
+    try:
+        await _enqueue_edge_execution(
+            producer,
+            task_id=task_id,
+            task_type=TaskType.EDGE_TRAIN,
+            remote_execution_id=execution_id,
+        )
+    except Exception as exc:
+        _mark_distributed_enqueue_failed(
+            session,
+            job=job,
+            pipeline=pipeline,
+            task=task,
+            run=run,
+            execution=execution,
+            error=exc,
+        )
+    session.refresh(job)
+    session.refresh(task)
+    return _job_response(
+        job,
+        environment,
+        task,
+        distributed_run_id=run.id,
+        remote_execution_id=execution.id,
+    )
+
+
+@router.post(
+    "/training-jobs/{training_job_id}/stop",
+    response_model=TrainingJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def stop_distributed_training_job(
+    training_job_id: str,
+    session: Session = Depends(get_training_job_session),
+    producer: Any = Depends(get_training_stream_producer),
+) -> TrainingJobResponse:
+    job = session.get(TrainingJob, training_job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+    run = _latest_distributed_run(session, job.id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Training job is not distributed")
+    if run.status not in {"queued", "running", "resuming"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Distributed training cannot be stopped from status: {run.status}",
+        )
+    task_id = new_id()
+    execution_id = new_id()
+    task = Task(
+        id=task_id,
+        task_type=TaskType.EDGE_STOP_TRAINING.value,
+        status=TaskStatus.QUEUED.value,
+        progress=0,
+        resource_type="training_job",
+        resource_id=job.id,
+        payload={"distributed_training_run_id": run.id},
+    )
+    execution = RemoteExecution(
+        id=execution_id,
+        node_id=run.node_ids[0],
+        task_id=task_id,
+        training_job_id=job.id,
+        resource_type="distributed_training_run",
+        resource_id=run.id,
+        operation="stop_training",
+        phase="queued",
+        status="queued",
+        idempotency_key=f"stop_training:{run.id}:{execution_id}",
+    )
+    job.task_id = task_id
+    job.status = "stopping"
+    run.status = "stopping"
+    session.add_all([job, run, task, execution])
+    session.commit()
+    try:
+        await _enqueue_edge_execution(
+            producer,
+            task_id=task_id,
+            task_type=TaskType.EDGE_STOP_TRAINING,
+            remote_execution_id=execution_id,
+        )
+    except Exception as exc:
+        pipeline = session.get(TrainingPipeline, job.pipeline_id)
+        _mark_distributed_enqueue_failed(
+            session,
+            job=job,
+            pipeline=pipeline,
+            task=task,
+            run=run,
+            execution=execution,
+            error=exc,
+        )
+    session.refresh(job)
+    return _job_response(
+        job,
+        task=task,
+        distributed_run_id=run.id,
+        remote_execution_id=execution.id,
+    )
+
+
+@router.post(
+    "/training-jobs/{training_job_id}/resume",
+    response_model=TrainingJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def resume_distributed_training_job(
+    training_job_id: str,
+    request: DistributedTrainingResumeRequest,
+    session: Session = Depends(get_training_job_session),
+    producer: Any = Depends(get_training_stream_producer),
+) -> TrainingJobResponse:
+    job = session.get(TrainingJob, training_job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+    previous = _latest_distributed_run(session, job.id)
+    if previous is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Training job is not distributed")
+    if previous.status not in {"failed", "stopped", "canceled"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Distributed training cannot be resumed from status: {previous.status}",
+        )
+    checkpoint_uri = request.checkpoint_uri or previous.checkpoint_uri
+    checkpoint_checksum = request.checkpoint_checksum or previous.checkpoint_checksum
+    _validate_checkpoint(checkpoint_uri, checkpoint_checksum)
+    if previous.training_image_digest is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Distributed training image is unavailable for resume",
+        )
+    distributed = request.distributed or DistributedTrainingRequest(
+        resource_pool_id=previous.resource_pool_id,
+        requested_gpus=previous.world_size,
+        node_ids=list(previous.node_ids),
+        training_image_digest=previous.training_image_digest,
+        master_port=previous.master_port,
+    )
+    if distributed.resource_pool_id != previous.resource_pool_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Resume must use the original compatible resource pool",
+        )
+    if distributed.training_image_digest != previous.training_image_digest:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Resume must use the original immutable training image",
+        )
+    plan, image_digest = _distributed_plan(session, distributed)
+    context = _distributed_training_context(session, job)
+    attempt = int(
+        session.scalar(
+            select(func.max(DistributedTrainingRun.attempt)).where(
+                DistributedTrainingRun.training_job_id == job.id
+            )
+        )
+        or 0
+    ) + 1
+    run_id = new_id()
+    task_id = new_id()
+    execution_id = new_id()
+    run = DistributedTrainingRun(
+        id=run_id,
+        training_job_id=job.id,
+        resource_pool_id=plan.resource_pool_id,
+        node_ids=[rank.node_id for rank in plan.nodes],
+        ranks=_rank_payloads(plan),
+        master_addr=plan.master_addr,
+        master_port=plan.master_port,
+        world_size=plan.world_size,
+        rendezvous_backend=plan.rendezvous_backend,
+        training_image_digest=image_digest,
+        checkpoint_uri=checkpoint_uri,
+        checkpoint_checksum=checkpoint_checksum,
+        attempt=attempt,
+        status="queued",
+    )
+    task = Task(
+        id=task_id,
+        task_type=TaskType.EDGE_RESUME_TRAINING.value,
+        status=TaskStatus.QUEUED.value,
+        progress=0,
+        resource_type="training_job",
+        resource_id=job.id,
+        payload={**context, "distributed_training_run_id": run_id},
+    )
+    execution = RemoteExecution(
+        id=execution_id,
+        node_id=plan.nodes[0].node_id,
+        task_id=task_id,
+        training_job_id=job.id,
+        resource_type="distributed_training_run",
+        resource_id=run_id,
+        operation="resume_training",
+        phase="queued",
+        status="queued",
+        idempotency_key=f"resume_training:{run_id}:{attempt}",
+    )
+    pipeline = session.get(TrainingPipeline, job.pipeline_id)
+    job.task_id = task_id
+    job.status = "queued"
+    job.finished_at = None
+    if pipeline is not None:
+        pipeline.status = "running"
+    session.add_all([job, run, task, execution])
+    if pipeline is not None:
+        session.add(pipeline)
+    session.commit()
+    try:
+        await _enqueue_edge_execution(
+            producer,
+            task_id=task_id,
+            task_type=TaskType.EDGE_RESUME_TRAINING,
+            remote_execution_id=execution_id,
+        )
+    except Exception as exc:
+        _mark_distributed_enqueue_failed(
+            session,
+            job=job,
+            pipeline=pipeline,
+            task=task,
+            run=run,
+            execution=execution,
+            error=exc,
+        )
+    session.refresh(job)
+    return _job_response(
+        job,
+        context.get("environment", {}),
+        task,
+        distributed_run_id=run.id,
+        remote_execution_id=execution.id,
+    )
+
+
+def _distributed_plan(
+    session: Session,
+    request: DistributedTrainingRequest,
+) -> tuple[DistributedPlan, str]:
+    pool = session.get(ResourcePool, request.resource_pool_id)
+    if pool is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource pool not found")
+    if not pool.enabled:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource pool is disabled")
+    try:
+        image_digest = validate_image_digest(request.training_image_digest)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+    requested_node_ids = request.node_ids
+    if requested_node_ids is not None and (
+        not requested_node_ids or len(requested_node_ids) != len(set(requested_node_ids))
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Distributed node_ids must be non-empty and unique",
+        )
+    query = select(ComputeNode).where(
+        ComputeNode.resource_pool_id == pool.id,
+        ComputeNode.status == "online",
+    )
+    if requested_node_ids is not None:
+        query = query.where(ComputeNode.id.in_(requested_node_ids))
+    nodes = session.scalars(query.order_by(ComputeNode.id)).all()
+    if requested_node_ids is not None and {node.id for node in nodes} != set(requested_node_ids):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="One or more requested nodes are not available",
+        )
+    distributed_nodes: list[DistributedNode] = []
+    try:
+        for node in nodes:
+            snapshot = InventorySnapshot.model_validate(
+                node.fingerprint.get("inventory_snapshot")
+            )
+            key = compatibility_key(snapshot)
+            if (
+                snapshot.platform_kind != pool.kind
+                or pool.compatibility_policy.get("compatibility_key") != key
+            ):
+                raise IncompatibleResourcePoolError(
+                    "node inventory is incompatible with the resource pool"
+                )
+            credential = session.scalar(
+                select(EdgeSshCredential).where(EdgeSshCredential.node_id == node.id)
+            )
+            if credential is None:
+                raise IncompatibleResourcePoolError(
+                    "distributed node does not have an SSH credential"
+                )
+            gpu_uuids = tuple(gpu.uuid for gpu in snapshot.gpus if gpu.uuid is not None)
+            distributed_nodes.append(
+                DistributedNode(
+                    node_id=node.id,
+                    resource_pool_id=pool.id,
+                    platform_kind=snapshot.platform_kind,
+                    architecture=snapshot.architecture,
+                    compatibility_key=key,
+                    lan_address=credential.ssh_host,
+                    gpu_uuids=gpu_uuids,
+                    status=node.status,
+                    draining=node.status == "draining",
+                )
+            )
+        plan = build_distributed_plan(
+            distributed_nodes,
+            requested_gpus=request.requested_gpus,
+            master_port=request.master_port,
+        )
+    except (ValueError, IncompatibleResourcePoolError) as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return plan, image_digest
+
+
+def _rank_payloads(plan: DistributedPlan) -> list[dict[str, Any]]:
+    return [
+        {
+            "node_id": rank.node_id,
+            "node_rank": rank.node_rank,
+            "lan_address": rank.lan_address,
+            "gpu_uuids": list(rank.gpu_uuids),
+        }
+        for rank in plan.nodes
+    ]
+
+
+def _latest_distributed_run(
+    session: Session,
+    training_job_id: str,
+) -> DistributedTrainingRun | None:
+    return session.scalar(
+        select(DistributedTrainingRun)
+        .where(DistributedTrainingRun.training_job_id == training_job_id)
+        .order_by(
+            DistributedTrainingRun.attempt.desc(),
+            DistributedTrainingRun.created_at.desc(),
+            DistributedTrainingRun.id.desc(),
+        )
+    )
+
+
+def _distributed_response_refs(
+    session: Session,
+    training_job_id: str,
+) -> tuple[str | None, str | None]:
+    run = _latest_distributed_run(session, training_job_id)
+    if run is None:
+        return None, None
+    execution = session.scalar(
+        select(RemoteExecution)
+        .where(
+            RemoteExecution.training_job_id == training_job_id,
+            RemoteExecution.resource_type == "distributed_training_run",
+            RemoteExecution.resource_id == run.id,
+        )
+        .order_by(RemoteExecution.created_at.desc(), RemoteExecution.id.desc())
+    )
+    return run.id, execution.id if execution is not None else None
+
+
+def _distributed_training_context(session: Session, job: TrainingJob) -> dict[str, Any]:
+    task = session.scalar(
+        select(Task)
+        .where(
+            Task.resource_type == "training_job",
+            Task.resource_id == job.id,
+            Task.task_type.in_(
+                [TaskType.EDGE_TRAIN.value, TaskType.EDGE_RESUME_TRAINING.value]
+            ),
+        )
+        .order_by(Task.created_at.desc(), Task.id.desc())
+    )
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Distributed training context is unavailable",
+        )
+    payload = dict(task.payload or {})
+    payload.pop("distributed_training_run_id", None)
+    return payload
+
+
+def _validate_checkpoint(uri: str | None, checksum: str | None) -> None:
+    if uri is None or checksum is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A durable checkpoint URI and checksum are required to resume",
+        )
+    remainder = uri.removeprefix("minio://")
+    if remainder == uri or "/" not in remainder or not all(remainder.split("/", 1)):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Resume checkpoint must use a durable MinIO URI",
+        )
+
+
+def _mark_distributed_enqueue_failed(
+    session: Session,
+    *,
+    job: TrainingJob,
+    pipeline: TrainingPipeline | None,
+    task: Task,
+    run: DistributedTrainingRun,
+    execution: RemoteExecution,
+    error: Exception,
+) -> None:
+    now = _utc_now()
+    job.status = "failed"
+    job.finished_at = now
+    run.status = "failed"
+    run.finished_at = now
+    task.status = TaskStatus.FAILED.value
+    task.error_code = "ENQUEUE_FAILED"
+    task.error_message = str(error)
+    task.finished_at = now
+    task.retryable = True
+    execution.status = "failed"
+    execution.phase = "enqueue"
+    execution.error_code = "ENQUEUE_FAILED"
+    execution.error_message = str(error)
+    execution.finished_at = now
+    if pipeline is not None:
+        pipeline.status = "failed"
+        session.add(pipeline)
+    session.add_all([job, run, task, execution])
+    session.commit()
+
+
 @router.get("/training-jobs", response_model=TrainingJobListResponse)
 def list_training_jobs(
     pipeline_id: str | None = None,
@@ -220,7 +793,17 @@ def list_training_jobs(
         list_query = list_query.where(*filters)
     total = session.scalar(total_query) or 0
     jobs = session.scalars(list_query.limit(limit).offset(offset)).all()
-    items = [_job_response(job, task=session.get(Task, job.task_id) if job.task_id else None) for job in jobs]
+    items = []
+    for job in jobs:
+        run_id, execution_id = _distributed_response_refs(session, job.id)
+        items.append(
+            _job_response(
+                job,
+                task=session.get(Task, job.task_id) if job.task_id else None,
+                distributed_run_id=run_id,
+                remote_execution_id=execution_id,
+            )
+        )
     return TrainingJobListResponse(items=items, total=total, limit=limit, offset=offset)
 
 
@@ -230,7 +813,13 @@ def get_training_job(training_job_id: str, session: Session = Depends(get_traini
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
     task = session.get(Task, job.task_id) if job.task_id else None
-    return _job_response(job, task=task)
+    run_id, execution_id = _distributed_response_refs(session, job.id)
+    return _job_response(
+        job,
+        task=task,
+        distributed_run_id=run_id,
+        remote_execution_id=execution_id,
+    )
 
 
 @router.get("/training-jobs/{training_job_id}/log")
