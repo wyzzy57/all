@@ -16,6 +16,7 @@ import paramiko
 
 
 _MAX_TIMEOUT_SECONDS = 60
+_MAX_COMMAND_TIMEOUT_SECONDS = 30 * 60
 _CHANNEL_READ_BYTES = 64 * 1024
 _DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 _MIN_POLL_INTERVAL_SECONDS = 0.01
@@ -98,14 +99,27 @@ def _scanned_host_key(host_key: Any) -> ScannedHostKey:
     return ScannedHostKey(host_key_type=host_key.get_name(), fingerprint=_fingerprint_sha256(host_key))
 
 
-def _validate_timeout(timeout: float) -> float:
-    if not 0 < timeout <= _MAX_TIMEOUT_SECONDS:
-        raise ValueError(f"SSH timeout must be between 0 and {_MAX_TIMEOUT_SECONDS} seconds")
+def _validate_timeout(
+    timeout: float,
+    *,
+    maximum_seconds: float = _MAX_TIMEOUT_SECONDS,
+) -> float:
+    if not 0 < timeout <= maximum_seconds:
+        raise ValueError(
+            f"SSH timeout must be between 0 and {maximum_seconds} seconds"
+        )
     return timeout
 
 
-def _deadline(timeout: float) -> float:
-    return time.monotonic() + _validate_timeout(timeout)
+def _deadline(
+    timeout: float,
+    *,
+    maximum_seconds: float = _MAX_TIMEOUT_SECONDS,
+) -> float:
+    return time.monotonic() + _validate_timeout(
+        timeout,
+        maximum_seconds=maximum_seconds,
+    )
 
 
 def _remaining(deadline: float, timeout_error: type[Exception], message: str) -> float:
@@ -415,7 +429,10 @@ class StrictSshSession:
     ) -> CommandResult:
         self._ensure_open()
         operation_timeout = self._resolve_timeout(timeout_seconds, timeout)
-        deadline = _deadline(operation_timeout)
+        deadline = _deadline(
+            operation_timeout,
+            maximum_seconds=_MAX_COMMAND_TIMEOUT_SECONDS,
+        )
         try:
             return _run_with_deadline(
                 lambda: self._run_command(command, deadline),

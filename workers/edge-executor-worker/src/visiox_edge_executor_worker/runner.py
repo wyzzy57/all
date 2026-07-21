@@ -22,8 +22,10 @@ from visiox_common.settings import Settings, get_settings
 from visiox_common.tasks import TaskCommand
 from visiox_db.models import RemoteExecution
 from visiox_db.session import create_session_factory
+from visiox_storage.client import MinioObjectStorageClient
 
 from .bootstrap_server import BootstrapServer
+from .deployment import build_deployment_handlers
 from .reconciliation import RemoteRuntimeReconciler
 from .startup import EdgeExecutorSecurityContext, initialize_security
 from .state import (
@@ -525,7 +527,20 @@ def build_application(
     security: EdgeExecutorSecurityContext = initialize_security(settings)
     session_factory = create_session_factory()
     repository = RemoteExecutionRepository(session_factory)
-    dispatcher = EdgeExecutionDispatcher(repository, handlers or {})
+    configured_handlers = handlers
+    if configured_handlers is None:
+        storage = MinioObjectStorageClient(
+            endpoint=settings.minio_endpoint,
+            access_key=settings.minio_access_key,
+            secret_key=settings.minio_secret_key,
+            secure=settings.minio_secure,
+        )
+        configured_handlers = build_deployment_handlers(
+            session_factory,
+            security,
+            storage,
+        )
+    dispatcher = EdgeExecutionDispatcher(repository, configured_handlers)
     reconciler = RemoteRuntimeReconciler(session_factory, repository, security)
     blocking_pool = BlockingWorkPool()
     redis_client: Redis = redis_factory(settings.redis_url)

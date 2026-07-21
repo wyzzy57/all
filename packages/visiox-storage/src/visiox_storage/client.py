@@ -1,3 +1,4 @@
+from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -16,6 +17,8 @@ class ObjectStorageClient(Protocol):
     def object_size(self, bucket: str, object_name: str) -> int: ...
 
     def delete_file(self, bucket: str, object_name: str) -> None: ...
+
+    def presigned_get_url(self, uri: str, *, expires: timedelta) -> str: ...
 
 
 class MinioObjectStorageClient:
@@ -61,6 +64,18 @@ class MinioObjectStorageClient:
             if not _is_object_missing(exc):
                 raise
 
+    def presigned_get_url(self, uri: str, *, expires: timedelta) -> str:
+        bucket, object_name = _parse_minio_uri(uri)
+        if not timedelta(0) < expires <= timedelta(hours=1):
+            raise ValueError("presigned URL expiry must be between zero and one hour")
+        return str(
+            self._client.presigned_get_object(
+                bucket,
+                object_name,
+                expires=expires,
+            )
+        )
+
 
 class InMemoryObjectStorageClient:
     def __init__(self) -> None:
@@ -87,6 +102,25 @@ class InMemoryObjectStorageClient:
 
     def delete_file(self, bucket: str, object_name: str) -> None:
         self.objects.pop((bucket, object_name), None)
+
+    def presigned_get_url(self, uri: str, *, expires: timedelta) -> str:
+        del uri, expires
+        raise ValueError("in-memory objects cannot be presigned")
+
+
+def _parse_minio_uri(uri: str) -> tuple[str, str]:
+    remainder = uri.removeprefix("minio://")
+    if (
+        remainder == uri
+        or "/" not in remainder
+        or "?" in remainder
+        or "#" in remainder
+    ):
+        raise ValueError("object URI must be a durable MinIO URI")
+    bucket, object_name = remainder.split("/", 1)
+    if not bucket or not object_name:
+        raise ValueError("object URI must be a durable MinIO URI")
+    return bucket, object_name
 
 
 def _is_bucket_exists_race(exc: Exception) -> bool:

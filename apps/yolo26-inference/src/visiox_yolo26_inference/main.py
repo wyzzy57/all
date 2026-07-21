@@ -83,37 +83,55 @@ def create_app(config: InferenceConfig | None = None, predictor: Predictor | Non
             raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image is too large")
         return _predict(app, image_bytes, {"filename": file.filename, "content_type": file.content_type})
 
-    @app.post("/predict/video-frame")
-    def predict_video_frame(request: VideoFrameRequest) -> dict[str, object]:
-        import base64
-        import binascii
+    if not app.state.config.production:
 
-        try:
-            if len(request.image_base64) > MAX_IMAGE_BYTES * 2:
-                raise ValueError("base64 image is too large")
-            image_bytes = base64.b64decode(request.image_base64, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            _record_prediction_request(app, failed=True)
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid base64 image") from exc
-        if len(image_bytes) > MAX_IMAGE_BYTES:
-            _record_prediction_request(app, failed=True)
-            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image is too large")
-        metadata = {"camera_id": request.camera_id, "timestamp_ms": request.timestamp_ms}
-        return _predict(app, image_bytes, metadata)
+        @app.post("/predict/video-frame")
+        def predict_video_frame(request: VideoFrameRequest) -> dict[str, object]:
+            import base64
+            import binascii
 
-    @app.post("/runtime/reload")
-    def runtime_reload(request: RuntimeReloadRequest) -> dict[str, object]:
-        current: InferenceConfig = app.state.config
-        payload = current.model_dump()
-        for key, value in request.model_dump(exclude_none=True).items():
-            payload[key] = value
-        try:
-            new_config = InferenceConfig(**payload)
-            _load_runtime(app, new_config)
-        except (InferenceConfigError, ValueError) as exc:
-            app.state.metrics.reload_errors += 1
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
-        return {"status": "reloaded", "task": new_config.task, "model_path": str(new_config.model_path)}
+            try:
+                if len(request.image_base64) > MAX_IMAGE_BYTES * 2:
+                    raise ValueError("base64 image is too large")
+                image_bytes = base64.b64decode(request.image_base64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                _record_prediction_request(app, failed=True)
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="Invalid base64 image",
+                ) from exc
+            if len(image_bytes) > MAX_IMAGE_BYTES:
+                _record_prediction_request(app, failed=True)
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail="Image is too large",
+                )
+            metadata = {
+                "camera_id": request.camera_id,
+                "timestamp_ms": request.timestamp_ms,
+            }
+            return _predict(app, image_bytes, metadata)
+
+        @app.post("/runtime/reload")
+        def runtime_reload(request: RuntimeReloadRequest) -> dict[str, object]:
+            current: InferenceConfig = app.state.config
+            payload = current.model_dump()
+            for key, value in request.model_dump(exclude_none=True).items():
+                payload[key] = value
+            try:
+                new_config = InferenceConfig(**payload)
+                _load_runtime(app, new_config)
+            except (InferenceConfigError, ValueError) as exc:
+                app.state.metrics.reload_errors += 1
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=str(exc),
+                ) from exc
+            return {
+                "status": "reloaded",
+                "task": new_config.task,
+                "model_path": str(new_config.model_path),
+            }
 
     @app.get("/metrics")
     def metrics() -> dict[str, object]:

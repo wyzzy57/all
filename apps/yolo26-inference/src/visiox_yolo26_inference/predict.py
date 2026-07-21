@@ -123,8 +123,83 @@ class DeterministicPredictor:
         return f"class_{class_id}"
 
 
+class UltralyticsPredictor:
+    def __init__(self, config: InferenceConfig) -> None:
+        if config.model_path is None:
+            raise ValueError("production model path is required")
+        from ultralytics import YOLO
+
+        self.config = config
+        self.model = YOLO(str(config.model_path), task="detect")
+
+    def predict_image(
+        self,
+        image_bytes: bytes,
+        metadata: dict[str, Any] | None = None,
+    ) -> PredictionResult:
+        start = time.perf_counter()
+        with Image.open(BytesIO(image_bytes)) as opened_image:
+            image = opened_image.convert("RGB")
+            width, height = image.size
+        results = self.model.predict(
+            source=image,
+            conf=self.config.confidence,
+            iou=self.config.iou,
+            device=self.config.device,
+            verbose=False,
+        )
+        predictions: list[dict[str, Any]] = []
+        if results:
+            result = results[0]
+            boxes = getattr(result, "boxes", None)
+            if boxes is not None:
+                coordinates = boxes.xyxy.tolist()
+                confidences = boxes.conf.tolist()
+                classes = boxes.cls.tolist()
+                names = getattr(result, "names", None) or self.model.names
+                for coordinate, confidence, class_value in zip(
+                    coordinates,
+                    confidences,
+                    classes,
+                    strict=True,
+                ):
+                    class_id = int(class_value)
+                    label = (
+                        names.get(class_id, f"class_{class_id}")
+                        if isinstance(names, dict)
+                        else names[class_id]
+                    )
+                    predictions.append(
+                        {
+                            "class_id": class_id,
+                            "label": str(label),
+                            "confidence": float(confidence),
+                            "bbox": {
+                                "x1": float(coordinate[0]),
+                                "y1": float(coordinate[1]),
+                                "x2": float(coordinate[2]),
+                                "y2": float(coordinate[3]),
+                            },
+                        }
+                    )
+        latency_ms = (time.perf_counter() - start) * 1000
+        return PredictionResult(
+            task="detect",
+            predictions=predictions,
+            latency_ms=round(latency_ms, 3),
+            image={
+                "width": width,
+                "height": height,
+                "mode": "RGB",
+                "metadata": dict(metadata or {}),
+            },
+        )
+
+
 def load_predictor(config: InferenceConfig) -> Predictor:
     validate_model_task_match(config)
+    if config.production:
+        return UltralyticsPredictor(config)
     return DeterministicPredictor(config)
 
 

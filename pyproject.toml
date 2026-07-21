@@ -56,7 +56,10 @@ packages = [
 
 [tool.hatch.build.targets.wheel.force-include]
 "workers/edge-executor-worker/remote/probe_inventory.sh" = "visiox_edge_executor_worker/remote/probe_inventory.sh"
+"workers/edge-executor-worker/remote/deploy_inference.sh" = "visiox_edge_executor_worker/remote/deploy_inference.sh"
+"workers/edge-executor-worker/remote/inspect_deployment.sh" = "visiox_edge_executor_worker/remote/inspect_deployment.sh"
 "workers/edge-executor-worker/remote/inspect_runtime.sh" = "visiox_edge_executor_worker/remote/inspect_runtime.sh"
+"workers/edge-executor-worker/remote/stop_deployment.sh" = "visiox_edge_executor_worker/remote/stop_deployment.sh"
 
 [tool.pytest.ini_options]
 pythonpath = [

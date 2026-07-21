@@ -6,10 +6,16 @@ import re
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 YOLO26_TASKS = ("detect", "segment", "semantic", "pose", "obb", "classify")
-SUPPORTED_MODEL_FORMATS = ("onnx", "torchscript", "pt")
+SUPPORTED_MODEL_FORMATS = ("engine", "onnx", "torchscript", "pt")
 
 
 class InferenceConfigError(ValueError):
@@ -17,6 +23,7 @@ class InferenceConfigError(ValueError):
 
 
 class InferenceConfig(BaseModel):
+    production: bool = False
     task: str = "detect"
     model_path: Path | None = None
     model_format: str = "onnx"
@@ -41,6 +48,20 @@ class InferenceConfig(BaseModel):
         if normalized not in SUPPORTED_MODEL_FORMATS:
             raise ValueError(f"unsupported model format: {value}")
         return normalized
+
+    @model_validator(mode="after")
+    def _validate_production_contract(self) -> "InferenceConfig":
+        if not self.production:
+            return self
+        if (
+            self.task != "detect"
+            or self.model_path is None
+            or self.input.get("type") != "http"
+        ):
+            raise ValueError(
+                "production inference requires a detect model and HTTP image input"
+            )
+        return self
 
 
 def load_config(path: str | Path | None = None) -> InferenceConfig:

@@ -8,7 +8,15 @@ from sqlalchemy import create_engine
 
 from visiox_common.settings import Settings
 from visiox_db.base import Base
-from visiox_db.models import EdgeSshCredential, RemoteExecution
+from visiox_db.models import (
+    ComputeNode,
+    DeploymentInstance,
+    DeploymentService,
+    EdgeSshCredential,
+    RemoteExecution,
+    TrainedModel,
+    TrainingPipeline,
+)
 from visiox_db.session import create_session_factory
 from visiox_edge_executor_worker.crypto import CredentialCipher
 from visiox_edge_executor_worker.reconciliation import DockerLabels, RemoteRuntimeReconciler
@@ -303,3 +311,206 @@ def test_static_reconciliation_script_is_packaged_and_uses_structured_docker_cal
     assert "docker inspect" not in script
     assert "request_path" in script
     assert "len(container_ids) >" not in script
+
+
+def _deployment_runtime(response: dict[str, object]):
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    cipher = CredentialCipher(b"a" * 32, key_version=1)
+    encrypted = cipher.encrypt(b"private-key")
+    image_digest = "registry.internal/visiox/yolo26-inference@sha256:" + "b" * 64
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            id="pipeline-1",
+            name="pipeline",
+            task="detect",
+            scale="n",
+            status="success",
+        )
+        model = TrainedModel(
+            id="model-1",
+            pipeline_id=pipeline.id,
+            name="best.pt",
+            version="best.pt",
+            task="detect",
+            artifact_uri="minio://models/model-1/best.pt",
+            status="ready",
+        )
+        node = ComputeNode(
+            id="node-1",
+            name="node",
+            status="online",
+            architecture="x86_64",
+            platform_kind="x86_nvidia",
+            capabilities={},
+            resources={},
+            fingerprint={},
+            agent_version="ssh-bootstrap",
+        )
+        service = DeploymentService(
+            id="service-1",
+            name="service",
+            pipeline_id=pipeline.id,
+            trained_model_id=model.id,
+            model_name="yolo26n.pt",
+            model_weight="best.pt",
+            environment="node",
+            instance_count=1,
+            instance_name="pepper-prod-01",
+            status="warming_up",
+            endpoint="pending",
+            config={},
+        )
+        instance = DeploymentInstance(
+            id="instance-1",
+            deployment_service_id=service.id,
+            node_id=node.id,
+            instance_name=service.instance_name,
+            container_id="a" * 64,
+            image_digest=image_digest,
+            model_checksum="c" * 64,
+            engine="engine",
+            engine_digest="d" * 64,
+            port=18080,
+            status="warming_up",
+            health_status="starting",
+            rollback_metadata={},
+        )
+        execution = RemoteExecution(
+            id="exec-deploy",
+            node_id=node.id,
+            deployment_service_id=service.id,
+            resource_type="deployment_instance",
+            resource_id=instance.id,
+            operation="deploy",
+            phase="warming_up",
+            status="succeeded",
+            idempotency_key="deploy-instance-1-attempt-1",
+        )
+        credential = EdgeSshCredential(
+            node_id=node.id,
+            ssh_host="10.0.0.10",
+            ssh_port=22,
+            ssh_user="visiox-edge",
+            host_key_type="ssh-ed25519",
+            host_key_fingerprint="SHA256:pinned",
+            public_key="ssh-ed25519 public",
+            encrypted_private_key=encrypted.ciphertext,
+            encryption_nonce=encrypted.nonce,
+            key_version=encrypted.key_version,
+        )
+        session.add_all(
+            [pipeline, model, node, service, instance, execution, credential]
+        )
+        session.commit()
+    ssh_session = RecordingSshSession(response)
+    ssh_client = RecordingSshClient(ssh_session)
+    repository = RemoteExecutionRepository(session_factory)
+    reconciler = RemoteRuntimeReconciler(
+        session_factory,
+        repository,
+        EdgeExecutorSecurityContext(credential_cipher=cipher, ssh_client=ssh_client),
+    )
+    return reconciler, session_factory, ssh_client, image_digest
+
+
+def _healthy_deployment_response(image_digest: str) -> dict[str, object]:
+    return {
+        "containers": [
+            {
+                "id": "a" * 64,
+                "status": "running",
+                "health": "healthy",
+                "labels": {
+                    "com.visiox.deployment-instance-id": "instance-1",
+                    "com.visiox.image-digest": image_digest,
+                    "com.visiox.model-checksum": "c" * 64,
+                    "com.visiox.engine": "engine",
+                    "com.visiox.engine-digest": "d" * 64,
+                    "com.visiox.port": "18080",
+                },
+                "endpoint_reachable": True,
+            }
+        ]
+    }
+
+
+def test_reconciler_recovers_running_deployment_from_exact_observed_tuple() -> None:
+    image_digest = "registry.internal/visiox/yolo26-inference@sha256:" + "b" * 64
+    reconciler, factory, ssh_client, _ = _deployment_runtime(
+        _healthy_deployment_response(image_digest)
+    )
+
+    assert reconciler.reconcile_startup() == 1
+
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        execution = session.get(RemoteExecution, "exec-deploy")
+        assert service is not None and service.status == "running"
+        assert service.endpoint == "http://10.0.0.10:18080"
+        assert instance is not None and instance.status == "running"
+        assert instance.endpoint == service.endpoint
+        assert instance.health_status == "healthy"
+        assert instance.health_checked_at is not None
+        assert execution is not None and execution.phase == "reconciled_running"
+        assert execution.error_code is None
+    uploaded_names = [
+        path.rsplit("/", 1)[-1] for path, _ in ssh_client.ssh_session.uploads
+    ]
+    assert uploaded_names == ["inspect_deployment.sh", "request.json"]
+    request = json.loads(ssh_client.ssh_session.uploads[1][1])
+    assert request == {
+        "labels": {"com.visiox.deployment-instance-id": "instance-1"},
+        "expected_container_id": "a" * 64,
+        "port": 18080,
+    }
+
+
+def test_reconciler_persists_deterministic_failure_for_mismatched_deployment() -> None:
+    image_digest = "registry.internal/visiox/yolo26-inference@sha256:" + "b" * 64
+    response = _healthy_deployment_response(image_digest)
+    response["containers"][0]["labels"]["com.visiox.model-checksum"] = "f" * 64  # type: ignore[index]
+    reconciler, factory, _ssh_client, _ = _deployment_runtime(response)
+
+    assert reconciler.reconcile_startup() == 1
+
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        execution = session.get(RemoteExecution, "exec-deploy")
+        assert service is not None and service.status == "failed"
+        assert service.endpoint == "pending"
+        assert instance is not None and instance.status == "failed"
+        assert instance.health_status == "unhealthy"
+        assert execution is not None
+        assert execution.phase == "reconciliation_failed"
+        assert execution.error_code == "REMOTE_DEPLOYMENT_MISMATCH"
+        assert execution.error_message == "Remote deployment state did not match"
+
+
+def test_inspect_deployment_script_uses_stable_label_and_structured_commands() -> None:
+    script = load_packaged_script("inspect_deployment.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "inspect_deployment.sh", "exec"), namespace)
+    request = namespace["_validate_request"](  # type: ignore[operator]
+        {
+            "labels": {"com.visiox.deployment-instance-id": "instance-1"},
+            "expected_container_id": "a" * 64,
+            "port": 18080,
+        }
+    )
+
+    assert namespace["_list_command"](request) == [  # type: ignore[operator]
+        "docker",
+        "ps",
+        "-a",
+        "--filter",
+        "label=com.visiox.deployment-instance-id=instance-1",
+        "--format",
+        "{{.ID}}",
+    ]
+    assert "shell=True" not in script
+    assert "docker inspect" not in script

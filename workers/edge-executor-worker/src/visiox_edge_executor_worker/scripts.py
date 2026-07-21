@@ -3,7 +3,14 @@ from pathlib import Path
 
 
 _PACKAGED_SCRIPTS = frozenset(
-    {"bootstrap_user.sh", "inspect_runtime.sh", "probe_inventory.sh"}
+    {
+        "bootstrap_user.sh",
+        "deploy_inference.sh",
+        "inspect_deployment.sh",
+        "inspect_runtime.sh",
+        "probe_inventory.sh",
+        "stop_deployment.sh",
+    }
 )
 
 
