@@ -593,7 +593,7 @@ class StrictSshSession:
             opened_file = None
             created = False
             try:
-                opened_file = sftp.file(remote_path, "x")
+                opened_file = sftp.file(remote_path, "wx")
                 created = True
                 sftp.chmod(remote_path, 0o600)
                 self._validate_remote_file_attributes(

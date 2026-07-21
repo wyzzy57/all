@@ -1,0 +1,34 @@
+services:
+  edge-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: visiox-edge-ssh-smoke:local
+    ports:
+      - "127.0.0.1::22"
+    volumes:
+      - edge-a-host-keys:/etc/ssh/host-keys
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.create_connection(('127.0.0.1',22),2); s.close()"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  edge-b:
+    image: visiox-edge-ssh-smoke:local
+    depends_on:
+      edge-a:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1::22"
+    volumes:
+      - edge-b-host-keys:/etc/ssh/host-keys
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.create_connection(('127.0.0.1',22),2); s.close()"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  edge-a-host-keys:
+  edge-b-host-keys:

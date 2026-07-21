@@ -317,7 +317,7 @@ class ExistingFileSftp:
         self.closed = False
 
     def file(self, path: str, mode: str):
-        assert mode == "x"
+        assert mode == "wx"
         raise FileExistsError(path)
 
     def remove(self, path: str) -> None:

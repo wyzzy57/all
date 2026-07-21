@@ -723,6 +723,7 @@ def test_bootstrap_script_is_idempotent_and_keeps_dynamic_data_out_of_commands()
 
     assert "id -u visiox-edge" in script
     assert "useradd" in script
+    assert "usermod -p x visiox-edge" in script
     assert "usermod -aG docker visiox-edge" in script
     assert "install -d -m 0700" in script
     assert "chmod 0600" in script

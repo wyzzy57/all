@@ -37,6 +37,7 @@ if [ "${OPERATION}" = "bootstrap_add" ]; then
     if ! id -u visiox-edge >/dev/null 2>&1; then
         "${BOOTSTRAP_PRIVILEGE[@]}" useradd --create-home --shell /bin/bash visiox-edge
     fi
+    "${BOOTSTRAP_PRIVILEGE[@]}" usermod -p x visiox-edge
     "${BOOTSTRAP_PRIVILEGE[@]}" groupadd -f docker
     "${BOOTSTRAP_PRIVILEGE[@]}" usermod -aG docker visiox-edge
 fi
