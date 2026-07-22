@@ -105,28 +105,36 @@ def unpack_dataset(archive, destination):
 def main():
     if len(sys.argv) != 2:
         return 2
+    stage = "request-validation"
     try:
         with open(sys.argv[1], "r", encoding="utf-8") as source:
             request = validate(json.load(source))
+        stage = "runtime-image-pull"
         subprocess.run(["docker", "pull", request["image_digest"]], check=True, capture_output=True, text=True, timeout=1800)
-        root = Path("/var/lib/visiox/training") / request["run_id"] / str(request["attempt"])
+        stage = "workspace-prepare"
+        root = Path.home() / ".local" / "share" / "visiox" / "training" / request["run_id"] / str(request["attempt"])
         artifacts_dir = root / "artifacts"
         output_dir = root / "output"
         artifacts_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
         output_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
         paths = {}
         for artifact in request["artifacts"]:
+            stage = f"artifact-download:{artifact['name']}"
             destination = artifacts_dir / artifact["filename"]
             download(artifact["download_url"], destination, artifact["checksum"])
             paths[artifact["name"]] = str(destination)
         dataset_dir = root / "dataset"
+        stage = "dataset-unpack"
         unpack_dataset(Path(paths["dataset"]), dataset_dir)
         paths["dataset"] = str(dataset_dir)
         paths["output"] = str(output_dir)
         print(json.dumps({"root": str(root), "paths": paths}, ensure_ascii=True, separators=(",", ":"), sort_keys=True))
         return 0
-    except Exception:
-        print("training artifact staging failed", file=sys.stderr)
+    except Exception as error:
+        print(
+            f"training artifact staging failed at stage={stage} ({type(error).__name__})",
+            file=sys.stderr,
+        )
         return 1
 
 

@@ -218,6 +218,7 @@ async def create_service(
             input_shape=request.input_shape,
             gpu_uuids=request.gpu_uuids,
             calibration_dataset_uri=request.calibration_dataset_uri,
+            runtime_image_digest=image_digest,
         )
         plan = build_deployment_plan(artifact, inventory, options)
         _require_minio_uri(trained_model.artifact_uri, "Trained model artifact")
@@ -300,8 +301,12 @@ async def create_service(
         status="queued",
         idempotency_key=f"deploy:{instance_id}:{execution_id}",
     )
-    session.add_all([service, instance, task, execution])
     try:
+        session.add(service)
+        session.flush()
+        session.add_all([instance, task])
+        session.flush()
+        session.add(execution)
         session.commit()
     except IntegrityError as error:
         session.rollback()
@@ -424,6 +429,7 @@ async def upgrade_service(
                 input_shape=request.input_shape,
                 gpu_uuids=request.gpu_uuids,
                 calibration_dataset_uri=request.calibration_dataset_uri,
+                runtime_image_digest=image_digest,
             ),
         )
         _require_minio_uri(trained_model.artifact_uri, "Trained model artifact")
@@ -476,7 +482,9 @@ async def upgrade_service(
     service.config = config
     service.status = "upgrade_queued"
     instance.status = "upgrade_queued"
-    session.add_all([service, instance, task, execution])
+    session.add_all([service, instance, task])
+    session.flush()
+    session.add(execution)
     session.commit()
     try:
         await _enqueue_execution(
@@ -747,7 +755,9 @@ async def _queue_service_operation(
         "current_remote_execution_id": execution_id,
     }
     instance.status = service_status
-    session.add_all([service, instance, task, execution])
+    session.add_all([service, instance, task])
+    session.flush()
+    session.add(execution)
     session.commit()
     try:
         await _enqueue_execution(

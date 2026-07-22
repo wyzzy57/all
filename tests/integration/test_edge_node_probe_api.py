@@ -88,7 +88,7 @@ def test_probe_persists_inventory_and_assigns_exact_compatible_pool(
     assert response.status_code == 200
     body = response.json()
     assert body["supported"] is True
-    assert body["compatibility_key"] == "x86_nvidia:x86_64:12:10:8.9"
+    assert body["compatibility_key"] == "x86_nvidia:x86_64:12:unknown:8.9"
     assert body["unsupported_reasons"] == []
     assert service.node_ids == [node_id]
     with agent_session_factory() as session:
@@ -202,7 +202,7 @@ def test_probe_rejects_non_accepting_same_name_pool(
     with agent_session_factory() as session:
         session.add(
             ResourcePool(
-                name="x86_nvidia:x86_64:12:10:8.9",
+                name="x86_nvidia:x86_64:12:unknown:8.9",
                 kind=kind,
                 selector={},
                 compatibility_policy=policy,
@@ -230,7 +230,7 @@ def test_probe_rejects_disabled_pool_that_wins_creation_race(
     snapshot = parse_inventory(_inventory("x86.json"))
     with agent_session_factory() as session:
         winning_pool = ResourcePool(
-            name="x86_nvidia:x86_64:12:10:8.9",
+            name="x86_nvidia:x86_64:12:unknown:8.9",
             kind="x86_nvidia",
             selector={},
             compatibility_policy=compatibility_policy(snapshot),

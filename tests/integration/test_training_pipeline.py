@@ -7,7 +7,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from PIL import Image
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -141,6 +141,13 @@ def session_factory(tmp_path):
     command.upgrade(config, "head")
 
     engine = create_engine(database_url)
+
+    @event.listens_for(engine, "connect")
+    def enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
@@ -629,6 +636,36 @@ def test_create_distributed_training_job_persists_plan_and_enqueues_id_only_edge
     assert detail.status_code == 200
     assert detail.json()["distributed_run_id"] == run.id
     assert detail.json()["remote_execution_id"] == execution.id
+
+
+def test_delete_pipeline_removes_distributed_training_dependencies(
+    client: TestClient,
+    session_factory,
+) -> None:
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+    created = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 2,
+                "node_ids": node_ids,
+                "training_image_digest": f"registry.example/visiox/training@sha256:{'a' * 64}",
+            }
+        },
+    ).json()
+
+    response = client.delete(f"/pipelines/{pipeline_id}")
+
+    assert response.status_code == 204
+    with session_factory() as session:
+        assert session.get(TrainingPipeline, pipeline_id) is None
+        assert session.get(TrainingJob, created["id"]) is None
+        assert session.get(Task, created["task_id"]) is None
+        assert session.get(DistributedTrainingRun, created["distributed_run_id"]) is None
+        assert session.get(RemoteExecution, created["remote_execution_id"]) is None
 
 
 def test_distributed_training_rejects_unavailable_requested_node(

@@ -43,7 +43,7 @@ def test_inventory_snapshot_parses_supported_hosts(load_fixture, fixture, platfo
     ("fixture", "expected"),
     [
         ("jetson.json", "jetson:aarch64:12:10:8.7"),
-        ("x86.json", "x86_nvidia:x86_64:12:10:8.9"),
+        ("x86.json", "x86_nvidia:x86_64:12:unknown:8.9"),
     ],
 )
 def test_compatibility_key_separates_jetson_and_x86(load_fixture, fixture, expected):
@@ -63,7 +63,7 @@ def test_non_tegra_aarch64_nvidia_host_is_not_classified_as_jetson(load_fixture)
 @pytest.mark.parametrize(
     ("fixture", "driver_ceiling", "runtime_version", "expected_key"),
     [
-        ("x86.json", "13.0", "12.4.127-1", "x86_nvidia:x86_64:12:10:8.9"),
+        ("x86.json", "13.0", "12.4.127-1", "x86_nvidia:x86_64:13:unknown:8.9"),
         ("jetson.json", "12.8", "12.2.140-1", "jetson:aarch64:12:10:8.7"),
     ],
 )
@@ -85,7 +85,7 @@ def test_compatibility_uses_installed_cuda_not_driver_ceiling(
     assert compatibility_key(snapshot) == expected_key
 
 
-def test_driver_cuda_ceiling_without_installed_runtime_is_unsupported(load_fixture):
+def test_x86_driver_and_container_runtime_do_not_require_host_cuda(load_fixture):
     inventory = load_fixture("x86.json")
     inventory["jetson"]["packages"] = {
         name: version
@@ -98,9 +98,10 @@ def test_driver_cuda_ceiling_without_installed_runtime_is_unsupported(load_fixtu
     assert snapshot.driver_cuda_compatibility_version == "12.4"
     assert snapshot.cuda_runtime_version is None
     assert snapshot.cuda_major is None
-    assert snapshot.supported is False
-    assert "CUDA runtime/toolkit is unavailable" in snapshot.unsupported_reasons
-    assert compatibility_key(snapshot) == "x86_nvidia:x86_64:unknown:10:8.9"
+    assert snapshot.supported is True
+    assert "CUDA runtime/toolkit is unavailable" not in snapshot.unsupported_reasons
+    assert "TensorRT version is unavailable" not in snapshot.unsupported_reasons
+    assert compatibility_key(snapshot) == "x86_nvidia:x86_64:12:unknown:8.9"
 
 
 @pytest.mark.parametrize(

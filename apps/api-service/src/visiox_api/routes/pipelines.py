@@ -8,11 +8,21 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict
 from pydantic import Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from visiox_db.models import BaseModel, TrainingJob, TrainingPipeline
+from visiox_db.models import (
+    BaseModel,
+    DeploymentService,
+    DistributedTrainingRun,
+    PipelineEvaluation,
+    RemoteExecution,
+    Task,
+    TrainedModel,
+    TrainingJob,
+    TrainingPipeline,
+)
 from visiox_db.session import get_session
 from visiox_yolo26.training.params import (
     TrainingParamsError,
@@ -242,6 +252,82 @@ def delete_pipeline(pipeline_id: str, session: Session = Depends(get_pipeline_se
     pipeline = session.get(TrainingPipeline, pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
-    session.execute(delete(TrainingJob).where(TrainingJob.pipeline_id == pipeline_id))
+
+    if session.scalar(
+        select(DeploymentService.id).where(DeploymentService.pipeline_id == pipeline_id).limit(1)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Delete pipeline services before deleting the pipeline",
+        )
+
+    job_ids = list(
+        session.scalars(select(TrainingJob.id).where(TrainingJob.pipeline_id == pipeline_id))
+    )
+    task_ids: set[str] = set()
+    if job_ids:
+        task_ids.update(
+            value
+            for value in session.scalars(
+                select(TrainingJob.task_id).where(
+                    TrainingJob.id.in_(job_ids),
+                    TrainingJob.task_id.is_not(None),
+                )
+            )
+            if value is not None
+        )
+        run_ids = list(
+            session.scalars(
+                select(DistributedTrainingRun.id).where(
+                    DistributedTrainingRun.training_job_id.in_(job_ids)
+                )
+            )
+        )
+        execution_filter = RemoteExecution.training_job_id.in_(job_ids)
+        if run_ids:
+            execution_filter = or_(
+                execution_filter,
+                RemoteExecution.resource_id.in_(run_ids),
+            )
+        task_ids.update(
+            value
+            for value in session.scalars(
+                select(RemoteExecution.task_id).where(
+                    execution_filter,
+                    RemoteExecution.task_id.is_not(None),
+                )
+            )
+            if value is not None
+        )
+        task_ids.update(
+            session.scalars(
+                select(Task.id).where(
+                    Task.resource_type == "training_job",
+                    Task.resource_id.in_(job_ids),
+                )
+            )
+        )
+        session.execute(delete(RemoteExecution).where(execution_filter))
+        session.execute(
+            delete(DistributedTrainingRun).where(
+                DistributedTrainingRun.training_job_id.in_(job_ids)
+            )
+        )
+        session.execute(
+            delete(TrainedModel).where(
+                or_(
+                    TrainedModel.pipeline_id == pipeline_id,
+                    TrainedModel.training_job_id.in_(job_ids),
+                )
+            )
+        )
+        session.execute(delete(TrainingJob).where(TrainingJob.id.in_(job_ids)))
+        if task_ids:
+            session.execute(delete(Task).where(Task.id.in_(task_ids)))
+    else:
+        session.execute(delete(TrainedModel).where(TrainedModel.pipeline_id == pipeline_id))
+    session.execute(
+        delete(PipelineEvaluation).where(PipelineEvaluation.pipeline_id == pipeline_id)
+    )
     session.delete(pipeline)
     session.commit()

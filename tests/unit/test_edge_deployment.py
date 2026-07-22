@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -158,6 +159,26 @@ def test_plan_rejects_incompatible_task4_inventory() -> None:
 
     with pytest.raises(ValueError, match="compatible"):
         build_deployment_plan(_model(), parse_inventory(raw), DeploymentOptions())
+
+
+def test_x86_engine_plan_uses_runtime_image_without_host_tensorrt() -> None:
+    raw = json.loads((FIXTURES / "x86.json").read_text(encoding="utf-8"))
+    raw["jetson"]["packages"] = {}
+
+    plan = build_deployment_plan(
+        _model(),
+        parse_inventory(raw),
+        DeploymentOptions(runtime_image_digest=IMAGE_DIGEST),
+    )
+
+    assert plan.export_format == "engine"
+    assert plan.engine_cache_key == engine_cache_key(
+        model_checksum=MODEL_CHECKSUM,
+        tensorrt_version=IMAGE_DIGEST,
+        compute_capability="8.9",
+        precision="fp16",
+        input_shape=(1, 3, 640, 640),
+    )
 
 
 @pytest.mark.parametrize(
@@ -660,6 +681,7 @@ def test_deploy_script_builds_hardened_docker_arguments_from_validated_json() ->
         request,
         artifact_path=Path("/var/lib/visiox/model.engine"),
         config_path=Path("/var/lib/visiox/config.json"),
+        engine_digest="f" * 64,
         name="visiox-candidate-fixed",
         host_port=None,
         runtime_user="1000:1000",
@@ -690,6 +712,7 @@ def test_deploy_script_builds_hardened_docker_arguments_from_validated_json() ->
         args.index("-p") : args.index("-p") + 2
     ]
     assert args[-1] == IMAGE_DIGEST
+    assert f"com.visiox.engine-digest={'f' * 64}" in args
 
 
 def test_deploy_script_exposes_only_active_container_to_the_lan() -> None:
@@ -700,6 +723,7 @@ def test_deploy_script_exposes_only_active_container_to_the_lan() -> None:
         request,
         artifact_path=Path("/var/lib/visiox/model.engine"),
         config_path=Path("/var/lib/visiox/config.json"),
+        engine_digest="f" * 64,
         name="visiox-active-fixed",
         host_port=18080,
         runtime_user="1000:1000",
@@ -734,6 +758,34 @@ def test_deploy_script_rejects_policy_tampering_before_docker() -> None:
 
     with pytest.raises(ValueError, match="invalid deployment request"):
         namespace["_validate_request"](request)  # type: ignore[operator]
+
+
+def test_deploy_script_failure_reports_only_safe_stage_and_error_type(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    namespace = _script_namespace("deploy_inference.sh")
+    request = _remote_deploy_request()
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    secret = "X-Amz-Signature=must-not-appear"
+
+    class FailingOperations:
+        def __init__(self, _request: object) -> None:
+            pass
+
+        def verify_previous(self) -> None:
+            pass
+
+        def pull(self) -> None:
+            raise RuntimeError(f"pull failed: https://registry.invalid/image?{secret}")
+
+    monkeypatch.setitem(namespace, "Operations", FailingOperations)
+    monkeypatch.setattr(sys, "argv", ["deploy_inference.py", str(request_path)])
+
+    assert namespace["main"]() == 1  # type: ignore[operator]
+    stderr = capsys.readouterr().err
+    assert stderr == "deployment operation failed at stage=runtime-image-pull (RuntimeError)\n"
+    assert secret not in stderr
 
 
 def test_upgrade_keeps_previous_container_until_candidate_real_warmup() -> None:

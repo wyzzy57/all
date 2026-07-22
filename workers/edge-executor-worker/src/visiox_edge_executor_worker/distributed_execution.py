@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from typing import Any
 
+import yaml
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy.orm import Session
 
@@ -133,13 +134,7 @@ class DistributedTrainingHandler:
                 target = self._stage._load_target(rank.node_id)
                 response = self._stage._run_script(
                     target,
-                    {
-                        "run_id": run.id,
-                        "action": "launch",
-                        "attempt": run.attempt,
-                        "image_digest": validate_image_digest(str(run.training_image_digest)),
-                        "artifacts": artifacts,
-                    },
+                    _staging_request(run, artifacts),
                 )
                 staged[rank.node_id] = _StageResult.model_validate(response)
 
@@ -150,20 +145,7 @@ class DistributedTrainingHandler:
                 target = self._launch._load_target(rank.node_id)
                 response = self._launch._run_script(
                     target,
-                    {
-                        "run_id": run.id,
-                        "attempt": run.attempt,
-                        "image_digest": validate_image_digest(str(run.training_image_digest)),
-                        "node_id": rank.node_id,
-                        "gpu_uuids": list(rank.gpu_uuids),
-                        "node_rank": rank.node_rank,
-                        "nnodes": len(ranks),
-                        "nproc_per_node": len(rank.gpu_uuids),
-                        "master_addr": run.master_addr,
-                        "master_port": run.master_port,
-                        "training_arguments": arguments,
-                        "paths": stage.paths,
-                    },
+                    _launch_request(run, rank, ranks, stage, arguments),
                 )
                 launched_rank = _LaunchResult.model_validate(response)
                 if launched_rank.node_rank != rank.node_rank:
@@ -232,6 +214,7 @@ class DistributedTrainingHandler:
             with self._session_factory() as session:
                 export_yolo26_dataset(session, self._storage, dataset.id, dataset_dir)
             _ensure_split_directories(dataset_dir)
+            _set_container_dataset_root(dataset_dir)
             archive = Path(shutil.make_archive(str(root / "dataset"), "gztar", dataset_dir))
             dataset_checksum = _sha256(archive)
             dataset_uri = self._storage.put_file(
@@ -584,9 +567,57 @@ def _training_arguments(job: TrainingJob, task: Task) -> list[str]:
     return command.argv[2:]
 
 
+def _staging_request(
+    run: DistributedTrainingRun,
+    artifacts: list[dict[str, str]],
+) -> dict[str, Any]:
+    return {
+        "run_id": run.id,
+        "attempt": run.attempt,
+        "image_digest": validate_image_digest(str(run.training_image_digest)),
+        "artifacts": artifacts,
+    }
+
+
+def _launch_request(
+    run: DistributedTrainingRun,
+    rank: _Rank,
+    ranks: tuple[_Rank, ...],
+    stage: _StageResult,
+    arguments: list[str],
+) -> dict[str, Any]:
+    return {
+        "action": "launch",
+        "run_id": run.id,
+        "attempt": run.attempt,
+        "image_digest": validate_image_digest(str(run.training_image_digest)),
+        "node_id": rank.node_id,
+        "gpu_uuids": list(rank.gpu_uuids),
+        "node_rank": rank.node_rank,
+        "nnodes": len(ranks),
+        "nproc_per_node": len(rank.gpu_uuids),
+        "master_addr": run.master_addr,
+        "master_port": run.master_port,
+        "training_arguments": arguments,
+        "paths": stage.paths,
+    }
+
+
 def _ensure_split_directories(root: Path) -> None:
     for relative in ("images/train", "images/val", "images/test", "labels/train", "labels/val", "labels/test"):
         (root / relative).mkdir(parents=True, exist_ok=True)
+
+
+def _set_container_dataset_root(root: Path) -> None:
+    data_yaml = root / "data.yaml"
+    payload = yaml.safe_load(data_yaml.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("exported dataset configuration is invalid")
+    payload["path"] = "/workspace/dataset"
+    data_yaml.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def _sha256(path: Path) -> str:

@@ -703,6 +703,59 @@ def test_application_cleanup_stops_queue_socket_and_redis() -> None:
     assert "redis-close" in events
 
 
+def test_application_stays_alive_after_startup_stages_complete() -> None:
+    from visiox_edge_executor_worker.runner import EdgeExecutorApplication
+
+    async def exercise() -> None:
+        queue_started = asyncio.Event()
+        queue_release = asyncio.Event()
+        server_release = threading.Event()
+
+        class Reconciler:
+            def reconcile_startup(self, *, stop_requested):
+                return None
+
+        class Queue:
+            async def ensure_consumer_group(self):
+                return None
+
+            async def run_forever(self, *, group_ready=False):
+                assert group_ready is True
+                queue_started.set()
+                await queue_release.wait()
+
+            def stop(self):
+                queue_release.set()
+
+        class Server:
+            def serve_forever(self):
+                server_release.wait()
+
+            def stop(self):
+                server_release.set()
+
+        class Redis:
+            async def aclose(self):
+                return None
+
+        application = EdgeExecutorApplication(
+            dispatcher=SimpleNamespace(),
+            reconciler=Reconciler(),
+            queue=Queue(),
+            bootstrap_server=Server(),
+            redis_client=Redis(),
+        )
+        run_task = asyncio.create_task(application.run())
+        await asyncio.wait_for(queue_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not run_task.done()
+
+        application.request_shutdown()
+        await asyncio.wait_for(run_task, timeout=1)
+
+    asyncio.run(exercise())
+
+
 def test_application_retries_database_reconciliation_before_starting_listeners() -> None:
     events: list[str] = []
 

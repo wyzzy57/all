@@ -1,6 +1,7 @@
 from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 
 
 class ObjectStorageClient(Protocol):
@@ -30,10 +31,30 @@ class MinioObjectStorageClient:
         access_key: str,
         secret_key: str,
         secure: bool = False,
+        public_url: str | None = None,
     ) -> None:
         from minio import Minio
 
         self._client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
+        self._presign_client = self._client
+        if public_url is not None:
+            parsed = urlsplit(public_url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("MinIO public URL must contain only an HTTP(S) origin")
+            self._presign_client = Minio(
+                parsed.netloc,
+                access_key=access_key,
+                secret_key=secret_key,
+                secure=parsed.scheme == "https",
+            )
 
     def put_file(
         self,
@@ -71,7 +92,7 @@ class MinioObjectStorageClient:
         if not timedelta(0) < expires <= timedelta(hours=1):
             raise ValueError("presigned URL expiry must be between zero and one hour")
         return str(
-            self._client.presigned_get_object(
+            self._presign_client.presigned_get_object(
                 bucket,
                 object_name,
                 expires=expires,
@@ -83,7 +104,7 @@ class MinioObjectStorageClient:
         if not timedelta(0) < expires <= timedelta(hours=1):
             raise ValueError("presigned URL expiry must be between zero and one hour")
         return str(
-            self._client.presigned_put_object(
+            self._presign_client.presigned_put_object(
                 bucket,
                 object_name,
                 expires=expires,

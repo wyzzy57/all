@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from visiox_storage.client import ObjectStorageClient
 
 from .crypto import EncryptedSecret
 from .inventory import InventorySnapshot
+from .redaction import redact
 from .scripts import load_packaged_script
 from .startup import EdgeExecutorSecurityContext
 from .state import ExecutionResult
@@ -47,6 +49,8 @@ _TRANSFER_TIMEOUT_SECONDS = 60.0
 _DEPLOYMENT_TIMEOUT_SECONDS = 30 * 60.0
 _PRESIGNED_URL_TTL = timedelta(minutes=15)
 _SHM_SIZE = "1g"
+
+logger = logging.getLogger(__name__)
 
 
 class DeploymentLabels:
@@ -89,6 +93,7 @@ class DeploymentOptions(BaseModel):
     input_shape: tuple[int, int, int, int] = (1, 3, 640, 640)
     gpu_uuids: tuple[str, ...] = ()
     calibration_dataset_uri: str | None = None
+    runtime_image_digest: str | None = None
 
     @field_validator("input_shape")
     @classmethod
@@ -201,11 +206,12 @@ def build_deployment_plan(
 
     cache_key = None
     if export_format == "engine":
-        if not inventory.tensorrt_version or not inventory.compute_capability:
+        runtime_identity = inventory.tensorrt_version or options.runtime_image_digest
+        if not runtime_identity or not inventory.compute_capability:
             raise ValueError("TensorRT inventory is incomplete")
         cache_key = engine_cache_key(
             model_checksum=model.checksum,
-            tensorrt_version=inventory.tensorrt_version,
+            tensorrt_version=runtime_identity,
             compute_capability=inventory.compute_capability,
             precision=precision,
             input_shape=options.input_shape,
@@ -464,6 +470,11 @@ class _DeploymentHandlerBase:
                     timeout_seconds=_DEPLOYMENT_TIMEOUT_SECONDS,
                 )
                 if result.exit_status != 0:
+                    logger.error(
+                        "Remote deployment script failed with exit code %s: %s",
+                        result.exit_status,
+                        redact(result.stderr.decode("utf-8", errors="replace")),
+                    )
                     raise RuntimeError("remote deployment script failed")
                 return json.loads(result.stdout)
             finally:
@@ -577,7 +588,12 @@ class DeployInferenceHandler(_DeploymentHandlerBase):
                 rollback_metadata=prior or {},
             )
             return ExecutionResult.succeeded(phase="running")
-        except Exception:
+        except Exception as error:
+            logger.error(
+                "Deployment execution %s failed: %s",
+                execution.id,
+                redact(error),
+            )
             return self._fail(
                 execution.id,
                 restore_healthy=prior is not None,
@@ -692,6 +708,7 @@ def _validated_desired_state(
                 input_shape=desired.input_shape,
                 gpu_uuids=desired.gpu_uuids,
                 calibration_dataset_uri=desired.calibration_dataset_uri,
+                runtime_image_digest=desired.image_digest,
             ),
         )
     except (ValueError, ValidationError):

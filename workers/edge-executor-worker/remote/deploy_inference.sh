@@ -207,6 +207,7 @@ def _container_args(
     *,
     artifact_path,
     config_path,
+    engine_digest,
     name,
     host_port,
     runtime_user,
@@ -219,7 +220,7 @@ def _container_args(
             "com.visiox.image-digest": request["image_digest"],
             "com.visiox.model-checksum": request["model"]["checksum"],
             "com.visiox.engine": runtime["format"],
-            "com.visiox.engine-digest": runtime["engine_cache_key"] or request["model"]["checksum"],
+            "com.visiox.engine-digest": engine_digest,
             "com.visiox.port": str(runtime["port"]),
         }
     )
@@ -480,6 +481,7 @@ class Operations:
                 self.request,
                 artifact_path=self.artifact_path,
                 config_path=self.config_path,
+                engine_digest=self.engine_digest,
                 name=name,
                 host_port=None if candidate else self.runtime["port"],
                 runtime_user=self.runtime_user,
@@ -595,17 +597,24 @@ class Operations:
 def main():
     if len(sys.argv) != 2:
         return 2
+    stage = "request-validation"
     try:
         with open(sys.argv[1], "r", encoding="utf-8") as request_file:
             request = _validate_request(json.load(request_file))
         operations = Operations(request)
         if request["action"] == "deploy":
+            stage = "previous-deployment-check"
             operations.verify_previous()
+            stage = "runtime-image-pull"
             operations.pull()
+            stage = "model-prepare"
             operations.prepare()
+            stage = "container-activation"
             result = _promote(operations, request["previous_container_id"])
         else:
+            stage = "rollback-target-check"
             operations.verify_target()
+            stage = "rollback-activation"
             result = _rollback(
                 operations,
                 request["current_container_id"],
@@ -613,8 +622,11 @@ def main():
             )
         print(json.dumps(result, ensure_ascii=True, separators=(",", ":"), sort_keys=True))
         return 0
-    except Exception:
-        print("deployment operation failed", file=sys.stderr)
+    except Exception as error:
+        print(
+            f"deployment operation failed at stage={stage} ({type(error).__name__})",
+            file=sys.stderr,
+        )
         return 1
 
 

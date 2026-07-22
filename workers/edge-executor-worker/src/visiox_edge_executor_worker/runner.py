@@ -434,6 +434,7 @@ class EdgeExecutorApplication:
             tasks.add(reconciliation_task)
             if not await self._stage_completed(reconciliation_task, shutdown_task):
                 return
+            tasks.discard(reconciliation_task)
             if self.is_shutdown_requested():
                 return
 
@@ -441,6 +442,7 @@ class EdgeExecutorApplication:
             tasks.add(group_task)
             if not await self._stage_completed(group_task, shutdown_task):
                 return
+            tasks.discard(group_task)
             if self.is_shutdown_requested():
                 return
 
@@ -535,6 +537,7 @@ def build_application(
             access_key=settings.minio_access_key,
             secret_key=settings.minio_secret_key,
             secure=settings.minio_secure,
+            public_url=settings.minio_public_url,
         )
         configured_handlers = build_deployment_handlers(
             session_factory,

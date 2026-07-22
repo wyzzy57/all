@@ -24,6 +24,35 @@ _ZERO_GRAD_WRAPPED_ATTRIBUTE = "_visiox_zero_grad_wrapped"
 logger = logging.getLogger(__name__)
 
 
+def initialize_distributed_process_group() -> bool:
+    rank = int(os.getenv("RANK", "-1"))
+    if rank < 0:
+        return False
+
+    import torch
+    import torch.distributed as distributed
+
+    if distributed.is_initialized():
+        return False
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        backend = "nccl"
+    else:
+        backend = "gloo"
+    distributed.init_process_group(backend=backend, init_method="env://")
+    return True
+
+
+def shutdown_distributed_process_group(initialized_here: bool) -> None:
+    if not initialized_here:
+        return
+    import torch.distributed as distributed
+
+    if distributed.is_initialized():
+        distributed.destroy_process_group()
+
+
 def parse_overrides(arguments: list[str]) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     for argument in arguments:
@@ -335,15 +364,19 @@ def main() -> None:
     model_path = str(overrides.pop("model"))
     task = overrides.pop("task", None)
     overrides.pop("mode", None)
-    model = YOLO(model_path, task=task)
-    model.add_callback("on_pretrain_routine_end", install_pre_zero_gradient_capture)
-    model.add_callback("on_train_epoch_start", reset_training_batch_index)
-    model.add_callback("on_train_batch_start", track_training_batch_start)
-    model.add_callback("on_before_zero_grad", capture_gradient_sample)
-    model.add_callback("on_train_batch_end", capture_gradient_sample)
-    model.add_callback("on_train_epoch_end", log_epoch_observability)
-    model.add_callback("on_train_end", write_final_progress_snapshot)
-    model.train(**overrides)
+    initialized_here = initialize_distributed_process_group()
+    try:
+        model = YOLO(model_path, task=task)
+        model.add_callback("on_pretrain_routine_end", install_pre_zero_gradient_capture)
+        model.add_callback("on_train_epoch_start", reset_training_batch_index)
+        model.add_callback("on_train_batch_start", track_training_batch_start)
+        model.add_callback("on_before_zero_grad", capture_gradient_sample)
+        model.add_callback("on_train_batch_end", capture_gradient_sample)
+        model.add_callback("on_train_epoch_end", log_epoch_observability)
+        model.add_callback("on_train_end", write_final_progress_snapshot)
+        model.train(**overrides)
+    finally:
+        shutdown_distributed_process_group(initialized_here)
 
 
 if __name__ == "__main__":

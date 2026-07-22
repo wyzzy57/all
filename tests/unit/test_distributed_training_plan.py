@@ -1,4 +1,6 @@
-from pathlib import Path
+import json
+from pathlib import Path, PurePosixPath
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,9 @@ from visiox_edge_executor_worker.distributed import (
 from visiox_edge_executor_worker.distributed_execution import (
     DistributedTrainingHandler,
     StopDistributedTrainingHandler,
+    _launch_request,
+    _set_container_dataset_root,
+    _staging_request,
     build_distributed_handlers,
     _training_arguments,
 )
@@ -123,6 +128,72 @@ def test_remote_training_scripts_are_json_driven_and_do_not_eval_request_values(
         assert "docker" in text
 
 
+def test_remote_rank_container_uses_edge_user_for_writable_output_mount() -> None:
+    script = load_packaged_script("launch_rank.sh").decode("utf-8")
+
+    assert '"--user", f"{os.getuid()}:{os.getgid()}"' in script
+    assert "dst=/workspace/model/base.pt,readonly" in script
+    assert "dst=/workspace/dataset,readonly" not in script
+    assert "dst=/workspace/dataset" in script
+    assert '"USER=visiox-edge"' in script
+    assert '"LOGNAME=visiox-edge"' in script
+    assert '"TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor"' in script
+
+
+def test_remote_staging_failure_reports_safe_stage_only(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = load_packaged_script("stage_training.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "stage_training.sh", "exec"), namespace)
+    request_path = tmp_path / "request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "run_id": "run-1",
+                "attempt": 1,
+                "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
+                "artifacts": [
+                    {
+                        "name": "model",
+                        "download_url": "https://minio.invalid/model?X-Amz-Signature=secret",
+                        "checksum": "b" * 64,
+                        "filename": "base.pt",
+                    },
+                    {
+                        "name": "dataset",
+                        "download_url": "https://minio.invalid/dataset?X-Amz-Signature=secret",
+                        "checksum": "c" * 64,
+                        "filename": "dataset.zip",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_pull(*_args, **_kwargs):
+        raise RuntimeError("X-Amz-Signature=must-not-appear")
+
+    monkeypatch.setattr(namespace["subprocess"], "run", fail_pull)  # type: ignore[arg-type]
+    monkeypatch.setattr(sys, "argv", ["stage_training.py", str(request_path)])
+
+    assert namespace["main"]() == 1  # type: ignore[operator]
+    stderr = capsys.readouterr().err
+    assert stderr == "training artifact staging failed at stage=runtime-image-pull (RuntimeError)\n"
+    assert "must-not-appear" not in stderr
+
+
+def test_remote_staging_uses_ssh_user_owned_workspace() -> None:
+    script = load_packaged_script("stage_training.sh").decode("utf-8")
+
+    assert 'Path.home() / ".local" / "share" / "visiox" / "training"' in script
+    assert 'Path("/var/lib/visiox/training")' not in script
+
+
 def test_production_handler_factory_registers_train_resume_and_stop() -> None:
     handlers = build_distributed_handlers(object(), object(), object())  # type: ignore[arg-type]
 
@@ -145,11 +216,89 @@ def test_distributed_training_arguments_remove_global_device_selection() -> None
     assert not any(argument.startswith("device=") for argument in arguments)
 
 
+def test_staging_request_matches_remote_script_contract() -> None:
+    artifacts = [{"name": "model"}]
+    request = _staging_request(  # type: ignore[arg-type]
+        SimpleNamespace(
+            id="run-1",
+            attempt=1,
+            training_image_digest="registry.local/visiox/train@sha256:" + "a" * 64,
+        ),
+        artifacts,  # type: ignore[arg-type]
+    )
+
+    assert request == {
+        "run_id": "run-1",
+        "attempt": 1,
+        "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
+        "artifacts": artifacts,
+    }
+    assert "action" not in request
+
+
+def test_launch_request_matches_remote_script_contract() -> None:
+    run = SimpleNamespace(
+        id="run-1",
+        attempt=1,
+        training_image_digest="registry.local/visiox/train@sha256:" + "a" * 64,
+        master_addr="10.10.40.10",
+        master_port=29500,
+    )
+    rank = SimpleNamespace(node_id="node-1", gpu_uuids=("GPU-one",), node_rank=0)
+    stage = SimpleNamespace(
+        paths={
+            "model": "/home/edge/model.pt",
+            "dataset": "/home/edge/dataset",
+            "output": "/home/edge/output",
+        }
+    )
+
+    request = _launch_request(  # type: ignore[arg-type]
+        run,
+        rank,
+        (rank,),  # type: ignore[arg-type]
+        stage,
+        ["epochs=1"],
+    )
+
+    assert request["action"] == "launch"
+    assert set(request) == {
+        "action",
+        "run_id",
+        "attempt",
+        "image_digest",
+        "node_id",
+        "gpu_uuids",
+        "node_rank",
+        "nnodes",
+        "nproc_per_node",
+        "master_addr",
+        "master_port",
+        "training_arguments",
+        "paths",
+    }
+
+
+def test_exported_dataset_uses_training_container_mount_root(tmp_path: Path) -> None:
+    data_yaml = tmp_path / "data.yaml"
+    data_yaml.write_text(
+        "path: .\ntrain: images/train\nval: images/val\nnames:\n  0: pepper\n",
+        encoding="utf-8",
+    )
+
+    _set_container_dataset_root(tmp_path)
+
+    assert data_yaml.read_text(encoding="utf-8").startswith(
+        "path: /workspace/dataset\ntrain: images/train\n"
+    )
+
+
 def test_remote_rank_script_rejects_control_characters() -> None:
     script = load_packaged_script("launch_rank.sh").decode("utf-8")
     embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     namespace: dict[str, object] = {"__name__": "visiox_script_test"}
     exec(compile(embedded, "launch_rank.sh", "exec"), namespace)
+    namespace["Path"] = PurePosixPath
     validate = namespace["validate"]
     request = {
         "action": "launch",
@@ -173,6 +322,57 @@ def test_remote_rank_script_rejects_control_characters() -> None:
 
     with pytest.raises(ValueError, match="request"):
         validate(request)  # type: ignore[operator]
+
+
+def test_remote_rank_failure_reports_safe_stage_only(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = load_packaged_script("launch_rank.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "launch_rank.sh", "exec"), namespace)
+    namespace["Path"] = PurePosixPath
+    namespace["os"] = SimpleNamespace(getuid=lambda: 1000, getgid=lambda: 1000)
+    request = {
+        "action": "launch",
+        "run_id": "run-1",
+        "attempt": 1,
+        "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
+        "node_id": "node-1",
+        "gpu_uuids": ["GPU-one"],
+        "node_rank": 0,
+        "nnodes": 1,
+        "nproc_per_node": 1,
+        "master_addr": "10.10.40.10",
+        "master_port": 29500,
+        "training_arguments": ["epochs=1"],
+        "paths": {
+            "model": "/home/edge/model.pt",
+            "dataset": "/home/edge/dataset",
+            "output": "/home/edge/output",
+        },
+    }
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    calls = 0
+
+    def fail_launch(*_args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if kwargs.get("check"):
+            raise RuntimeError("token=must-not-appear")
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(namespace["subprocess"], "run", fail_launch)  # type: ignore[arg-type]
+    monkeypatch.setattr(sys, "argv", ["launch_rank.py", str(request_path)])
+
+    assert namespace["main"]() == 1  # type: ignore[operator]
+    stderr = capsys.readouterr().err
+    assert calls == 2
+    assert stderr == "distributed rank operation failed at stage=container-launch (RuntimeError)\n"
+    assert "must-not-appear" not in stderr
 
 
 def test_remote_rank_collect_uploads_last_checkpoint(tmp_path: Path) -> None:

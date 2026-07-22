@@ -340,7 +340,13 @@ async def _create_distributed_training_job(
     )
     job.task_id = task_id
     pipeline.status = "running"
-    session.add_all([job, task, run, execution, pipeline])
+    session.add(task)
+    session.flush()
+    session.add_all([job, pipeline])
+    session.flush()
+    session.add(run)
+    session.flush()
+    session.add(execution)
     session.commit()
     response.status_code = status.HTTP_201_CREATED
     try:
@@ -415,10 +421,14 @@ async def stop_distributed_training_job(
         status="queued",
         idempotency_key=f"stop_training:{run.id}:{execution_id}",
     )
+    session.add(task)
+    session.flush()
     job.task_id = task_id
     job.status = "stopping"
     run.status = "stopping"
-    session.add_all([job, run, task, execution])
+    session.add_all([job, run])
+    session.flush()
+    session.add(execution)
     session.commit()
     try:
         await _enqueue_edge_execution(
@@ -545,14 +555,18 @@ async def resume_distributed_training_job(
         idempotency_key=f"resume_training:{run_id}:{attempt}",
     )
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
+    session.add(task)
+    session.flush()
     job.task_id = task_id
     job.status = "queued"
     job.finished_at = None
     if pipeline is not None:
         pipeline.status = "running"
-    session.add_all([job, run, task, execution])
+    session.add_all([job, run])
     if pipeline is not None:
         session.add(pipeline)
+    session.flush()
+    session.add(execution)
     session.commit()
     try:
         await _enqueue_edge_execution(

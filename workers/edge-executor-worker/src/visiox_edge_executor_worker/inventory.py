@@ -158,9 +158,9 @@ def parse_inventory(value: Mapping[str, Any] | bytes | str) -> InventorySnapshot
         reasons.append("NVIDIA Container Runtime is unavailable")
     if not gpus and not is_jetson:
         reasons.append("NVIDIA GPU inventory is unavailable")
-    if _version_major(cuda_runtime_version) is None:
+    if platform_kind == "jetson" and _version_major(cuda_runtime_version) is None:
         reasons.append("CUDA runtime/toolkit is unavailable")
-    if _version_major(tensorrt_version) is None:
+    if platform_kind == "jetson" and _version_major(tensorrt_version) is None:
         reasons.append("TensorRT version is unavailable")
     if len(compute_capabilities) > 1:
         reasons.append("GPU compute capabilities are heterogeneous")
@@ -200,8 +200,8 @@ def compatibility_key(snapshot: InventorySnapshot) -> str:
         (
             snapshot.platform_kind,
             snapshot.architecture,
-            _key_part(snapshot.cuda_major),
-            _key_part(snapshot.tensorrt_major),
+            _key_part(_compatibility_cuda_major(snapshot)),
+            _key_part(_compatibility_tensorrt_major(snapshot)),
             _key_part(snapshot.compute_capability),
         )
     )
@@ -212,10 +212,22 @@ def compatibility_policy(snapshot: InventorySnapshot) -> dict[str, str | int]:
         "compatibility_key": compatibility_key(snapshot),
         "platform_kind": snapshot.platform_kind,
         "architecture": snapshot.architecture,
-        "cuda_major": snapshot.cuda_major or 0,
-        "tensorrt_major": snapshot.tensorrt_major or 0,
+        "cuda_major": _compatibility_cuda_major(snapshot) or 0,
+        "tensorrt_major": _compatibility_tensorrt_major(snapshot) or 0,
         "compute_capability": snapshot.compute_capability or "unknown",
     }
+
+
+def _compatibility_cuda_major(snapshot: InventorySnapshot) -> int | None:
+    if snapshot.platform_kind == "x86_nvidia":
+        return _version_major(snapshot.driver_cuda_compatibility_version)
+    return snapshot.cuda_major
+
+
+def _compatibility_tensorrt_major(snapshot: InventorySnapshot) -> int | None:
+    if snapshot.platform_kind == "x86_nvidia":
+        return None
+    return snapshot.tensorrt_major
 
 
 def pool_accepts_inventory(

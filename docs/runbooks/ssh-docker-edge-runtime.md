@@ -44,6 +44,31 @@ x86 脚本额外要求 `platform_kind=x86_nvidia`、有效 GPU inventory（来�
 - 从 API 主机执行时，默认 API 地址为 `http://127.0.0.1:8000`。如果管理接口
   位于受保护代理之后，应把 `-PlatformApiBaseUri` 指向已授权的管理入口。
 
+## 运行时镜像与网络边界
+
+- x86 NVIDIA 节点只要求宿主机安装兼容的 NVIDIA 驱动、Docker 与 NVIDIA
+  Container Toolkit。CUDA、TensorRT、PyTorch 和 Ultralytics 由不可变训练或
+  推理镜像提供，不要求宿主机安装同版本 CUDA/TensorRT。
+- 平台按 GPU compute capability、宿主驱动可支持的最高 CUDA 版本和架构选择
+  兼容资源池；TensorRT 版本属于镜像身份，不参与 x86 宿主资源池兼容键。
+- 部署和训练请求必须使用包含 registry、仓库名与 `sha256` 的完整镜像摘要。
+  不接受可变 tag 作为生产执行身份。
+- `VISIOX_MINIO_PUBLIC_URL` 必须配置为边缘节点可访问的 MinIO 地址。平台内部
+  读写仍可使用 Compose 服务名；预签名下载与上传 URL 使用这个外部地址。
+- 每次训练先把模型与数据集下载到远端任务目录。模型权重以只读方式挂载；
+  数据集挂载的是任务独享副本，并允许 Ultralytics 写入图片修复结果与
+  `labels/*.cache`；原始 MinIO 数据不会被修改。
+
+边缘训练镜像复用同一套已验证的 CUDA/Ultralytics 推理基础镜像，只增加训练
+入口，并移除继承的 HTTP 健康检查：
+
+```powershell
+docker build `
+  -f workers/training-worker/Dockerfile.edge `
+  --build-arg INFERENCE_IMAGE='registry.local/visiox/yolo26-inference@sha256:...' `
+  -t registry.local/visiox/yolo26-training:release .
+```
+
 ## 请求文件
 
 服务请求文件遵循 `POST /services`，其中 `node_id`、`format` 和 `precision`

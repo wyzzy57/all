@@ -580,3 +580,30 @@ def test_main_registers_native_callbacks_and_keeps_native_integrations_enabled(
     }
     assert setting_updates == [{"mlflow": True, "tensorboard": True}]
     assert train_calls == [{"epochs": 40}]
+
+
+def test_distributed_process_group_uses_nccl_and_local_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    distributed = SimpleNamespace(
+        is_initialized=lambda: False,
+        init_process_group=lambda **kwargs: calls.append(("init", kwargs)),
+    )
+    cuda = SimpleNamespace(
+        is_available=lambda: True,
+        set_device=lambda rank: calls.append(("device", rank)),
+    )
+    torch = ModuleType("torch")
+    torch.cuda = cuda
+    torch.distributed = distributed
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.distributed", distributed)
+    monkeypatch.setenv("RANK", "2")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+
+    assert train_entrypoint.initialize_distributed_process_group() is True
+    assert calls == [
+        ("device", 1),
+        ("init", {"backend": "nccl", "init_method": "env://"}),
+    ]
