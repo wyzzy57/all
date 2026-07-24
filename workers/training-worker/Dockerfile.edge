@@ -2,6 +2,7 @@ ARG INFERENCE_IMAGE=visiox-yolo26-inference:latest
 FROM ${INFERENCE_IMAGE}
 
 USER root
+RUN pip install --no-cache-dir "tensorboard>=2.18,<3.0"
 COPY workers/training-worker/src/visiox_training_worker /usr/local/lib/python3.12/site-packages/visiox_training_worker
 
 # This image runs finite training commands, not the inherited inference health check.

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from visiox_common.tasks import TaskStatus, TaskType
 from visiox_db.models import BaseModel, Dataset, Task, TrainedModel, TrainingJob, TrainingPipeline
 from visiox_storage.client import ObjectStorageClient
+from visiox_storage.checksum import sha256_file
 from visiox_yolo26.converters import export_yolo26_dataset
 from visiox_yolo26.converters.internal_schema import parse_storage_uri
 from visiox_yolo26.training.commands import build_train_command
@@ -173,6 +174,7 @@ def run_training_job(
         weight_uris: dict[str, str] = {}
         trained_model: TrainedModel | None = None
         for weight_name, weight_path in weight_paths.items():
+            model_metrics = {**metrics, "checksum": sha256_file(weight_path)}
             model = TrainedModel(
                 pipeline_id=pipeline.id,
                 training_job_id=job.id if trained_model is None else None,
@@ -180,7 +182,7 @@ def run_training_job(
                 version=weight_name,
                 task=pipeline.task,
                 artifact_uri="pending",
-                metrics=metrics,
+                metrics=model_metrics,
                 status="ready",
             )
             session.add(model)

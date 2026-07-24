@@ -43,23 +43,39 @@
         </div>
         <div v-if="listLoading" class="run-list-state">正在加载训练记录...</div>
         <el-empty v-else-if="jobs.length === 0" description="暂无训练记录" />
-        <button
+        <div
           v-for="job in jobs"
           v-else
           :key="job.id"
-          class="run-item"
+          class="run-row"
           :class="{ active: selectedJob?.id === job.id }"
-          :data-testid="`job-${job.id}`"
-          type="button"
-          @click="selectJob(job)"
         >
-          <span class="run-title">{{ pipelineName(job.pipeline_id) }}</span>
-          <span class="run-meta">
-            <el-tag :type="statusType(job.status)" size="small" effect="light">{{ statusLabel(job.status) }}</el-tag>
-            <time>{{ formatDate(job.created_at) }}</time>
-          </span>
-          <code>{{ observationRunName(job) }}</code>
-        </button>
+          <button
+            class="run-item"
+            :class="{ active: selectedJob?.id === job.id }"
+            :data-testid="`job-${job.id}`"
+            type="button"
+            @click="selectJob(job)"
+          >
+            <span class="run-title">{{ pipelineName(job.pipeline_id) }}</span>
+            <span class="run-meta">
+              <el-tag :type="statusType(job.status)" size="small" effect="light">{{ statusLabel(job.status) }}</el-tag>
+              <time>{{ formatDate(job.created_at) }}</time>
+            </span>
+            <code>{{ observationRunName(job) }}</code>
+          </button>
+          <button
+            class="delete-run-button"
+            type="button"
+            :disabled="!canDeleteRun(job)"
+            :title="canDeleteRun(job) ? '删除训练记录' : '请先停止训练'"
+            :aria-label="`删除训练记录 ${pipelineName(job.pipeline_id)}`"
+            :data-testid="`delete-job-${job.id}`"
+            @click="deleteRun(job)"
+          >
+            <el-icon><Delete /></el-icon>
+          </button>
+        </div>
       </aside>
 
       <main class="visualization-workspace">
@@ -242,8 +258,8 @@
 </template>
 
 <script setup lang="ts">
-import { MoreFilled, Refresh } from "@element-plus/icons-vue";
-import { ElMessage } from "element-plus";
+import { Delete, MoreFilled, Refresh } from "@element-plus/icons-vue";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 
@@ -500,6 +516,37 @@ function resetSelectedData() {
   resourcesLoadedJobId = null;
 }
 
+function isActiveStatus(status: string) {
+  return ACTIVE_STATUSES.has(status.toLowerCase());
+}
+
+function canDeleteRun(job: TrainingJobRecord) {
+  const status = job.status.toLowerCase();
+  if (!ACTIVE_STATUSES.has(status)) return true;
+  return status === "queued"
+    && !job.task_id
+    && !job.distributed_run_id
+    && !job.remote_execution_id;
+}
+
+async function deleteRun(job: TrainingJobRecord) {
+  try {
+    await ElMessageBox.confirm(
+      "将删除本次训练记录、日志和结果图，已经产出的可部署模型权重会保留。",
+      "删除训练记录",
+      { confirmButtonText: "删除", cancelButtonText: "取消", type: "warning" },
+    );
+    await api.deleteTrainingJob(job.id);
+    if (selectedJob.value?.id === job.id) selectedJob.value = null;
+    ElMessage.success("训练记录已删除");
+    await loadRuns();
+  } catch (error) {
+    if (error !== "cancel" && error !== "close") {
+      ElMessage.error(error instanceof Error ? error.message : "训练记录删除失败");
+    }
+  }
+}
+
 async function loadScalars(requestGeneration: number, force = false) {
   const job = selectedJob.value;
   const advertisedKeys = [...new Set(summaryData.value?.available_scalar_keys.filter((key) => key.trim()) ?? [])];
@@ -661,9 +708,13 @@ onBeforeUnmount(() => {
 .run-list-heading { display: flex; align-items: center; justify-content: space-between; height: 52px; padding: 0 16px; border-bottom: 1px solid #dfe5ef; }
 .run-list-heading span { color: #667085; font-size: 13px; }
 .run-list-state { padding: 24px 16px; color: #667085; }
-.run-item { display: grid; width: 100%; gap: 9px; padding: 14px 16px; border: 0; border-bottom: 1px solid #e8edf5; background: transparent; text-align: left; cursor: pointer; }
-.run-item:hover { background: #f1f5f9; }
-.run-item.active { box-shadow: inset 3px 0 #2563eb; background: #eef4ff; }
+.run-row { position: relative; border-bottom: 1px solid #e8edf5; }
+.run-row:hover { background: #f1f5f9; }
+.run-row.active { box-shadow: inset 3px 0 #2563eb; background: #eef4ff; }
+.run-item { display: grid; width: 100%; gap: 9px; padding: 14px 48px 14px 16px; border: 0; background: transparent; text-align: left; cursor: pointer; }
+.delete-run-button { position: absolute; top: 10px; right: 10px; display: grid; width: 30px; height: 30px; padding: 0; place-items: center; border: 0; border-radius: 4px; background: transparent; color: #667085; cursor: pointer; }
+.delete-run-button:hover:not(:disabled) { background: #fee2e2; color: #dc2626; }
+.delete-run-button:disabled { cursor: not-allowed; opacity: .35; }
 .run-title { overflow: hidden; color: #172033; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .run-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #667085; font-size: 12px; }
 .run-item code, .selected-run-band code { overflow: hidden; color: #475467; font-family: Consolas, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }

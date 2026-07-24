@@ -13,6 +13,9 @@
           <span>{{ taskText(datasetDetail.task) }}数据集，包含 {{ numberValue(datasetDetail.sample_count) }} 个文件。</span>
         </div>
         <div class="detail-actions">
+          <el-button type="primary" @click="openDatasetProcessing(datasetDetail)">
+            数据处理
+          </el-button>
           <el-button plain @click="confirmDeleteDataset(datasetDetail)">
             <Delete />
             删除
@@ -175,7 +178,14 @@
             <div v-if="activeDatasetMenuId === dataset.id" class="dataset-action-menu">
               <button v-if="activeTab === 'datasets'" type="button">编辑</button>
               <button v-if="activeTab === 'datasets'" type="button">公开配置</button>
-              <button v-if="activeTab === 'prepare'" type="button" @click="convertToDataset(dataset)">转为数据集</button>
+              <button
+                v-if="activeTab === 'prepare'"
+                type="button"
+                :disabled="convertingDatasetId === dataset.id"
+                @click="convertToDataset(dataset)"
+              >
+                {{ convertingDatasetId === dataset.id ? "转换中" : "转为数据集" }}
+              </button>
               <button
                 class="danger"
                 type="button"
@@ -192,7 +202,6 @@
             <div class="prepare-card-head">
               <span class="status-dot"></span>
               <strong>{{ dataset.name || dataset.id }}</strong>
-              <span class="warning-mark">△</span>
             </div>
             <div class="chip-row">
               <span class="chip chip-success">✓ {{ datasetStatusText(dataset.status) }}</span>
@@ -208,6 +217,21 @@
             </div>
             <div class="dataset-stats">
               <span>样本 {{ numberValue(dataset.sample_count) }}</span>
+              <span>标注 {{ numberValue(dataset.annotation_count) }}</span>
+            </div>
+          </template>
+
+          <template v-else>
+            <header class="library-card-head">
+              <strong>{{ dataset.name || dataset.id }}</strong>
+              <span>label</span>
+            </header>
+            <div class="library-tags">
+              <span>{{ primaryLabelProject(dataset) ? "labelstudio导入" : importSourceText(dataset) }}</span>
+            </div>
+            <p>{{ taskText(dataset.task) }}数据集，共 {{ numberValue(dataset.sample_count) }} 个文件</p>
+            <time>{{ formatTime(dataset.updated_at || dataset.created_at) }}</time>
+            <div class="dataset-stats">
               <span>标注 {{ numberValue(dataset.annotation_count) }}</span>
               <button
                 v-if="canValidateDataset(dataset)"
@@ -228,18 +252,6 @@
                 数据处理
               </button>
             </div>
-          </template>
-
-          <template v-else>
-            <header class="library-card-head">
-              <strong>{{ dataset.name || dataset.id }}</strong>
-              <span>label</span>
-            </header>
-            <div class="library-tags">
-              <span>{{ primaryLabelProject(dataset) ? "labelstudio导入" : importSourceText(dataset) }}</span>
-            </div>
-            <p>{{ taskText(dataset.task) }}数据集，共 {{ numberValue(dataset.sample_count) }} 个文件</p>
-            <time>{{ formatTime(dataset.updated_at || dataset.created_at) }}</time>
           </template>
         </article>
 
@@ -524,6 +536,7 @@ interface DatasetRow extends AnyRecord {
   task?: string;
   status?: string;
   source?: string | null;
+  storage_uri?: string | null;
   sample_count?: number;
   annotation_count?: number;
   created_at?: string;
@@ -573,6 +586,7 @@ const uploading = ref(false);
 const syncingAll = ref(false);
 const deletingDatasetId = ref("");
 const validatingDatasetId = ref("");
+const convertingDatasetId = ref("");
 const activeDatasetMenuId = ref("");
 const processingDrawerVisible = ref(false);
 const processingLoading = ref(false);
@@ -630,9 +644,12 @@ const operationState = ref({
 });
 
 const filteredDatasets = computed(() => {
+  const rows = datasets.value.filter((dataset) =>
+    activeTab.value === "prepare" ? isPreparationRecord(dataset) : dataset.status !== "preparing",
+  );
   const term = keyword.value.trim().toLowerCase();
-  if (!term) return datasets.value;
-  return datasets.value.filter((dataset) =>
+  if (!term) return rows;
+  return rows.filter((dataset) =>
     [dataset.name, dataset.task, dataset.status, dataset.id]
       .filter(Boolean)
       .join(" ")
@@ -640,6 +657,13 @@ const filteredDatasets = computed(() => {
       .includes(term),
   );
 });
+
+function isPreparationRecord(dataset: DatasetRow) {
+  if (dataset.status === "preparing") return true;
+  const storageUri = dataset.storage_uri || "";
+  if (storageUri.startsWith("preparation://")) return false;
+  return dataset.source !== "label_studio";
+}
 
 const uploadPreview = computed(() =>
   uploadFiles.value.slice(0, 200).map((file) => ({
@@ -771,10 +795,41 @@ function handleDatasetCardClick(dataset: DatasetRow) {
   datasetDetail.value = dataset;
 }
 
-function convertToDataset(dataset: DatasetRow) {
+async function convertToDataset(dataset: DatasetRow) {
   activeDatasetMenuId.value = "";
-  activeTab.value = "datasets";
-  datasetDetail.value = dataset;
+  convertingDatasetId.value = dataset.id;
+  startOperation("转为数据集", 3, "正在从 Label Studio 导入标注");
+  try {
+    const project = await ensureLabelProject(dataset);
+    const importTask = await api.importLabelProjectAnnotations(project.id);
+    updateOperation(1, "正在读取 Label Studio 标注");
+    const completedTask = await waitForTask(importTask.id);
+    if (completedTask.status !== "SUCCESS") {
+      throw new Error(completedTask.error_message || "Label Studio 标注导入失败");
+    }
+    updateOperation(2, "正在筛选有标注的样本");
+    const promoted = await api.promoteDataset(dataset.id);
+    updateOperation(3, "训练数据集已生成");
+    finishOperation(`已生成 ${promoted.sample_count} 个有标注样本的数据集`);
+    await loadDatasets();
+    activeTab.value = "datasets";
+    datasetDetail.value = promoted;
+    ElMessage.success("已将有标注的样本转为数据集");
+  } catch (error) {
+    failOperation(getErrorMessage(error, "转为数据集失败"));
+    ElMessage.error(getErrorMessage(error, "没有可转换的有效标注"));
+  } finally {
+    convertingDatasetId.value = "";
+  }
+}
+
+async function waitForTask(taskId: string) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const task = await api.getTask(taskId);
+    if (["SUCCESS", "FAILED", "CANCELED"].includes(task.status)) return task;
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+  }
+  throw new Error("标注导入超时，请稍后重试");
 }
 
 async function openDatasetProcessing(row: DatasetRow) {
@@ -1095,6 +1150,7 @@ async function resolveUploadDatasetId() {
     task: newDataset.value.task,
     class_schema: { names: parseClassNames() },
     source: importMode.value === "video" ? "video" : "upload",
+    preparation: true,
   });
   uploadDatasetId.value = dataset.id;
   return dataset.id;
@@ -1223,10 +1279,12 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 <style scoped>
 .data-preparation-view {
+  container: data-preparation / inline-size;
   display: flex;
   flex-direction: column;
   gap: 18px;
-  padding: 20px 18px 28px;
+  min-width: 0;
+  padding: 0 0 8px;
 }
 
 .page-title h1,
@@ -2247,13 +2305,13 @@ function getErrorMessage(error: unknown, fallback: string) {
   height: 100%;
 }
 
-@media (max-width: 1280px) {
+@container data-preparation (max-width: 1120px) {
   .import-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
-@media (max-width: 980px) {
+@container data-preparation (max-width: 720px) {
   .import-grid,
   .dataset-grid,
   .dataset-grid-compact,
@@ -2276,6 +2334,23 @@ function getErrorMessage(error: unknown, fallback: string) {
   .search-input {
     flex: 1;
     width: auto;
+  }
+}
+
+@container data-preparation (max-width: 480px) {
+  .workspace-tabs,
+  .operation-head {
+    gap: 12px;
+  }
+
+  .tab-list {
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .toolbar {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
 </style>

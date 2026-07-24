@@ -30,20 +30,14 @@ _SCRIPT_NAME = "inspect_runtime.sh"
 _REQUEST_NAME = "request.json"
 _SAFE_LABEL_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}\Z")
 _CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
-_CONTAINER_STATUSES = frozenset({"created", "restarting", "running", "removing", "paused", "exited", "dead"})
+_CONTAINER_STATUSES = frozenset(
+    {"created", "restarting", "running", "removing", "paused", "exited", "dead"}
+)
 _HEALTH_STATUSES = frozenset({"starting", "healthy", "unhealthy"})
-_ACTIVE_DEPLOYMENT_STATUSES = frozenset(
+_RECONCILABLE_DEPLOYMENT_STATUSES = frozenset(
     {
-        "connecting",
-        "probing",
-        "preparing",
-        "optimizing",
-        "starting",
-        "warming_up",
         "running",
         "reconciliation_retry",
-        "rollback_starting",
-        "rollback_warming_up",
     }
 )
 _DEPLOYMENT_LABELS = frozenset(
@@ -139,6 +133,17 @@ class RemoteRuntimeReconciler:
             reconciled += 1
         if should_stop():
             return reconciled
+        reconciled += self.reconcile_deployments(stop_requested=should_stop)
+        return reconciled
+
+    def reconcile_deployments(
+        self,
+        *,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> int:
+        """Refresh long-lived deployments without reclaiming active queue work."""
+        should_stop = stop_requested or (lambda: False)
+        reconciled = 0
         for instance_id in self._list_reconcilable_deployments():
             if should_stop():
                 break
@@ -149,7 +154,9 @@ class RemoteRuntimeReconciler:
     def _list_reconcilable_deployments(self) -> list[str]:
         statement = (
             select(DeploymentInstance.id)
-            .where(DeploymentInstance.status.in_(_ACTIVE_DEPLOYMENT_STATUSES))
+            .where(
+                DeploymentInstance.status.in_(_RECONCILABLE_DEPLOYMENT_STATUSES)
+            )
             .order_by(DeploymentInstance.updated_at, DeploymentInstance.id)
         )
         with self._session_factory() as session:
@@ -158,7 +165,10 @@ class RemoteRuntimeReconciler:
     def _reconcile_deployment(self, instance_id: str) -> None:
         with self._session_factory() as session:
             instance = session.get(DeploymentInstance, instance_id)
-            if instance is None or instance.status not in _ACTIVE_DEPLOYMENT_STATUSES:
+            if (
+                instance is None
+                or instance.status not in _RECONCILABLE_DEPLOYMENT_STATUSES
+            ):
                 return
             service = session.get(DeploymentService, instance.deployment_service_id)
             if service is None:
@@ -335,7 +345,10 @@ class RemoteRuntimeReconciler:
                 sort_keys=True,
             ).encode("ascii")
             try:
-                for data, path in ((self._script, script_path), (request, request_path)):
+                for data, path in (
+                    (self._script, script_path),
+                    (request, request_path),
+                ):
                     ssh_session.upload_bytes_exclusive(
                         data,
                         path,
@@ -380,9 +393,7 @@ class RemoteRuntimeReconciler:
             workspace = ssh_session.create_private_directory(
                 timeout_seconds=INSPECTION_TIMEOUT_SECONDS
             )
-            script_path = str(
-                PurePosixPath(workspace.path) / "inspect_deployment.sh"
-            )
+            script_path = str(PurePosixPath(workspace.path) / "inspect_deployment.sh")
             request_path = str(PurePosixPath(workspace.path) / _REQUEST_NAME)
             remote_paths = (script_path, request_path)
             request = json.dumps(
@@ -536,15 +547,22 @@ def _validate_response(response: object) -> list[dict[str, Any]]:
             "health",
         }:
             raise ValueError("remote runtime inspection response is invalid")
-        if not isinstance(container["id"], str) or not _CONTAINER_ID.fullmatch(container["id"]):
+        if not isinstance(container["id"], str) or not _CONTAINER_ID.fullmatch(
+            container["id"]
+        ):
             raise ValueError("remote runtime inspection response is invalid")
         if container["status"] not in _CONTAINER_STATUSES:
             raise ValueError("remote runtime inspection response is invalid")
-        if not isinstance(container["exit_code"], int) or isinstance(container["exit_code"], bool):
+        if not isinstance(container["exit_code"], int) or isinstance(
+            container["exit_code"], bool
+        ):
             raise ValueError("remote runtime inspection response is invalid")
         if not isinstance(container["oom_killed"], bool):
             raise ValueError("remote runtime inspection response is invalid")
-        if container["health"] is not None and container["health"] not in _HEALTH_STATUSES:
+        if (
+            container["health"] is not None
+            and container["health"] not in _HEALTH_STATUSES
+        ):
             raise ValueError("remote runtime inspection response is invalid")
         validated.append(container)
     return validated

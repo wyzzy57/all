@@ -1,5 +1,5 @@
 <template>
-  <section class="services-view">
+  <section class="services-view" :class="{ 'list-mode': !selectedService }">
     <template v-if="!selectedService">
       <header class="services-header">
         <h1>服务列表</h1>
@@ -17,7 +17,7 @@
       <el-empty v-if="filteredServices.length === 0" description="暂无服务" />
       <div v-else class="service-grid">
         <article
-          v-for="service in filteredServices"
+          v-for="service in pagedServices"
           :key="service.id"
           class="service-card"
           role="button"
@@ -59,11 +59,14 @@
 
       <footer class="service-pagination">
         <span>共 {{ filteredServices.length }} 条</span>
-        <button type="button">1</button>
-        <el-select v-model="pageSize" class="page-size">
-          <el-option label="20 条/页" :value="20" />
-          <el-option label="40 条/页" :value="40" />
-        </el-select>
+        <el-pagination
+          v-model:current-page="currentPage"
+          v-model:page-size="pageSize"
+          background
+          layout="prev, pager, next, sizes"
+          :page-sizes="[20, 40]"
+          :total="filteredServices.length"
+        />
       </footer>
     </template>
 
@@ -112,6 +115,7 @@
 
         <div class="metric-grid">
           <div><span>健康状态</span><strong :class="healthTone(selectedService.healthStatus)">{{ healthText(selectedService.healthStatus) }}</strong></div>
+          <div><span>最近检查</span><strong>{{ selectedService.healthCheckedAt }}</strong></div>
           <div><span>边缘节点</span><strong>{{ selectedService.nodeId || "-" }}</strong></div>
           <div><span>容器</span><strong>{{ shortContainerId(selectedService.containerId) }}</strong></div>
           <div><span>运行引擎</span><strong>{{ selectedService.engine || "等待部署" }}</strong></div>
@@ -181,6 +185,7 @@ type ServiceRecord = {
   containerId: string;
   engine: string;
   healthStatus: string;
+  healthCheckedAt: string;
   phase: string;
   logUri: string;
   errorCode: string;
@@ -192,6 +197,7 @@ const router = useRouter();
 const services = ref<ServiceRecord[]>([]);
 const keyword = ref("");
 const sortMode = ref("newest");
+const currentPage = ref(1);
 const pageSize = ref(20);
 const activeTab = ref<ServiceTab>("basic");
 const detailSubtab = ref<DetailSubtab>("example");
@@ -225,6 +231,11 @@ const filteredServices = computed(() => {
   );
 });
 
+const pagedServices = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value;
+  return filteredServices.value.slice(start, start + pageSize.value);
+});
+
 onMounted(() => {
   void loadServices();
   pollTimer = window.setInterval(pollActiveServices, 2500);
@@ -241,6 +252,11 @@ watch(
     detailSubtab.value = "example";
   },
 );
+
+watch([filteredServices, pageSize], () => {
+  const maxPage = Math.max(1, Math.ceil(filteredServices.value.length / pageSize.value));
+  if (currentPage.value > maxPage) currentPage.value = maxPage;
+});
 
 function openService(service: ServiceRecord, subtab: DetailSubtab = "example") {
   detailSubtab.value = subtab;
@@ -262,7 +278,7 @@ async function loadServices() {
 }
 
 async function pollActiveServices() {
-  const targets = services.value.filter((service) => isActive(service.status));
+  const targets = services.value.filter((service) => service.status === "running" || isActive(service.status));
   await Promise.all(
     targets.map(async (service) => {
       try {
@@ -365,7 +381,10 @@ function serviceFromApi(service: DeploymentServiceRecord): ServiceRecord {
     nodeId: service.node_id || "",
     containerId: service.container_id || "",
     engine: service.engine || "",
-    healthStatus: service.health_status || "pending",
+    healthStatus: service.health_status || (service.instance_id ? "pending" : "unmanaged"),
+    healthCheckedAt: service.health_checked_at
+      ? new Date(service.health_checked_at).toLocaleString("zh-CN", { hour12: false })
+      : "尚未检查",
     phase: service.phase || service.status,
     logUri: service.log_uri || "",
     errorCode: service.error_code || "",
@@ -374,7 +393,7 @@ function serviceFromApi(service: DeploymentServiceRecord): ServiceRecord {
 }
 
 function isActive(status: string) {
-  return ["queued", "deploying", "connecting", "probing", "preparing", "optimizing", "starting", "warming_up", "upgrade_queued", "stopping", "rollback_queued"].includes(status);
+  return ["queued", "deploying", "connecting", "probing", "preparing", "optimizing", "starting", "warming_up", "reconciliation_retry", "upgrade_queued", "stopping", "rollback_queued"].includes(status);
 }
 
 function canStop(status: string) {
@@ -385,7 +404,7 @@ function statusText(status: string) {
   const labels: Record<string, string> = {
     queued: "部署排队中", deploying: "部署中", connecting: "连接中", probing: "环境探测中",
     preparing: "准备资源中", optimizing: "模型优化中", starting: "启动中", warming_up: "预热中",
-    running: "运行中", stopping: "停止排队中", stopped: "已停止", rollback_queued: "回滚排队中",
+    running: "运行中", reconciliation_retry: "健康检查重试中", stopping: "停止排队中", stopped: "已停止", rollback_queued: "回滚排队中",
     upgrade_queued: "升级排队中", failed: "运行失败",
   };
   return labels[status] || status || "未知";
@@ -396,7 +415,7 @@ function phaseText(phase: string) {
 }
 
 function healthText(health: string) {
-  const labels: Record<string, string> = { pending: "等待检查", starting: "启动中", healthy: "健康", unhealthy: "异常", stopped: "已停止" };
+  const labels: Record<string, string> = { pending: "等待检查", unknown: "检查重试中", unmanaged: "无部署实例", starting: "启动中", healthy: "健康", unhealthy: "异常", stopped: "已停止" };
   return labels[health] || health || "未知";
 }
 
@@ -425,7 +444,8 @@ function errorMessage(error: unknown, fallback: string) {
 </script>
 
 <style scoped>
-.services-view { min-height: 100%; color: #111827; }
+.services-view { container: services / inline-size; min-width: 0; min-height: 100%; color: #111827; }
+.services-view.list-mode { display: flex; flex-direction: column; }
 .services-header, .detail-header, .card-heading, .detail-actions, .service-card footer, .back-link, .log-toolbar { display: flex; align-items: center; }
 .services-header, .detail-header, .log-toolbar { justify-content: space-between; }
 .services-header { margin-bottom: 32px; }
@@ -433,8 +453,8 @@ function errorMessage(error: unknown, fallback: string) {
 .services-tools, .detail-actions { display: flex; gap: 12px; }
 .sort-select { width: 130px; } .search-input { width: 280px; }
 .service-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
-.service-card { min-height: 190px; border: 1px solid #dfe5ef; border-radius: 4px; background: #fff; padding: 20px; cursor: pointer; }
-.service-card:hover { border-color: #1763ff; }
+.service-card { min-width: 0; min-height: 176px; border: 1px solid #dfe5ef; border-radius: 6px; background: #fff; padding: 18px; box-shadow: 0 1px 2px rgb(15 23 42 / 4%); cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+.service-card:hover { border-color: #7eb0ff; box-shadow: 0 10px 24px rgb(15 23 42 / 7%); transform: translateY(-1px); }
 .card-heading { justify-content: space-between; gap: 12px; }
 .service-card h2 { margin: 0; font-size: 16px; }
 .service-card time, .service-card p { color: #667085; font-size: 13px; }
@@ -453,9 +473,11 @@ button { font: inherit; }
 .delete-service :deep(svg) { width: 17px; }
 .text-action { color: #1763ff; } .text-action.warning { color: #d92d20; }
 .text-action:disabled { color: #b7c0ce; cursor: not-allowed; }
-.service-pagination { display: flex; justify-content: flex-end; align-items: center; gap: 14px; margin-top: 24px; }
-.service-pagination > button { border: 0; border-radius: 4px; background: #eef5ff; color: #1763ff; padding: 8px 12px; }
-.page-size { width: 112px; }
+.service-pagination { position: sticky; bottom: 0; z-index: 5; display: flex; flex: 0 0 auto; justify-content: flex-end; align-items: center; gap: 14px; margin-top: auto; padding: 20px 0 4px; background: #fff; }
+.service-pagination :deep(.el-pagination.is-background .el-pager li),
+.service-pagination :deep(.el-pagination.is-background .btn-prev),
+.service-pagination :deep(.el-pagination.is-background .btn-next) { background: #fff; color: #344054; }
+.service-pagination :deep(.el-pagination.is-background .el-pager li.is-active) { border: 1px solid #e6e9ef; background: #f5f7fa; color: #5b9cf6; font-weight: 500; }
 .back-link { gap: 6px; margin-bottom: 28px; color: #344054; }
 .back-link :deep(svg) { width: 16px; }
 .detail-header { margin-bottom: 28px; }
@@ -486,6 +508,19 @@ button { font: inherit; }
 .code-panel, .log-panel pre { margin: 0; padding: 28px; color: #344054; font-family: Consolas, monospace; line-height: 1.65; white-space: pre-wrap; }
 .log-toolbar { border-bottom: 1px solid #dfe5ef; padding: 12px 18px; }
 .log-toolbar button { border: 0; background: transparent; color: #1763ff; cursor: pointer; }
-@media (max-width: 1300px) { .service-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 900px) { .service-grid, .metric-grid { grid-template-columns: 1fr; } .phase-track { overflow-x: auto; grid-template-columns: repeat(8, 90px); } }
+@container services (max-width: 1240px) { .service-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@container services (max-width: 860px) {
+  .services-header { align-items: flex-start; flex-direction: column; gap: 14px; margin-bottom: 22px; }
+  .services-tools { width: 100%; }
+  .search-input { flex: 1; width: auto; }
+  .service-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .phase-track { overflow-x: auto; grid-template-columns: repeat(8, 90px); }
+}
+@container services (max-width: 520px) {
+  .services-tools, .detail-header, .detail-actions { align-items: stretch; flex-direction: column; }
+  .sort-select, .search-input { width: 100%; }
+  .service-grid, .metric-grid { grid-template-columns: 1fr; }
+  .detail-tabs { gap: 20px; overflow-x: auto; }
+}
 </style>

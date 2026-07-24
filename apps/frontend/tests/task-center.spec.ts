@@ -2,6 +2,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useTaskCenterStore } from "@/stores/taskCenter";
+import taskViewSource from "@/views/tasks/TasksView.vue?raw";
 
 function task(id: string, status: string) {
   return {
@@ -64,5 +65,33 @@ describe("task center store", () => {
       expect.objectContaining({ method: "POST" }),
     );
     expect(store.items[0].status).toBe("CANCELLED");
+  });
+
+  it("keeps long task errors on one line and exposes details in a tooltip", () => {
+    expect(taskViewSource).toContain('class="task-error"');
+    expect(taskViewSource).toContain(":content=\"taskError(row)\"");
+    expect(taskViewSource).toContain("text-overflow: ellipsis");
+    expect(taskViewSource).toContain("white-space: nowrap");
+    expect(taskViewSource).toContain('class="task-table-scroll"');
+    expect(taskViewSource).toContain("min-width: 1210px");
+  });
+
+  it("deletes a terminal training task and refreshes the list", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() => mockJsonResponse())
+      .mockImplementationOnce(() =>
+        mockJsonResponse({ items: [], total: 0, limit: 100, offset: 0 }),
+      );
+
+    const store = useTaskCenterStore();
+    await store.remove("task-1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/tasks/task-1",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(store.items).toEqual([]);
   });
 });

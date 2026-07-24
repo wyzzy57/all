@@ -207,6 +207,26 @@ class TrainingObservabilityService:
             tensorboard_available = False
             tensorboard_reason = str(exc)
 
+        if not any(series.values()):
+            try:
+                samples = self._progress_snapshot(job).get("metric_samples", [])
+                if isinstance(samples, list):
+                    for sample in samples:
+                        if not isinstance(sample, dict):
+                            continue
+                        step = sample.get("step")
+                        timestamp = sample.get("timestamp")
+                        if not isinstance(step, int | float) or not isinstance(timestamp, int | float):
+                            continue
+                        for name, value in sample.items():
+                            normalized = _normalize_metric_name(str(name))
+                            if normalized in series and isinstance(value, int | float):
+                                series[normalized].append(
+                                    {"step": float(step), "value": float(value), "timestamp": float(timestamp)}
+                                )
+            except ObservabilitySourceError:
+                pass
+
         limit = self._point_limit(max_points)
         for key, points in series.items():
             filtered = self._filter_points(points, start_step, end_step)
@@ -417,6 +437,10 @@ class TrainingObservabilityService:
     def _progress_snapshot(self, job: Any) -> dict[str, Any]:
         path = self._run_path(job) / "visiox-progress.json"
         if not path.is_file():
+            metrics = getattr(job, "metrics", {})
+            snapshot = metrics.get("observability_snapshot") if isinstance(metrics, dict) else None
+            if isinstance(snapshot, dict):
+                return snapshot
             raise ObservabilitySourceError("progress", "progress snapshot not found")
         try:
             import json

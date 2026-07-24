@@ -358,7 +358,7 @@ def _deployment_runtime(response: dict[str, object]):
             environment="node",
             instance_count=1,
             instance_name="pepper-prod-01",
-            status="warming_up",
+            status="running",
             endpoint="pending",
             config={},
         )
@@ -373,8 +373,8 @@ def _deployment_runtime(response: dict[str, object]):
             engine="engine",
             engine_digest="d" * 64,
             port=18080,
-            status="warming_up",
-            health_status="starting",
+            status="running",
+            health_status="healthy",
             rollback_metadata={},
         )
         execution = RemoteExecution(
@@ -488,6 +488,39 @@ def test_reconciler_persists_deterministic_failure_for_mismatched_deployment() -
         assert execution.phase == "reconciliation_failed"
         assert execution.error_code == "REMOTE_DEPLOYMENT_MISMATCH"
         assert execution.error_message == "Remote deployment state did not match"
+
+
+def test_reconciler_does_not_inspect_deployment_while_optimization_is_active() -> None:
+    reconciler, factory, ssh_client, _ = _deployment_runtime({"containers": []})
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        execution = session.get(RemoteExecution, "exec-deploy")
+        assert service is not None
+        assert instance is not None
+        assert execution is not None
+        service.status = "optimizing"
+        instance.status = "optimizing"
+        instance.health_status = "starting"
+        instance.container_id = None
+        instance.engine_digest = None
+        execution.status = "running"
+        execution.phase = "optimizing"
+        session.add_all([service, instance, execution])
+        session.commit()
+
+    assert reconciler.reconcile_deployments() == 0
+
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        execution = session.get(RemoteExecution, "exec-deploy")
+        assert service is not None and service.status == "optimizing"
+        assert instance is not None and instance.status == "optimizing"
+        assert instance.health_status == "starting"
+        assert execution is not None and execution.phase == "optimizing"
+        assert execution.error_code is None
+    assert ssh_client.connections == []
 
 
 def test_inspect_deployment_script_uses_stable_label_and_structured_commands() -> None:

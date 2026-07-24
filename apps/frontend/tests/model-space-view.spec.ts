@@ -7,6 +7,7 @@ import modelSpaceViewSource from "@/views/model-space/ModelSpaceView.vue?raw";
 const pushMock = vi.hoisted(() => vi.fn());
 const apiMock = vi.hoisted(() => ({
   listBaseModels: vi.fn(),
+  uploadBaseModel: vi.fn(),
   listTrainedModels: vi.fn(),
   listDatasets: vi.fn(),
   listPipelines: vi.fn(),
@@ -117,6 +118,13 @@ function mockDeployablePipeline() {
 }
 
 describe("ModelSpaceView", () => {
+  it("anchors the list pagination and styles its selected page", () => {
+    expect(modelSpaceViewSource).toContain("'list-mode': viewMode === 'list'");
+    expect(modelSpaceViewSource).toContain("position: sticky");
+    expect(modelSpaceViewSource).toContain("margin-top: auto");
+    expect(modelSpaceViewSource).toContain("li.is-active");
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     apiMock.listBaseModels.mockResolvedValue({
@@ -128,6 +136,8 @@ describe("ModelSpaceView", () => {
           task: "detect",
           scale: "n",
           status: "ready",
+          local_uri: "minio://models/base/yolo26-detect-n/yolo26n.pt",
+          checksum: "c".repeat(64),
           created_at: "2026-07-06T00:00:00Z",
         },
       ],
@@ -144,6 +154,16 @@ describe("ModelSpaceView", () => {
           class_schema: { names: ["a", "b"] },
         },
       ],
+    });
+    apiMock.uploadBaseModel.mockResolvedValue({
+      id: "custom-model-1",
+      family: "custom-custom-model-1",
+      filename: "custom.pt",
+      task: "detect",
+      scale: "n",
+      status: "ready",
+      local_uri: "memory://models/custom/custom-model-1/custom.pt",
+      checksum: "d".repeat(64),
     });
     apiMock.listTrainedModels.mockResolvedValue({ items: [] });
     apiMock.listPipelines.mockResolvedValue({
@@ -365,6 +385,28 @@ describe("ModelSpaceView", () => {
     expect(wrapper.text()).toContain("提交训练");
   });
 
+  it("uploads a local pt model and binds it to the draft pipeline", async () => {
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
+    await wrapper.get('[data-testid="create-pipeline"]').trigger("click");
+    await wrapper.findAll("button").find((button) => button.text() === "本地模型")?.trigger("click");
+    const file = new File([new Uint8Array(2048)], "custom.pt", { type: "application/octet-stream" });
+    const input = wrapper.get('[data-testid="local-model-file"]');
+    Object.defineProperty(input.element, "files", { value: [file], configurable: true });
+    await input.trigger("change");
+    await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.uploadBaseModel).toHaveBeenCalledWith(file, { task: "detect", scale: "n" });
+    expect(apiMock.createPipeline).toHaveBeenCalledWith({
+      name: "新建产线",
+      task: "detect",
+      scale: "n",
+      base_model_id: "custom-model-1",
+    });
+    expect(wrapper.text()).toContain("选择产线");
+  });
+
   it("reuses dataset processing visualization tabs in the training wizard", async () => {
     const wrapper = mountView();
 
@@ -416,6 +458,88 @@ describe("ModelSpaceView", () => {
     await wrapper.findAll("button").find((button) => button.text() === "下一步")?.trigger("click");
     await flushPromises();
     await vi.waitFor(() => expect(apiMock.analyzeDataset).toHaveBeenCalledWith("dataset-1"));
+  });
+
+  it("selects a real online GPU node and submits the distributed training contract", async () => {
+    apiMock.listNodes.mockResolvedValueOnce({
+      items: [
+        {
+          id: "node-rtx3060",
+          name: "edge-10-10-13-20",
+          resource_pool_id: "pool-x86",
+          status: "online",
+          architecture: "x86_64",
+          platform_kind: "x86_nvidia",
+          capabilities: { nvidia_gpu: true, gpu_models: ["NVIDIA GeForce RTX 3060"] },
+          resources: { gpu_count: 1, gpu_memory_total_mib: 12288 },
+          fingerprint: {
+            inventory_snapshot: {
+              gpus: [
+                {
+                  name: "NVIDIA GeForce RTX 3060",
+                  uuid: "GPU-rtx3060",
+                  memory_total_mib: 12288,
+                },
+              ],
+            },
+          },
+          agent_version: "ssh-bootstrap",
+        },
+      ],
+      total: 1,
+    });
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
+    await flushPromises();
+
+    await wrapper.get('[data-testid="pipeline-card-pipeline-1"]').trigger("click");
+    await wrapper.findAll(".wizard-steps button")[3].trigger("click");
+    await vi.waitFor(() => expect(apiMock.listNodes).toHaveBeenCalledTimes(1));
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("远程 GPU");
+    expect(wrapper.text()).toContain("edge-10-10-13-20");
+    expect(wrapper.text()).toContain("NVIDIA GeForce RTX 3060");
+    expect(wrapper.text()).toContain("12288 MiB");
+    expect(wrapper.get('[data-testid="training-node-node-rtx3060"]').classes()).toContain("selected");
+
+    await wrapper.get('[data-testid="training-image-digest"]').setValue(
+      `registry.local/visiox/yolo26-training@sha256:${"a".repeat(64)}`,
+    );
+    await wrapper.findAll("button").find((button) => button.text() === "提交训练")?.trigger("click");
+    await flushPromises();
+
+    expect(apiMock.updatePipeline).toHaveBeenCalledWith(
+      "pipeline-1",
+      expect.objectContaining({ default_environment: { device: "0", workers: 2 } }),
+    );
+    expect(apiMock.createTrainingJob).toHaveBeenCalledWith("pipeline-1", {
+      environment: { device: "0", workers: 2 },
+      distributed: {
+        resource_pool_id: "pool-x86",
+        requested_gpus: 1,
+        node_ids: ["node-rtx3060"],
+        training_image_digest: `registry.local/visiox/yolo26-training@sha256:${"a".repeat(64)}`,
+      },
+    });
+  });
+
+  it("keeps local CPU training free of distributed node settings", async () => {
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
+    await flushPromises();
+
+    await wrapper.get('[data-testid="pipeline-card-pipeline-1"]').trigger("click");
+    await wrapper.findAll(".wizard-steps button")[3].trigger("click");
+    await wrapper.get('[data-testid="training-target-local"]').trigger("click");
+    await wrapper.findAll("button").find((button) => button.text() === "提交训练")?.trigger("click");
+    await flushPromises();
+
+    expect(apiMock.updatePipeline).toHaveBeenCalledWith(
+      "pipeline-1",
+      expect.objectContaining({ default_environment: { device: "cpu", workers: 2 } }),
+    );
+    expect(apiMock.createTrainingJob).toHaveBeenCalledWith("pipeline-1", {});
   });
 
   it("shows saved pipeline evaluation history with ultralytics metrics", async () => {
@@ -630,14 +754,57 @@ describe("ModelSpaceView", () => {
       expect.objectContaining({
         trained_model_id: "model-best",
         node_id: "node-a",
-        image_digest: `sha256:${"b".repeat(64)}`,
-        model_checksum: "a".repeat(64),
         format: "auto",
         precision: "auto",
         input_shape: [1, 3, 640, 640],
         gpu_uuids: ["GPU-a"],
       }),
     );
+    const request = apiMock.createService.mock.calls[0][0];
+    expect(request).not.toHaveProperty("image_digest");
+    expect(request).not.toHaveProperty("model_checksum");
+  });
+
+  it("selects an official pretrained weight without user-supplied digests", async () => {
+    mockDeployablePipeline();
+    apiMock.listTrainedModels.mockResolvedValueOnce({
+      items: [
+        {
+          id: "model-best",
+          pipeline_id: "pipeline-1",
+          training_job_id: "job-1",
+          name: "best.pt",
+          version: "best.pt",
+          task: "detect",
+          artifact_uri: "minio://models/best.pt",
+          metrics: { checksum: "a".repeat(64) },
+          status: "ready",
+        },
+      ],
+    });
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="pipeline-card-pipeline-1"]').trigger("click");
+    await wrapper.get('[data-testid="detail-tab-deploy"]').trigger("click");
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("本产线模型权重");
+    expect(wrapper.text()).toContain("官方预训练权重");
+    expect(wrapper.text()).not.toContain("镜像摘要：");
+    expect(wrapper.text()).not.toContain("模型校验和：");
+
+    await wrapper.get('[data-testid="deployment-weight-official"]').trigger("click");
+    await wrapper.findAll("button").find((button) => button.text().includes("开始部署"))!.trigger("click");
+    await flushPromises();
+
+    expect(apiMock.createService).toHaveBeenCalledWith(
+      expect.objectContaining({
+        base_model_id: "base-1",
+        model_name: "yolo26n.pt",
+        model_weight: "yolo26n.pt",
+      }),
+    );
+    expect(apiMock.createService.mock.calls[0][0]).not.toHaveProperty("trained_model_id");
   });
 
   it("reveals manual optimization controls", async () => {

@@ -45,6 +45,7 @@ RETRY_INITIAL_SECONDS = 0.25
 RETRY_MAX_SECONDS = 4.0
 BLOCKING_WORKERS = 4
 SHUTDOWN_GRACE_SECONDS = 5.0
+RECONCILIATION_INTERVAL_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -68,7 +69,9 @@ class BlockingWorkPool:
         self._closed = threading.Event()
         self._inflight: set[asyncio.Future[Any]] = set()
 
-    async def run(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    async def run(
+        self, function: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Any:
         if not self._accepting.is_set():
             raise RuntimeError("blocking work pool is not accepting work")
         await self._slots.acquire()
@@ -202,7 +205,9 @@ class ExecutionRepository(Protocol):
         reclaim_running: bool = False,
     ) -> RemoteExecution | None: ...
 
-    def finalize(self, execution_id: str, result: ExecutionResult) -> RemoteExecution: ...
+    def finalize(
+        self, execution_id: str, result: ExecutionResult
+    ) -> RemoteExecution: ...
 
 
 @dataclass(frozen=True)
@@ -344,7 +349,9 @@ class EdgeExecutorQueue:
                 reclaim_running=reclaimed,
             )
         except Exception:
-            LOGGER.error("edge command remains pending after dispatch failure; details were suppressed")
+            LOGGER.error(
+                "edge command remains pending after dispatch failure; details were suppressed"
+            )
             return False
         if not outcome.durable_terminal:
             return False
@@ -420,6 +427,7 @@ class EdgeExecutorApplication:
     sleep: Callable[[float], Any] = asyncio.sleep
     blocking_pool: BlockingWorkPool = field(default_factory=BlockingWorkPool)
     shutdown_grace_seconds: float = SHUTDOWN_GRACE_SECONDS
+    reconciliation_interval_seconds: float = RECONCILIATION_INTERVAL_SECONDS
     _shutdown_requested: threading.Event = field(
         default_factory=threading.Event,
         init=False,
@@ -450,7 +458,8 @@ class EdgeExecutorApplication:
                 asyncio.to_thread(self.bootstrap_server.serve_forever)
             )
             queue_task = asyncio.create_task(self.queue.run_forever(group_ready=True))
-            tasks.update((server_task, queue_task))
+            reconciliation_loop_task = asyncio.create_task(self._reconcile_forever())
+            tasks.update((server_task, queue_task, reconciliation_loop_task))
             done, _ = await asyncio.wait(
                 tasks | {shutdown_task},
                 return_when=asyncio.FIRST_COMPLETED,
@@ -515,9 +524,35 @@ class EdgeExecutorApplication:
             except Exception:
                 if attempt == RETRY_ATTEMPTS - 1:
                     raise
-                LOGGER.error("database reconciliation is not ready; details were suppressed")
+                LOGGER.error(
+                    "database reconciliation is not ready; details were suppressed"
+                )
                 await self.sleep(delay)
                 delay = min(delay * 2, RETRY_MAX_SECONDS)
+
+    async def _reconcile_forever(self) -> None:
+        while not self.is_shutdown_requested():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=self.reconciliation_interval_seconds,
+                )
+                return
+            except TimeoutError:
+                pass
+            try:
+                await self.blocking_pool.run(
+                    self.reconciler.reconcile_deployments,
+                    stop_requested=self.is_shutdown_requested,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if self.is_shutdown_requested():
+                    return
+                LOGGER.error(
+                    "periodic runtime reconciliation failed; details were suppressed"
+                )
 
 
 def build_application(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import time
 from collections.abc import Callable, Mapping
@@ -23,6 +24,7 @@ from visiox_db.models import (
     TrainingPipeline,
     TrainedModel,
 )
+from visiox_common.settings import get_settings
 from visiox_storage.client import ObjectStorageClient
 from visiox_yolo26.converters import export_yolo26_dataset
 from visiox_yolo26.training.commands import build_train_command
@@ -33,6 +35,26 @@ from .state import ExecutionResult
 
 
 _PRESIGNED_URL_TTL = timedelta(minutes=30)
+_VISUALIZATION_ARTIFACTS = (
+    "results.csv",
+    "results.png",
+    "confusion_matrix.png",
+    "confusion_matrix_normalized.png",
+    "BoxPR_curve.png",
+    "BoxP_curve.png",
+    "BoxR_curve.png",
+    "BoxF1_curve.png",
+    "labels.jpg",
+    "train_batch0.jpg",
+    "train_batch1.jpg",
+    "train_batch2.jpg",
+    "val_batch0_labels.jpg",
+    "val_batch0_pred.jpg",
+    "val_batch1_labels.jpg",
+    "val_batch1_pred.jpg",
+    "val_batch2_labels.jpg",
+    "val_batch2_pred.jpg",
+)
 
 
 class _Rank(BaseModel):
@@ -122,6 +144,8 @@ class DistributedTrainingHandler:
     def execute(self, execution: RemoteExecution) -> ExecutionResult:
         launched: list[tuple[str, int]] = []
         try:
+            if self._converge_existing_success(execution.id):
+                return ExecutionResult.succeeded(phase="succeeded")
             context = self._load(execution)
             run, job, task, pipeline, base_model, dataset = context
             ranks = tuple(_Rank.model_validate(item) for item in run.ranks)
@@ -156,9 +180,11 @@ class DistributedTrainingHandler:
             self._mark_training(execution.id)
             containers = tuple(
                 (rank, container_id)
-                for rank, container_id in zip(ranks, self._container_ids(run.id), strict=True)
+                for rank, container_id in zip(
+                    ranks, self._container_ids(run.id), strict=True
+                )
             )
-            if not self._wait_for_completion(execution.id, containers):
+            if not self._wait_for_completion(execution.id, containers, staged):
                 if self._cancel_requested(execution.id):
                     return ExecutionResult.succeeded(phase="canceled")
                 self._stop_peers(execution, launched)
@@ -169,7 +195,9 @@ class DistributedTrainingHandler:
                     error_message="Distributed edge training failed",
                     phase="failed",
                 )
-            collected = self._collect_rank_zero(run, job, ranks[0], staged[ranks[0].node_id])
+            collected = self._collect_rank_zero(
+                run, job, ranks[0], staged[ranks[0].node_id]
+            )
             self._mark_succeeded(execution.id, collected)
             return ExecutionResult.succeeded(phase="succeeded")
         except Exception:
@@ -181,16 +209,71 @@ class DistributedTrainingHandler:
                 phase="failed",
             )
 
+    def _converge_existing_success(self, execution_id: str) -> bool:
+        """Make duplicate delivery idempotent after artifacts were committed."""
+        with self._session_factory() as session:
+            execution = session.get(RemoteExecution, execution_id)
+            run = session.get(
+                DistributedTrainingRun, execution.resource_id if execution else None
+            )
+            job = session.get(
+                TrainingJob, execution.training_job_id if execution else None
+            )
+            task = session.get(Task, execution.task_id if execution else None)
+            pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
+            metrics = (
+                job.metrics if job is not None and isinstance(job.metrics, dict) else {}
+            )
+            weights = metrics.get("weights") if isinstance(metrics, dict) else None
+            completed = bool(
+                execution
+                and run
+                and job
+                and task
+                and pipeline
+                and job.finished_at
+                and job.trained_model_id
+                and isinstance(weights, dict)
+                and {"best.pt", "last.pt"}.issubset(weights)
+            )
+            if not completed:
+                return False
+            assert execution is not None and run is not None and job is not None
+            assert task is not None and pipeline is not None
+            finished_at = job.finished_at or datetime.now(UTC)
+            job.status = "success"
+            run.status = "succeeded"
+            run.finished_at = run.finished_at or finished_at
+            task.status = "SUCCESS"
+            task.stage = "completed"
+            task.progress = 100
+            task.error_code = None
+            task.error_message = None
+            task.finished_at = task.finished_at or finished_at
+            pipeline.status = "success"
+            execution.phase = "succeeded"
+            execution.error_code = None
+            execution.error_message = None
+            session.add_all([execution, run, job, task, pipeline])
+            session.commit()
+            return True
+
     def _load(self, execution: RemoteExecution):
         with self._session_factory() as session:
             current = session.get(RemoteExecution, execution.id)
-            if current is None or current.status != "running" or current.resource_id is None:
+            if (
+                current is None
+                or current.status != "running"
+                or current.resource_id is None
+            ):
                 raise ValueError("distributed execution is not runnable")
             run = session.get(DistributedTrainingRun, current.resource_id)
             job = session.get(TrainingJob, current.training_job_id)
             task = session.get(Task, current.task_id)
             pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
-            base_model = session.get(StoredBaseModel, pipeline.base_model_id if pipeline else None)
+            base_model = session.get(
+                StoredBaseModel, pipeline.base_model_id if pipeline else None
+            )
             dataset = session.get(Dataset, pipeline.dataset_id if pipeline else None)
             if not all((run, job, task, pipeline, base_model, dataset)):
                 raise ValueError("distributed training resources are incomplete")
@@ -204,7 +287,9 @@ class DistributedTrainingHandler:
         dataset: Dataset,
     ) -> list[dict[str, str]]:
         checksum = (base_model.checksum or "").lower()
-        if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+        if len(checksum) != 64 or any(
+            char not in "0123456789abcdef" for char in checksum
+        ):
             raise ValueError("base model checksum is unavailable")
         if not base_model.local_uri:
             raise ValueError("base model artifact is unavailable")
@@ -215,7 +300,9 @@ class DistributedTrainingHandler:
                 export_yolo26_dataset(session, self._storage, dataset.id, dataset_dir)
             _ensure_split_directories(dataset_dir)
             _set_container_dataset_root(dataset_dir)
-            archive = Path(shutil.make_archive(str(root / "dataset"), "gztar", dataset_dir))
+            archive = Path(
+                shutil.make_archive(str(root / "dataset"), "gztar", dataset_dir)
+            )
             dataset_checksum = _sha256(archive)
             dataset_uri = self._storage.put_file(
                 "training",
@@ -226,13 +313,17 @@ class DistributedTrainingHandler:
         artifacts = [
             {
                 "name": "model",
-                "download_url": self._storage.presigned_get_url(base_model.local_uri, expires=_PRESIGNED_URL_TTL),
+                "download_url": self._storage.presigned_get_url(
+                    base_model.local_uri, expires=_PRESIGNED_URL_TTL
+                ),
                 "checksum": checksum,
                 "filename": "base.pt",
             },
             {
                 "name": "dataset",
-                "download_url": self._storage.presigned_get_url(dataset_uri, expires=_PRESIGNED_URL_TTL),
+                "download_url": self._storage.presigned_get_url(
+                    dataset_uri, expires=_PRESIGNED_URL_TTL
+                ),
                 "checksum": dataset_checksum,
                 "filename": "dataset.tar.gz",
             },
@@ -241,7 +332,9 @@ class DistributedTrainingHandler:
             artifacts.append(
                 {
                     "name": "checkpoint",
-                    "download_url": self._storage.presigned_get_url(run.checkpoint_uri, expires=_PRESIGNED_URL_TTL),
+                    "download_url": self._storage.presigned_get_url(
+                        run.checkpoint_uri, expires=_PRESIGNED_URL_TTL
+                    ),
                     "checksum": run.checkpoint_checksum,
                     "filename": "last.pt",
                 }
@@ -251,8 +344,12 @@ class DistributedTrainingHandler:
     def _transition(self, execution_id: str, phase: str, progress: int) -> None:
         with self._session_factory() as session:
             execution = session.get(RemoteExecution, execution_id)
-            run = session.get(DistributedTrainingRun, execution.resource_id if execution else None)
-            job = session.get(TrainingJob, execution.training_job_id if execution else None)
+            run = session.get(
+                DistributedTrainingRun, execution.resource_id if execution else None
+            )
+            job = session.get(
+                TrainingJob, execution.training_job_id if execution else None
+            )
             task = session.get(Task, execution.task_id if execution else None)
             if not all((execution, run, job, task)):
                 raise ValueError("distributed training state is incomplete")
@@ -292,10 +389,13 @@ class DistributedTrainingHandler:
         self,
         execution_id: str,
         containers: tuple[tuple[_Rank, str], ...],
+        staged: dict[str, _StageResult],
     ) -> bool:
         while True:
             if self._cancel_requested(execution_id):
                 return False
+            rank_zero = containers[0][0]
+            self._sync_observability(execution_id, rank_zero, staged[rank_zero.node_id])
             completed = 0
             for rank, container_id in containers:
                 target = self._launch._load_target(rank.node_id)
@@ -314,10 +414,95 @@ class DistributedTrainingHandler:
                 return True
             time.sleep(5)
 
+    def _sync_observability(
+        self,
+        execution_id: str,
+        rank: _Rank,
+        staged: _StageResult,
+    ) -> None:
+        try:
+            with self._session_factory() as session:
+                execution = session.get(RemoteExecution, execution_id)
+                job = session.get(
+                    TrainingJob, execution.training_job_id if execution else None
+                )
+                if job is None:
+                    return
+                job_id = job.id
+            object_names = {
+                "visiox-progress.json": f"jobs/{job_id}/observability/visiox-progress.json",
+                "events.out.tfevents.remote": f"jobs/{job_id}/observability/events.out.tfevents.remote",
+            }
+            uploads = {
+                name: self._storage.presigned_put_url(
+                    f"minio://training/{object_name}",
+                    expires=_PRESIGNED_URL_TTL,
+                )
+                for name, object_name in object_names.items()
+            }
+            target = self._launch._load_target(rank.node_id)
+            result = _CollectResult.model_validate(
+                self._launch._run_script(
+                    target,
+                    {
+                        "action": "collect",
+                        "output_path": staged.paths["output"],
+                        "uploads": uploads,
+                    },
+                )
+            )
+            run_path = get_settings().training_runs_root / "runs" / f"job-{job_id}"
+            run_path.mkdir(parents=True, exist_ok=True)
+            for name, object_name in object_names.items():
+                if name not in result.artifacts:
+                    continue
+                destination = run_path / name
+                self._storage.get_file("training", object_name, destination)
+            progress_path = run_path / "visiox-progress.json"
+            if progress_path.is_file():
+                snapshot = json.loads(progress_path.read_text(encoding="utf-8"))
+                self._persist_observability_snapshot(execution_id, snapshot)
+        except Exception:
+            return
+
+    def _persist_observability_snapshot(self, execution_id: str, snapshot: Any) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        with self._session_factory() as session:
+            execution = session.get(RemoteExecution, execution_id)
+            job = session.get(
+                TrainingJob, execution.training_job_id if execution else None
+            )
+            task = session.get(Task, execution.task_id if execution else None)
+            if job is None or task is None:
+                return
+            progress = (
+                snapshot.get("progress")
+                if isinstance(snapshot.get("progress"), dict)
+                else {}
+            )
+            percent = progress.get("percent")
+            if isinstance(percent, int | float):
+                task.progress = max(
+                    task.progress, min(90, 65 + int(float(percent) * 0.25))
+                )
+            job.metrics = {
+                **(job.metrics or {}),
+                "observability": {
+                    "mlflow_run_name": f"job-{job.id}",
+                    "tensorboard_run_name": f"job-{job.id}",
+                },
+                "observability_snapshot": snapshot,
+            }
+            session.add_all([job, task])
+            session.commit()
+
     def _cancel_requested(self, execution_id: str) -> bool:
         with self._session_factory() as session:
             execution = session.get(RemoteExecution, execution_id)
-            run = session.get(DistributedTrainingRun, execution.resource_id if execution else None)
+            run = session.get(
+                DistributedTrainingRun, execution.resource_id if execution else None
+            )
             return run is None or run.status in {"stopping", "canceled"}
 
     def _collect_rank_zero(
@@ -330,9 +515,15 @@ class DistributedTrainingHandler:
         uris = {
             "best.pt": f"minio://models/trained/{job.id}/best.pt",
             "last.pt": f"minio://models/trained/{job.id}/last.pt",
-            "results.csv": f"minio://training/jobs/{job.id}/results.csv",
-            "results.png": f"minio://training/jobs/{job.id}/results.png",
+            "visiox-progress.json": f"minio://training/jobs/{job.id}/observability/visiox-progress.json",
+            "events.out.tfevents.remote": f"minio://training/jobs/{job.id}/observability/events.out.tfevents.remote",
         }
+        uris.update(
+            {
+                name: f"minio://training/jobs/{job.id}/visualizations/{name}"
+                for name in _VISUALIZATION_ARTIFACTS
+            }
+        )
         uploads = {
             name: self._storage.presigned_put_url(uri, expires=_PRESIGNED_URL_TTL)
             for name, uri in uris.items()
@@ -393,8 +584,12 @@ class DistributedTrainingHandler:
         now = datetime.now(UTC)
         with self._session_factory() as session:
             execution = session.get(RemoteExecution, execution_id)
-            run = session.get(DistributedTrainingRun, execution.resource_id if execution else None)
-            job = session.get(TrainingJob, execution.training_job_id if execution else None)
+            run = session.get(
+                DistributedTrainingRun, execution.resource_id if execution else None
+            )
+            job = session.get(
+                TrainingJob, execution.training_job_id if execution else None
+            )
             task = session.get(Task, execution.task_id if execution else None)
             pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
             if not all((execution, run, job, task, pipeline)):
@@ -404,8 +599,8 @@ class DistributedTrainingHandler:
                 for name in ("best.pt", "last.pt")
             }
             visualizations = {
-                name: f"minio://training/jobs/{job.id}/{name}"
-                for name in ("results.csv", "results.png")
+                name: f"minio://training/jobs/{job.id}/visualizations/{name}"
+                for name in _VISUALIZATION_ARTIFACTS
                 if name in collected.artifacts
             }
             best = TrainedModel(
@@ -432,7 +627,11 @@ class DistributedTrainingHandler:
             session.flush()
             job.trained_model_id = best.id
             job.status = "success"
-            job.metrics = {**(job.metrics or {}), "weights": weights, "visualizations": visualizations}
+            job.metrics = {
+                **(job.metrics or {}),
+                "weights": weights,
+                "visualizations": visualizations,
+            }
             job.finished_at = now
             run.status = "succeeded"
             run.finished_at = now
@@ -445,7 +644,9 @@ class DistributedTrainingHandler:
             session.add_all([execution, run, job, task, pipeline])
             session.commit()
 
-    def _stop_peers(self, execution: RemoteExecution, launched: list[tuple[str, int]]) -> None:
+    def _stop_peers(
+        self, execution: RemoteExecution, launched: list[tuple[str, int]]
+    ) -> None:
         with self._session_factory() as session:
             run = session.get(DistributedTrainingRun, execution.resource_id)
             if run is None:
@@ -468,6 +669,7 @@ class DistributedTrainingHandler:
             run = session.get(DistributedTrainingRun, execution.resource_id)
             job = session.get(TrainingJob, execution.training_job_id)
             task = session.get(Task, execution.task_id)
+            pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
             execution.phase = "failed"
             execution.error_code = "EDGE_TRAIN_FAILED"
             execution.error_message = "Distributed edge training failed"
@@ -483,6 +685,8 @@ class DistributedTrainingHandler:
                 task.error_code = "EDGE_TRAIN_FAILED"
                 task.error_message = "Distributed edge training failed"
                 task.finished_at = now
+            if pipeline:
+                pipeline.status = "failed"
             session.commit()
 
 
@@ -491,7 +695,9 @@ class StopDistributedTrainingHandler(DistributedTrainingHandler):
         try:
             with self._session_factory() as session:
                 current = session.get(RemoteExecution, execution.id)
-                run = session.get(DistributedTrainingRun, current.resource_id if current else None)
+                run = session.get(
+                    DistributedTrainingRun, current.resource_id if current else None
+                )
                 if current is None or run is None:
                     raise ValueError("distributed run was not found")
                 nodes = tuple(run.node_ids)
@@ -500,7 +706,9 @@ class StopDistributedTrainingHandler(DistributedTrainingHandler):
             for node_id in nodes:
                 target = self._stop._load_target(node_id)
                 _StopResult.model_validate(
-                    self._stop._run_script(target, {"run_id": run_id, "attempt": attempt})
+                    self._stop._run_script(
+                        target, {"run_id": run_id, "attempt": attempt}
+                    )
                 )
             rank_zero = _Rank.model_validate(run.ranks[0])
             self._try_collect_checkpoint(
@@ -516,9 +724,16 @@ class StopDistributedTrainingHandler(DistributedTrainingHandler):
             now = datetime.now(UTC)
             with self._session_factory() as session:
                 current = session.get(RemoteExecution, execution.id)
-                run = session.get(DistributedTrainingRun, current.resource_id if current else None)
-                job = session.get(TrainingJob, current.training_job_id if current else None)
+                run = session.get(
+                    DistributedTrainingRun, current.resource_id if current else None
+                )
+                job = session.get(
+                    TrainingJob, current.training_job_id if current else None
+                )
                 task = session.get(Task, current.task_id if current else None)
+                pipeline = session.get(
+                    TrainingPipeline, job.pipeline_id if job else None
+                )
                 if run:
                     run.status = "canceled"
                     run.finished_at = now
@@ -529,6 +744,8 @@ class StopDistributedTrainingHandler(DistributedTrainingHandler):
                     task.status = "CANCELED"
                     task.stage = "canceled"
                     task.finished_at = now
+                if pipeline:
+                    pipeline.status = "canceled"
                 session.commit()
             return ExecutionResult.succeeded(phase="canceled")
         except Exception:
@@ -546,8 +763,12 @@ def build_distributed_handlers(
 ) -> dict[str, DistributedTrainingHandler]:
     return {
         "train": DistributedTrainingHandler(session_factory, security, storage),
-        "resume_training": DistributedTrainingHandler(session_factory, security, storage),
-        "stop_training": StopDistributedTrainingHandler(session_factory, security, storage),
+        "resume_training": DistributedTrainingHandler(
+            session_factory, security, storage
+        ),
+        "stop_training": StopDistributedTrainingHandler(
+            session_factory, security, storage
+        ),
     }
 
 
@@ -604,7 +825,14 @@ def _launch_request(
 
 
 def _ensure_split_directories(root: Path) -> None:
-    for relative in ("images/train", "images/val", "images/test", "labels/train", "labels/val", "labels/test"):
+    for relative in (
+        "images/train",
+        "images/val",
+        "images/test",
+        "labels/train",
+        "labels/val",
+        "labels/test",
+    ):
         (root / relative).mkdir(parents=True, exist_ok=True)
 
 

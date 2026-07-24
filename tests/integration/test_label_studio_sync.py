@@ -302,7 +302,7 @@ def test_label_project_response_uses_public_url_when_configured(
         response = test_client.post(f"/datasets/{dataset_id}/label-projects")
 
     assert response.status_code == 201
-    assert response.json()["project_url"] == "http://127.0.0.1:8080/projects/9001/data"
+    assert response.json()["project_url"] == "http://127.0.0.1:8080/visiox-auth?next=/projects/9001/data"
 
 
 def test_link_existing_label_project_rejects_unsafe_external_project_id(
@@ -653,6 +653,49 @@ def test_worker_imports_annotations_and_writes_raw_payload_to_storage(session_fa
     assert sample.annotation_status == "labeled"
     assert task.status == TaskStatus.SUCCESS.value
     assert len(storage.objects) == 1
+
+
+def test_worker_does_not_treat_unannotated_label_studio_tasks_as_annotations(session_factory):
+    dataset_id, sample_id = create_dataset_with_sample(session_factory)
+    storage = InMemoryObjectStorageClient()
+    label_client = FakeLabelStudioClient()
+    label_client.export_payload = [
+        {
+            "id": 101,
+            "data": {"visiox_sample_id": sample_id},
+            "annotations": [{"id": 1, "result": []}],
+        }
+    ]
+    with session_factory() as session:
+        project = LabelProject(
+            dataset_id=dataset_id,
+            provider="label_studio",
+            external_project_id="9001",
+            sync_status="synced",
+        )
+        task = Task(
+            task_type=TaskType.IMPORT_LABEL_STUDIO_ANNOTATION.value,
+            status=TaskStatus.QUEUED.value,
+            resource_type="label_project",
+            payload={},
+        )
+        session.add_all([project, task])
+        session.commit()
+        project_id = project.id
+        task_id = task.id
+        task.payload = {"label_project_id": project_id}
+        session.add(task)
+        session.commit()
+
+    with session_factory() as session:
+        import_label_project_annotations(session, storage, label_client, task_id, project_id)
+
+    with session_factory() as session:
+        assert session.scalar(select(Annotation).where(Annotation.dataset_sample_id == sample_id)) is None
+        assert session.get(Dataset, dataset_id).annotation_count == 0
+        assert session.get(DatasetSample, sample_id).annotation_status == "pending"
+        assert session.get(Task, task_id).status == TaskStatus.SUCCESS.value
+    assert storage.objects == {}
 
 
 def test_worker_cleans_raw_payload_when_later_annotation_import_fails(session_factory):

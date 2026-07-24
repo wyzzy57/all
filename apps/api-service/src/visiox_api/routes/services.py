@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import Generator
 from datetime import UTC, datetime
+from io import BytesIO
 import inspect
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
+import httpx
 from fastapi import (
     APIRouter,
     Depends,
@@ -23,15 +27,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from visiox_api.routes.pipeline_inference import (
-    PipelinePredictor,
     PipelinePredictResponse,
     get_pipeline_inference_storage,
-    get_pipeline_predictor,
-    predict_pipeline_image,
 )
 from visiox_common.tasks import TaskStatus, TaskType
+from visiox_common.settings import get_settings
 from visiox_db.base import new_id
 from visiox_db.models import (
+    BaseModel as BaseModelRecord,
     ComputeNode,
     DeploymentInstance,
     DeploymentService,
@@ -54,6 +57,7 @@ from visiox_edge_executor_worker.inventory import (
 )
 from visiox_messaging.streams import RedisStreamProducer
 from visiox_storage.client import ObjectStorageClient
+from visiox_storage.checksum import sha256_file
 
 
 router = APIRouter(prefix="/services", tags=["services"])
@@ -74,7 +78,8 @@ _ROLLBACK_FIELDS = {
 class ServiceCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     pipeline_id: str
-    trained_model_id: str
+    trained_model_id: str | None = None
+    base_model_id: str | None = None
     model_name: str = Field(min_length=1, max_length=160)
     model_weight: str = Field(min_length=1, max_length=160)
     environment: str = Field(min_length=1, max_length=120)
@@ -85,8 +90,8 @@ class ServiceCreateRequest(BaseModel):
     )
     resource_summary: str = Field(default="", max_length=255)
     node_id: str
-    image_digest: str
-    model_checksum: str
+    image_digest: str | None = None
+    model_checksum: str | None = None
     port: int = Field(default=8080, ge=1024, le=65535)
     format: Literal["auto", "pt", "onnx", "engine"] = "auto"
     precision: Literal["auto", "fp32", "fp16", "int8"] = "auto"
@@ -136,6 +141,7 @@ class ServiceResponse(BaseModel):
     engine_digest: str | None
     port: int | None
     health_status: str | None
+    health_checked_at: datetime | None
     task_id: str | None
     remote_execution_id: str | None
     phase: str | None
@@ -183,21 +189,18 @@ async def create_service(
     request: ServiceCreateRequest,
     session: Session = Depends(get_service_session),
     producer: Any = Depends(get_service_stream_producer),
+    storage: ObjectStorageClient = Depends(get_pipeline_inference_storage),
 ) -> ServiceResponse:
     pipeline = session.get(TrainingPipeline, request.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
-    trained_model = session.get(TrainedModel, request.trained_model_id)
-    if (
-        trained_model is None
-        or trained_model.pipeline_id != pipeline.id
-        or trained_model.status != "ready"
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Trained model is not ready for this pipeline",
-        )
-    if pipeline.task != "detect" or trained_model.task != "detect":
+    trained_model, base_model, artifact = _resolve_deployment_artifact(
+        session,
+        pipeline,
+        request,
+        storage,
+    )
+    if pipeline.task != "detect" or artifact.task != "detect":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Production deployment supports YOLO26 detect models only",
@@ -205,12 +208,8 @@ async def create_service(
 
     node, inventory = _deployment_node(session, request.node_id)
     try:
-        image_digest = validate_image_digest(request.image_digest)
-        artifact = ModelArtifact(
-            task=trained_model.task,
-            artifact_uri=trained_model.artifact_uri,
-            checksum=request.model_checksum,
-            format=_artifact_format(trained_model.artifact_uri),
+        image_digest = validate_image_digest(
+            request.image_digest or get_settings().deployment_image_digest
         )
         options = DeploymentOptions(
             format=request.format,
@@ -221,7 +220,7 @@ async def create_service(
             runtime_image_digest=image_digest,
         )
         plan = build_deployment_plan(artifact, inventory, options)
-        _require_minio_uri(trained_model.artifact_uri, "Trained model artifact")
+        _require_minio_uri(artifact.artifact_uri, "Model artifact")
         if request.calibration_dataset_uri is not None:
             _require_minio_uri(
                 request.calibration_dataset_uri,
@@ -239,6 +238,8 @@ async def create_service(
     execution_id = new_id()
     normalized_config = dict(request.config)
     normalized_config["current_remote_execution_id"] = execution_id
+    if base_model is not None:
+        normalized_config["base_model_id"] = base_model.id
     normalized_config["deployment"] = {
         "image_digest": image_digest,
         "model_checksum": artifact.checksum,
@@ -255,9 +256,9 @@ async def create_service(
         id=service_id,
         name=request.name.strip(),
         pipeline_id=pipeline.id,
-        trained_model_id=trained_model.id,
-        model_name=request.model_name,
-        model_weight=request.model_weight,
+        trained_model_id=trained_model.id if trained_model is not None else None,
+        model_name=base_model.filename if base_model is not None else request.model_name,
+        model_weight=base_model.filename if base_model is not None else request.model_weight,
         environment=request.environment,
         instance_count=1,
         instance_name=request.instance_name.strip(),
@@ -575,8 +576,6 @@ async def predict_service_image(
     service_id: str,
     file: UploadFile = File(...),
     session: Session = Depends(get_service_session),
-    storage: ObjectStorageClient = Depends(get_pipeline_inference_storage),
-    predictor: PipelinePredictor = Depends(get_pipeline_predictor),
 ) -> PipelinePredictResponse:
     service = session.get(DeploymentService, service_id)
     if service is None:
@@ -586,19 +585,173 @@ async def predict_service_image(
             status_code=status.HTTP_409_CONFLICT,
             detail="Service is not running",
         )
-    result = await predict_pipeline_image(
-        pipeline_id=service.pipeline_id,
-        file=file,
-        model_weight=service.model_weight,
-        environment=service.environment,
-        session=session,
-        storage=storage,
-        predictor=predictor,
-    )
+    result = await _request_deployed_prediction(service, file)
     service.calls += 1
     session.add(service)
     session.commit()
     return result
+
+
+async def _request_deployed_prediction(
+    service: DeploymentService,
+    file: UploadFile,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> PipelinePredictResponse:
+    endpoint = service.endpoint.strip().rstrip("/")
+    try:
+        endpoint_url = httpx.URL(endpoint)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Service endpoint is unavailable",
+        ) from exc
+    if endpoint_url.scheme not in {"http", "https"} or not endpoint_url.host:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Service endpoint is unavailable",
+        )
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Only image files are supported",
+        )
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Image file is empty",
+        )
+
+    async def send(active_client: httpx.AsyncClient) -> httpx.Response:
+        return await active_client.post(
+            f"{endpoint}/predict/image",
+            files={
+                "file": (
+                    Path(file.filename or "image.png").name,
+                    image_bytes,
+                    file.content_type or "application/octet-stream",
+                )
+            },
+        )
+
+    try:
+        if client is None:
+            async with httpx.AsyncClient(timeout=60.0) as active_client:
+                response = await send(active_client)
+        else:
+            response = await send(client)
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Deployed inference service is unreachable: {exc}",
+        ) from exc
+
+    if response.is_error:
+        detail = _upstream_error_detail(response)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Deployed inference failed: {detail}",
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Deployed inference returned an invalid response",
+        ) from exc
+    predictions = payload.get("predictions")
+    if not isinstance(predictions, list):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Deployed inference response is missing predictions",
+        )
+    annotated_bytes = _render_deployed_predictions(image_bytes, predictions)
+    return PipelinePredictResponse(
+        pipeline_id=service.pipeline_id,
+        model_weight=service.model_weight,
+        environment=service.resource_summary or service.environment,
+        predictions=predictions,
+        result_image=f"data:image/png;base64,{base64.b64encode(annotated_bytes).decode('ascii')}",
+        latency_ms=_optional_float(payload.get("latency_ms")),
+    )
+
+
+def _render_deployed_predictions(
+    image_bytes: bytes,
+    predictions: list[dict[str, Any]],
+) -> bytes:
+    from PIL import Image, ImageDraw
+
+    with Image.open(BytesIO(image_bytes)) as source:
+        image = source.convert("RGB")
+    draw = ImageDraw.Draw(image)
+    line_width = max(2, round(min(image.size) / 240))
+    for prediction in predictions:
+        bbox = prediction.get("bbox")
+        if not isinstance(bbox, dict):
+            continue
+        try:
+            coordinates = tuple(float(bbox[key]) for key in ("x1", "y1", "x2", "y2"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        color = _prediction_color(prediction)
+        draw.rectangle(coordinates, outline=color, width=line_width)
+        label = str(prediction.get("label", prediction.get("class_id", "object")))
+        confidence = _optional_float(prediction.get("confidence"))
+        caption = f"{label} {confidence:.2f}" if confidence is not None else label
+        text_box = draw.textbbox((coordinates[0], coordinates[1]), caption)
+        text_height = max(14, text_box[3] - text_box[1] + 6)
+        caption_top = max(0.0, coordinates[1] - text_height)
+        caption_right = min(float(image.width), coordinates[0] + text_box[2] - text_box[0] + 8)
+        draw.rectangle(
+            (coordinates[0], caption_top, caption_right, coordinates[1]),
+            fill=color,
+        )
+        draw.text((coordinates[0] + 4, caption_top + 2), caption, fill="white")
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+_PREDICTION_COLORS = (
+    "#e45756",
+    "#54a24b",
+    "#f58518",
+    "#b279a2",
+    "#72b7b2",
+    "#ff9da6",
+    "#eeca3b",
+    "#4c78a8",
+    "#9d755d",
+    "#79706e",
+)
+
+
+def _prediction_color(prediction: dict[str, Any]) -> str:
+    class_id = prediction.get("class_id")
+    try:
+        color_index = int(class_id)
+    except (TypeError, ValueError):
+        label = str(prediction.get("label", "object"))
+        color_index = sum(label.encode("utf-8"))
+    return _PREDICTION_COLORS[color_index % len(_PREDICTION_COLORS)]
+
+
+def _upstream_error_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text[:500] or f"HTTP {response.status_code}"
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    return str(detail or f"HTTP {response.status_code}")[:500]
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 @router.delete("/{service_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -610,10 +763,16 @@ def delete_service(
     if service is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
     if service.status != "stopped":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Service must be stopped before deletion",
+        instance_id = session.scalar(
+            select(DeploymentInstance.id).where(
+                DeploymentInstance.deployment_service_id == service_id
+            )
         )
+        if instance_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Service must be stopped before deletion",
+            )
     execution_task_ids = list(
         session.scalars(
             select(RemoteExecution.task_id).where(
@@ -674,6 +833,102 @@ def _deployment_node(
     return node, inventory
 
 
+def _resolve_deployment_artifact(
+    session: Session,
+    pipeline: TrainingPipeline,
+    request: ServiceCreateRequest,
+    storage: ObjectStorageClient,
+) -> tuple[TrainedModel | None, BaseModelRecord | None, ModelArtifact]:
+    if bool(request.trained_model_id) == bool(request.base_model_id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Select exactly one trained model or official base model",
+        )
+
+    if request.trained_model_id is not None:
+        trained_model = session.get(TrainedModel, request.trained_model_id)
+        if (
+            trained_model is None
+            or trained_model.pipeline_id != pipeline.id
+            or trained_model.status != "ready"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Trained model is not ready for this pipeline",
+            )
+        checksum = _trained_model_checksum(trained_model)
+        if checksum is None:
+            checksum = _calculate_trained_model_checksum(storage, trained_model)
+            trained_model.metrics = {**trained_model.metrics, "checksum": checksum}
+            session.add(trained_model)
+        try:
+            artifact = ModelArtifact(
+                task=trained_model.task,
+                artifact_uri=trained_model.artifact_uri,
+                checksum=checksum,
+                format=_artifact_format(trained_model.artifact_uri),
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Trained model metadata is invalid",
+            ) from error
+        return trained_model, None, artifact
+
+    base_model = session.get(BaseModelRecord, request.base_model_id)
+    if (
+        base_model is None
+        or base_model.family.lower() != "yolo26"
+        or base_model.task != pipeline.task
+        or base_model.status != "ready"
+        or base_model.local_uri is None
+        or base_model.checksum is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Official base model is not ready for this pipeline",
+        )
+    try:
+        artifact = ModelArtifact(
+            task=base_model.task,
+            artifact_uri=base_model.local_uri,
+            checksum=base_model.checksum,
+            format=_artifact_format(base_model.local_uri),
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Official base model metadata is invalid",
+        ) from error
+    return None, base_model, artifact
+
+
+def _trained_model_checksum(model: TrainedModel) -> str | None:
+    for key in ("checksum", "sha256", "artifact_checksum"):
+        value = model.metrics.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _calculate_trained_model_checksum(
+    storage: ObjectStorageClient,
+    model: TrainedModel,
+) -> str:
+    try:
+        _require_minio_uri(model.artifact_uri, "Trained model artifact")
+        bucket, object_name = model.artifact_uri.removeprefix("minio://").split("/", 1)
+        with TemporaryDirectory(prefix="visiox-model-checksum-") as temp_dir:
+            artifact_path = Path(temp_dir) / (PurePosixPath(object_name).name or "model.pt")
+            storage.get_file(bucket, object_name, artifact_path)
+            return sha256_file(artifact_path)
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Trained model artifact is unavailable for checksum calculation",
+        ) from error
+
+
 def _artifact_format(uri: str) -> Literal["pt", "onnx", "engine"]:
     suffix = PurePosixPath(uri.split("?", 1)[0]).suffix.lower().removeprefix(".")
     if suffix not in {"pt", "onnx", "engine"}:
@@ -712,6 +967,17 @@ async def _queue_service_operation(
         )
     )
     if instance is None:
+        if operation == _STOP_OPERATION:
+            service.status = "stopped"
+            service.endpoint = ""
+            service.config = {
+                key: value
+                for key, value in service.config.items()
+                if key != "current_remote_execution_id"
+            }
+            session.add(service)
+            session.commit()
+            return _service_response(session, service.id)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Deployment instance is unavailable",
@@ -858,6 +1124,7 @@ def _service_response(session: Session, service_id: str) -> ServiceResponse:
         engine_digest=instance.engine_digest if instance is not None else None,
         port=instance.port if instance is not None else None,
         health_status=instance.health_status if instance is not None else None,
+        health_checked_at=instance.health_checked_at if instance is not None else None,
         task_id=execution.task_id if execution is not None else None,
         remote_execution_id=execution.id if execution is not None else None,
         phase=execution.phase if execution is not None else None,

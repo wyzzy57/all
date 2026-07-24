@@ -33,6 +33,7 @@ class PipelinePredictResponse(BaseModel):
     environment: str
     predictions: list[dict[str, Any]]
     result_image: str
+    latency_ms: float | None = None
 
 
 class PipelinePredictor(Protocol):

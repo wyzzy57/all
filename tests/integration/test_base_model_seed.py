@@ -65,3 +65,44 @@ def test_seed_yolo26_base_models_updates_existing_stale_models(tmp_path):
     assert model is not None
     assert model.status == "ready"
     assert model.local_uri == "memory://models/base/yolo26-detect-n/yolo26n.pt"
+
+
+def test_seed_yolo26_base_models_preserves_existing_real_weights(tmp_path):
+    database_path = tmp_path / "visiox-seed-real.db"
+    database_url = f"sqlite:///{database_path}"
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "head")
+
+    engine = create_engine(database_url)
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    storage = InMemoryObjectStorageClient()
+    checksum = "a" * 64
+
+    with session_factory() as session:
+        session.add(
+            BaseModel(
+                id="yolo26-detect-n",
+                family="yolo26",
+                task="detect",
+                scale="n",
+                filename="yolo26n.pt",
+                source_path="yolo26/detect/yolo26n.pt",
+                local_uri="memory://models/base/yolo26-detect-n/yolo26n.pt",
+                checksum=checksum,
+                size_bytes=2 * 1024 * 1024,
+                status="ready",
+            )
+        )
+        session.commit()
+
+    with session_factory() as session:
+        seed_yolo26_base_models(session, storage=storage)
+
+    with session_factory() as session:
+        model = session.get(BaseModel, "yolo26-detect-n")
+
+    assert model is not None
+    assert model.checksum == checksum
+    assert model.size_bytes == 2 * 1024 * 1024
+    assert ("models", "base/yolo26-detect-n/yolo26n.pt") not in storage.objects

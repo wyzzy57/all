@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from visiox_common.tasks import EDGE_EXECUTOR_TASK_TYPES, TaskCommand, TaskProgressEvent, TaskStatus, TaskType
 from visiox_db.base import new_id
-from visiox_db.models import Task, TrainingJob, TrainingPipeline
+from visiox_db.models import RemoteExecution, Task, TrainingJob, TrainingPipeline
 from visiox_db.session import get_session
 from visiox_messaging.streams import RedisStreamProducer
 
@@ -18,6 +18,7 @@ from visiox_messaging.streams import RedisStreamProducer
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 TERMINAL_STATUSES = {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELED}
 CANCELABLE_STATUSES = {TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.RUNNING}
+TRAINING_TASK_TYPES = {TaskType.TRAIN_MODEL.value, TaskType.EDGE_TRAIN.value}
 
 
 class CreateTaskRequest(BaseModel):
@@ -135,9 +136,10 @@ def list_tasks(
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_task_session),
 ) -> TaskListResponse:
-    total = session.scalar(select(func.count()).select_from(Task)) or 0
+    filters = (Task.task_type.in_(TRAINING_TASK_TYPES),)
+    total = session.scalar(select(func.count()).select_from(Task).where(*filters)) or 0
     tasks = session.scalars(
-        select(Task).order_by(Task.created_at, Task.id).limit(limit).offset(offset)
+        select(Task).where(*filters).order_by(Task.created_at.desc(), Task.id.desc()).limit(limit).offset(offset)
     ).all()
     return TaskListResponse(items=list(tasks), total=total, limit=limit, offset=offset)
 
@@ -145,6 +147,25 @@ def list_tasks(
 @router.get("/{task_id}", response_model=TaskResponse)
 def get_task(task_id: str, session: Session = Depends(get_task_session)) -> Task:
     return _task_or_404(session, task_id)
+
+
+@router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_task(task_id: str, session: Session = Depends(get_task_session)) -> None:
+    task = _task_or_404(session, task_id)
+    if task.task_type not in TRAINING_TASK_TYPES:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only training tasks can be deleted")
+    if TaskStatus(task.status) not in TERMINAL_STATUSES:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Active training tasks must be canceled first")
+
+    for job in session.scalars(select(TrainingJob).where(TrainingJob.task_id == task.id)).all():
+        job.task_id = None
+        session.add(job)
+    for execution in session.scalars(select(RemoteExecution).where(RemoteExecution.task_id == task.id)).all():
+        execution.task_id = None
+        session.add(execution)
+    session.flush()
+    session.delete(task)
+    session.commit()
 
 
 @router.post("/{task_id}/cancel", response_model=TaskResponse)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -18,7 +19,9 @@ _BATCH_INDEX_ATTRIBUTE = "_visiox_batch_index"
 _GRADIENT_SAMPLE_EPOCH_ATTRIBUTE = "_visiox_gradient_sample_epoch"
 _GRADIENT_SAMPLES_ATTRIBUTE = "_visiox_gradient_samples"
 _RESOURCE_SAMPLES_ATTRIBUTE = "_visiox_resource_samples"
+_METRIC_SAMPLES_ATTRIBUTE = "_visiox_metric_samples"
 _ZERO_GRAD_WRAPPED_ATTRIBUTE = "_visiox_zero_grad_wrapped"
+_SCIENTIFIC_NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)[eE][+-]?\d+$")
 
 
 logger = logging.getLogger(__name__)
@@ -59,7 +62,10 @@ def parse_overrides(arguments: list[str]) -> dict[str, Any]:
         key, separator, raw_value = argument.partition("=")
         if not separator or not key:
             raise ValueError(f"Invalid training argument: {argument}")
-        overrides[key] = yaml.safe_load(raw_value)
+        value = yaml.safe_load(raw_value)
+        if isinstance(value, str) and _SCIENTIFIC_NUMBER.fullmatch(value):
+            value = float(value)
+        overrides[key] = value
     return overrides
 
 
@@ -130,6 +136,7 @@ def write_progress_snapshot(trainer: Any) -> Path:
         },
         "environment": {"device": str(getattr(trainer, "device", "unknown"))},
         "latest_metrics": _scalar_metrics(trainer),
+        "metric_samples": list(getattr(trainer, _METRIC_SAMPLES_ATTRIBUTE, [])),
         "resources": list(getattr(trainer, _RESOURCE_SAMPLES_ATTRIBUTE, [])),
     }
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
@@ -303,6 +310,15 @@ def log_epoch_observability(trainer: Any) -> None:
 
     resource_metrics: dict[str, float] = {}
     if epoch is not None:
+        try:
+            metric_sample = {"step": epoch, "timestamp": time.time(), **_scalar_metrics(trainer)}
+            metric_samples = getattr(trainer, _METRIC_SAMPLES_ATTRIBUTE, None)
+            if metric_samples is None:
+                metric_samples = []
+                setattr(trainer, _METRIC_SAMPLES_ATTRIBUTE, metric_samples)
+            metric_samples.append(metric_sample)
+        except Exception:
+            logger.exception("Training observability metric sample retention failed")
         try:
             resource_metrics = _collect_resource_metrics(trainer)
         except Exception:

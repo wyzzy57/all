@@ -7,6 +7,7 @@ import artifactGallerySource from "@/components/training/ArtifactGallery.vue?raw
 import trainingVisualizationViewSource from "@/views/training-visualization/TrainingVisualizationView.vue?raw";
 
 const apiMock = vi.hoisted(() => ({
+  deleteTrainingJob: vi.fn(),
   getTrainingObservabilityResources: vi.fn(),
   getTrainingObservabilityScalars: vi.fn(),
   getTrainingObservabilitySummary: vi.fn(),
@@ -99,6 +100,10 @@ function mountView() {
     global: {
       stubs: {
         MetricLineChart: MetricLineChartStub,
+        "el-dialog": {
+          props: ["modelValue", "title"],
+          template: '<section v-if="modelValue" class="el-dialog-stub"><h2>{{ title }}</h2><slot /><slot name="footer" /></section>',
+        },
         "el-empty": { props: ["description"], template: '<div class="el-empty-stub">{{ description }}</div>' },
         "el-icon": { template: "<span><slot /></span>" },
         "el-progress": { props: ["percentage"], template: '<div class="el-progress-stub">{{ percentage }}%</div>' },
@@ -130,6 +135,7 @@ describe("TrainingVisualizationView", () => {
       offset: 0,
     });
     apiMock.listTrainingJobs.mockResolvedValue({ items: jobs, total: 2, limit: 200, offset: 0 });
+    apiMock.deleteTrainingJob.mockResolvedValue(undefined);
     apiMock.getTrainingObservabilitySummary.mockResolvedValue(summary());
     apiMock.getTrainingObservabilityScalars.mockResolvedValue({
       series: {
@@ -242,6 +248,37 @@ describe("TrainingVisualizationView", () => {
     wrapper.unmount();
   });
 
+  it("shows record deletion only for terminal training jobs", async () => {
+    apiMock.listTrainingJobs.mockResolvedValue({
+      items: [
+        ...jobs,
+        {
+          id: "job-orphan",
+          pipeline_id: "pipeline-1",
+          status: "queued",
+          task_id: null,
+          distributed_run_id: null,
+          remote_execution_id: null,
+          environment: {},
+          params: {},
+          metrics: {},
+          created_at: "2026-07-08T02:32:13Z",
+        },
+      ],
+      total: 3,
+      limit: 200,
+      offset: 0,
+    });
+    const wrapper = mountView();
+    await flushPromises();
+
+    expect(wrapper.get('[data-testid="delete-job-job-1"]').attributes("disabled")).toBeDefined();
+    expect(wrapper.get('[data-testid="delete-job-job-2"]').attributes("disabled")).toBeUndefined();
+    expect(wrapper.get('[data-testid="delete-job-job-orphan"]').attributes("disabled")).toBeUndefined();
+
+    wrapper.unmount();
+  });
+
   it("requests only advertised scalars and keeps TensorBoard-backed series visible", async () => {
     const wrapper = mountView();
     await flushPromises();
@@ -296,6 +333,15 @@ describe("TrainingVisualizationView", () => {
     expect(panel.get('[data-testid="artifact-preview-results.png"]').attributes("src"))
       .toBe("/downloads/job-1/visualization/results.png");
     expect(panel.get('[data-testid="artifact-preview-results.png"]').classes()).toContain("artifact-preview-image");
+    const previewButton = panel.get('[data-testid="artifact-preview-button-results.png"]');
+    expect(previewButton.element.tagName).toBe("BUTTON");
+    expect(previewButton.attributes("href")).toBeUndefined();
+    await previewButton.trigger("click");
+    await flushPromises();
+    expect(wrapper.get('[data-testid="artifact-preview-dialog-image"]').attributes("src"))
+      .toBe("/downloads/job-1/visualization/results.png");
+    expect(wrapper.get('[data-testid="artifact-preview-dialog-download"]').attributes("href"))
+      .toBe("/downloads/job-1/visualization/results.png");
     expect(panel.get('[data-testid="artifact-download-best.pt"]').attributes("href"))
       .toBe("/downloads/job-1/weight/best.pt");
     expect(apiMock.trainingJobArtifactDownloadUrl).toHaveBeenCalledWith("job-1", "weight", "best.pt");

@@ -63,7 +63,19 @@
       </div>
       <div class="result-body" :class="{ empty: !hasRun }">
         <template v-if="hasRun">
-          <img v-if="resultMode === 'image'" :src="resultImage" alt="运行结果" />
+          <button
+            v-if="resultMode === 'image'"
+            class="result-image-preview"
+            type="button"
+            aria-label="放大查看运行结果"
+            data-testid="service-result-preview-button"
+            @click="openPreview"
+          >
+            <img class="result-image" :src="resultImage" alt="运行结果" />
+            <span class="result-image-zoom" aria-hidden="true">
+              <el-icon><ZoomIn /></el-icon>
+            </span>
+          </button>
           <pre v-else>{{ resultJson }}</pre>
         </template>
         <div v-else class="empty-result">
@@ -72,10 +84,58 @@
         </div>
       </div>
     </main>
+
+    <el-dialog
+      v-model="previewVisible"
+      class="service-result-preview-dialog"
+      width="min(1200px, 94vw)"
+      title="运行结果"
+      append-to-body
+      destroy-on-close
+    >
+      <div class="service-result-preview-toolbar" aria-label="预览缩放控制">
+        <el-tooltip content="缩小" placement="bottom">
+          <button
+            type="button"
+            aria-label="缩小运行结果"
+            :disabled="previewZoom <= 100"
+            @click="changePreviewZoom(-25)"
+          >
+            <el-icon><ZoomOut /></el-icon>
+          </button>
+        </el-tooltip>
+        <span>{{ previewZoom === 100 ? "适应窗口" : `${previewZoom}%` }}</span>
+        <el-tooltip content="放大" placement="bottom">
+          <button
+            type="button"
+            aria-label="放大运行结果"
+            :disabled="previewZoom >= 300"
+            @click="changePreviewZoom(25)"
+          >
+            <el-icon><ZoomIn /></el-icon>
+          </button>
+        </el-tooltip>
+        <el-tooltip content="还原" placement="bottom">
+          <button type="button" aria-label="还原预览大小" :disabled="previewZoom === 100" @click="resetPreviewZoom">
+            <el-icon><RefreshLeft /></el-icon>
+          </button>
+        </el-tooltip>
+      </div>
+      <div class="service-result-preview-stage" :class="{ zoomed: previewZoom > 100 }">
+        <img
+          :src="resultImage"
+          alt="运行结果放大预览"
+          data-testid="service-result-preview-dialog-image"
+          :class="{ zoomed: previewZoom > 100 }"
+          :style="previewZoom > 100 ? { width: `${previewZoom}%` } : undefined"
+        />
+      </div>
+    </el-dialog>
   </section>
 </template>
 
 <script setup lang="ts">
+import { RefreshLeft, ZoomIn, ZoomOut } from "@element-plus/icons-vue";
 import { computed, ref, watch } from "vue";
 
 type ResultMode = "image" | "json";
@@ -139,6 +199,8 @@ const selectedExampleId = ref("anime-group");
 const resultMode = ref<ResultMode>("image");
 const hasRun = ref(false);
 const running = ref(false);
+const previewVisible = ref(false);
+const previewZoom = ref(100);
 const errorMessage = ref("");
 const selectedModelWeight = ref("");
 const selectedEnvironment = ref(props.defaultEnvironment);
@@ -218,10 +280,24 @@ async function runExperience() {
 
 function resetExperience() {
   hasRun.value = false;
+  previewVisible.value = false;
   resultMode.value = "image";
   selectedExampleId.value = sampleExamples[0].id;
   inferenceResult.value = null;
   errorMessage.value = "";
+}
+
+function openPreview() {
+  resetPreviewZoom();
+  previewVisible.value = true;
+}
+
+function changePreviewZoom(delta: number) {
+  previewZoom.value = Math.min(300, Math.max(100, previewZoom.value + delta));
+}
+
+function resetPreviewZoom() {
+  previewZoom.value = 100;
 }
 
 function handleExampleUpload(event: Event) {
@@ -491,10 +567,135 @@ function svgResultImage() {
   padding: 28px;
 }
 
-.result-body img {
+.result-image-preview {
+  position: relative;
+  display: grid;
+  max-width: 100%;
+  max-height: 520px;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: #f4f7fb;
+  cursor: zoom-in;
+  place-items: center;
+}
+
+.result-image {
+  display: block;
   max-width: 100%;
   max-height: 520px;
   object-fit: contain;
+}
+
+.result-image-zoom {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: grid;
+  width: 36px;
+  height: 36px;
+  border-radius: 4px;
+  background: rgb(17 24 39 / 78%);
+  color: #fff;
+  font-size: 18px;
+  opacity: 0;
+  place-items: center;
+  transition: opacity 160ms ease;
+}
+
+.result-image-preview:hover .result-image-zoom,
+.result-image-preview:focus-visible .result-image-zoom {
+  opacity: 1;
+}
+
+.result-image-preview:focus-visible {
+  outline: 2px solid #1763ff;
+  outline-offset: 3px;
+}
+
+.service-result-preview-stage {
+  position: relative;
+  display: grid;
+  height: min(58vh, 640px);
+  overflow: hidden;
+  background: #f4f7fb;
+  place-items: center;
+}
+
+.service-result-preview-stage.zoomed {
+  overflow: auto;
+  place-items: start center;
+}
+
+.service-result-preview-stage img {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.service-result-preview-stage img.zoomed {
+  position: static;
+  inset: auto;
+  max-width: none;
+  max-height: none;
+  height: auto;
+}
+
+.service-result-preview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 44px;
+  border: 1px solid #e1e7f0;
+  border-bottom: 0;
+  background: #fff;
+}
+
+.service-result-preview-toolbar button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #354052;
+  cursor: pointer;
+  place-items: center;
+}
+
+.service-result-preview-toolbar button:hover:not(:disabled),
+.service-result-preview-toolbar button:focus-visible {
+  background: #eef4ff;
+  color: #1763ff;
+}
+
+.service-result-preview-toolbar button:focus-visible {
+  outline: 2px solid #1763ff;
+  outline-offset: 1px;
+}
+
+.service-result-preview-toolbar button:disabled {
+  color: #b8c0cc;
+  cursor: not-allowed;
+}
+
+.service-result-preview-toolbar span {
+  min-width: 72px;
+  color: #536173;
+  font-size: 13px;
+  text-align: center;
+}
+
+:deep(.service-result-preview-dialog .el-dialog__body) {
+  padding: 12px 20px 20px;
 }
 
 .result-body pre {
@@ -522,6 +723,12 @@ function svgResultImage() {
 
 .empty-result span {
   color: #111827;
+}
+
+@media (hover: none) {
+  .result-image-zoom {
+    opacity: 1;
+  }
 }
 
 @media (max-width: 1100px) {

@@ -2,6 +2,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import WorkbenchView from "@/views/workbench/WorkbenchView.vue";
+import workbenchSource from "@/views/workbench/WorkbenchView.vue?raw";
 
 const pushMock = vi.hoisted(() => vi.fn());
 const apiMock = vi.hoisted(() => ({
@@ -90,6 +91,16 @@ describe("WorkbenchView", () => {
     expect(wrapper.text()).toContain("真实边缘服务");
     expect(wrapper.text()).toContain("真实检测产线");
     expect(wrapper.text()).not.toContain("千问3");
+    expect(wrapper.find(".pie-chart-animated").exists()).toBe(true);
+    const pieSectors = wrapper.findAll(".pie-sector");
+    expect(pieSectors).toHaveLength(2);
+    expect(wrapper.find(".pie-tooltip").exists()).toBe(false);
+    await pieSectors[0].trigger("mouseenter");
+    expect(wrapper.find(".pie-sector-group.active").exists()).toBe(true);
+    expect(wrapper.get(".pie-tooltip").text()).toContain("1");
+    await wrapper.get(".pie-chart-animated").trigger("mouseleave");
+    expect(wrapper.find(".pie-tooltip").exists()).toBe(false);
+    expect(wrapper.findAll(".progress-track i, .pipeline-track i").length).toBeGreaterThan(0);
     const stoppedStatus = wrapper.findAll(".status-card").find((card) => card.text().includes("运行中止"));
     expect(stoppedStatus?.text()).toContain("1");
 
@@ -103,5 +114,15 @@ describe("WorkbenchView", () => {
     expect(pushMock).toHaveBeenNthCalledWith(1, "/data-preparation");
     expect(pushMock).toHaveBeenNthCalledWith(2, "/data-preparation");
     expect(pushMock).toHaveBeenNthCalledWith(3, "/services");
+  });
+
+  it("responds to its content container instead of the browser viewport", () => {
+    expect(workbenchSource).toContain("container: workbench / inline-size");
+    expect(workbenchSource).toContain("@container workbench (max-width: 760px)");
+    expect(workbenchSource).not.toContain("@media (max-width: 1280px)");
+    expect(workbenchSource).toContain("@keyframes pie-reveal");
+    expect(workbenchSource).toContain("@keyframes sector-enter");
+    expect(workbenchSource).toContain("@keyframes bar-grow");
+    expect(workbenchSource).toContain(".pipeline-track {\n  height: 14px;");
   });
 });

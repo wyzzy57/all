@@ -694,11 +694,11 @@ def test_command_allows_bounded_long_running_deployment_deadline() -> None:
     channel = FakeChannel(stdout_chunks=[b"deployment-complete"])
     session, transport, _ = _connected_session(channel=channel)
 
-    result = session.run("deploy-static-script", timeout_seconds=1800)
+    result = session.run("deploy-static-script", timeout_seconds=7200)
     session.close()
 
     assert result.stdout == b"deployment-complete"
-    assert 60 < transport.open_timeouts[0] <= 1800
+    assert 60 < transport.open_timeouts[0] <= 7200
 
 
 def test_command_that_never_exits_times_out_and_closes_channel() -> None:

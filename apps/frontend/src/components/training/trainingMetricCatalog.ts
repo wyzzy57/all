@@ -49,7 +49,7 @@ const CARD_DEFINITIONS: CardDefinition[] = [
     format: "scientific",
     direction: "min",
     canonicalKeys: ["learning_rate"],
-    lines: [{ key: "learning_rate", label: "Learning Rate" }],
+    lines: [{ key: "learning_rate", label: "Train" }],
     primaryKey: "learning_rate",
   },
 ];
@@ -79,7 +79,7 @@ function qualityDefinition(id: string, title: string, key: string): CardDefiniti
     direction: "max",
     axis: { min: 0, max: 1 },
     canonicalKeys: [key],
-    lines: [{ key, label: title }],
+    lines: [{ key, label: "Validation" }],
     primaryKey: key,
   };
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import shutil
 from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
 from visiox_common.tasks import TaskCommand, TaskStatus, TaskType
+from visiox_common.settings import get_settings
 from visiox_db.base import new_id
 from visiox_db.models import (
     ComputeNode,
@@ -834,6 +836,68 @@ def get_training_job(training_job_id: str, session: Session = Depends(get_traini
         distributed_run_id=run_id,
         remote_execution_id=execution_id,
     )
+
+
+@router.delete("/training-jobs/{training_job_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_training_job(
+    training_job_id: str,
+    session: Session = Depends(get_training_job_session),
+    storage: ObjectStorageClient = Depends(get_training_object_storage_client),
+) -> None:
+    job = session.get(TrainingJob, training_job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+    if job.status in {"pending", "queued", "running"}:
+        has_execution_link = (
+            job.task_id is not None
+            or session.scalar(
+                select(DistributedTrainingRun.id).where(
+                    DistributedTrainingRun.training_job_id == job.id
+                )
+            )
+            is not None
+            or session.scalar(
+                select(RemoteExecution.id).where(
+                    RemoteExecution.training_job_id == job.id
+                )
+            )
+            is not None
+        )
+        if job.status != "queued" or has_execution_link:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Active training jobs must be canceled first",
+            )
+
+    metrics = job.metrics if isinstance(job.metrics, dict) else {}
+    removable_uris = list(_string_map(metrics.get("visualizations")).values())
+    if job.log_uri:
+        removable_uris.append(job.log_uri)
+    for uri in removable_uris:
+        try:
+            bucket, object_name = _parse_storage_uri(uri)
+            storage.delete_file(bucket, object_name)
+        except Exception:
+            # Database cleanup must still succeed when an optional artifact has already expired.
+            pass
+
+    run_path = get_settings().training_runs_root / "runs" / f"job-{job.id}"
+    shutil.rmtree(run_path, ignore_errors=True)
+
+    task = session.get(Task, job.task_id) if job.task_id else None
+    for execution in session.scalars(select(RemoteExecution).where(RemoteExecution.training_job_id == job.id)).all():
+        session.delete(execution)
+    for run in session.scalars(select(DistributedTrainingRun).where(DistributedTrainingRun.training_job_id == job.id)).all():
+        session.delete(run)
+    for model in session.scalars(select(TrainedModel).where(TrainedModel.training_job_id == job.id)).all():
+        model.training_job_id = None
+        session.add(model)
+    session.flush()
+    session.delete(job)
+    session.flush()
+    if task is not None:
+        session.delete(task)
+    session.commit()
 
 
 @router.get("/training-jobs/{training_job_id}/log")

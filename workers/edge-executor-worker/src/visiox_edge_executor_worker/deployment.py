@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from visiox_db.models import (
+    BaseModel as BaseModelRecord,
     ComputeNode,
     DeploymentInstance,
     DeploymentService,
@@ -46,7 +47,9 @@ _GPU_UUID = re.compile(r"GPU-[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z")
 _CONTAINER_ID = re.compile(r"[a-f0-9]{12,64}\Z")
 _LABEL_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}\Z")
 _TRANSFER_TIMEOUT_SECONDS = 60.0
-_DEPLOYMENT_TIMEOUT_SECONDS = 30 * 60.0
+# TensorRT tactic selection can legitimately exceed 30 minutes for larger models,
+# especially on a busy edge GPU during the first uncached deployment.
+_DEPLOYMENT_TIMEOUT_SECONDS = 2 * 60 * 60.0
 _PRESIGNED_URL_TTL = timedelta(minutes=15)
 _SHM_SIZE = "1g"
 
@@ -291,7 +294,43 @@ class _DeploymentContext:
     service: DeploymentService
     instance: DeploymentInstance
     node: ComputeNode
-    model: TrainedModel
+    model: _DeploymentModel
+
+
+@dataclass(frozen=True)
+class _DeploymentModel:
+    task: str
+    artifact_uri: str
+
+
+def _deployment_model(
+    session: Session,
+    service: DeploymentService | None,
+) -> _DeploymentModel | None:
+    if service is None:
+        return None
+    if service.trained_model_id is not None:
+        trained_model = session.get(TrainedModel, service.trained_model_id)
+        if trained_model is None or trained_model.status != "ready":
+            return None
+        return _DeploymentModel(
+            task=trained_model.task,
+            artifact_uri=trained_model.artifact_uri,
+        )
+    base_model_id = service.config.get("base_model_id")
+    if not isinstance(base_model_id, str):
+        return None
+    base_model = session.get(BaseModelRecord, base_model_id)
+    if (
+        base_model is None
+        or base_model.status != "ready"
+        or base_model.local_uri is None
+    ):
+        return None
+    return _DeploymentModel(
+        task=base_model.task,
+        artifact_uri=base_model.local_uri,
+    )
 
 
 @dataclass(frozen=True)
@@ -331,11 +370,7 @@ class _DeploymentHandlerBase:
             service = session.get(DeploymentService, current.deployment_service_id)
             instance = session.get(DeploymentInstance, current.resource_id)
             node = session.get(ComputeNode, current.node_id)
-            model = (
-                session.get(TrainedModel, service.trained_model_id)
-                if service is not None and service.trained_model_id is not None
-                else None
-            )
+            model = _deployment_model(session, service)
             task = session.get(Task, current.task_id)
             if (
                 service is None

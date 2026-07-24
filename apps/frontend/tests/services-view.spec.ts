@@ -2,6 +2,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import ServicesView from "@/views/services/ServicesView.vue";
+import servicesViewSource from "@/views/services/ServicesView.vue?raw";
 
 const pushMock = vi.hoisted(() => vi.fn());
 const routeState = vi.hoisted(() => ({ params: {} as Record<string, string | undefined> }));
@@ -44,6 +45,7 @@ function mountView() {
           template: "<input :value=\"modelValue\" @input=\"$emit('update:modelValue', $event.target.value)\" />",
         },
         "el-option": true,
+        "el-pagination": true,
         "el-select": true,
       },
     },
@@ -51,6 +53,14 @@ function mountView() {
 }
 
 describe("ServicesView", () => {
+  it("keeps functional pagination anchored in list mode", () => {
+    expect(servicesViewSource).toContain("v-for=\"service in pagedServices\"");
+    expect(servicesViewSource).toContain("'list-mode': !selectedService");
+    expect(servicesViewSource).toContain("v-model:current-page=\"currentPage\"");
+    expect(servicesViewSource).toContain("margin-top: auto");
+    expect(servicesViewSource).toContain("li.is-active");
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     routeState.params = {};
@@ -150,6 +160,25 @@ describe("ServicesView", () => {
     await wrapper.get('[data-testid="service-card-service-pepper"]').trigger("click");
 
     expect(pushMock).toHaveBeenCalledWith("/services/service-pepper");
+  });
+
+  it("keeps polling running services for fresh health checks", async () => {
+    vi.useFakeTimers();
+    apiMock.getService.mockResolvedValue({
+      ...(await apiMock.listServices()).items[0],
+      health_status: "healthy",
+      health_checked_at: "2026-07-22T08:30:00Z",
+    });
+    const wrapper = mountView();
+    await flushPromises();
+
+    await vi.advanceTimersByTimeAsync(2500);
+    await flushPromises();
+
+    expect(apiMock.getService).toHaveBeenCalledWith("service-real");
+    expect(apiMock.getService).toHaveBeenCalledWith("service-pepper");
+    wrapper.unmount();
+    vi.useRealTimers();
   });
 
   it("opens service detail from a card", async () => {

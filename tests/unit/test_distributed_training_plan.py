@@ -1,10 +1,21 @@
 import json
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 import sys
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine
 
+from visiox_db.base import Base
+from visiox_db.models import (
+    DistributedTrainingRun,
+    RemoteExecution,
+    Task,
+    TrainingJob,
+    TrainingPipeline,
+)
+from visiox_db.session import create_session_factory
 from visiox_edge_executor_worker.distributed import (
     DistributedNode,
     IncompatibleResourcePoolError,
@@ -75,7 +86,9 @@ def test_scheduler_assigns_stable_node_and_gpu_ranks() -> None:
         [_node("node-1"), _node("node-2", compatibility_key="other")],
     ],
 )
-def test_scheduler_rejects_mixed_or_incompatible_nodes(nodes: list[DistributedNode]) -> None:
+def test_scheduler_rejects_mixed_or_incompatible_nodes(
+    nodes: list[DistributedNode],
+) -> None:
     with pytest.raises(IncompatibleResourcePoolError):
         build_distributed_plan(nodes, requested_gpus=4)
 
@@ -119,7 +132,9 @@ def test_torchrun_argv_rejects_control_characters() -> None:
         torchrun_argv(plan, plan.nodes[0], training_arguments=("epochs=2\nwhoami",))
 
 
-def test_remote_training_scripts_are_json_driven_and_do_not_eval_request_values() -> None:
+def test_remote_training_scripts_are_json_driven_and_do_not_eval_request_values() -> (
+    None
+):
     remote = Path(__file__).parents[2] / "workers" / "edge-executor-worker" / "remote"
     for name in ("stage_training.sh", "launch_rank.sh", "stop_training.sh"):
         text = (remote / name).read_text(encoding="utf-8")
@@ -183,7 +198,10 @@ def test_remote_staging_failure_reports_safe_stage_only(
 
     assert namespace["main"]() == 1  # type: ignore[operator]
     stderr = capsys.readouterr().err
-    assert stderr == "training artifact staging failed at stage=runtime-image-pull (RuntimeError)\n"
+    assert (
+        stderr
+        == "training artifact staging failed at stage=runtime-image-pull (RuntimeError)\n"
+    )
     assert "must-not-appear" not in stderr
 
 
@@ -201,6 +219,82 @@ def test_production_handler_factory_registers_train_resume_and_stop() -> None:
     assert isinstance(handlers["train"], DistributedTrainingHandler)
     assert isinstance(handlers["resume_training"], DistributedTrainingHandler)
     assert isinstance(handlers["stop_training"], StopDistributedTrainingHandler)
+
+
+def test_completed_distributed_job_converges_without_relaunching() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    finished_at = datetime.now(UTC)
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            id="pipeline-1",
+            name="pipeline-1",
+            task="detect",
+            scale="n",
+            status="running",
+        )
+        task = Task(
+            id="task-1",
+            task_type="EDGE_TRAIN",
+            status="RUNNING",
+            progress=65,
+            stage="training",
+            error_code="EDGE_TRAIN_FAILED",
+            error_message="Distributed edge training failed",
+        )
+        job = TrainingJob(
+            id="job-1",
+            pipeline_id=pipeline.id,
+            task_id=task.id,
+            trained_model_id="model-1",
+            status="running",
+            metrics={
+                "weights": {
+                    "best.pt": "minio://models/trained/job-1/best.pt",
+                    "last.pt": "minio://models/trained/job-1/last.pt",
+                }
+            },
+            finished_at=finished_at,
+        )
+        run = DistributedTrainingRun(
+            id="run-1",
+            training_job_id=job.id,
+            resource_pool_id="pool-1",
+            node_ids=["node-1"],
+            ranks=[],
+            master_addr="10.0.0.1",
+            master_port=29500,
+            world_size=1,
+            status="training",
+        )
+        execution = RemoteExecution(
+            id="execution-1",
+            node_id="node-1",
+            task_id=task.id,
+            training_job_id=job.id,
+            resource_type="distributed_training_run",
+            resource_id=run.id,
+            operation="train",
+            status="running",
+            idempotency_key="train-run-1-attempt-1",
+        )
+        session.add_all([pipeline, task, job, run, execution])
+        session.commit()
+
+    handler = DistributedTrainingHandler(session_factory, object(), object())  # type: ignore[arg-type]
+
+    assert handler._converge_existing_success("execution-1") is True
+
+    with session_factory() as session:
+        assert session.get(TrainingJob, "job-1").status == "success"  # type: ignore[union-attr]
+        assert session.get(DistributedTrainingRun, "run-1").status == "succeeded"  # type: ignore[union-attr]
+        current_task = session.get(Task, "task-1")
+        assert current_task is not None
+        assert current_task.status == "SUCCESS"
+        assert current_task.progress == 100
+        assert current_task.error_code is None
+        assert session.get(TrainingPipeline, "pipeline-1").status == "success"  # type: ignore[union-attr]
 
 
 def test_distributed_training_arguments_remove_global_device_selection() -> None:
@@ -371,7 +465,10 @@ def test_remote_rank_failure_reports_safe_stage_only(
     assert namespace["main"]() == 1  # type: ignore[operator]
     stderr = capsys.readouterr().err
     assert calls == 2
-    assert stderr == "distributed rank operation failed at stage=container-launch (RuntimeError)\n"
+    assert (
+        stderr
+        == "distributed rank operation failed at stage=container-launch (RuntimeError)\n"
+    )
     assert "must-not-appear" not in stderr
 
 
@@ -408,3 +505,45 @@ def test_remote_rank_collect_uploads_last_checkpoint(tmp_path: Path) -> None:
 
     assert uploaded == [b"checkpoint"]
     assert result["last.pt"]["size_bytes"] == 10
+
+
+def test_remote_rank_collect_uploads_ultralytics_visualizations(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    run_dir = output / "runs" / "job-1"
+    run_dir.mkdir(parents=True)
+    expected = {
+        "confusion_matrix.png": b"confusion",
+        "train_batch0.jpg": b"train-batch",
+        "val_batch0_pred.jpg": b"validation-batch",
+        "BoxPR_curve.png": b"pr-curve",
+    }
+    for name, payload in expected.items():
+        (run_dir / name).write_bytes(payload)
+    script = load_packaged_script("launch_rank.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "launch_rank.sh", "exec"), namespace)
+    uploaded: list[bytes] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def urlopen(request, timeout):
+        assert timeout == 600
+        uploaded.append(request.data)
+        return Response()
+
+    namespace["urlopen"] = urlopen
+    result = namespace["collect_artifacts"](  # type: ignore[operator]
+        str(output),
+        {name: f"https://minio.internal/{name}" for name in expected},
+    )
+
+    assert uploaded == list(expected.values())
+    assert set(result) == set(expected)

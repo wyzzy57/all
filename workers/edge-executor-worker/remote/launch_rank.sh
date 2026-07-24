@@ -18,6 +18,30 @@ IMAGE_DIGEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,430}@sha256:[a-f0-9]{6
 GPU_UUID = re.compile(r"GPU-[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z")
 CONTAINER_ID = re.compile(r"[a-f0-9]{12,64}\Z")
 LAN_ADDRESS = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]{0,253}\Z")
+COLLECTABLE_ARTIFACTS = {
+    "best.pt",
+    "last.pt",
+    "results.csv",
+    "results.png",
+    "confusion_matrix.png",
+    "confusion_matrix_normalized.png",
+    "BoxPR_curve.png",
+    "BoxP_curve.png",
+    "BoxR_curve.png",
+    "BoxF1_curve.png",
+    "labels.jpg",
+    "train_batch0.jpg",
+    "train_batch1.jpg",
+    "train_batch2.jpg",
+    "val_batch0_labels.jpg",
+    "val_batch0_pred.jpg",
+    "val_batch1_labels.jpg",
+    "val_batch1_pred.jpg",
+    "val_batch2_labels.jpg",
+    "val_batch2_pred.jpg",
+    "visiox-progress.json",
+    "events.out.tfevents.remote",
+}
 
 
 class RequestValidationError(ValueError):
@@ -39,7 +63,7 @@ def validate(request):
         if set(request) != {"action", "output_path", "uploads"} or not isinstance(request["output_path"], str) or not Path(request["output_path"]).is_absolute():
             invalid("collect-request")
         uploads = request["uploads"]
-        if not isinstance(uploads, dict) or not uploads or set(uploads) - {"best.pt", "last.pt", "results.csv", "results.png"}:
+        if not isinstance(uploads, dict) or not uploads or set(uploads) - COLLECTABLE_ARTIFACTS:
             invalid("collect-uploads")
         for url in uploads.values():
             parsed = urlsplit(url) if isinstance(url, str) else None
@@ -99,12 +123,17 @@ def collect_artifacts(output_path, uploads):
     root = Path(output_path).resolve()
     results = {}
     for name, url in uploads.items():
-        matches = sorted(root.glob(f"runs/**/{name}"))
+        pattern = "runs/**/events.out.tfevents.*" if name == "events.out.tfevents.remote" else f"runs/**/{name}"
+        matches = sorted(root.glob(pattern))
         if not matches:
             if name in {"best.pt", "last.pt"}:
                 raise ValueError("required training artifact is missing")
             continue
-        path = matches[-1].resolve()
+        path = (
+            max(matches, key=lambda candidate: candidate.stat().st_size)
+            if name == "events.out.tfevents.remote"
+            else matches[-1]
+        ).resolve()
         if root not in path.parents:
             invalid("collect-path")
         payload = path.read_bytes()

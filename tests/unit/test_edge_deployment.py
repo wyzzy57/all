@@ -20,6 +20,7 @@ from visiox_edge_executor_worker.deployment import (
     build_deployment_handlers,
     engine_cache_key,
     validate_image_digest,
+    _deployment_model,
 )
 from visiox_edge_executor_worker.crypto import CredentialCipher
 from visiox_edge_executor_worker.inventory import parse_inventory
@@ -28,6 +29,7 @@ from visiox_edge_executor_worker.ssh import CommandResult, RemotePrivateDirector
 from visiox_edge_executor_worker.startup import EdgeExecutorSecurityContext
 from visiox_db.base import Base
 from visiox_db.models import (
+    BaseModel,
     ComputeNode,
     DeploymentInstance,
     DeploymentService,
@@ -64,6 +66,46 @@ def _model(**overrides: object) -> ModelArtifact:
     }
     values.update(overrides)
     return ModelArtifact.model_validate(values)
+
+
+def test_deployment_model_resolves_official_base_weight() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
+    with factory() as session:
+        base_model = BaseModel(
+            id="base-model-1",
+            family="yolo26",
+            task="detect",
+            scale="n",
+            filename="yolo26n.pt",
+            source_path="yolo26n.pt",
+            local_uri="minio://models/base/yolo26-detect-n/yolo26n.pt",
+            checksum=MODEL_CHECKSUM,
+            size_bytes=5_544_453,
+            status="ready",
+        )
+        service = DeploymentService(
+            id="service-official",
+            name="official-service",
+            pipeline_id="pipeline-1",
+            trained_model_id=None,
+            model_name="yolo26n.pt",
+            model_weight="yolo26n.pt",
+            environment="node-1",
+            instance_name="official-01",
+            status="queued",
+            endpoint="pending",
+            config={"base_model_id": base_model.id},
+        )
+        session.add_all([base_model, service])
+        session.commit()
+
+        resolved = _deployment_model(session, service)
+
+    assert resolved is not None
+    assert resolved.task == "detect"
+    assert resolved.artifact_uri == base_model.local_uri
 
 
 def test_auto_plan_prefers_tensorrt_fp16_and_explicit_inventory_gpu() -> None:
@@ -256,7 +298,7 @@ class DeploymentSshSession:
         assert 0 < timeout_seconds <= 60
 
     def run(self, command: str, *, timeout_seconds: float) -> CommandResult:
-        assert 0 < timeout_seconds <= 1800
+        assert 0 < timeout_seconds <= 7200
         self.commands.append(command)
         self.run_timeouts.append(timeout_seconds)
         return self.results.pop(0)
@@ -468,7 +510,7 @@ def test_deploy_handler_presigns_at_execution_and_persists_healthy_upgrade() -> 
     assert request["labels"]["com.visiox.health-path"] == "/health"
     assert request["labels"]["com.visiox.warmup-path"] == "/predict/image"
     assert all("short-lived-secret" not in command for command in ssh_session.commands)
-    assert ssh_session.run_timeouts == [1800.0]
+    assert ssh_session.run_timeouts == [7200.0]
     assert ssh_client.connect_request == {
         "host": "edge.internal",
         "port": 22,

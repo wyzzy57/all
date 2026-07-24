@@ -14,6 +14,7 @@ ARG TORCH_VERSION=2.12.1
 ARG TORCHVISION_VERSION=0.27.1
 ARG TENSORRT_VERSION=10.13.3.9.post1
 ARG ULTRALYTICS_VERSION=8.4.103
+ARG ONNXRUNTIME_GPU_VERSION=1.27.0
 
 RUN groupadd --gid 10001 visiox \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin visiox
@@ -28,6 +29,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && pip install \
         "fastapi>=0.115,<1.0" \
         "onnx>=1.16,<2.0" \
+        "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}" \
         "onnxslim>=0.1,<1.0" \
         "pillow>=10.0,<12.0" \
         "python-multipart>=0.0.9,<1.0" \

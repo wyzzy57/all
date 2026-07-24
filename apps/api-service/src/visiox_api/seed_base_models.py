@@ -25,6 +25,7 @@ class SeedStorage(Protocol):
 
 
 DEFAULT_SEED_PATH = Path("infra/seed/yolo26_base_models.json")
+_MIN_REAL_MODEL_SIZE_BYTES = 1024 * 1024
 
 
 def seed_yolo26_base_models(
@@ -42,6 +43,18 @@ def seed_yolo26_base_models(
             model_id = str(record["id"])
             filename = str(record["filename"])
             object_name = f"base/{model_id}/{filename}"
+            model = session.get(BaseModel, model_id)
+
+            if model is not None and _has_real_artifact(model):
+                model.family = str(record["family"])
+                model.task = str(record["task"])
+                model.scale = str(record["scale"])
+                model.filename = filename
+                model.source_path = str(record["source_path"])
+                session.add(model)
+                prepared_count += 1
+                continue
+
             payload = _placeholder_payload(record)
             checksum = sha256(payload).hexdigest()
             local_uri = str(record.get("local_uri") or f"minio://models/{object_name}")
@@ -56,7 +69,6 @@ def seed_yolo26_base_models(
                     content_type="application/octet-stream",
                 )
 
-            model = session.get(BaseModel, model_id)
             if model is None:
                 model = BaseModel(id=model_id)
 
@@ -74,6 +86,17 @@ def seed_yolo26_base_models(
 
     session.commit()
     return prepared_count
+
+
+def _has_real_artifact(model: BaseModel) -> bool:
+    checksum = (model.checksum or "").lower()
+    return bool(
+        model.status == "ready"
+        and model.local_uri
+        and (model.size_bytes or 0) >= _MIN_REAL_MODEL_SIZE_BYTES
+        and len(checksum) == 64
+        and all(character in "0123456789abcdef" for character in checksum)
+    )
 
 
 def _placeholder_payload(record: dict[str, object]) -> bytes:

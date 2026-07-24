@@ -26,7 +26,9 @@ class Settings(BaseSettings):
     max_dataset_image_bytes: int = 25 * 1024 * 1024
     max_dataset_zip_entries: int = 10_000
     max_dataset_zip_uncompressed_bytes: int = 500 * 1024 * 1024
+    max_model_upload_bytes: int = 2 * 1024 * 1024 * 1024
     registry_url: str = "registry:5000"
+    deployment_image_digest: str = ""
     label_studio_url: str = "http://label-studio:8080"
     label_studio_public_url: str | None = None
     label_studio_token: str = ""

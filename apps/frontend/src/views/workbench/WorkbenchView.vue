@@ -19,7 +19,54 @@
             </div>
           </div>
           <div class="pie-row">
-            <div class="pie-chart" :style="{ background: dataPieBackground }" aria-label="数据导入类型占比"></div>
+            <div v-if="loading" class="pie-chart pie-chart-loading" aria-hidden="true"></div>
+            <div v-else-if="pieSegments.length === 0" class="pie-chart pie-chart-loading" aria-label="暂无数据导入记录"></div>
+            <div
+              v-else
+              class="pie-chart pie-chart-animated"
+              role="group"
+              aria-label="数据导入类型占比"
+              @mouseleave="activePieIndex = null"
+            >
+              <svg viewBox="0 0 220 220">
+                <g
+                  v-for="segment in pieSegments"
+                  :key="segment.index"
+                  class="pie-sector-group"
+                  :class="{ active: activePieIndex === segment.index }"
+                  :style="{
+                    '--segment-index': segment.order,
+                  }"
+                >
+                  <path
+                    class="pie-sector"
+                    :d="segment.path"
+                    :fill="segment.color"
+                    role="button"
+                    tabindex="0"
+                    :aria-label="`${segment.label} ${segment.value}`"
+                    @mouseenter="activePieIndex = segment.index"
+                    @focus="activePieIndex = segment.index"
+                    @blur="activePieIndex = null"
+                    @click="togglePieSegment(segment.index)"
+                    @keydown.enter.prevent="togglePieSegment(segment.index)"
+                    @keydown.space.prevent="togglePieSegment(segment.index)"
+                  >
+                    <title>{{ segment.label }}：{{ segment.value }}</title>
+                  </path>
+                </g>
+              </svg>
+              <div
+                v-if="activePieSegment"
+                class="pie-tooltip"
+                role="tooltip"
+                :style="{ left: `${activePieSegment.tooltipX}%`, top: `${activePieSegment.tooltipY}%` }"
+              >
+                <i :style="{ background: activePieSegment.color }"></i>
+                <span>{{ activePieSegment.label }}</span>
+                <strong>{{ activePieSegment.value }}</strong>
+              </div>
+            </div>
             <ul class="pie-legend">
               <li v-for="metric in dataMetrics" :key="metric.label">
                 <i :style="{ background: metric.color }"></i>
@@ -117,6 +164,7 @@ const loading = ref(true);
 const datasets = ref<DatasetRecord[]>([]);
 const pipelines = ref<TrainingPipelineRecord[]>([]);
 const services = ref<DeploymentServiceRecord[]>([]);
+const activePieIndex = ref<number | null>(null);
 
 const taskNames: Record<string, string> = {
   detect: "目标检测",
@@ -143,17 +191,63 @@ const dataMetrics = computed(() => {
   ];
 });
 
-const dataPieBackground = computed(() => {
+const pieSegments = computed(() => {
   const total = dataMetrics.value.reduce((sum, metric) => sum + metric.value, 0);
-  if (total === 0) return "#edf0f5";
-  let cursor = 0;
-  const segments = dataMetrics.value.map((metric) => {
-    const start = cursor;
-    cursor += (metric.value / total) * 100;
-    return `${metric.color} ${start}% ${cursor}%`;
+  if (total === 0) return [];
+
+  let cursor = -90;
+  return dataMetrics.value.flatMap((metric, index) => {
+    if (metric.value <= 0) return [];
+    const sweep = (metric.value / total) * 360;
+    const startAngle = cursor;
+    const endAngle = cursor + sweep;
+    const middleAngle = startAngle + sweep / 2;
+    cursor = endAngle;
+    const middleRadians = (middleAngle * Math.PI) / 180;
+    const tooltipRadius = 72;
+    return [{
+      ...metric,
+      index,
+      order: index,
+      path: pieSectorPath(startAngle, endAngle),
+      tooltipX: clamp(((110 + Math.cos(middleRadians) * tooltipRadius) / 220) * 100, 18, 82),
+      tooltipY: clamp(((110 + Math.sin(middleRadians) * tooltipRadius) / 220) * 100, 14, 86),
+    }];
   });
-  return `conic-gradient(${segments.join(", ")})`;
 });
+
+const activePieSegment = computed(() =>
+  pieSegments.value.find((segment) => segment.index === activePieIndex.value) ?? null,
+);
+
+function pieSectorPath(startAngle: number, endAngle: number) {
+  const center = 110;
+  const radius = 92;
+  const sweep = endAngle - startAngle;
+  if (sweep >= 359.999) {
+    return `M ${center} ${center - radius} A ${radius} ${radius} 0 1 1 ${center} ${center + radius} A ${radius} ${radius} 0 1 1 ${center} ${center - radius} Z`;
+  }
+  const start = polarPoint(center, center, radius, startAngle);
+  const end = polarPoint(center, center, radius, endAngle);
+  const largeArc = sweep > 180 ? 1 : 0;
+  return `M ${center} ${center} L ${start.x} ${start.y} A ${radius} ${radius} 0 ${largeArc} 1 ${end.x} ${end.y} Z`;
+}
+
+function polarPoint(centerX: number, centerY: number, radius: number, angle: number) {
+  const radians = (angle * Math.PI) / 180;
+  return {
+    x: centerX + Math.cos(radians) * radius,
+    y: centerY + Math.sin(radians) * radius,
+  };
+}
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function togglePieSegment(index: number) {
+  activePieIndex.value = activePieIndex.value === index ? null : index;
+}
 
 const dataTags = computed(() => {
   const counts = new Map<string, number>();
@@ -268,34 +362,37 @@ function goServices() {
 
 <style scoped>
 .workbench-view {
+  container: workbench / inline-size;
   min-height: 100%;
-  background: #f5f7fb;
+  min-width: 0;
   color: #111827;
 }
 
 .workbench-title h1 {
-  margin: 0 0 14px;
-  font-size: 26px;
-  font-weight: 600;
+  margin: 0 0 16px;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 0;
 }
 
 .panel {
   border: 1px solid #e3e8f0;
+  border-radius: 6px;
   background: #fff;
-  box-shadow: 0 6px 16px rgb(15 23 42 / 4%);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 4%), 0 8px 24px rgb(15 23 42 / 3%);
 }
 
 .panel-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 18px 20px 10px;
+  padding: 16px 18px 12px;
 }
 
 .panel-heading h2 {
   margin: 0;
-  font-size: 22px;
-  font-weight: 500;
+  font-size: 17px;
+  font-weight: 700;
 }
 
 .quick-link {
@@ -303,28 +400,35 @@ function goServices() {
   background: transparent;
   color: #1763ff;
   cursor: pointer;
-  font-size: 16px;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .data-grid {
   display: grid;
-  grid-template-columns: minmax(480px, 1.45fr) minmax(320px, 0.95fr) minmax(280px, 0.62fr);
-  gap: 18px;
-  padding: 0 20px 12px;
+  grid-template-columns: minmax(420px, 1.25fr) minmax(250px, 0.72fr) minmax(250px, 0.72fr);
+  gap: 14px;
+  padding: 0 18px 18px;
 }
 
 .data-chart-card,
 .tag-card,
 .dataset-list {
-  min-height: 412px;
+  min-width: 0;
+  min-height: 334px;
   border: 1px solid #e1e6ee;
+  border-radius: 4px;
   background: #fff;
+}
+
+.data-chart-card {
+  grid-row: auto;
 }
 
 .metric-strip {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  margin: 10px;
+  margin: 10px 10px 0;
   border: 1px solid #e4e8ef;
   background: #f8fafc;
 }
@@ -333,8 +437,8 @@ function goServices() {
   display: grid;
   gap: 4px;
   justify-items: center;
-  padding: 18px 8px 10px;
-  font-size: 18px;
+  padding: 13px 8px 11px;
+  font-size: 14px;
 }
 
 .metric-strip strong {
@@ -346,24 +450,103 @@ function goServices() {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 92px;
-  min-height: 300px;
+  gap: clamp(28px, 6cqw, 74px);
+  min-height: 250px;
+  padding: 18px;
 }
 
 .pie-chart {
-  width: 222px;
-  height: 222px;
+  position: relative;
+  width: clamp(168px, 21cqw, 218px);
+  aspect-ratio: 1;
+  height: auto;
+  flex: 0 0 auto;
+}
+
+.pie-chart-loading {
   border-radius: 50%;
-  background: conic-gradient(#16a34a 0 29%, #8b35eb 29% 98%, #f59e0b 98% 100%);
+  background: #edf0f5;
+}
+
+.pie-chart-animated svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  animation: pie-reveal 900ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.pie-sector-group {
+  transform-box: view-box;
+  transform-origin: 110px 110px;
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.pie-sector-group.active {
+  transform: scale(1.065);
+}
+
+.pie-sector {
+  stroke: #ffffff;
+  stroke-width: 1.5;
+  cursor: pointer;
+  outline: none;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: sector-enter 560ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: calc(var(--segment-index) * 70ms);
+  transition: filter 180ms ease;
+}
+
+.pie-sector:hover,
+.pie-sector:focus-visible {
+  filter: drop-shadow(0 4px 5px rgb(15 23 42 / 20%));
+}
+
+.pie-sector:focus-visible {
+  stroke: #172033;
+  stroke-width: 2.5;
+}
+
+.pie-tooltip {
+  position: absolute;
+  z-index: 3;
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border: 1px solid #d8dee9;
+  border-radius: 4px;
+  background: #ffffff;
+  box-shadow: 0 5px 14px rgb(15 23 42 / 16%);
+  color: #475467;
+  font-size: 12px;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
+}
+
+.pie-tooltip i {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border-radius: 50%;
+}
+
+.pie-tooltip strong {
+  margin-left: 6px;
+  color: #172033;
+  font-weight: 600;
 }
 
 .pie-legend {
   display: grid;
-  gap: 30px;
+  gap: 22px;
   margin: 0;
   padding: 0;
   list-style: none;
-  font-size: 16px;
+  font-size: 13px;
 }
 
 .pie-legend li {
@@ -379,7 +562,7 @@ function goServices() {
 }
 
 .tag-card {
-  padding: 24px 20px 0;
+  padding: 18px 16px 0;
 }
 
 .tag-card h3 {
@@ -391,20 +574,26 @@ function goServices() {
 
 .progress-row {
   display: grid;
-  grid-template-columns: 112px 1fr 42px;
+  grid-template-columns: minmax(72px, 100px) minmax(50px, 1fr) 38px;
   align-items: center;
   gap: 10px;
-  min-height: 74px;
+  min-height: 54px;
   border-bottom: 1px solid #edf0f4;
-  font-size: 16px;
+  font-size: 13px;
 }
 
-.progress-track,
-.pipeline-track {
+.progress-track {
   height: 8px;
   border-radius: 999px;
   background: #f1f2f4;
   overflow: hidden;
+}
+
+.pipeline-track {
+  height: 14px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #f1f2f4;
 }
 
 .progress-track i,
@@ -413,6 +602,34 @@ function goServices() {
   height: 100%;
   border-radius: 999px;
   background: #2878ff;
+  transform-origin: left center;
+  animation: bar-grow 760ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes pie-reveal {
+  from { transform: scale(0.92) rotate(-8deg); opacity: 0.35; }
+  to { transform: scale(1) rotate(0); opacity: 1; }
+}
+
+@keyframes sector-enter {
+  from { transform: scale(0.82); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+@keyframes bar-grow {
+  from { transform: scaleX(0); opacity: 0.35; }
+  to { transform: scaleX(1); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pie-chart-animated svg,
+  .pie-sector,
+  .pie-sector-group,
+  .progress-track i,
+  .pipeline-track i {
+    animation: none;
+    transition: none;
+  }
 }
 
 .progress-row strong {
@@ -422,35 +639,41 @@ function goServices() {
 
 .dataset-list {
   display: grid;
-  gap: 12px;
-  padding: 12px 14px;
+  align-content: start;
+  gap: 8px;
+  min-height: 0;
+  padding: 10px;
   overflow: hidden;
 }
 
 .dataset-card {
   border: 1px solid #dfe5ee;
   border-radius: 4px;
-  padding: 22px 20px 14px;
+  padding: 14px 14px 12px;
 }
 
 .dataset-card h3 {
-  margin: 0 0 14px;
-  font-size: 16px;
+  overflow: hidden;
+  margin: 0 0 10px;
+  font-size: 14px;
   font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dataset-badges {
   display: flex;
-  gap: 8px;
-  margin-bottom: 14px;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
 }
 
 .dataset-badges span,
 .service-row strong {
   border-radius: 999px;
-  padding: 6px 10px;
+  padding: 4px 8px;
   background: #f2f4f7;
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 500;
 }
 
@@ -482,16 +705,24 @@ function goServices() {
 
 .lower-grid {
   display: grid;
-  grid-template-columns: minmax(560px, 1fr) minmax(430px, 0.65fr);
-  gap: 20px;
-  margin-top: 20px;
+  grid-template-columns: minmax(0, 1.08fr) minmax(390px, 0.92fr);
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.lower-grid > *,
+.model-content,
+.status-cards,
+.pipeline-bars,
+.service-table {
+  min-width: 0;
 }
 
 .model-content {
   display: grid;
-  grid-template-columns: 204px 1fr;
-  gap: 48px;
-  padding: 4px 20px 10px;
+  grid-template-columns: minmax(150px, 184px) minmax(0, 1fr);
+  gap: 24px;
+  padding: 4px 18px 16px;
 }
 
 .status-cards {
@@ -503,33 +734,33 @@ function goServices() {
   display: grid;
   grid-template-columns: 18px 1fr auto;
   align-items: center;
-  min-height: 78px;
-  padding: 0 20px;
+  min-height: 58px;
+  padding: 0 14px;
   box-shadow: 0 6px 18px rgb(30 64 175 / 9%);
 }
 
 .status-card em {
   font-style: normal;
-  font-size: 18px;
+  font-size: 13px;
 }
 
 .status-card strong {
-  font-size: 36px;
-  font-weight: 400;
+  font-size: 24px;
+  font-weight: 600;
 }
 
 .pipeline-bars {
   display: grid;
-  gap: 34px;
+  gap: 24px;
   padding: 8px 0 0;
 }
 
 .pipeline-row {
   display: grid;
-  grid-template-columns: 140px 1fr 38px;
+  grid-template-columns: minmax(86px, 120px) minmax(60px, 1fr) 38px;
   align-items: center;
   gap: 14px;
-  font-size: 15px;
+  font-size: 13px;
 }
 
 .service-table {
@@ -540,12 +771,21 @@ function goServices() {
 
 .service-row {
   display: grid;
-  grid-template-columns: minmax(130px, 1fr) 170px minmax(80px, 1fr) 74px;
+  grid-template-columns: minmax(100px, 1fr) minmax(132px, auto) minmax(80px, 1fr) 68px;
   align-items: center;
   min-height: 50px;
   padding: 0 10px;
   background: #f8f5ff;
-  font-size: 16px;
+  font-size: 13px;
+}
+
+.service-row > span,
+.service-row > time,
+.service-row > strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .service-row strong.deploying {
@@ -574,10 +814,73 @@ function goServices() {
   text-align: center;
 }
 
-@media (max-width: 1280px) {
+@container workbench (max-width: 1040px) {
+  .data-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 0.72fr);
+  }
+
+  .dataset-list {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .lower-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@container workbench (max-width: 760px) {
   .data-grid,
   .lower-grid {
     grid-template-columns: 1fr;
+  }
+
+  .data-chart-card {
+    grid-row: auto;
+  }
+
+  .dataset-list {
+    grid-column: auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .service-table {
+    overflow-x: auto;
+  }
+
+  .service-row {
+    min-width: 620px;
+  }
+}
+
+@container workbench (max-width: 520px) {
+  .metric-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .metric-strip div {
+    grid-template-columns: 1fr auto;
+    justify-items: start;
+  }
+
+  .pie-row {
+    flex-direction: column;
+  }
+
+  .pie-legend {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .dataset-list,
+  .model-content {
+    grid-template-columns: 1fr;
+  }
+
+  .service-table {
+    max-width: 100%;
+    overflow-x: auto;
   }
 }
 </style>

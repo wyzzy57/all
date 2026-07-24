@@ -26,7 +26,7 @@ describe("training metric catalog", () => {
 
     expect(cards).toHaveLength(1);
     expect(cards[0].id).toBe("map50");
-    expect(cards[0].series).toEqual({ mAP50: [point(1, 0.7)] });
+    expect(cards[0].series).toEqual({ Validation: [point(1, 0.7)] });
   });
 
   it("pairs train and validation lines only for the same loss", () => {
@@ -43,6 +43,31 @@ describe("training metric catalog", () => {
     });
     expect(cards.find((card) => card.id === "cls-loss")?.series).toEqual({ Train: [point(1, 0.8)] });
     expect(cards.find((card) => card.id === "precision")?.axis).toEqual({ min: 0, max: 1 });
+    expect(cards.find((card) => card.id === "precision")?.series).toEqual({
+      Validation: [point(1, 0.72)],
+    });
+  });
+
+  it("labels validation quality metrics and training-only learning rate by source", () => {
+    const cards = buildMetricCards({
+      "metrics.recall": [point(1, 0.8)],
+      "metrics.map50": [point(1, 0.9)],
+      "metrics.map50_95": [point(1, 0.7)],
+      learning_rate: [point(1, 0.001)],
+    });
+
+    expect(cards.find((card) => card.id === "recall")?.series).toEqual({
+      Validation: [point(1, 0.8)],
+    });
+    expect(cards.find((card) => card.id === "map50")?.series).toEqual({
+      Validation: [point(1, 0.9)],
+    });
+    expect(cards.find((card) => card.id === "map50-95")?.series).toEqual({
+      Validation: [point(1, 0.7)],
+    });
+    expect(cards.find((card) => card.id === "learning-rate")?.series).toEqual({
+      Train: [point(1, 0.001)],
+    });
   });
 
   it("creates a separate card for every unknown scalar", () => {

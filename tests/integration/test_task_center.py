@@ -192,6 +192,38 @@ def test_get_tasks_and_get_task_read_persisted_tasks(
     assert detail_response.json()["task_type"] == "TRAIN_MODEL"
 
 
+def test_task_center_lists_only_training_tasks(client: TestClient, session_factory):
+    with session_factory() as session:
+        training = Task(task_type="EDGE_TRAIN", status="SUCCESS", progress=100, payload={})
+        dataset = Task(task_type="ANALYZE_DATASET", status="SUCCESS", progress=100, payload={})
+        session.add_all([training, dataset])
+        session.commit()
+
+    response = client.get("/tasks")
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert [item["task_type"] for item in response.json()["items"]] == ["EDGE_TRAIN"]
+
+
+def test_delete_terminal_training_task_and_reject_active_task(client: TestClient, session_factory):
+    with session_factory() as session:
+        completed = Task(task_type="TRAIN_MODEL", status="SUCCESS", progress=100, payload={})
+        running = Task(task_type="EDGE_TRAIN", status="RUNNING", progress=50, payload={})
+        session.add_all([completed, running])
+        session.commit()
+        completed_id = completed.id
+        running_id = running.id
+
+    assert client.delete(f"/tasks/{completed_id}").status_code == 204
+    active_response = client.delete(f"/tasks/{running_id}")
+    assert active_response.status_code == 409
+
+    with session_factory() as session:
+        assert session.get(Task, completed_id) is None
+        assert session.get(Task, running_id) is not None
+
+
 def test_cancel_queued_task_and_reject_finished_task(client: TestClient, session_factory):
     with session_factory() as session:
         queued = Task(task_type="TRAIN_MODEL", status="QUEUED", payload={})
@@ -357,6 +389,7 @@ def test_get_tasks_uses_limit_and_offset(client: TestClient, session_factory):
 def test_missing_task_returns_404(client: TestClient):
     assert client.get("/tasks/missing").status_code == 404
     assert client.post("/tasks/missing/cancel").status_code == 404
+    assert client.delete("/tasks/missing").status_code == 404
 
 
 def test_update_task_progress_sets_finished_at_for_terminal_status(session_factory):

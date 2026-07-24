@@ -48,8 +48,10 @@ services:
     environment:
       VISIOX_EDGE_BOOTSTRAP_SOCKET: /run/visiox-edge/edge-bootstrap.sock
       VISIOX_EDGE_CREDENTIAL_MASTER_KEY_FILE: /run/secrets/edge_credential_master_key
+      VISIOX_TRAINING_RUNS_ROOT: /workspace/training-runs
     volumes:
       - edge-runtime:/run/visiox-edge
+      - training-runs:/workspace/training-runs
       - ../../workers/edge-executor-worker/remote:/app/workers/edge-executor-worker/remote:ro
     secrets:
       - source: edge_credential_master_key
@@ -218,10 +220,22 @@ services:
       LABEL_STUDIO_PASSWORD: ${LABEL_STUDIO_PASSWORD:-visiox123}
       LABEL_STUDIO_USER_TOKEN: ${LABEL_STUDIO_USER_TOKEN:-visiox-label-studio-token}
     ports:
-      - "80:8080"
       - "8080:8080"
     volumes:
       - label-studio-data:/label-studio/data
+
+  label-studio-gateway:
+    build:
+      context: ../..
+      dockerfile: apps/label-studio-gateway/Dockerfile
+    environment:
+      LABEL_STUDIO_UPSTREAM: http://label-studio:8080
+      LABEL_STUDIO_USERNAME: ${LABEL_STUDIO_USERNAME:-admin@example.com}
+      LABEL_STUDIO_PASSWORD: ${LABEL_STUDIO_PASSWORD:-visiox123}
+    depends_on:
+      - label-studio
+    ports:
+      - "80:8081"
 
 volumes:
   postgres-data:

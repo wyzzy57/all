@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 from collections.abc import Generator
+from hashlib import sha256
+from io import BytesIO
 import json
 from pathlib import Path
 from typing import Any
@@ -8,11 +12,17 @@ from typing import Any
 from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI
+from fastapi import UploadFile
 from fastapi.testclient import TestClient
+import httpx
+from PIL import Image
 import pytest
+from starlette.datastructures import Headers
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from visiox_api.routes import services as services_route
+from visiox_api.routes.pipeline_inference import PipelinePredictResponse
 from visiox_api.routes.services import (
     get_service_session,
     get_service_stream_producer,
@@ -20,6 +30,7 @@ from visiox_api.routes.services import (
 )
 from visiox_common.tasks import TaskType
 from visiox_db.models import (
+    BaseModel,
     ComputeNode,
     DeploymentInstance,
     DeploymentService,
@@ -30,6 +41,7 @@ from visiox_db.models import (
     TrainingPipeline,
 )
 from visiox_edge_executor_worker.inventory import compatibility_policy, parse_inventory
+from visiox_storage.client import InMemoryObjectStorageClient
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "edge_inventory"
@@ -89,7 +101,19 @@ def service_runtime(tmp_path):
             version="best.pt",
             task="detect",
             artifact_uri="minio://models/trained/detect/best.pt",
-            metrics={},
+            metrics={"checksum": MODEL_CHECKSUM},
+            status="ready",
+        )
+        base_model = BaseModel(
+            id="base-model-1",
+            family="yolo26",
+            task="detect",
+            scale="n",
+            filename="yolo26n.pt",
+            source_path="yolo26n.pt",
+            local_uri="minio://models/base/yolo26-detect-n/yolo26n.pt",
+            checksum="c" * 64,
+            size_bytes=5_544_453,
             status="ready",
         )
         node = ComputeNode(
@@ -107,11 +131,13 @@ def service_runtime(tmp_path):
             },
             agent_version="ssh-bootstrap",
         )
-        session.add_all([pool, pipeline, model, node])
+        session.add_all([pool, pipeline, model, base_model, node])
         session.commit()
 
     producer = FakeEdgeProducer()
+    storage = InMemoryObjectStorageClient()
     app = FastAPI()
+    app.state.object_storage = storage
     app.include_router(router)
 
     def override_session() -> Generator[Session]:
@@ -158,6 +184,7 @@ def test_create_service_transactionally_persists_real_resources_then_enqueues(
     assert body["phase"] == "queued"
     assert body["node_id"] == "node-1"
     assert body["health_status"] == "pending"
+    assert body["health_checked_at"] is None
     assert len(producer.enqueued) == 1
     assert producer.enqueued[0] == {
         "task_id": body["task_id"],
@@ -186,6 +213,201 @@ def test_create_service_transactionally_persists_real_resources_then_enqueues(
         serialized_config = json.dumps(service.config)
         assert "X-Amz" not in serialized_config
         assert "secret" not in serialized_config.casefold()
+
+
+def test_running_service_inference_uses_deployed_endpoint(
+    service_runtime,
+    monkeypatch,
+) -> None:
+    app, factory, _producer = service_runtime
+    with TestClient(app) as client:
+        created = client.post("/services", json=_request())
+    service_id = created.json()["id"]
+    with factory() as session:
+        service = session.get(DeploymentService, service_id)
+        assert service is not None
+        service.status = "running"
+        service.endpoint = "http://edge.example:18080"
+        session.add(service)
+        session.commit()
+
+    captured: dict[str, str] = {}
+
+    async def fake_remote_prediction(service, file):
+        captured["endpoint"] = service.endpoint
+        captured["filename"] = file.filename
+        return PipelinePredictResponse(
+            pipeline_id=service.pipeline_id,
+            model_weight=service.model_weight,
+            environment=service.resource_summary,
+            predictions=[{"label": "pepper", "confidence": 0.9}],
+            result_image="data:image/png;base64,cG5n",
+            latency_ms=12.5,
+        )
+
+    monkeypatch.setattr(services_route, "_request_deployed_prediction", fake_remote_prediction)
+    with TestClient(app) as client:
+        response = client.post(
+            f"/services/{service_id}/predict/image",
+            files={"file": ("pepper.png", b"image", "image/png")},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["latency_ms"] == 12.5
+    assert captured == {
+        "endpoint": "http://edge.example:18080",
+        "filename": "pepper.png",
+    }
+    with factory() as session:
+        service = session.get(DeploymentService, service_id)
+        assert service is not None
+        assert service.calls == 1
+
+
+def test_deployed_prediction_adapter_returns_annotated_image(service_runtime) -> None:
+    app, factory, _producer = service_runtime
+    with TestClient(app) as client:
+        created = client.post("/services", json=_request())
+    with factory() as session:
+        service = session.get(DeploymentService, created.json()["id"])
+        assert service is not None
+        service.status = "running"
+        service.endpoint = "http://edge.example:18080"
+        session.add(service)
+        session.commit()
+        session.expunge(service)
+
+    image_buffer = BytesIO()
+    Image.new("RGB", (64, 48), "white").save(image_buffer, format="PNG")
+    image_bytes = image_buffer.getvalue()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "http://edge.example:18080/predict/image"
+        return httpx.Response(
+            200,
+            json={
+                "predictions": [
+                    {
+                        "class_id": 0,
+                        "label": "pepper",
+                        "confidence": 0.91,
+                        "bbox": {"x1": 5, "y1": 6, "x2": 30, "y2": 32},
+                    },
+                    {
+                        "class_id": 1,
+                        "label": "leaf",
+                        "confidence": 0.83,
+                        "bbox": {"x1": 35, "y1": 6, "x2": 55, "y2": 32},
+                    },
+                ],
+                "latency_ms": 8.75,
+            },
+        )
+
+    async def run_prediction() -> PipelinePredictResponse:
+        upload = UploadFile(
+            filename="pepper.png",
+            file=BytesIO(image_bytes),
+            headers=Headers({"content-type": "image/png"}),
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await services_route._request_deployed_prediction(
+                service,
+                upload,
+                client=client,
+            )
+
+    result = asyncio.run(run_prediction())
+    assert result.predictions[0]["label"] == "pepper"
+    assert result.latency_ms == 8.75
+    assert result.result_image.startswith("data:image/png;base64,")
+    assert result.environment == "RTX 4090"
+    encoded_image = result.result_image.split(",", 1)[1]
+    with Image.open(BytesIO(base64.b64decode(encoded_image))) as annotated:
+        assert annotated.convert("RGB").getpixel((5, 32)) != annotated.convert("RGB").getpixel(
+            (35, 32)
+        )
+
+
+def test_create_service_resolves_system_image_and_trained_checksum(
+    service_runtime,
+    monkeypatch,
+) -> None:
+    app, factory, _producer = service_runtime
+    monkeypatch.setattr(
+        "visiox_api.routes.services.get_settings",
+        lambda: type("Settings", (), {"deployment_image_digest": IMAGE_DIGEST})(),
+    )
+    payload = _request(name="automatic-metadata")
+    payload.pop("image_digest")
+    payload.pop("model_checksum")
+
+    with TestClient(app) as client:
+        response = client.post("/services", json=payload)
+
+    assert response.status_code == 201
+    with factory() as session:
+        instance = session.get(DeploymentInstance, response.json()["instance_id"])
+        assert instance is not None
+        assert instance.image_digest == IMAGE_DIGEST
+        assert instance.model_checksum == MODEL_CHECKSUM
+
+
+def test_create_service_calculates_and_persists_missing_trained_checksum(
+    service_runtime,
+    tmp_path,
+) -> None:
+    app, factory, _producer = service_runtime
+    model_bytes = b"legacy-trained-model"
+    artifact_path = tmp_path / "best.pt"
+    artifact_path.write_bytes(model_bytes)
+    storage = app.state.object_storage
+    storage.put_file("models", "trained/detect/best.pt", artifact_path)
+    with factory() as session:
+        model = session.get(TrainedModel, "model-1")
+        assert model is not None
+        model.metrics = {}
+        session.add(model)
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.post("/services", json=_request(name="legacy-model"))
+
+    expected_checksum = sha256(model_bytes).hexdigest()
+    assert response.status_code == 201
+    assert response.json()["model_checksum"] == expected_checksum
+    with factory() as session:
+        model = session.get(TrainedModel, "model-1")
+        assert model is not None
+        assert model.metrics["checksum"] == expected_checksum
+
+
+def test_create_service_accepts_official_base_model(service_runtime) -> None:
+    app, factory, _producer = service_runtime
+    payload = _request(
+        name="official-model",
+        trained_model_id=None,
+        base_model_id="base-model-1",
+        model_name="ignored-client-name",
+        model_weight="ignored-client-weight",
+        model_checksum=None,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/services", json=payload)
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["trained_model_id"] is None
+    assert body["model_name"] == "yolo26n.pt"
+    assert body["model_weight"] == "yolo26n.pt"
+    with factory() as session:
+        service = session.get(DeploymentService, body["id"])
+        instance = session.get(DeploymentInstance, body["instance_id"])
+        assert service is not None
+        assert service.config["base_model_id"] == "base-model-1"
+        assert instance is not None
+        assert instance.model_checksum == "c" * 64
 
 
 def test_create_service_persists_redacted_deterministic_enqueue_failure(
@@ -236,6 +458,53 @@ def test_stop_service_creates_real_stop_execution_and_dedicated_command(
             "remote_execution_id": body["remote_execution_id"],
         }
     ]
+
+
+def test_stop_service_without_instance_converges_and_can_be_deleted(
+    service_runtime,
+) -> None:
+    app, factory, producer = service_runtime
+    with TestClient(app) as client:
+        created = client.post("/services", json=_request()).json()
+        with factory() as session:
+            service = session.get(DeploymentService, created["id"])
+            instance = session.get(DeploymentInstance, created["instance_id"])
+            assert service is not None and instance is not None
+            service.status = "running"
+            service.endpoint = "http://edge.example:18080"
+            session.delete(instance)
+            session.commit()
+
+        producer.enqueued.clear()
+        stopped = client.post(f"/services/{created['id']}/stop")
+        deleted = client.delete(f"/services/{created['id']}")
+        missing = client.get(f"/services/{created['id']}")
+
+    assert stopped.status_code == 202
+    assert stopped.json()["status"] == "stopped"
+    assert stopped.json()["endpoint"] == ""
+    assert producer.enqueued == []
+    assert deleted.status_code == 204
+    assert missing.status_code == 404
+
+
+def test_running_service_without_instance_can_be_deleted_directly(
+    service_runtime,
+) -> None:
+    app, factory, _producer = service_runtime
+    with TestClient(app) as client:
+        created = client.post("/services", json=_request()).json()
+        with factory() as session:
+            service = session.get(DeploymentService, created["id"])
+            instance = session.get(DeploymentInstance, created["instance_id"])
+            assert service is not None and instance is not None
+            service.status = "running"
+            session.delete(instance)
+            session.commit()
+
+        deleted = client.delete(f"/services/{created['id']}")
+
+    assert deleted.status_code == 204
 
 
 def test_upgrade_queues_deploy_without_overwriting_healthy_observed_tuple(

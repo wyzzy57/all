@@ -1,5 +1,5 @@
 <template>
-  <section class="model-space-view">
+  <section class="model-space-view" :class="{ 'list-mode': viewMode === 'list' }">
     <template v-if="viewMode === 'list'">
       <header class="page-header">
         <h1>模型空间</h1>
@@ -237,24 +237,40 @@
           </label>
 
           <section class="deploy-section">
-            <h3>请选择模型方案</h3>
-            <p>请选择各模块对应的模型方案，默认选择官方提供的模型权重，支持用户修改为在产线评估环节标记的模型权重</p>
+            <h3>请选择部署权重</h3>
+            <p>选择本产线训练生成的模型权重，或与当前任务匹配的官方预训练权重</p>
 
             <template v-if="deployMode === 'online'">
-              <div class="model-radio-row required-row">
-                <span>{{ taskLabel(detailPipeline.task) }}模块：</span>
-                <el-radio-group v-model="deployForm.model">
-                  <el-radio v-for="model in deployModelOptions" :key="model" :label="model">{{ model }}</el-radio>
-                </el-radio-group>
+              <div class="weight-source-switch" role="group" aria-label="部署权重来源">
+                <button
+                  type="button"
+                  :class="{ active: deployForm.weightSource === 'pipeline' }"
+                  data-testid="deployment-weight-pipeline"
+                  @click="selectDeploymentWeightSource('pipeline')"
+                >
+                  本产线模型权重
+                </button>
+                <button
+                  type="button"
+                  :class="{ active: deployForm.weightSource === 'official' }"
+                  data-testid="deployment-weight-official"
+                  @click="selectDeploymentWeightSource('official')"
+                >
+                  官方预训练权重
+                </button>
               </div>
-              <el-select v-model="deployForm.weight" class="detail-select" placeholder="请选择模型权重">
-                <el-option
-                  v-for="option in deployWeightOptions"
-                  :key="option.value"
-                  :label="option.label"
-                  :value="option.value"
-                />
-              </el-select>
+              <div class="deployment-weight-row required-row">
+                <span>模型权重：</span>
+                <el-select v-model="deployForm.weight" class="detail-select" placeholder="请选择模型权重">
+                  <el-option
+                    v-for="option in deployWeightOptions"
+                    :key="option.value"
+                    :label="option.label"
+                    :value="option.value"
+                  />
+                </el-select>
+              </div>
+              <el-empty v-if="deployWeightOptions.length === 0" description="当前来源暂无可用权重" :image-size="56" />
             </template>
 
             <div v-else class="offline-model-row required-row">
@@ -341,10 +357,6 @@
               </div>
             </section>
 
-            <div class="deployment-artifact-grid">
-              <label><span class="required-label">镜像摘要：</span><input v-model="deployForm.imageDigest" placeholder="sha256:..." /></label>
-              <label><span class="required-label">模型校验和：</span><input v-model="deployForm.modelChecksum" placeholder="64 位 SHA-256" /></label>
-            </div>
             <div class="env-note">
               <strong>环境分配：</strong>
               <span>{{ selectedDeploymentNode ? nodeResourceSummary(selectedDeploymentNode) : "请先选择在线节点" }}</span>
@@ -511,7 +523,7 @@
 
         <div v-else-if="activeStep === 1" class="step-panel data-step">
           <div class="step-main">
-            <h2>请 选择模型并添加数据集</h2>
+            <h2>请选择模型并添加数据集</h2>
             <label class="field-label required">选择模型</label>
             <el-select v-model="form.base_model_id" class="full-input" placeholder="请选择基础模型" @change="syncScaleFromModel">
               <el-option
@@ -699,16 +711,112 @@
 
         <div v-else class="step-panel submit-step">
           <h2>请选择训练环境</h2>
-          <label class="field-label required">选择环境</label>
-          <el-select v-model="form.device" class="environment-select" placeholder="请选择训练环境">
-            <el-option label="CPU" value="cpu" />
-            <el-option label="gpu节点_1" value="0" />
-          </el-select>
+          <div class="training-target-switch" role="group" aria-label="训练运行位置">
+            <button
+              type="button"
+              :class="{ active: trainingEnvironment.mode === 'local' }"
+              data-testid="training-target-local"
+              @click="selectTrainingTarget('local')"
+            >
+              <strong>本机 CPU</strong>
+              <span>使用平台本地训练 Worker</span>
+            </button>
+            <button
+              type="button"
+              :class="{ active: trainingEnvironment.mode === 'remote' }"
+              data-testid="training-target-remote"
+              @click="selectTrainingTarget('remote')"
+            >
+              <strong>远程 GPU</strong>
+              <span>使用已接入的边缘服务器</span>
+            </button>
+          </div>
+
+          <div v-if="trainingEnvironment.mode === 'local'" class="local-training-summary">
+            <span class="resource-status-dot online"></span>
+            <div><strong>CPU</strong><small>device=cpu · workers=2</small></div>
+          </div>
+
+          <section v-else class="training-resource-section" aria-label="远程训练资源选择">
+            <p v-if="edgeResourcesLoading">正在读取服务器 GPU 资源...</p>
+            <p v-else-if="edgeResourceError" class="deploy-error">{{ edgeResourceError }}</p>
+            <template v-else>
+              <div class="training-resource-group">
+                <div class="training-resource-heading"><strong>资源池</strong><span>同一次训练只使用同类兼容设备</span></div>
+                <div v-if="trainingResourcePools.length" class="training-resource-options">
+                  <button
+                    v-for="pool in trainingResourcePools"
+                    :key="pool.id"
+                    type="button"
+                    class="training-resource-card"
+                    :class="{ selected: trainingEnvironment.poolId === pool.id }"
+                    :data-testid="`training-pool-${pool.id}`"
+                    @click="selectTrainingPool(pool.id)"
+                  >
+                    <strong>{{ pool.name }}</strong>
+                    <small>{{ platformLabel(pool.kind) }} · {{ poolCompatibility(pool) }}</small>
+                  </button>
+                </div>
+                <el-empty v-else description="暂无可用的 GPU 资源池" :image-size="64" />
+              </div>
+
+              <div class="training-resource-group">
+                <div class="training-resource-heading"><strong>服务器与 GPU</strong><span>仅显示在线且 GPU 可用的节点</span></div>
+                <div v-if="trainingNodeOptions.length" class="training-resource-options">
+                  <button
+                    v-for="node in trainingNodeOptions"
+                    :key="node.id"
+                    type="button"
+                    class="training-resource-card training-node-card"
+                    :class="{ selected: trainingEnvironment.nodeId === node.id }"
+                    :data-testid="`training-node-${node.id}`"
+                    @click="selectTrainingNode(node.id)"
+                  >
+                    <span class="resource-card-title">
+                      <span class="resource-status-dot online"></span>
+                      <strong>{{ node.name }}</strong>
+                      <em>在线</em>
+                    </span>
+                    <small>{{ nodeResourceSummary(node) }}</small>
+                    <small>{{ platformLabel(node.platform_kind) }} · {{ node.architecture }}</small>
+                  </button>
+                </div>
+                <el-empty v-else description="当前资源池没有在线 GPU 服务器" :image-size="64" />
+              </div>
+
+              <div v-if="selectedTrainingNode" class="training-allocation-row">
+                <div>
+                  <span>GPU 数量</span>
+                  <small>该服务器可用 {{ selectedTrainingNodeGpuCount }} 张</small>
+                </div>
+                <el-input-number
+                  v-model="trainingEnvironment.requestedGpus"
+                  :min="1"
+                  :max="selectedTrainingNodeGpuCount"
+                  data-testid="training-gpu-count"
+                />
+              </div>
+
+              <details class="training-runtime-config">
+                <summary>运行镜像配置</summary>
+                <label>
+                  <span class="required-label">训练镜像摘要</span>
+                  <el-input
+                    v-model="trainingEnvironment.imageDigest"
+                    placeholder="registry.example/visiox/yolo26-training@sha256:..."
+                    data-testid="training-image-digest"
+                  />
+                  <small>远程服务器将拉取该不可变镜像；可通过 VITE_REMOTE_TRAINING_IMAGE_DIGEST 预配置。</small>
+                </label>
+              </details>
+            </template>
+          </section>
           <div class="submit-summary">
             <span>产线名称：{{ form.name }}</span>
             <span>任务类型：{{ taskLabel(form.task) }}</span>
             <span>基础模型：{{ selectedModelName }}</span>
             <span>数据集：{{ selectedDataset?.name || "待选择" }}</span>
+            <span>训练位置：{{ trainingEnvironmentLabel }}</span>
           </div>
         </div>
 
@@ -819,7 +927,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="createDialogVisible" title="创建产线" width="720px" class="create-dialog">
+    <el-dialog v-model="createDialogVisible" title="创建产线" width="760px" class="create-dialog">
       <div class="dialog-tabs">
         <button :class="{ active: createTab === 'zero' }" type="button" @click="createTab = 'zero'">零代码产线</button>
         <button :class="{ active: createTab === 'local' }" type="button" @click="createTab = 'local'">本地模型</button>
@@ -838,8 +946,13 @@
             type="button"
             @click="selectScenario(scenario.key)"
           >
-            <strong>{{ scenario.label }}</strong>
-            <span>{{ scenario.description }}</span>
+            <span class="scenario-copy">
+              <strong>{{ scenario.label }}</strong>
+              <span>{{ scenario.description }}</span>
+            </span>
+            <span class="scenario-icon" :class="scenario.tone" aria-hidden="true">
+              <el-icon><component :is="scenario.icon" /></el-icon>
+            </span>
           </button>
         </div>
       </div>
@@ -847,11 +960,30 @@
       <div v-else class="create-form local-form">
         <label class="field-label required">产线名称</label>
         <el-input v-model="createForm.name" placeholder="请输入产线名称" />
-        <label class="field-label required">文件上传</label>
-        <button class="upload-box" type="button">
-          <el-icon><UploadFilled /></el-icon>
-          <span>点击上传本地模型文件</span>
+        <div class="local-model-fields">
+          <div>
+            <label class="field-label required">任务类型</label>
+            <el-select v-model="createForm.localTask" class="full-input" aria-label="本地模型任务类型">
+              <el-option v-for="option in localModelTaskOptions" :key="option.value" :label="option.label" :value="option.value" />
+            </el-select>
+          </div>
+          <div>
+            <label class="field-label required">模型规格</label>
+            <el-select v-model="createForm.localScale" class="full-input" aria-label="本地模型规格">
+              <el-option v-for="scale in ['n', 's', 'm', 'l', 'x']" :key="scale" :label="scale.toUpperCase()" :value="scale" />
+            </el-select>
+          </div>
+        </div>
+        <label class="field-label required">模型权重</label>
+        <input ref="modelFileInput" class="visually-hidden" type="file" accept=".pt" data-testid="local-model-file" @change="selectLocalModelFile" />
+        <button class="upload-box" :class="{ selected: localModelFile }" type="button" @click="modelFileInput?.click()">
+          <span class="upload-icon"><el-icon><UploadFilled /></el-icon></span>
+          <span class="upload-copy">
+            <strong>{{ localModelFile?.name || '点击上传模型权重' }}</strong>
+            <small>{{ localModelFile ? formatFileSize(localModelFile.size) : '支持 Ultralytics / PyTorch .pt，单文件最大 2 GB' }}</small>
+          </span>
         </button>
+        <p class="local-model-hint">ONNX 与 TensorRT Engine 用于部署，不能作为继续训练的基础权重。</p>
         <label class="field-label">标签</label>
         <el-input v-model="createForm.tags" placeholder="请输入标签" />
         <label class="field-label">简介摘要</label>
@@ -902,20 +1034,29 @@
 
 <script setup lang="ts">
 import {
+  Aim,
   ArrowLeft,
   Check,
   CircleClose,
+  Cpu,
+  Crop,
+  Document,
   Download,
+  EditPen,
+  Grid,
   Loading,
   MoreFilled,
+  Picture,
+  PriceTag,
   Refresh,
   Search,
   Star,
   StarFilled,
+  Timer,
   UploadFilled,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch, type Component } from "vue";
 import { useRouter } from "vue-router";
 
 import {
@@ -954,12 +1095,17 @@ type Scenario = {
   label: string;
   task: string;
   description: string;
+  icon: Component;
+  tone: "blue" | "green";
 };
 
 type WeightOption = {
   label: string;
   value: string;
   modelId?: string;
+  baseModelId?: string;
+  modelName?: string;
+  weightName?: string;
   deploymentName?: string;
 };
 
@@ -993,6 +1139,8 @@ type TrainForm = {
   device: string;
 };
 
+type TrainingEnvironmentMode = "local" | "remote";
+
 const router = useRouter();
 
 const tabOptions: Array<{ label: string; value: ActiveTab }> = [
@@ -1002,15 +1150,24 @@ const tabOptions: Array<{ label: string; value: ActiveTab }> = [
 ];
 
 const scenarios: Scenario[] = [
-  { key: "detect", label: "目标检测", task: "detect", description: "通用目标检测" },
-  { key: "doc", label: "文档图像信息抽取", task: "document", description: "版面理解与字段抽取" },
-  { key: "ocr", label: "OCR", task: "ocr", description: "文本检测与识别" },
-  { key: "table", label: "通用表格识别", task: "table", description: "表格结构识别" },
-  { key: "classify", label: "图像分类", task: "classify", description: "单标签与多标签分类" },
-  { key: "timeseries", label: "时序分析", task: "timeseries", description: "时序预测与异常分析" },
-  { key: "segment", label: "图像分割", task: "segment", description: "实例分割" },
-  { key: "attribute", label: "属性识别", task: "attribute", description: "属性标签识别" },
-  { key: "llm", label: "大模型训练", task: "llm", description: "偏好对齐与微调" },
+  { key: "detect", label: "目标检测", task: "detect", description: "从图像或视频中定位并识别目标对象", icon: Aim, tone: "blue" },
+  { key: "doc", label: "文档图像信息抽取", task: "document", description: "分析文档版面并提取关键字段信息", icon: Document, tone: "blue" },
+  { key: "ocr", label: "OCR", task: "ocr", description: "检测并识别图片、扫描件中的文字", icon: EditPen, tone: "blue" },
+  { key: "table", label: "通用表格识别", task: "table", description: "识别表格区域、结构与单元格内容", icon: Grid, tone: "green" },
+  { key: "classify", label: "图像分类", task: "classify", description: "按照图像特征划分单标签或多标签类别", icon: Picture, tone: "blue" },
+  { key: "timeseries", label: "时序分析", task: "timeseries", description: "分析时间序列趋势、周期与异常", icon: Timer, tone: "blue" },
+  { key: "segment", label: "图像分割", task: "segment", description: "对目标像素区域进行实例级分割", icon: Crop, tone: "green" },
+  { key: "attribute", label: "属性识别", task: "attribute", description: "识别目标对象的多维属性标签", icon: PriceTag, tone: "blue" },
+  { key: "llm", label: "大模型训练", task: "llm", description: "完成大模型偏好对齐与参数微调", icon: Cpu, tone: "blue" },
+];
+
+const localModelTaskOptions = [
+  { label: "目标检测", value: "detect" },
+  { label: "图像分割", value: "segment" },
+  { label: "语义分割", value: "semantic" },
+  { label: "姿态估计", value: "pose" },
+  { label: "旋转框检测", value: "obb" },
+  { label: "图像分类", value: "classify" },
 ];
 
 const scopeOptions = ["管理员部门", "1组", "2组", "班级1", "班级2"];
@@ -1139,6 +1296,8 @@ const deployMode = ref<"online" | "offline">("online");
 const evaluationTab = ref<"pipeline" | "history">("pipeline");
 const batchMode = ref(false);
 const createDialogVisible = ref(false);
+const modelFileInput = ref<HTMLInputElement | null>(null);
+const localModelFile = ref<File | null>(null);
 const renameDialogVisible = ref(false);
 const publicDialogVisible = ref(false);
 const resultFilesDialogVisible = ref(false);
@@ -1183,6 +1342,8 @@ const createForm = reactive({
   scenarioKey: "detect",
   tags: "",
   description: "",
+  localTask: "detect",
+  localScale: "n",
 });
 
 const publicForm = reactive({
@@ -1191,7 +1352,7 @@ const publicForm = reactive({
 
 const deployForm = reactive({
   serviceName: "",
-  model: "",
+  weightSource: "pipeline" as "pipeline" | "official",
   weight: "official",
   environment: "",
   instanceName: "",
@@ -1202,8 +1363,6 @@ const deployForm = reactive({
   precision: "fp16" as "fp32" | "fp16" | "int8",
   inputSize: 640,
   calibrationDatasetUri: "",
-  imageDigest: "",
-  modelChecksum: "",
 });
 
 const evaluationForm = reactive({
@@ -1246,6 +1405,14 @@ const form = reactive<TrainForm>({
   save_period: 1,
   eval_interval: 1,
   device: "cpu",
+});
+
+const trainingEnvironment = reactive({
+  mode: "local" as TrainingEnvironmentMode,
+  poolId: "",
+  nodeId: "",
+  requestedGpus: 1,
+  imageDigest: String(import.meta.env.VITE_REMOTE_TRAINING_IMAGE_DIGEST ?? ""),
 });
 
 const typeOptions = computed(() => Array.from(new Set(pipelines.value.map((item) => item.task))).sort());
@@ -1330,11 +1497,6 @@ const detailClassCount = computed(() => {
     : undefined;
   return Array.isArray(names) && names.length > 0 ? names.length : "-";
 });
-const deployModelOptions = computed(() => {
-  const pipeline = detailPipeline.value;
-  const models = baseModels.value.filter((model) => !pipeline || model.task === pipeline.task).map((model) => modelLabel(model));
-  return models.length > 0 ? models.slice(0, 6) : [detailModelName.value === "-" ? "YOLO26" : detailModelName.value];
-});
 const detailReadyTrainedModels = computed(() => {
   const pipeline = detailPipeline.value;
   if (!pipeline) return [];
@@ -1352,6 +1514,8 @@ const trainedWeightOptions = computed<WeightOption[]>(() => {
       label: deploymentName || sourceWeight,
       value: sourceWeight,
       modelId: model.id,
+      modelName: detailModelName.value === "-" ? model.name : detailModelName.value,
+      weightName: sourceWeight,
       deploymentName,
     });
   });
@@ -1362,32 +1526,65 @@ const detailInferenceModelOptions = computed<WeightOption[]>(() => {
 });
 const inferenceEnvironmentOptions = ["cpu", "0", "gpu-node-1", "gpu-node-2"];
 const enabledResourcePools = computed(() => resourcePools.value.filter((pool) => pool.enabled));
+const onlineGpuNodes = computed(() =>
+  computeNodes.value.filter((node) => node.status === "online" && nodeGpuCount(node) > 0),
+);
+const trainingResourcePools = computed(() =>
+  enabledResourcePools.value.filter((pool) => onlineGpuNodes.value.some((node) => node.resource_pool_id === pool.id)),
+);
+const trainingNodeOptions = computed(() =>
+  onlineGpuNodes.value.filter((node) => node.resource_pool_id === trainingEnvironment.poolId),
+);
+const selectedTrainingNode = computed(() =>
+  onlineGpuNodes.value.find((node) => node.id === trainingEnvironment.nodeId),
+);
+const selectedTrainingNodeGpuCount = computed(() => Math.max(1, selectedTrainingNode.value ? nodeGpuCount(selectedTrainingNode.value) : 1));
+const trainingEnvironmentLabel = computed(() => {
+  if (trainingEnvironment.mode === "local") return "本机 CPU";
+  const node = selectedTrainingNode.value;
+  return node ? `${node.name} · ${nodeGpuSummary(node)} × ${trainingEnvironment.requestedGpus}` : "远程 GPU（待选择）";
+});
 const deploymentNodeOptions = computed(() =>
   computeNodes.value.filter((node) => node.status === "online" && node.resource_pool_id === deployForm.poolId),
 );
 const selectedDeploymentNode = computed(() => computeNodes.value.find((node) => node.id === deployForm.nodeId));
+const officialDeploymentWeightOptions = computed<WeightOption[]>(() => {
+  const pipeline = detailPipeline.value;
+  if (!pipeline) return [];
+  return baseModels.value
+    .filter(
+      (model) =>
+        model.family.toLowerCase() === "yolo26" &&
+        model.task === pipeline.task &&
+        model.status === "ready" &&
+        Boolean(model.local_uri && model.checksum),
+    )
+    .map((model) => ({
+      label: modelLabel(model),
+      value: `official:${model.id}`,
+      baseModelId: model.id,
+      modelName: modelLabel(model),
+      weightName: model.filename,
+    }));
+});
+const deployWeightOptions = computed(() =>
+  deployForm.weightSource === "pipeline" ? trainedWeightOptions.value : officialDeploymentWeightOptions.value,
+);
+const selectedDeployWeightOption = computed(() =>
+  deployWeightOptions.value.find((option) => option.value === deployForm.weight),
+);
 const canDeploy = computed(() =>
   Boolean(
     deployForm.serviceName.trim() &&
-      deployForm.model &&
-      deployForm.weight &&
+      selectedDeployWeightOption.value &&
       deployForm.nodeId &&
-      deployForm.instanceName.trim() &&
-      deployForm.imageDigest.trim() &&
-      deployForm.modelChecksum.trim() &&
-      selectedDeployTrainedModel.value,
+      deployForm.instanceName.trim(),
   ),
 );
 const detailWeightOptions = computed(() => {
   const options = detailInferenceModelOptions.value.filter((option) => option.value !== "base");
   return options.length > 0 ? options : [{ label: "best.pt", value: "best.pt" }];
 });
-const deployWeightOptions = computed(() => [
-  ...detailWeightOptions.value,
-]);
-const selectedDeployTrainedModel = computed(() =>
-  detailReadyTrainedModels.value.find((model) => model.id === deployWeightOptions.value.find((option) => option.value === deployForm.weight)?.modelId),
-);
 const evaluationDatasetOptions = computed(() => {
   return evaluationDatasetsByStatus(evaluationDatasetTab.value);
 });
@@ -1518,7 +1715,9 @@ watch(configMode, (enabled) => {
   if (enabled) configText.value = buildConfigText();
 });
 
-watch(() => deployForm.weight, syncDeploymentArtifactMetadata);
+watch(activeStep, (step) => {
+  if (step === 3 && resourcePools.value.length === 0 && !edgeResourcesLoading.value) void loadEdgeResources();
+});
 
 watch(
   () => evaluationForm.dataset,
@@ -1563,6 +1762,10 @@ async function loadWorkspace(options: { silent?: boolean } = {}) {
 
 function openCreateDialog() {
   createForm.name = nextPipelineName();
+  createForm.localTask = "detect";
+  createForm.localScale = "n";
+  localModelFile.value = null;
+  if (modelFileInput.value) modelFileInput.value.value = "";
   createDialogVisible.value = true;
   createTab.value = "zero";
 }
@@ -1580,16 +1783,33 @@ function selectScenario(key: string) {
   createForm.scenarioKey = key;
 }
 
+function selectLocalModelFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0] ?? null;
+  if (file && !file.name.toLowerCase().endsWith(".pt")) {
+    localModelFile.value = null;
+    input.value = "";
+    ElMessage.warning("请选择 Ultralytics / PyTorch .pt 权重文件");
+    return;
+  }
+  localModelFile.value = file;
+}
+
 async function startWizard() {
-  const scenario = selectedScenario.value;
   const name = createForm.name.trim();
   if (!name) {
     ElMessage.warning("请输入产线名称");
     return;
   }
+  if (createTab.value === "local" && !localModelFile.value) {
+    ElMessage.warning("请上传本地 .pt 模型权重");
+    return;
+  }
+  const task = createTab.value === "local" ? createForm.localTask : selectedScenario.value.task;
+  const scale = createTab.value === "local" ? createForm.localScale : "n";
   form.name = name;
-  form.task = scenario.task;
-  form.scale = "n";
+  form.task = task;
+  form.scale = scale;
   form.base_model_id = "";
   form.dataset_id = "";
   analysisResult.value = null;
@@ -1600,10 +1820,18 @@ async function startWizard() {
   ensureWizardDefaults();
   submitting.value = true;
   try {
+    let uploadedModel: BaseModelRecord | null = null;
+    if (createTab.value === "local" && localModelFile.value) {
+      uploadedModel = await api.uploadBaseModel(localModelFile.value, { task, scale });
+      baseModels.value = [uploadedModel, ...baseModels.value.filter((model) => model.id !== uploadedModel?.id)];
+      form.base_model_id = uploadedModel.id;
+      createForm.scenarioKey = scenarioKeyForTask(task);
+    }
     const pipeline = await api.createPipeline({
       name: form.name,
       task: form.task,
       scale: form.scale,
+      ...(uploadedModel ? { base_model_id: uploadedModel.id } : {}),
     });
     wizardPipelineId.value = pipeline.id;
     pipelines.value = [pipeline, ...pipelines.value.filter((item) => item.id !== pipeline.id)];
@@ -1650,8 +1878,7 @@ function openPipelineDetail(pipeline: TrainingPipelineRecord) {
   detailTab.value = "basic";
   deployMode.value = "online";
   deployForm.serviceName = `${pipeline.name}-service`;
-  deployForm.model = detailModelName.value === "-" ? "" : detailModelName.value;
-  deployForm.weight = detailWeightOptions.value[0]?.value ?? "";
+  selectDeploymentWeightSource(trainedWeightOptions.value.length > 0 ? "pipeline" : "official");
   deployForm.environment = "";
   deployForm.instanceName = `${pipeline.name}-01`;
   deployForm.poolId = "";
@@ -1661,8 +1888,6 @@ function openPipelineDetail(pipeline: TrainingPipelineRecord) {
   deployForm.precision = "fp16";
   deployForm.inputSize = 640;
   deployForm.calibrationDatasetUri = "";
-  deployForm.imageDigest = "";
-  deployForm.modelChecksum = "";
   evaluationForm.dataset = "val";
   evaluationForm.customDatasetId = "";
   evaluationForm.weight = "";
@@ -1673,7 +1898,6 @@ function openPipelineDetail(pipeline: TrainingPipelineRecord) {
   evaluationHistoryLoading.value = false;
   detailLogText.value = "";
   viewMode.value = "detail";
-  syncDeploymentArtifactMetadata();
 }
 
 function openDetailTab(tab: DetailTab) {
@@ -1693,9 +1917,17 @@ function openTrainingVisualization() {
 
 function setDeployMode(mode: "online" | "offline") {
   deployMode.value = mode;
-  if (mode === "offline" && (deployForm.weight === "official" || !deployForm.weight)) {
+  if (mode === "offline") {
     deployForm.weight = detailWeightOptions.value[0]?.value ?? "";
+  } else {
+    selectDeploymentWeightSource(deployForm.weightSource);
   }
+}
+
+function selectDeploymentWeightSource(source: "pipeline" | "official") {
+  deployForm.weightSource = source;
+  const options = source === "pipeline" ? trainedWeightOptions.value : officialDeploymentWeightOptions.value;
+  deployForm.weight = options[0]?.value ?? "";
 }
 
 function exportOfflineModel() {
@@ -1714,8 +1946,8 @@ function exportOfflineModel() {
 async function startDeployment() {
   const pipeline = detailPipeline.value;
   const node = selectedDeploymentNode.value;
-  const trainedModel = selectedDeployTrainedModel.value;
-  if (!pipeline || !node || !trainedModel || !canDeploy.value) {
+  const weight = selectedDeployWeightOption.value;
+  if (!pipeline || !node || !weight || !canDeploy.value) {
     ElMessage.warning("请完整填写部署配置");
     return;
   }
@@ -1725,15 +1957,14 @@ async function startDeployment() {
     await api.createService({
       name: deployForm.serviceName.trim(),
       pipeline_id: pipeline.id,
-      trained_model_id: trainedModel.id,
-      model_name: deployForm.model,
-      model_weight: deployForm.weight,
+      ...(weight.modelId ? { trained_model_id: weight.modelId } : {}),
+      ...(weight.baseModelId ? { base_model_id: weight.baseModelId } : {}),
+      model_name: weight.modelName ?? detailModelName.value,
+      model_weight: weight.weightName ?? weight.label,
       environment: node.id,
       instance_name: deployForm.instanceName.trim(),
       resource_summary: `${node.name} · ${nodeResourceSummary(node)}`,
       node_id: node.id,
-      image_digest: deployForm.imageDigest.trim(),
-      model_checksum: deployForm.modelChecksum.trim(),
       format: deployForm.optimizationMode === "auto" ? "auto" : deployForm.format,
       precision: deployForm.optimizationMode === "auto" ? "auto" : deployForm.precision,
       input_shape: [1, 3, deployForm.inputSize, deployForm.inputSize],
@@ -1768,6 +1999,10 @@ async function loadEdgeResources() {
       computeNodes.value.some((node) => node.resource_pool_id === pool.id && node.status === "online"),
     );
     if (!deployForm.poolId && firstPool) selectDeploymentPool(firstPool.id);
+    if (!trainingEnvironment.poolId) {
+      const firstTrainingPool = trainingResourcePools.value[0];
+      if (firstTrainingPool) selectTrainingPool(firstTrainingPool.id);
+    }
   } catch (error) {
     edgeResourceError.value = getErrorMessage(error, "边缘资源加载失败");
   } finally {
@@ -1775,12 +2010,33 @@ async function loadEdgeResources() {
   }
 }
 
+function selectTrainingTarget(mode: TrainingEnvironmentMode) {
+  trainingEnvironment.mode = mode;
+  form.device = mode === "local" ? "cpu" : "0";
+  if (mode === "remote") {
+    if (resourcePools.value.length === 0 && !edgeResourcesLoading.value) void loadEdgeResources();
+    const pool = trainingResourcePools.value.find((item) => item.id === trainingEnvironment.poolId) ?? trainingResourcePools.value[0];
+    if (pool) selectTrainingPool(pool.id);
+  }
+}
+
+function selectTrainingPool(poolId: string) {
+  trainingEnvironment.poolId = poolId;
+  const firstNode = onlineGpuNodes.value.find((node) => node.resource_pool_id === poolId);
+  selectTrainingNode(firstNode?.id ?? "");
+}
+
+function selectTrainingNode(nodeId: string) {
+  trainingEnvironment.nodeId = nodeId;
+  const node = onlineGpuNodes.value.find((item) => item.id === nodeId);
+  trainingEnvironment.requestedGpus = Math.min(Math.max(1, trainingEnvironment.requestedGpus), Math.max(1, node ? nodeGpuCount(node) : 1));
+}
+
 function selectDeploymentPool(poolId: string) {
   deployForm.poolId = poolId;
   const firstNode = computeNodes.value.find((node) => node.resource_pool_id === poolId && node.status === "online");
   deployForm.nodeId = firstNode?.id ?? "";
   deployForm.environment = firstNode?.id ?? "";
-  syncDeploymentArtifactMetadata();
 }
 
 function selectDeploymentNode(nodeId: string) {
@@ -1788,37 +2044,53 @@ function selectDeploymentNode(nodeId: string) {
   deployForm.environment = nodeId;
 }
 
-function syncDeploymentArtifactMetadata() {
-  if (!deployForm.weight) deployForm.weight = detailWeightOptions.value[0]?.value ?? "";
-  const model = selectedDeployTrainedModel.value;
-  if (!model) return;
-  deployForm.modelChecksum = metricString(model.metrics, ["checksum", "sha256", "artifact_checksum"]);
-  deployForm.imageDigest = metricString(model.metrics, ["deployment_image_digest", "image_digest"]);
-}
-
-function metricString(metrics: Record<string, unknown>, keys: string[]) {
-  for (const key of keys) {
-    const value = metrics[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-  return "";
-}
-
 function deploymentGpuUuids(node: ComputeNodeRecord) {
   const direct = node.capabilities.gpu_uuids;
   if (Array.isArray(direct)) return direct.filter((value): value is string => typeof value === "string");
   const gpus = node.resources.gpus;
-  if (!Array.isArray(gpus)) return [];
-  return gpus
+  const candidates = Array.isArray(gpus) ? gpus : inventoryGpus(node);
+  return candidates
     .map((gpu) => (gpu && typeof gpu === "object" ? (gpu as Record<string, unknown>).uuid : undefined))
     .filter((value): value is string => typeof value === "string");
 }
 
 function nodeResourceSummary(node: ComputeNodeRecord) {
-  const gpu = String(node.resources.gpu_name ?? node.resources.gpu_model ?? node.platform_kind);
+  const gpu = nodeGpuSummary(node);
   const free = Number(node.resources.gpu_memory_free_mb ?? 0);
-  const total = Number(node.resources.gpu_memory_total_mb ?? 0);
-  return total > 0 ? `${gpu}（${free || "-"} / ${total} MB）` : gpu;
+  const total = nodeGpuMemoryTotalMib(node);
+  return total > 0 ? `${gpu}（${free > 0 ? `${free} / ` : ""}${total} MiB）` : gpu;
+}
+
+function nodeGpuCount(node: ComputeNodeRecord) {
+  const direct = Number(node.resources.gpu_count ?? 0);
+  if (direct > 0) return direct;
+  const resourceGpus = node.resources.gpus;
+  if (Array.isArray(resourceGpus)) return resourceGpus.length;
+  return inventoryGpus(node).length;
+}
+
+function nodeGpuSummary(node: ComputeNodeRecord) {
+  const direct = node.resources.gpu_name ?? node.resources.gpu_model;
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  const capabilityModels = node.capabilities.gpu_models;
+  if (Array.isArray(capabilityModels) && capabilityModels.length > 0) return capabilityModels.map(String).join(" / ");
+  const names = inventoryGpus(node).map((gpu) => gpu.name).filter((name): name is string => typeof name === "string" && Boolean(name));
+  return names.length > 0 ? Array.from(new Set(names)).join(" / ") : node.platform_kind;
+}
+
+function nodeGpuMemoryTotalMib(node: ComputeNodeRecord) {
+  const mib = Number(node.resources.gpu_memory_total_mib ?? node.resources.gpu_memory_total_mb ?? 0);
+  if (mib > 0) return mib;
+  const bytes = Number(node.resources.gpu_memory_total_bytes ?? 0);
+  if (bytes > 0) return Math.round(bytes / 1024 / 1024);
+  return inventoryGpus(node).reduce((total, gpu) => total + Number(gpu.memory_total_mib ?? 0), 0);
+}
+
+function inventoryGpus(node: ComputeNodeRecord): Array<Record<string, unknown>> {
+  const snapshot = node.fingerprint.inventory_snapshot;
+  if (!snapshot || typeof snapshot !== "object") return [];
+  const gpus = (snapshot as Record<string, unknown>).gpus;
+  return Array.isArray(gpus) ? gpus.filter((gpu): gpu is Record<string, unknown> => Boolean(gpu) && typeof gpu === "object") : [];
 }
 
 function platformLabel(kind: string) {
@@ -1948,8 +2220,20 @@ async function submitTraining() {
     return;
   }
   if (configMode.value) applyConfigText();
+  if (trainingEnvironment.mode === "remote") {
+    if (!trainingEnvironment.poolId || !trainingEnvironment.nodeId) {
+      ElMessage.warning("请选择在线 GPU 服务器");
+      return;
+    }
+    if (!trainingEnvironment.imageDigest.trim()) {
+      ElMessage.warning("请配置远程训练镜像摘要");
+      return;
+    }
+  }
   submitting.value = true;
   try {
+    const defaultEnvironment = { device: trainingEnvironment.mode === "remote" ? "0" : "cpu", workers: 2 };
+    const jobPayload = trainingJobPayload(defaultEnvironment);
     if (wizardPipelineId.value) {
       await api.updatePipeline(wizardPipelineId.value, {
         task: form.task,
@@ -1957,9 +2241,9 @@ async function submitTraining() {
         base_model_id: form.base_model_id,
         dataset_id: form.dataset_id,
         params_template: trainingParams(),
-        default_environment: { device: form.device, workers: 2 },
+        default_environment: defaultEnvironment,
       });
-      await api.createTrainingJob(wizardPipelineId.value, {});
+      await api.createTrainingJob(wizardPipelineId.value, jobPayload);
       ElMessage.success("已提交训练");
       await loadWorkspace();
       backToList();
@@ -1972,9 +2256,9 @@ async function submitTraining() {
       base_model_id: form.base_model_id,
       dataset_id: form.dataset_id,
       params_template: trainingParams(),
-      default_environment: { device: form.device, workers: 2 },
+      default_environment: defaultEnvironment,
     });
-    await api.createTrainingJob(pipeline.id, {});
+    await api.createTrainingJob(pipeline.id, jobPayload);
     ElMessage.success("已提交训练");
     await loadWorkspace();
     backToList();
@@ -1983,6 +2267,19 @@ async function submitTraining() {
   } finally {
     submitting.value = false;
   }
+}
+
+function trainingJobPayload(environment: { device: string; workers: number }) {
+  if (trainingEnvironment.mode === "local") return {};
+  return {
+    environment,
+    distributed: {
+      resource_pool_id: trainingEnvironment.poolId,
+      requested_gpus: trainingEnvironment.requestedGpus,
+      node_ids: [trainingEnvironment.nodeId],
+      training_image_digest: trainingEnvironment.imageDigest.trim(),
+    },
+  };
 }
 
 async function stopTrainingPipeline(pipeline: TrainingPipelineRecord) {
@@ -2219,6 +2516,7 @@ function applyPipelineParams(pipeline: TrainingPipelineRecord) {
   form.resume_weight = params.resume ? "last.pt" : "";
   if (typeof environment.device === "string" || typeof environment.device === "number") {
     form.device = String(environment.device);
+    trainingEnvironment.mode = form.device === "cpu" ? "local" : "remote";
   }
 }
 
@@ -2361,6 +2659,9 @@ function latestJobsByPipelineId(jobs: TrainingJobRecord[]) {
 }
 
 function modelLabel(model: BaseModelRecord) {
+  if (model.family.startsWith("custom-") && model.source_path?.startsWith("upload://")) {
+    return model.source_path.slice("upload://".length);
+  }
   return model.filename || `${model.family}-${model.task}-${model.scale}`;
 }
 
@@ -2628,8 +2929,15 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 <style scoped>
 .model-space-view {
+  container: model-space / inline-size;
   min-height: 100%;
+  min-width: 0;
   color: #111827;
+}
+
+.model-space-view.list-mode {
+  display: flex;
+  flex-direction: column;
 }
 
 .page-header,
@@ -2880,11 +3188,31 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 .pagination-row {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
   display: flex;
+  flex: 0 0 auto;
   justify-content: flex-end;
   align-items: center;
   gap: 18px;
+  margin-top: auto;
   padding: 20px 0 4px;
+  background: #fff;
+}
+
+.pagination-row :deep(.el-pagination.is-background .el-pager li),
+.pagination-row :deep(.el-pagination.is-background .btn-prev),
+.pagination-row :deep(.el-pagination.is-background .btn-next) {
+  background: #fff;
+  color: #344054;
+}
+
+.pagination-row :deep(.el-pagination.is-background .el-pager li.is-active) {
+  border: 1px solid #e6e9ef;
+  background: #f5f7fa;
+  color: #5b9cf6;
+  font-weight: 500;
 }
 
 .total-count {
@@ -3080,6 +3408,180 @@ function getErrorMessage(error: unknown, fallback: string) {
 .environment-select {
   width: 540px;
   max-width: 100%;
+}
+
+.training-target-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 280px));
+  gap: 12px;
+  margin: 18px 0 24px;
+}
+
+.training-target-switch button {
+  display: grid;
+  gap: 7px;
+  min-height: 76px;
+  padding: 14px 16px;
+  border: 1px solid #d8dee9;
+  border-radius: 4px;
+  background: #fff;
+  color: #202938;
+  cursor: pointer;
+  text-align: left;
+}
+
+.training-target-switch button.active,
+.training-resource-card.selected {
+  border-color: #1763ff;
+  background: #f5f8ff;
+  box-shadow: 0 0 0 1px #1763ff inset;
+}
+
+.training-target-switch span,
+.training-resource-heading span,
+.training-resource-card small,
+.training-allocation-row small,
+.training-runtime-config small,
+.local-training-summary small {
+  color: #667085;
+  font-size: 13px;
+  font-style: normal;
+  line-height: 1.45;
+}
+
+.local-training-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: min(100%, 572px);
+  padding: 14px 16px;
+  border: 1px solid #dfe5ef;
+  background: #f8fafc;
+}
+
+.local-training-summary div {
+  display: grid;
+  gap: 4px;
+}
+
+.resource-status-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border-radius: 50%;
+  background: #98a2b3;
+}
+
+.resource-status-dot.online {
+  background: #12b76a;
+  box-shadow: 0 0 0 3px #d1fadf;
+}
+
+.training-resource-section {
+  width: min(100%, 940px);
+  display: grid;
+  gap: 22px;
+}
+
+.training-resource-section > p {
+  color: #667085;
+}
+
+.training-resource-group {
+  display: grid;
+  gap: 10px;
+}
+
+.training-resource-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.training-resource-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.training-resource-card {
+  display: grid;
+  gap: 7px;
+  min-height: 72px;
+  padding: 12px 14px;
+  border: 1px solid #dfe5ef;
+  border-radius: 4px;
+  background: #fff;
+  color: #202938;
+  cursor: pointer;
+  text-align: left;
+}
+
+.training-node-card {
+  min-height: 104px;
+}
+
+.resource-card-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.resource-card-title em {
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 3px;
+  background: #ecfdf3;
+  color: #027a48;
+  font-size: 12px;
+  font-style: normal;
+}
+
+.training-allocation-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  max-width: 560px;
+  padding: 14px 16px;
+  border: 1px solid #dfe5ef;
+  background: #f8fafc;
+}
+
+.training-allocation-row > div {
+  display: grid;
+  gap: 4px;
+}
+
+.training-runtime-config {
+  max-width: 720px;
+  border-top: 1px solid #e4e7ec;
+  padding-top: 14px;
+}
+
+.training-runtime-config summary {
+  color: #344054;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.training-runtime-config label {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+@media (max-width: 760px) {
+  .training-target-switch,
+  .training-resource-options {
+    grid-template-columns: 1fr;
+  }
+
+  .training-allocation-row,
+  .training-resource-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
 }
 
 .dataset-picker {
@@ -3426,39 +3928,172 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 .dialog-tabs {
   display: flex;
-  gap: 8px;
+  justify-content: center;
+  gap: 30px;
   margin-bottom: 24px;
+  border-bottom: 1px solid #e7ebf2;
+}
+
+.dialog-tabs button {
+  min-width: 112px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 0 8px 13px;
+  background: transparent;
+  color: #475467;
+  cursor: pointer;
+}
+
+.dialog-tabs button.active {
+  border-bottom-color: #2563eb;
+  color: #2563eb;
+  font-weight: 600;
 }
 
 .scenario-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
-  max-height: 360px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  max-height: 390px;
+  padding: 1px 6px 1px 1px;
   overflow: auto;
 }
 
 .scenario-option {
-  display: grid;
-  gap: 10px;
-  min-height: 104px;
-  padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 96px;
+  padding: 15px 14px;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, background-color 0.16s ease;
 }
 
-.scenario-option span {
+.scenario-option:hover {
+  border-color: #a8c2f5;
+  background: #fbfdff;
+}
+
+.scenario-option:focus-visible {
+  outline: 2px solid #93b4ff;
+  outline-offset: 2px;
+}
+
+.scenario-copy {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+}
+
+.scenario-copy > span {
+  display: -webkit-box;
+  overflow: hidden;
   color: #667085;
   font-size: 13px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.scenario-icon {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  place-items: center;
+  border-radius: 7px;
+  color: #fff;
+  font-size: 24px;
+  box-shadow: 0 4px 10px rgb(37 99 235 / 20%);
+}
+
+.scenario-icon.blue {
+  background: #3478f6;
+}
+
+.scenario-icon.green {
+  background: #22a875;
+  box-shadow: 0 4px 10px rgb(34 168 117 / 20%);
+}
+
+.local-model-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.local-model-fields > div {
+  min-width: 0;
 }
 
 .upload-box {
-  display: grid;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
   width: 100%;
-  height: 120px;
-  place-items: center;
+  min-height: 104px;
   border: 1px dashed #b9c3d4;
   background: #fbfcff;
   color: #667085;
   cursor: pointer;
+  transition: border-color 0.16s ease, background-color 0.16s ease;
+}
+
+.upload-box:hover,
+.upload-box.selected {
+  border-color: #6d9df8;
+  background: #f6f9ff;
+}
+
+.upload-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 6px;
+  background: #eaf1ff;
+  color: #2563eb;
+  font-size: 22px;
+}
+
+.upload-copy {
+  display: grid;
+  max-width: calc(100% - 72px);
+  gap: 5px;
+  text-align: left;
+}
+
+.upload-copy strong,
+.upload-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-copy strong {
+  color: #344054;
+}
+
+.upload-copy small,
+.local-model-hint {
+  color: #7a8699;
+  font-size: 12px;
+}
+
+.local-model-hint {
+  margin: -4px 0 0;
+  line-height: 1.5;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  clip-path: inset(50%);
 }
 
 .public-switch-row {
@@ -3741,21 +4376,54 @@ function getErrorMessage(error: unknown, fallback: string) {
   padding: 12px 16px;
 }
 
-.model-radio-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 24px 0 14px 90px;
-}
-
-.model-radio-row > span {
-  min-width: 114px;
-  text-align: right;
-}
-
 .detail-select {
   width: 540px;
   margin-left: 214px;
+}
+
+.weight-source-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  width: min(100%, 720px);
+  margin-top: 18px;
+  border: 1px solid #dfe5ef;
+}
+
+.weight-source-switch button {
+  min-height: 44px;
+  border: 0;
+  border-right: 1px solid #dfe5ef;
+  background: #fff;
+  color: #344054;
+  cursor: pointer;
+}
+
+.weight-source-switch button:last-child {
+  border-right: 0;
+}
+
+.weight-source-switch button.active {
+  background: #f3f7ff;
+  color: #1763ff;
+  font-weight: 600;
+}
+
+.deployment-weight-row {
+  display: grid;
+  grid-template-columns: 128px minmax(0, 560px);
+  align-items: center;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.deployment-weight-row > span {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.deployment-weight-row .detail-select {
+  width: 100%;
+  margin-left: 0;
 }
 
 .offline-model-row {
@@ -3877,16 +4545,14 @@ function getErrorMessage(error: unknown, fallback: string) {
   color: #1763ff;
 }
 
-.manual-optimization-grid,
-.deployment-artifact-grid {
+.manual-optimization-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
   margin-top: 14px;
 }
 
-.manual-optimization-grid label,
-.deployment-artifact-grid label {
+.manual-optimization-grid label {
   display: grid;
   gap: 7px;
   color: #344054;
@@ -3894,18 +4560,12 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 .manual-optimization-grid input,
-.manual-optimization-grid select,
-.deployment-artifact-grid input {
+.manual-optimization-grid select {
   min-height: 38px;
   border: 1px solid #d0d5dd;
   border-radius: 4px;
   background: #fff;
   padding: 0 10px;
-}
-
-.deployment-artifact-grid {
-  max-width: 940px;
-  margin: 22px 0;
 }
 
 .env-note {
@@ -4345,13 +5005,37 @@ function getErrorMessage(error: unknown, fallback: string) {
   color: #98a2b3;
 }
 
-@media (max-width: 1400px) {
+@container model-space (max-width: 1400px) {
   .pipeline-grid {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 
-@media (max-width: 1100px) {
+@container model-space (max-width: 1080px) {
+  .pipeline-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@container model-space (max-width: 920px) {
+  .list-toolbar,
+  .page-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .toolbar-controls {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .search-input {
+    flex: 1 1 220px;
+    width: auto;
+  }
+}
+
+@container model-space (max-width: 720px) {
   .pipeline-grid,
   .scenario-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -4361,10 +5045,23 @@ function getErrorMessage(error: unknown, fallback: string) {
     grid-template-columns: 1fr;
   }
 
-  .list-toolbar,
-  .page-header {
-    align-items: flex-start;
+}
+
+@container model-space (max-width: 480px) {
+  .pipeline-grid,
+  .scenario-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .header-actions,
+  .toolbar-controls {
+    align-items: stretch;
     flex-direction: column;
+  }
+
+  .toolbar-select,
+  .search-input {
+    width: 100%;
   }
 }
 </style>

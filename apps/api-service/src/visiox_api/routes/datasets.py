@@ -30,6 +30,7 @@ class DatasetCreateRequest(BaseModel):
     task: str
     class_schema: dict[str, Any] = Field(default_factory=dict)
     source: str = "upload"
+    preparation: bool = False
 
 
 class DatasetResponse(BaseModel):
@@ -117,7 +118,7 @@ def create_dataset(
     dataset = Dataset(
         name=request.name,
         task=request.task,
-        status="created",
+        status="preparing" if request.preparation else "created",
         class_schema=request.class_schema,
         source=request.source,
     )
@@ -125,6 +126,88 @@ def create_dataset(
     session.commit()
     session.refresh(dataset)
     return dataset
+
+
+@router.post("/{dataset_id}/promote", response_model=DatasetResponse, status_code=status.HTTP_201_CREATED)
+def promote_annotated_dataset(
+    dataset_id: str,
+    response: Response,
+    session: Session = Depends(get_dataset_session),
+) -> Dataset:
+    source_dataset = dataset_or_404(session, dataset_id)
+    source_marker = f"preparation://{source_dataset.id}"
+    existing = session.scalar(select(Dataset).where(Dataset.storage_uri == source_marker))
+    if existing is not None:
+        response.status_code = status.HTTP_200_OK
+        return existing
+
+    source_samples = session.scalars(
+        select(DatasetSample)
+        .where(DatasetSample.dataset_id == source_dataset.id)
+        .order_by(DatasetSample.created_at, DatasetSample.id)
+    ).all()
+    annotations_by_sample: dict[str, list[Annotation]] = {}
+    if source_samples:
+        source_annotations = session.scalars(
+            select(Annotation).where(Annotation.dataset_sample_id.in_([sample.id for sample in source_samples]))
+        ).all()
+        for annotation in source_annotations:
+            annotations_by_sample.setdefault(annotation.dataset_sample_id, []).append(annotation)
+
+    annotated_samples = [sample for sample in source_samples if annotations_by_sample.get(sample.id)]
+    if not annotated_samples:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Label Studio has no annotations to convert",
+        )
+
+    dataset = Dataset(
+        name=_next_promoted_dataset_name(session, source_dataset.name),
+        task=source_dataset.task,
+        status="created",
+        class_schema=source_dataset.class_schema,
+        sample_count=len(annotated_samples),
+        annotation_count=sum(len(annotations_by_sample[sample.id]) for sample in annotated_samples),
+        source="label_studio",
+        storage_uri=source_marker,
+    )
+    session.add(dataset)
+    session.flush()
+    for source_sample in annotated_samples:
+        cloned_sample = DatasetSample(
+            dataset_id=dataset.id,
+            file_uri=source_sample.file_uri,
+            width=source_sample.width,
+            height=source_sample.height,
+            checksum=source_sample.checksum,
+            split=source_sample.split,
+            annotation_status="labeled",
+        )
+        session.add(cloned_sample)
+        session.flush()
+        for source_annotation in annotations_by_sample[source_sample.id]:
+            session.add(
+                Annotation(
+                    dataset_sample_id=cloned_sample.id,
+                    source=source_annotation.source,
+                    raw_payload_uri=source_annotation.raw_payload_uri,
+                    internal_payload=source_annotation.internal_payload,
+                    validation_status="pending",
+                )
+            )
+    session.commit()
+    session.refresh(dataset)
+    return dataset
+
+
+def _next_promoted_dataset_name(session: Session, source_name: str) -> str:
+    base = f"{source_name}-数据集"
+    candidate = base
+    suffix = 2
+    while session.scalar(select(Dataset.id).where(Dataset.name == candidate)) is not None:
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
 
 
 @router.get("", response_model=DatasetListResponse)
@@ -268,6 +351,29 @@ def delete_dataset(
     if sample_ids:
         annotations = session.scalars(select(Annotation).where(Annotation.dataset_sample_id.in_(sample_ids))).all()
         object_uris.extend(annotation.raw_payload_uri for annotation in annotations if annotation.raw_payload_uri)
+    shared_uris: set[str] = set()
+    if object_uris:
+        shared_uris.update(
+            session.scalars(
+                select(DatasetSample.file_uri).where(
+                    DatasetSample.dataset_id != dataset.id,
+                    DatasetSample.file_uri.in_(object_uris),
+                )
+            ).all()
+        )
+        shared_uris.update(
+            uri
+            for uri in session.scalars(
+                select(Annotation.raw_payload_uri)
+                .join(DatasetSample, Annotation.dataset_sample_id == DatasetSample.id)
+                .where(
+                    DatasetSample.dataset_id != dataset.id,
+                    Annotation.raw_payload_uri.in_(object_uris),
+                )
+            ).all()
+            if uri
+        )
+        object_uris = [uri for uri in object_uris if uri not in shared_uris]
 
     if label_project_ids:
         session.execute(delete(Task).where(Task.resource_type == "label_project", Task.resource_id.in_(label_project_ids)))

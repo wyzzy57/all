@@ -14,6 +14,9 @@ const apiMock = vi.hoisted(() => ({
   listLabelProjects: vi.fn(),
   listDatasetSamples: vi.fn(),
   processDataset: vi.fn(),
+  importLabelProjectAnnotations: vi.fn(),
+  getTask: vi.fn(),
+  promoteDataset: vi.fn(),
   validateDataset: vi.fn(),
 }));
 
@@ -67,7 +70,7 @@ describe("DataPreparationView", () => {
           id: "dataset-1",
           name: "huajiao",
           task: "detect",
-          status: "created",
+          status: "preparing",
           sample_count: 135,
           annotation_count: 135,
           created_at: "2026-07-06T00:00:00Z",
@@ -106,6 +109,16 @@ describe("DataPreparationView", () => {
       status: "SUCCESS",
       payload: { result: { valid: true } },
     });
+    apiMock.importLabelProjectAnnotations.mockResolvedValue({ id: "import-1", status: "QUEUED" });
+    apiMock.getTask.mockResolvedValue({ id: "import-1", status: "SUCCESS" });
+    apiMock.promoteDataset.mockResolvedValue({
+      id: "dataset-derived",
+      name: "huajiao-数据集",
+      task: "detect",
+      status: "created",
+      sample_count: 135,
+      annotation_count: 135,
+    });
     messageBoxMock.confirm.mockResolvedValue(undefined);
   });
 
@@ -122,11 +135,57 @@ describe("DataPreparationView", () => {
     expect(apiMock.listDatasets).toHaveBeenCalledTimes(2);
   });
 
-  it("validates a prepared dataset from the dataset card", async () => {
+  it("keeps legacy imported records visible in data preparation", async () => {
+    apiMock.listDatasets.mockResolvedValue({
+      items: [
+        {
+          id: "legacy-dataset",
+          name: "历史花椒数据",
+          task: "detect",
+          status: "validated",
+          source: "upload",
+          sample_count: 135,
+          annotation_count: 135,
+        },
+        {
+          id: "promoted-dataset",
+          name: "已转换数据集",
+          task: "detect",
+          status: "created",
+          source: "label_studio",
+          storage_uri: "preparation://source-dataset",
+          sample_count: 120,
+          annotation_count: 120,
+        },
+      ],
+      total: 2,
+      limit: 50,
+      offset: 0,
+    });
     const wrapper = mountView();
     await vi.waitFor(() => expect(apiMock.listDatasets).toHaveBeenCalledTimes(1));
     await flushPromises();
 
+    expect(wrapper.text()).toContain("历史花椒数据");
+    expect(wrapper.text()).not.toContain("已转换数据集");
+
+    await wrapper.get('[data-testid="dataset-tab"]').trigger("click");
+    expect(wrapper.text()).toContain("历史花椒数据");
+    expect(wrapper.text()).toContain("已转换数据集");
+  });
+
+  it("validates a prepared dataset from the dataset card", async () => {
+    apiMock.listDatasets.mockResolvedValue({
+      items: [{ id: "dataset-1", name: "huajiao", task: "detect", status: "created", sample_count: 135, annotation_count: 135 }],
+      total: 1,
+      limit: 50,
+      offset: 0,
+    });
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listDatasets).toHaveBeenCalledTimes(1));
+    await flushPromises();
+
+    await wrapper.get('[data-testid="dataset-tab"]').trigger("click");
     await wrapper.get('[data-testid="validate-dataset-dataset-1"]').trigger("click");
 
     expect(apiMock.validateDataset).toHaveBeenCalledWith("dataset-1");
@@ -200,6 +259,12 @@ describe("DataPreparationView", () => {
   });
 
   it("shows dataset detail with a downloadable export link from the dataset tab", async () => {
+    apiMock.listDatasets.mockResolvedValue({
+      items: [{ id: "dataset-1", name: "huajiao", task: "detect", status: "created", sample_count: 135, annotation_count: 135 }],
+      total: 1,
+      limit: 50,
+      offset: 0,
+    });
     const wrapper = mountView();
     await vi.waitFor(() => expect(apiMock.listDatasets).toHaveBeenCalledTimes(1));
     await flushPromises();
@@ -213,10 +278,17 @@ describe("DataPreparationView", () => {
   });
 
   it("applies split ratios from the processing panel", async () => {
+    apiMock.listDatasets.mockResolvedValue({
+      items: [{ id: "dataset-1", name: "huajiao", task: "detect", status: "created", sample_count: 135, annotation_count: 135 }],
+      total: 1,
+      limit: 50,
+      offset: 0,
+    });
     const wrapper = mountView();
     await vi.waitFor(() => expect(apiMock.listDatasets).toHaveBeenCalledTimes(1));
     await flushPromises();
 
+    await wrapper.get('[data-testid="dataset-tab"]').trigger("click");
     await wrapper.get('[data-testid="process-dataset-dataset-1"]').trigger("click");
     await flushPromises();
     await wrapper.get(".split-panel button").trigger("click");
@@ -251,6 +323,35 @@ describe("DataPreparationView", () => {
     await vi.waitFor(() => expect(apiMock.listDatasets).toHaveBeenCalledTimes(1));
     await flushPromises();
 
+    await wrapper.get('[data-testid="dataset-tab"]').trigger("click");
     expect(wrapper.get('[data-testid="validate-dataset-dataset-1"]').text()).toContain("重新检验");
+  });
+
+  it("converts only Label Studio annotations into a dataset", async () => {
+    apiMock.createLabelProject.mockResolvedValue({
+      id: "project-1",
+      dataset_id: "dataset-1",
+      provider: "label_studio",
+      project_url: "http://127.0.0.1:8080/projects/1/data",
+      sync_status: "synced",
+    });
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listDatasets).toHaveBeenCalledTimes(1));
+    await flushPromises();
+
+    await wrapper.get('[data-testid="dataset-more-dataset-1"]').trigger("click");
+    await wrapper.findAll(".dataset-action-menu button").find((button) => button.text().includes("转为数据集"))!.trigger("click");
+    await vi.waitFor(() => expect(apiMock.promoteDataset).toHaveBeenCalledWith("dataset-1"));
+
+    expect(apiMock.importLabelProjectAnnotations).toHaveBeenCalledWith("project-1");
+    expect(apiMock.getTask).toHaveBeenCalledWith("import-1");
+  });
+
+  it("does not render the old warning triangle on preparation cards", async () => {
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listDatasets).toHaveBeenCalledTimes(1));
+    await flushPromises();
+
+    expect(wrapper.text()).not.toContain("△");
   });
 });

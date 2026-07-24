@@ -114,13 +114,21 @@ def install_fake_psutil(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_parse_training_overrides_supports_ultralytics_types():
     assert parse_overrides(
-        ["model=/models/best.pt", "epochs=40", "pretrained=True", "classes=[0,1]", "lr0=0.0001"]
+        [
+            "model=/models/best.pt",
+            "epochs=40",
+            "pretrained=True",
+            "classes=[0,1]",
+            "lr0=0.0001",
+            "weight_decay=5e-04",
+        ]
     ) == {
         "model": "/models/best.pt",
         "epochs": 40,
         "pretrained": True,
         "classes": [0, 1],
         "lr0": 0.0001,
+        "weight_decay": 0.0005,
     }
 
 
@@ -162,6 +170,7 @@ def test_write_progress_snapshot_is_atomic_and_contains_training_state(
     assert payload["timing"]["updated_at"].endswith("+00:00")
     assert payload["environment"] == {"device": "cuda:0"}
     assert payload["latest_metrics"] == {"metrics/mAP50(B)": 0.51}
+    assert payload["metric_samples"] == []
 
 
 def test_supported_batch_callbacks_identify_last_batch_without_ultralytics_batch_i() -> None:

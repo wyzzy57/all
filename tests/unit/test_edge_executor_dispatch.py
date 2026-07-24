@@ -86,7 +86,6 @@ class SuccessfulHandler:
         return ExecutionResult.succeeded(exit_code=0, phase="complete")
 
 
-
 class FakeRedis:
     def __init__(self) -> None:
         self.acked: list[tuple[str, str, str]] = []
@@ -129,7 +128,6 @@ def test_dispatch_failure_does_not_log_or_persist_exception_secrets(caplog) -> N
     class FailingHandler:
         def execute(self, execution):
             raise RuntimeError("Authorization: Bearer secret password=secret")
-
 
     dispatcher = EdgeExecutionDispatcher(repository, {"deploy": FailingHandler()})
     command = decode_task_command(
@@ -176,7 +174,9 @@ def test_repository_claim_and_finalize_are_atomic_and_idempotent() -> None:
     )
     repeated = repository.finalize(
         "exec-1",
-        ExecutionResult.failed(error_code="LATE_FAILURE", error_message="password=secret"),
+        ExecutionResult.failed(
+            error_code="LATE_FAILURE", error_message="password=secret"
+        ),
     )
 
     assert claimed is not None
@@ -229,7 +229,9 @@ def test_queue_acknowledges_only_after_durable_terminal_state() -> None:
         def dispatch(self, command, *, reclaim_running: bool = False):
             return SimpleNamespace(durable_terminal=next(outcomes))
 
-    queue = EdgeExecutorQueue(redis_client, Dispatcher(), stream_name="edge-stream", consumer_name="worker-1")
+    queue = EdgeExecutorQueue(
+        redis_client, Dispatcher(), stream_name="edge-stream", consumer_name="worker-1"
+    )
 
     assert asyncio.run(queue.process_message("1-0", _stream_fields())) is False
     assert redis_client.acked == []
@@ -246,7 +248,9 @@ def test_reclaimed_pending_message_can_reclaim_running_execution() -> None:
             reclaim_flags.append(reclaim_running)
             return SimpleNamespace(durable_terminal=True)
 
-    queue = EdgeExecutorQueue(redis_client, Dispatcher(), stream_name="edge-stream", consumer_name="worker-1")
+    queue = EdgeExecutorQueue(
+        redis_client, Dispatcher(), stream_name="edge-stream", consumer_name="worker-1"
+    )
 
     asyncio.run(queue.process_message("2-0", _stream_fields(), reclaimed=True))
 
@@ -282,7 +286,9 @@ def test_pending_reclaim_scan_continues_from_redis_cursor() -> None:
             return SimpleNamespace(durable_terminal=True)
 
     redis_client = CursorRedis()
-    queue = EdgeExecutorQueue(redis_client, Dispatcher(), stream_name="edge-stream", consumer_name="worker-1")
+    queue = EdgeExecutorQueue(
+        redis_client, Dispatcher(), stream_name="edge-stream", consumer_name="worker-1"
+    )
 
     asyncio.run(queue.run_once(block_ms=1))
     asyncio.run(queue.run_once(block_ms=1))
@@ -459,10 +465,15 @@ def test_blocking_dispatch_keeps_signal_shutdown_and_cleanup_responsive() -> Non
     assert elapsed < 0.3
     assert handler_released is False
     assert events.count("server-stop") >= 1
-    assert events == [*filter(lambda item: item == "server-stop", events), "redis-close"]
+    assert events == [
+        *filter(lambda item: item == "server-stop", events),
+        "redis-close",
+    ]
 
 
-def test_blocking_work_pool_returns_results_propagates_errors_and_stops_accepting() -> None:
+def test_blocking_work_pool_returns_results_propagates_errors_and_stops_accepting() -> (
+    None
+):
     from visiox_edge_executor_worker.runner import BlockingWorkPool
 
     def fail() -> None:
@@ -513,7 +524,9 @@ def test_cancelled_waiter_does_not_release_blocking_work_backpressure() -> None:
     asyncio.run(exercise())
 
 
-def test_cancelled_waiter_consumes_late_secret_failure_without_loop_diagnostics() -> None:
+def test_cancelled_waiter_consumes_late_secret_failure_without_loop_diagnostics() -> (
+    None
+):
     from visiox_edge_executor_worker.runner import BlockingWorkPool
 
     first_started = threading.Event()
@@ -756,7 +769,73 @@ def test_application_stays_alive_after_startup_stages_complete() -> None:
     asyncio.run(exercise())
 
 
-def test_application_retries_database_reconciliation_before_starting_listeners() -> None:
+def test_application_periodically_reconciles_deployments_without_reclaiming_active_commands() -> (
+    None
+):
+    from visiox_edge_executor_worker.runner import EdgeExecutorApplication
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        reconciled_twice = asyncio.Event()
+        queue_release = asyncio.Event()
+        server_release = threading.Event()
+
+        class Reconciler:
+            def __init__(self) -> None:
+                self.startup_calls = 0
+                self.deployment_calls = 0
+
+            def reconcile_startup(self, *, stop_requested):
+                self.startup_calls += 1
+
+            def reconcile_deployments(self, *, stop_requested):
+                self.deployment_calls += 1
+                if self.deployment_calls >= 1:
+                    loop.call_soon_threadsafe(reconciled_twice.set)
+
+        class Queue:
+            async def ensure_consumer_group(self):
+                return None
+
+            async def run_forever(self, *, group_ready=False):
+                await queue_release.wait()
+
+            def stop(self):
+                queue_release.set()
+
+        class Server:
+            def serve_forever(self):
+                server_release.wait()
+
+            def stop(self):
+                server_release.set()
+
+        class Redis:
+            async def aclose(self):
+                return None
+
+        reconciler = Reconciler()
+        application = EdgeExecutorApplication(
+            dispatcher=SimpleNamespace(),
+            reconciler=reconciler,
+            queue=Queue(),
+            bootstrap_server=Server(),
+            redis_client=Redis(),
+            reconciliation_interval_seconds=0.01,
+        )
+        run_task = asyncio.create_task(application.run())
+        await asyncio.wait_for(reconciled_twice.wait(), timeout=1)
+        application.request_shutdown()
+        await asyncio.wait_for(run_task, timeout=1)
+        assert reconciler.startup_calls == 1
+        assert reconciler.deployment_calls >= 1
+
+    asyncio.run(exercise())
+
+
+def test_application_retries_database_reconciliation_before_starting_listeners() -> (
+    None
+):
     events: list[str] = []
 
     class Reconciler:
@@ -863,7 +942,9 @@ def test_application_shutdown_interrupts_consumer_group_readiness() -> None:
     assert events[-1] == "redis-close"
 
 
-def test_security_initializes_before_redis_or_socket_runtime_is_created(tmp_path) -> None:
+def test_security_initializes_before_redis_or_socket_runtime_is_created(
+    tmp_path,
+) -> None:
     events: list[str] = []
     settings = Settings(
         _env_file=None,
@@ -876,7 +957,9 @@ def test_security_initializes_before_redis_or_socket_runtime_is_created(tmp_path
 
     def server_factory(*args, **kwargs):
         events.append("server")
-        raise AssertionError("Socket server must not be created before security succeeds")
+        raise AssertionError(
+            "Socket server must not be created before security succeeds"
+        )
 
     with pytest.raises(ValueError, match="unavailable"):
         build_application(

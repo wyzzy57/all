@@ -34,6 +34,10 @@ export const useTaskCenterStore = defineStore("taskCenter", {
     async cancel(id: string) {
       await api.cancelTask(id);
       await this.refresh();
+    },
+    async remove(id: string) {
+      await api.deleteTask(id);
+      await this.refresh();
     }
   }
 });

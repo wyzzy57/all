@@ -98,8 +98,16 @@ def create_pipeline(
     response: Response,
     session: Session = Depends(get_pipeline_session),
 ) -> TrainingPipeline:
-    if (request.base_model_id is None) != (request.dataset_id is None):
-        raise _unprocessable("base_model_id and dataset_id must be provided together")
+    if request.dataset_id is not None and request.base_model_id is None:
+        raise _unprocessable("base_model_id is required when dataset_id is provided")
+    if request.base_model_id and not request.dataset_id:
+        base_model = session.get(BaseModel, request.base_model_id)
+        if base_model is None:
+            raise _unprocessable("Base model not found")
+        if base_model.status != "ready" or not base_model.local_uri:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Base model is not ready")
+        if base_model.task != request.task or base_model.scale != request.scale:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Base model task or scale does not match pipeline")
     if request.base_model_id and request.dataset_id:
         try:
             validate_training_resources(

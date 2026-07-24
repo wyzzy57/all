@@ -2,6 +2,7 @@ import inspect
 from collections.abc import Generator
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict
@@ -249,7 +250,11 @@ def _label_project_response(project: LabelProject, settings: Settings) -> LabelP
     project_url = None
     if project.external_project_id:
         base_url = settings.label_studio_public_url or settings.label_studio_url
-        project_url = f"{base_url.rstrip('/')}/projects/{project.external_project_id}/data"
+        destination = f"/projects/{project.external_project_id}/data"
+        if settings.label_studio_public_url:
+            project_url = f"{base_url.rstrip('/')}/visiox-auth?next={quote(destination, safe='/')}"
+        else:
+            project_url = f"{base_url.rstrip('/')}{destination}"
     response = LabelProjectResponse.model_validate(project)
     response.project_url = project_url
     return response

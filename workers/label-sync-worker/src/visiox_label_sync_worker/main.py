@@ -63,14 +63,20 @@ def import_label_project_annotations(
             sample = session.get(DatasetSample, normalized.sample_id)
             if sample is None or sample.dataset_id != project.dataset_id:
                 raise ValueError(f"Unknown dataset sample in Label Studio export: {normalized.sample_id}")
-            raw_payload_uri, stored_object = _store_raw_payload(storage, project, sample, task_payload)
-            stored_objects.append(stored_object)
             annotation = session.scalar(
                 select(Annotation).where(
                     Annotation.dataset_sample_id == sample.id,
                     Annotation.source == "label_studio",
                 )
             )
+            if not _has_annotation_results(normalized.payload):
+                if annotation is not None:
+                    session.delete(annotation)
+                sample.annotation_status = "pending"
+                session.add(sample)
+                continue
+            raw_payload_uri, stored_object = _store_raw_payload(storage, project, sample, task_payload)
+            stored_objects.append(stored_object)
             if annotation is None:
                 annotation = Annotation(dataset_sample_id=sample.id, source="label_studio")
             annotation.raw_payload_uri = raw_payload_uri
@@ -179,6 +185,18 @@ def _cleanup_stored_objects(storage: ObjectStorageClient, stored_objects: list[t
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _has_annotation_results(payload: dict[str, Any]) -> bool:
+    annotations = payload.get("annotations")
+    if not isinstance(annotations, list):
+        return False
+    return any(
+        isinstance(annotation, dict)
+        and isinstance(annotation.get("results"), list)
+        and bool(annotation["results"])
+        for annotation in annotations
+    )
 
 
 def _annotations_by_sample_id(session: Session, sample_ids: list[str]) -> dict[str, list[Annotation]]:

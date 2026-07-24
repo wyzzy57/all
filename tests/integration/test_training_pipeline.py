@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from hashlib import sha256
 import json
 from pathlib import Path
 
@@ -385,6 +386,33 @@ def test_create_pipeline_without_training_resources_persists_draft(client: TestC
     assert duplicate.json()["detail"] == "产线名称已存在，请使用其他名称"
 
 
+def test_create_pipeline_with_uploaded_base_model_persists_draft(client: TestClient, session_factory):
+    with session_factory() as session:
+        model = BaseModel(
+            family="custom-model",
+            task="detect",
+            scale="n",
+            filename="custom.pt",
+            source_path="upload://custom.pt",
+            local_uri="memory://models/custom/custom.pt",
+            checksum="a" * 64,
+            size_bytes=2048,
+            status="ready",
+        )
+        session.add(model)
+        session.commit()
+        model_id = model.id
+
+    response = client.post(
+        "/pipelines",
+        json={"name": "local-model-draft", "task": "detect", "scale": "n", "base_model_id": model_id},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "draft"
+    assert response.json()["base_model_id"] == model_id
+
+
 def test_update_and_delete_pipeline_visibility_settings(client: TestClient, session_factory):
     base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
     created = create_pipeline(client, base_model_id, dataset_id)
@@ -665,7 +693,89 @@ def test_delete_pipeline_removes_distributed_training_dependencies(
         assert session.get(TrainingJob, created["id"]) is None
         assert session.get(Task, created["task_id"]) is None
         assert session.get(DistributedTrainingRun, created["distributed_run_id"]) is None
+    assert session.get(RemoteExecution, created["remote_execution_id"]) is None
+
+
+def test_delete_training_record_preserves_trained_model_and_removes_task_dependencies(
+    client: TestClient,
+    session_factory,
+) -> None:
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+    created = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 2,
+                "node_ids": node_ids,
+                "training_image_digest": f"registry.example/visiox/training@sha256:{'c' * 64}",
+            }
+        },
+    ).json()
+    with session_factory() as session:
+        job = session.get(TrainingJob, created["id"])
+        task = session.get(Task, created["task_id"])
+        job.status = "success"
+        task.status = "SUCCESS"
+        model = TrainedModel(
+            pipeline_id=pipeline_id,
+            training_job_id=job.id,
+            name="preserved-model",
+            version="1",
+            task="detect",
+            artifact_uri="memory://models/trained/best.pt",
+            status="ready",
+        )
+        session.add_all([job, task, model])
+        session.commit()
+        model_id = model.id
+
+    response = client.delete(f"/training-jobs/{created['id']}")
+
+    assert response.status_code == 204
+    with session_factory() as session:
+        assert session.get(TrainingJob, created["id"]) is None
+        assert session.get(Task, created["task_id"]) is None
+        assert session.get(DistributedTrainingRun, created["distributed_run_id"]) is None
         assert session.get(RemoteExecution, created["remote_execution_id"]) is None
+        preserved = session.get(TrainedModel, model_id)
+        assert preserved is not None
+        assert preserved.training_job_id is None
+
+
+def test_delete_training_record_rejects_active_job(client: TestClient, session_factory) -> None:
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    created = client.post(f"/pipelines/{pipeline_id}/jobs", json={}).json()
+
+    response = client.delete(f"/training-jobs/{created['id']}")
+
+    assert response.status_code == 409
+
+
+def test_delete_training_record_allows_orphan_queued_job(
+    client: TestClient,
+    session_factory,
+) -> None:
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    created = client.post(f"/pipelines/{pipeline_id}/jobs", json={}).json()
+    with session_factory() as session:
+        job = session.get(TrainingJob, created["id"])
+        task = session.get(Task, created["task_id"])
+        assert job is not None and task is not None
+        job.task_id = None
+        job.status = "queued"
+        session.delete(task)
+        session.commit()
+
+    response = client.delete(f"/training-jobs/{created['id']}")
+
+    assert response.status_code == 204
+    with session_factory() as session:
+        assert session.get(TrainingJob, created["id"]) is None
 
 
 def test_distributed_training_rejects_unavailable_requested_node(
@@ -1021,6 +1131,12 @@ def test_worker_runs_training_exports_dataset_and_registers_model(session_factor
     assert task.status == TaskStatus.SUCCESS.value
     assert task.progress == 100
     assert {model.name for model in trained_models} == {"best.pt", "last.pt"}
+    assert {
+        model.name: model.metrics["checksum"] for model in trained_models
+    } == {
+        "best.pt": sha256(b"best model").hexdigest(),
+        "last.pt": sha256(b"last model").hexdigest(),
+    }
     weight_objects = {
         object_name.split("/")[-1]: payload
         for (bucket, object_name), payload in storage.objects.items()

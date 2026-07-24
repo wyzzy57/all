@@ -111,6 +111,77 @@ def test_create_and_get_datasets_support_defaults_and_filters(client: TestClient
     assert missing_response.status_code == 404
 
 
+def test_preparation_dataset_is_explicit_and_promotes_only_annotated_samples(
+    client: TestClient,
+    session_factory,
+) -> None:
+    preparation = client.post(
+        "/datasets",
+        json={
+            "name": "label-studio-source",
+            "task": "detect",
+            "class_schema": {"names": ["defect"]},
+            "preparation": True,
+        },
+    ).json()
+    with session_factory() as session:
+        labeled = DatasetSample(
+            dataset_id=preparation["id"],
+            file_uri="memory://datasets/source/labeled.png",
+            checksum="labeled",
+            annotation_status="labeled",
+        )
+        unlabeled = DatasetSample(
+            dataset_id=preparation["id"],
+            file_uri="memory://datasets/source/unlabeled.png",
+            checksum="unlabeled",
+            annotation_status="unlabeled",
+        )
+        session.add_all([labeled, unlabeled])
+        session.flush()
+        session.add(
+            Annotation(
+                dataset_sample_id=labeled.id,
+                source="label_studio",
+                internal_payload={"annotations": [{"results": [{"class_name": "defect"}]}]},
+                validation_status="pending",
+            )
+        )
+        source = session.get(Dataset, preparation["id"])
+        source.sample_count = 2
+        source.annotation_count = 1
+        session.commit()
+
+    response = client.post(f"/datasets/{preparation['id']}/promote")
+
+    assert preparation["status"] == "preparing"
+    assert response.status_code == 201
+    promoted = response.json()
+    assert promoted["status"] == "created"
+    assert promoted["source"] == "label_studio"
+    assert promoted["sample_count"] == 1
+    assert promoted["annotation_count"] == 1
+    with session_factory() as session:
+        samples = session.scalars(select(DatasetSample).where(DatasetSample.dataset_id == promoted["id"])).all()
+        assert [sample.file_uri for sample in samples] == ["memory://datasets/source/labeled.png"]
+
+
+def test_preparation_without_annotations_cannot_be_promoted(client: TestClient) -> None:
+    preparation = client.post(
+        "/datasets",
+        json={
+            "name": "empty-label-source",
+            "task": "detect",
+            "class_schema": {"names": ["defect"]},
+            "preparation": True,
+        },
+    ).json()
+
+    response = client.post(f"/datasets/{preparation['id']}/promote")
+
+    assert response.status_code == 409
+
+
 def test_upload_image_stores_object_and_indexes_sample(
     client: TestClient,
     session_factory,

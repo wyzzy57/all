@@ -11,8 +11,11 @@ export type BaseModelRecord = {
   task: string;
   scale: string;
   filename: string;
+  source_path?: string;
   status: string;
   local_uri?: string | null;
+  checksum?: string | null;
+  size_bytes?: number | null;
 };
 
 export type DatasetRecord = {
@@ -82,6 +85,8 @@ export type TrainingJobRecord = {
   pipeline_id: string;
   status: string;
   task_id?: string | null;
+  distributed_run_id?: string | null;
+  remote_execution_id?: string | null;
   trained_model_id?: string | null;
   environment?: Record<string, unknown>;
   params?: Record<string, unknown>;
@@ -244,6 +249,7 @@ export type DeploymentServiceRecord = {
   engine_digest?: string | null;
   port?: number | null;
   health_status?: string | null;
+  health_checked_at?: string | null;
   task_id?: string | null;
   remote_execution_id?: string | null;
   phase?: string | null;
@@ -283,15 +289,14 @@ export type ComputeNodeRecord = {
 export type ServiceCreatePayload = {
   name: string;
   pipeline_id: string;
-  trained_model_id: string;
+  trained_model_id?: string;
+  base_model_id?: string;
   model_name: string;
   model_weight: string;
   environment: string;
   instance_name: string;
   resource_summary: string;
   node_id: string;
-  image_digest: string;
-  model_checksum: string;
   port?: number;
   format?: "auto" | "pt" | "onnx" | "engine";
   precision?: "auto" | "fp32" | "fp16" | "int8";
@@ -370,6 +375,13 @@ function query(params: Record<string, string | number | undefined>): string {
 export const api = {
   listBaseModels: (params: { task?: string; status?: string } = {}) =>
     request<ListResponse<BaseModelRecord>>(`/base-models${query(params)}`),
+  uploadBaseModel: (file: File, payload: { task: string; scale: string }) => {
+    const formData = new FormData();
+    formData.set("file", file, file.name);
+    formData.set("task", payload.task);
+    formData.set("scale", payload.scale);
+    return request<BaseModelRecord>("/base-models:upload", { method: "POST", body: formData });
+  },
   listTrainedModels: (params: { task?: string; pipeline_id?: string; status?: string; limit?: number; offset?: number } = {}) =>
     request<ListResponse<TrainedModelRecord>>(`/trained-models${query(params)}`),
   markTrainedModelWeight: (modelId: string, payload: { deployment_name: string }) =>
@@ -379,8 +391,9 @@ export const api = {
     }),
   listDatasets: (params: { task?: string; status?: string } = {}) =>
     request<ListResponse<DatasetRecord>>(`/datasets${query(params)}`),
-  createDataset: (payload: { name: string; task: string; class_schema: Record<string, unknown>; source?: string }) =>
+  createDataset: (payload: { name: string; task: string; class_schema: Record<string, unknown>; source?: string; preparation?: boolean }) =>
     request<DatasetRecord>("/datasets", { method: "POST", body: JSON.stringify(payload) }),
+  promoteDataset: (id: string) => request<DatasetRecord>(`/datasets/${id}/promote`, { method: "POST" }),
   deleteDataset: (id: string) => request<void>(`/datasets/${id}`, { method: "DELETE" }),
   listDatasetSamples: (datasetId: string, params: { split?: string; limit?: number; offset?: number } = {}) =>
     request<ListResponse<DatasetSampleRecord>>(`/datasets/${datasetId}/samples${query(params)}`),
@@ -431,6 +444,7 @@ export const api = {
     request<TaskRecord>(`/label-projects/${projectId}/sync-samples`, { method: "POST" }),
   importLabelProjectAnnotations: (projectId: string) =>
     request<TaskRecord>(`/label-projects/${projectId}/import-annotations`, { method: "POST" }),
+  getTask: (id: string) => request<TaskRecord>(`/tasks/${id}`),
   createPipeline: (payload: Record<string, unknown>) =>
     request<TrainingPipelineRecord>("/pipelines", { method: "POST", body: JSON.stringify(payload) }),
   listPipelines: () => request<ListResponse<TrainingPipelineRecord>>("/pipelines"),
@@ -441,6 +455,8 @@ export const api = {
     request<TrainingJobRecord>(`/pipelines/${pipelineId}/jobs`, { method: "POST", body: JSON.stringify(payload) }),
   listTrainingJobs: (params: { pipeline_id?: string; status?: string; limit?: number; offset?: number } = {}) =>
     request<ListResponse<TrainingJobRecord>>(`/training-jobs${query(params)}`),
+  deleteTrainingJob: (trainingJobId: string) =>
+    request<void>(`/training-jobs/${trainingJobId}`, { method: "DELETE" }),
   getTrainingObservabilitySummary: (trainingJobId: string) =>
     request<TrainingObservabilitySummary>(`/training-jobs/${trainingJobId}/observability/summary`),
   getTrainingObservabilityScalars: (trainingJobId: string, params: TrainingObservabilityScalarsParams) =>
@@ -514,5 +530,6 @@ export const api = {
   },
   listTasks: (params: { limit?: number; offset?: number } = {}) =>
     request<ListResponse<TaskRecord>>(`/tasks${query(params)}`),
-  cancelTask: (id: string) => request<TaskRecord>(`/tasks/${id}/cancel`, { method: "POST" })
+  cancelTask: (id: string) => request<TaskRecord>(`/tasks/${id}/cancel`, { method: "POST" }),
+  deleteTask: (id: string) => request<void>(`/tasks/${id}`, { method: "DELETE" })
 };

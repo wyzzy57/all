@@ -298,7 +298,7 @@ def _rollback(operations, current_container_id, target_container_id):
     return operations.result(target_container_id)
 
 
-def _run(args, *, timeout=1800):
+def _run(args, *, timeout=7200):
     return subprocess.run(
         args,
         check=True,
