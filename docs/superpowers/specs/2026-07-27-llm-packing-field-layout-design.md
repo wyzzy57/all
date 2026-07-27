@@ -7,8 +7,8 @@ Make the LLM data-performance settings visually consistent, with Sample Packing 
 ## Layout
 
 - Keep the existing three-column parameter grid on desktop.
-- Place Maximum Samples, Sample Packing, and Preprocessing Worker in the first row.
-- Keep DataLoader Worker in the next available grid cell.
+- Place Maximum Samples, Preprocessing Worker, and DataLoader Worker in the first row.
+- Place Sample Packing on a dedicated second row spanning all three columns.
 - Collapse the grid responsively using the existing parameter-grid breakpoints.
 
 ## Sample Packing Field
@@ -16,6 +16,7 @@ Make the LLM data-performance settings visually consistent, with Sample Packing 
 - Use the same field width, spacing, and vertical rhythm as numeric parameter fields.
 - Put the label and switch on one horizontal line.
 - Put the helper text below that line.
+- Span the complete parameter-grid width so the control reads as a separate row.
 - Remove the standalone panel border and oversized minimum height.
 - Preserve the existing `form.packing` behavior and Element Plus switch control.
 
