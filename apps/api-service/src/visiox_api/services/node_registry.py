@@ -15,7 +15,7 @@ from visiox_api.services.agent_identity import (
     issue_agent_certificate,
 )
 from visiox_common.settings import Settings
-from visiox_db.models import AgentEnrollmentToken, ComputeNode, ResourcePool
+from visiox_db.models import AgentEnrollmentToken, ComputeNode, Organization, ResourcePool, User
 
 
 class EnrollmentRejected(Exception):
@@ -97,12 +97,17 @@ class NodeRegistryService:
             if self.session.scalar(select(ComputeNode.id).where(ComputeNode.name == request.node_name)):
                 raise EnrollmentRejected("Enrollment rejected")
 
+            organization, owner = self._default_owner()
             pool = self._get_or_create_default_pool(
                 request.architecture,
                 request.platform_kind,
+                organization_id=organization.id,
+                owner_user_id=owner.id,
             )
             node = ComputeNode(
                 name=request.node_name,
+                organization_id=organization.id,
+                owner_user_id=owner.id,
                 resource_pool_id=pool.id,
                 status="enrolling",
                 architecture=request.architecture,
@@ -235,6 +240,8 @@ class NodeRegistryService:
                 pool = self._get_or_create_default_pool(
                     inventory.architecture,
                     inventory.platform_kind,
+                    organization_id=node.organization_id,
+                    owner_user_id=node.owner_user_id,
                 )
                 node.resource_pool_id = pool.id
                 if node.status not in {"draining", "disabled"}:
@@ -271,6 +278,9 @@ class NodeRegistryService:
         self,
         architecture: str,
         platform_kind: str,
+        *,
+        organization_id: str,
+        owner_user_id: str,
     ) -> ResourcePool:
         pool_name = _DEFAULT_POOLS.get((architecture, platform_kind))
         if pool_name is None:
@@ -280,6 +290,8 @@ class NodeRegistryService:
             return pool
         pool = ResourcePool(
             name=pool_name,
+            organization_id=organization_id,
+            owner_user_id=owner_user_id,
             kind=platform_kind,
             selector={"architecture": architecture, "platform_kind": platform_kind},
             compatibility_policy={"architecture": architecture, "platform_kind": platform_kind},
@@ -297,6 +309,17 @@ class NodeRegistryService:
                 raise
             return winning_pool
         return pool
+
+    def _default_owner(self) -> tuple[Organization, User]:
+        organization = self.session.scalar(
+            select(Organization).where(Organization.slug == "default")
+        )
+        owner = self.session.scalar(
+            select(User).where(User.username == self.settings.bootstrap_admin_username)
+        )
+        if organization is None or owner is None or owner.organization_id != organization.id:
+            raise EnrollmentRejected("Enrollment rejected")
+        return organization, owner
 
 
 def refresh_stale_nodes(session: Session, now: datetime, offline_after_seconds: int) -> None:

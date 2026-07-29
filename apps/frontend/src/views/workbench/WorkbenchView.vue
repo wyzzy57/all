@@ -1,352 +1,257 @@
 <template>
   <section class="workbench-view">
-    <header class="workbench-title">
-      <h1>工作台</h1>
+    <header class="workbench-header">
+      <div>
+        <h1>工作台</h1>
+        <p>当前账号可访问资源的实时概览</p>
+      </div>
+      <time v-if="overview" class="generated-at">统计生成于 {{ formatTimestamp(overview.generated_at) }}</time>
     </header>
 
-    <section class="panel data-panel">
-      <div class="panel-heading">
-        <h2>数据准备分析</h2>
-        <button type="button" class="quick-link" @click="goDataPreparation">快速访问›</button>
-      </div>
+    <AsyncState
+      v-if="overviewLoading"
+      state="loading"
+      title="正在加载工作台统计..."
+      test-id="workbench-loading"
+    />
 
-      <div class="data-grid">
-        <div class="data-chart-card">
-          <div class="metric-strip">
-            <div v-for="metric in dataMetrics" :key="metric.label">
-              <span>{{ metric.label }}</span>
-              <strong :style="{ color: metric.color }">{{ metric.value }}</strong>
-            </div>
-          </div>
-          <div class="pie-row">
-            <div v-if="loading" class="pie-chart pie-chart-loading" aria-hidden="true"></div>
-            <div v-else-if="pieSegments.length === 0" class="pie-chart pie-chart-loading" aria-label="暂无数据导入记录"></div>
-            <div
-              v-else
-              class="pie-chart pie-chart-animated"
-              role="group"
-              aria-label="数据导入类型占比"
-              @mouseleave="activePieIndex = null"
-            >
-              <svg viewBox="0 0 220 220">
-                <g
-                  v-for="segment in pieSegments"
-                  :key="segment.index"
-                  class="pie-sector-group"
-                  :class="{ active: activePieIndex === segment.index }"
-                  :style="{
-                    '--segment-index': segment.order,
-                  }"
-                >
-                  <path
-                    class="pie-sector"
-                    :d="segment.path"
-                    :fill="segment.color"
-                    role="button"
-                    tabindex="0"
-                    :aria-label="`${segment.label} ${segment.value}`"
-                    @mouseenter="activePieIndex = segment.index"
-                    @focus="activePieIndex = segment.index"
-                    @blur="activePieIndex = null"
-                    @click="togglePieSegment(segment.index)"
-                    @keydown.enter.prevent="togglePieSegment(segment.index)"
-                    @keydown.space.prevent="togglePieSegment(segment.index)"
-                  >
-                    <title>{{ segment.label }}：{{ segment.value }}</title>
-                  </path>
-                </g>
-              </svg>
-              <div
-                v-if="activePieSegment"
-                class="pie-tooltip"
-                role="tooltip"
-                :style="{ left: `${activePieSegment.tooltipX}%`, top: `${activePieSegment.tooltipY}%` }"
-              >
-                <i :style="{ background: activePieSegment.color }"></i>
-                <span>{{ activePieSegment.label }}</span>
-                <strong>{{ activePieSegment.value }}</strong>
+    <AsyncState
+      v-else-if="overviewError"
+      :state="overviewErrorState"
+      :title="overviewError"
+      retry-label="重新加载"
+      @retry="loadOverview"
+    />
+
+    <AsyncState
+      v-else-if="isEmpty"
+      state="empty"
+      title="暂无可访问的资源。创建或获授权后，统计会自动显示在这里。"
+      test-id="workbench-empty"
+    />
+
+    <template v-else-if="overview">
+      <StatisticSummaryStrip :items="summaryItems" />
+
+      <section class="dashboard-section preparation-section">
+        <div class="section-heading">
+          <h2>数据准备分析</h2>
+          <button type="button" class="quick-link" @click="goDataPreparation">快速访问</button>
+        </div>
+        <div class="dashboard-grid dashboard-grid-three">
+          <DatasetTrendChart :trend="datasetTrend" title="数据集创建趋势" />
+          <ResourceUsagePanel
+            :usage="resourceUsage"
+            :gpu-series="gpuUsage"
+            :stale="resourceStale"
+          />
+          <section class="dataset-summary" aria-label="数据集状态">
+            <h3>数据集状态</h3>
+            <dl>
+              <div v-for="bucket in datasetStatusBuckets" :key="bucket.label">
+                <dt>{{ statusLabel(bucket.label) }}</dt>
+                <dd>{{ bucket.value }}</dd>
               </div>
-            </div>
-            <ul class="pie-legend">
-              <li v-for="metric in dataMetrics" :key="metric.label">
-                <i :style="{ background: metric.color }"></i>
-                <span>{{ metric.label }}</span>
-              </li>
-            </ul>
-          </div>
+              <div v-if="datasetStatusBuckets.length === 0" class="no-buckets">暂无数据集状态</div>
+            </dl>
+          </section>
         </div>
+      </section>
 
-        <div class="tag-card">
-          <h3>数据准备标签</h3>
-          <div v-for="tag in dataTags" :key="tag.name" class="progress-row">
-            <span>{{ tag.name }}</span>
-            <div class="progress-track">
-              <i :style="{ width: `${tag.percent}%` }"></i>
-            </div>
-            <strong>{{ tag.count }}个</strong>
-          </div>
-        </div>
-
-        <div class="dataset-list">
-          <article v-for="dataset in recentDatasets" :key="dataset.id" class="dataset-card">
-            <h3>{{ dataset.name }}</h3>
-            <div class="dataset-badges">
-              <span :class="{ success: dataset.status === 'validated' }">{{ datasetStatusLabel(dataset.status) }}</span>
-              <span class="imported">{{ datasetSourceLabel(dataset.source) }}</span>
-              <span>{{ taskLabel(dataset.task) }}</span>
-            </div>
-            <p>{{ formatDate(dataset.created_at) }} <button type="button" class="dataset-link" @click="goDataPreparation">Label Studio</button></p>
-          </article>
-          <p v-if="!loading && recentDatasets.length === 0" class="empty-state">暂无数据集</p>
-        </div>
-      </div>
-    </section>
-
-    <div class="lower-grid">
-      <section class="panel model-panel">
-        <div class="panel-heading">
+      <section class="dashboard-section model-section">
+        <div class="section-heading">
           <h2>模型空间分析</h2>
-          <button type="button" class="quick-link" @click="goDataPreparation">快速访问›</button>
+          <button type="button" class="quick-link" @click="goDataPreparation">快速访问</button>
         </div>
-        <div class="model-content">
-          <div class="status-cards">
-            <div v-for="status in modelStatuses" :key="status.label" class="status-card">
-              <span :style="{ color: status.color }">●</span>
-              <em>{{ status.label }}</em>
-              <strong :style="{ color: status.color }">{{ status.value }}</strong>
-            </div>
-          </div>
-          <div class="pipeline-bars">
-            <div v-for="pipeline in pipelineStats" :key="pipeline.name" class="pipeline-row">
-              <span>{{ pipeline.name }}</span>
-              <div class="pipeline-track">
-                <i :style="{ width: `${pipeline.percent}%` }"></i>
-              </div>
-              <strong>{{ pipeline.percent }}%</strong>
-            </div>
-          </div>
+        <div class="dashboard-grid dashboard-grid-two">
+          <PipelineStatusChart :buckets="pipelineStatusBuckets" />
+          <CreationTrendChart :trend="pipelineTrend" />
         </div>
       </section>
 
-      <section class="panel services-panel">
-        <div class="panel-heading">
+      <section class="dashboard-section service-section">
+        <div class="section-heading">
           <h2>服务列表分析</h2>
-          <button type="button" class="quick-link" @click="goServices">快速访问›</button>
+          <button type="button" class="quick-link" @click="goServices">快速访问</button>
         </div>
-        <div class="service-table">
-          <div v-for="service in recentServices" :key="service.id" class="service-row">
-            <span>{{ service.name }}</span>
-            <time>{{ formatDate(service.created_at) }}</time>
-            <span>{{ pipelineName(service.pipeline_id) }}</span>
-            <strong :class="service.status">{{ serviceStatusLabel(service.status) }}</strong>
-          </div>
-          <p v-if="!loading && recentServices.length === 0" class="empty-state">暂无已部署服务</p>
-        </div>
+        <ServiceHealthPanel
+          :health-buckets="resourceStatistics?.services.health_buckets ?? []"
+          :calls="resourceStatistics?.services.calls ?? 0"
+          :instances="resourceStatistics?.services.instances ?? 0"
+        />
       </section>
-    </div>
+
+      <p v-if="resourceError" class="resource-error" role="alert">
+        {{ resourceError }}。正在展示最近一次成功获取的资源统计。
+      </p>
+    </template>
   </section>
 </template>
 
 <script setup lang="ts">
-import { ElMessage } from "element-plus";
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 
 import {
   api,
-  type DatasetRecord,
-  type DeploymentServiceRecord,
-  type TrainingPipelineRecord,
+  type ResourceStatistics,
+  type StatisticsBucket,
+  type StatisticsTrend,
+  type WorkbenchStatistics,
 } from "@/api/client";
+import AsyncState from "@/components/common/AsyncState.vue";
+import CreationTrendChart from "@/components/dashboard/CreationTrendChart.vue";
+import DatasetTrendChart from "@/components/dashboard/DatasetTrendChart.vue";
+import PipelineStatusChart from "@/components/dashboard/PipelineStatusChart.vue";
+import ResourceUsagePanel, { type ResourceUsageValue } from "@/components/dashboard/ResourceUsagePanel.vue";
+import ServiceHealthPanel from "@/components/dashboard/ServiceHealthPanel.vue";
+import StatisticSummaryStrip, { type StatisticSummaryItem } from "@/components/dashboard/StatisticSummaryStrip.vue";
+
+const RESOURCE_POLL_INTERVAL_MS = 5_000;
 
 const router = useRouter();
-const loading = ref(true);
-const datasets = ref<DatasetRecord[]>([]);
-const pipelines = ref<TrainingPipelineRecord[]>([]);
-const services = ref<DeploymentServiceRecord[]>([]);
-const activePieIndex = ref<number | null>(null);
+const overview = ref<WorkbenchStatistics | null>(null);
+const resourceStatistics = ref<ResourceStatistics | null>(null);
+const overviewLoading = ref(true);
+const resourceLoading = ref(false);
+const overviewError = ref("");
+const overviewErrorState = ref<"denied" | "error">("error");
+const resourceError = ref("");
+let resourcePollTimer: ReturnType<typeof setInterval> | null = null;
 
-const taskNames: Record<string, string> = {
-  detect: "目标检测",
-  classify: "图像分类",
-  segment: "实例分割",
-  pose: "关键点检测",
-  obb: "旋转框检测",
-  semantic: "语义分割",
-  document: "文档信息抽取",
-  ocr: "OCR",
-  table: "表格识别",
-  llm: "大模型训练",
-};
+const isEmpty = computed(() => {
+  if (!overview.value) return false;
+  const { pipelines, datasets, training_jobs: trainingJobs, services, nodes } = overview.value.totals;
+  return pipelines + datasets + trainingJobs + services + nodes === 0;
+});
 
-const dataMetrics = computed(() => {
-  const isVideo = (dataset: DatasetRecord) => (dataset.source || "").toLowerCase().includes("video");
-  const video = datasets.value.filter(isVideo).length;
-  const annotated = datasets.value.filter((dataset) => dataset.annotation_count > 0 && !isVideo(dataset)).length;
-  const unannotated = datasets.value.length - annotated - video;
+const summaryItems = computed<StatisticSummaryItem[]>(() => {
+  if (!overview.value) return [];
+  const totals = overview.value.totals;
   return [
-    { label: "已标注数据导入", value: annotated, color: "#16a34a" },
-    { label: "未标注数据导入", value: Math.max(0, unannotated), color: "#8b35eb" },
-    { label: "视频文件导入", value: video, color: "#f59e0b" },
+    { label: "产线数量", value: totals.pipelines, unit: "个" },
+    { label: "数据集数量", value: totals.datasets, unit: "个" },
+    { label: "训练任务", value: totals.training_jobs, unit: "个" },
+    { label: "服务数量", value: totals.services, unit: "个" },
+    { label: "可用节点", value: totals.nodes, unit: "个" },
   ];
 });
 
-const pieSegments = computed(() => {
-  const total = dataMetrics.value.reduce((sum, metric) => sum + metric.value, 0);
-  if (total === 0) return [];
+const pipelineStatusBuckets = computed(() => overview.value?.status_buckets.pipelines ?? []);
+const datasetStatusBuckets = computed(() => overview.value?.status_buckets.datasets ?? []);
+const pipelineTrend = computed<StatisticsTrend>(() => overview.value?.creation_trends.pipelines ?? emptyTrend());
+const datasetTrend = computed<StatisticsTrend>(() => overview.value?.creation_trends.datasets ?? emptyTrend());
 
-  let cursor = -90;
-  return dataMetrics.value.flatMap((metric, index) => {
-    if (metric.value <= 0) return [];
-    const sweep = (metric.value / total) * 360;
-    const startAngle = cursor;
-    const endAngle = cursor + sweep;
-    const middleAngle = startAngle + sweep / 2;
-    cursor = endAngle;
-    const middleRadians = (middleAngle * Math.PI) / 180;
-    const tooltipRadius = 72;
-    return [{
-      ...metric,
-      index,
-      order: index,
-      path: pieSectorPath(startAngle, endAngle),
-      tooltipX: clamp(((110 + Math.cos(middleRadians) * tooltipRadius) / 220) * 100, 18, 82),
-      tooltipY: clamp(((110 + Math.sin(middleRadians) * tooltipRadius) / 220) * 100, 14, 86),
-    }];
-  });
+const resourceUsage = computed<ResourceUsageValue[]>(() => {
+  const usage = resourceStatistics.value?.nodes.resource_usage;
+  return [
+    resourceValue("CPU", usage?.cpu_utilization_percent),
+    resourceValue("内存", usage?.memory_utilization_percent),
+    resourceValue("磁盘", usage?.disk_utilization_percent),
+  ];
 });
 
-const activePieSegment = computed(() =>
-  pieSegments.value.find((segment) => segment.index === activePieIndex.value) ?? null,
+const gpuUsage = computed<ResourceUsageValue[]>(() =>
+  (resourceStatistics.value?.gpus.series ?? []).map((gpu, index) => ({
+    label: `GPU ${index + 1}`,
+    value: gpu.utilization_percent.value,
+    unit: "%",
+    available: gpu.utilization_percent.available,
+    unavailable: !gpu.utilization_percent.available,
+  })),
 );
 
-function pieSectorPath(startAngle: number, endAngle: number) {
-  const center = 110;
-  const radius = 92;
-  const sweep = endAngle - startAngle;
-  if (sweep >= 359.999) {
-    return `M ${center} ${center - radius} A ${radius} ${radius} 0 1 1 ${center} ${center + radius} A ${radius} ${radius} 0 1 1 ${center} ${center - radius} Z`;
-  }
-  const start = polarPoint(center, center, radius, startAngle);
-  const end = polarPoint(center, center, radius, endAngle);
-  const largeArc = sweep > 180 ? 1 : 0;
-  return `M ${center} ${center} L ${start.x} ${start.y} A ${radius} ${radius} 0 ${largeArc} 1 ${end.x} ${end.y} Z`;
+const resourceStale = computed(() => {
+  const freshness = resourceStatistics.value?.nodes.freshness;
+  return Boolean(freshness && (freshness.stale > 0 || freshness.unknown > 0));
+});
+
+function emptyTrend(): StatisticsTrend {
+  return { labels: [], values: [] };
 }
 
-function polarPoint(centerX: number, centerY: number, radius: number, angle: number) {
-  const radians = (angle * Math.PI) / 180;
+function resourceValue(label: string, metric?: { value: number | null; available: number; unavailable: number }): ResourceUsageValue {
   return {
-    x: centerX + Math.cos(radians) * radius,
-    y: centerY + Math.sin(radians) * radius,
+    label,
+    value: metric?.value ?? null,
+    unit: "%",
+    available: Boolean(metric && metric.available > 0),
+    unavailable: !metric || metric.unavailable > 0,
   };
 }
 
-function clamp(value: number, minimum: number, maximum: number) {
-  return Math.min(maximum, Math.max(minimum, value));
-}
-
-function togglePieSegment(index: number) {
-  activePieIndex.value = activePieIndex.value === index ? null : index;
-}
-
-const dataTags = computed(() => {
-  const counts = new Map<string, number>();
-  datasets.value.forEach((dataset) => {
-    const label = taskLabel(dataset.task);
-    counts.set(label, (counts.get(label) || 0) + 1);
-  });
-  const max = Math.max(1, ...counts.values());
-  return [...counts.entries()]
-    .map(([name, count]) => ({ name, count, percent: Math.round((count / max) * 100) }))
-    .sort((left, right) => right.count - left.count)
-    .slice(0, 5);
-});
-
-const recentDatasets = computed(() =>
-  [...datasets.value]
-    .sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")))
-    .slice(0, 3),
-);
-
-const modelStatuses = computed(() => {
-  const groups = [
-    { label: "运行中止", statuses: ["stopped", "failed", "aborted", "canceled"], color: "#dc2626" },
-    { label: "运行成功", statuses: ["success"], color: "#16a34a" },
-    { label: "训练中", statuses: ["running", "training"], color: "#0ea5e9" },
-    { label: "配置中", statuses: ["draft", "ready", "configuring"], color: "#8b35eb" },
-  ];
-  return groups.map((group) => ({
-    label: group.label,
-    color: group.color,
-    value: pipelines.value.filter((pipeline) => group.statuses.includes(pipeline.status)).length,
-  }));
-});
-
-const pipelineStats = computed(() => {
-  const counts = new Map<string, number>();
-  pipelines.value.forEach((pipeline) => {
-    const label = taskLabel(pipeline.task);
-    counts.set(label, (counts.get(label) || 0) + 1);
-  });
-  const total = Math.max(1, pipelines.value.length);
-  return [...counts.entries()]
-    .map(([name, count]) => ({ name, percent: Math.round((count / total) * 100) }))
-    .sort((left, right) => right.percent - left.percent)
-    .slice(0, 4);
-});
-
-const recentServices = computed(() =>
-  [...services.value].sort((left, right) => right.created_at.localeCompare(left.created_at)).slice(0, 5),
-);
-
-onMounted(async () => {
-  loading.value = true;
+async function loadOverview() {
+  overviewLoading.value = true;
+  overviewError.value = "";
   try {
-    const [datasetResponse, pipelineResponse, serviceResponse] = await Promise.all([
-      api.listDatasets(),
-      api.listPipelines(),
-      api.listServices({ limit: 200, offset: 0 }),
-    ]);
-    datasets.value = datasetResponse.items;
-    pipelines.value = pipelineResponse.items;
-    services.value = serviceResponse.items;
+    overview.value = await api.getWorkbenchStatistics();
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : "工作台数据加载失败");
+    overviewErrorState.value = errorStatus(error) === 403 ? "denied" : "error";
+    overviewError.value = errorMessage(error, "工作台统计加载失败");
   } finally {
-    loading.value = false;
+    overviewLoading.value = false;
   }
-});
-
-function taskLabel(task: string) {
-  return taskNames[task] || task || "未知任务";
 }
 
-function datasetStatusLabel(status: string) {
-  if (status === "validated") return "已校验";
-  if (status === "processing") return "处理中";
-  return "待校验";
+async function refreshResourceStatistics() {
+  if (document.hidden || resourceLoading.value) return;
+  resourceLoading.value = true;
+  resourceError.value = "";
+  try {
+    resourceStatistics.value = await api.getResourceStatistics();
+  } catch (error) {
+    resourceError.value = errorMessage(error, "资源统计刷新失败");
+  } finally {
+    resourceLoading.value = false;
+  }
 }
 
-function datasetSourceLabel(source?: string) {
-  const value = (source || "").toLowerCase();
-  if (value.includes("label")) return "Label Studio";
-  if (value.includes("video")) return "视频导入";
-  return "导入";
+function handleVisibilityChange() {
+  if (document.hidden) {
+    stopResourcePolling();
+    return;
+  }
+  void refreshResourceStatistics();
+  startResourcePolling();
 }
 
-function pipelineName(pipelineId: string) {
-  return pipelines.value.find((pipeline) => pipeline.id === pipelineId)?.name || pipelineId;
+function startResourcePolling() {
+  if (document.hidden || resourcePollTimer !== null) return;
+  resourcePollTimer = setInterval(() => {
+    void refreshResourceStatistics();
+  }, RESOURCE_POLL_INTERVAL_MS);
 }
 
-function serviceStatusLabel(status: string) {
-  if (status === "running") return "运行中";
-  if (status === "deploying") return "部署中";
-  if (status === "failed") return "部署失败";
-  return "已终止";
+function stopResourcePolling() {
+  if (resourcePollTimer === null) return;
+  clearInterval(resourcePollTimer);
+  resourcePollTimer = null;
 }
 
-function formatDate(value?: string) {
-  if (!value) return "-";
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
+function errorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object" || !("status" in error)) return undefined;
+  return typeof error.status === "number" ? error.status : undefined;
+}
+
+function statusLabel(status: string) {
+  const labels: Record<string, string> = {
+    created: "已创建",
+    validated: "已校验",
+    processing: "处理中",
+    failed: "失败",
+    running: "运行中",
+    success: "成功",
+    stopped: "已停止",
+    draft: "配置中",
+  };
+  return labels[status] ?? status;
+}
+
+function formatTimestamp(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
 }
@@ -358,529 +263,113 @@ function goDataPreparation() {
 function goServices() {
   void router.push("/services");
 }
+
+onMounted(() => {
+  void loadOverview();
+  void refreshResourceStatistics();
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  startResourcePolling();
+});
+
+onBeforeUnmount(() => {
+  stopResourcePolling();
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+});
 </script>
 
 <style scoped>
 .workbench-view {
   container: workbench / inline-size;
-  min-height: 100%;
+  display: grid;
+  gap: 18px;
   min-width: 0;
-  color: #111827;
+  min-height: 100%;
+  color: #18263b;
 }
 
-.workbench-title h1 {
-  margin: 0 0 16px;
-  font-size: 24px;
-  font-weight: 700;
-  letter-spacing: 0;
-}
-
-.panel {
-  border: 1px solid #e3e8f0;
-  border-radius: 6px;
-  background: #fff;
-  box-shadow: 0 1px 2px rgb(15 23 42 / 4%), 0 8px 24px rgb(15 23 42 / 3%);
-}
-
-.panel-heading {
+.workbench-header,
+.section-heading {
   display: flex;
-  align-items: center;
+  align-items: start;
   justify-content: space-between;
-  padding: 16px 18px 12px;
+  gap: 16px;
 }
 
-.panel-heading h2 {
+.workbench-header h1,
+.section-heading h2 {
   margin: 0;
-  font-size: 17px;
-  font-weight: 700;
+  color: #172033;
 }
+
+.workbench-header h1 { font-size: 24px; line-height: 32px; }
+.workbench-header p,
+.generated-at { margin: 4px 0 0; color: #718096; font-size: 13px; line-height: 20px; }
+.generated-at { margin-top: 8px; white-space: nowrap; }
 
 .quick-link {
+  position: relative;
+  min-width: 44px;
+  min-height: 24px;
+  padding: 0 4px;
   border: 0;
   background: transparent;
   color: #1763ff;
   cursor: pointer;
   font-size: 13px;
   font-weight: 600;
+  line-height: 20px;
 }
 
-.data-grid {
+.quick-link::before {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  content: "";
+  transform: translate(-50%, -50%);
+}
+
+.dashboard-section {
   display: grid;
-  grid-template-columns: minmax(420px, 1.25fr) minmax(250px, 0.72fr) minmax(250px, 0.72fr);
-  gap: 14px;
-  padding: 0 18px 18px;
-}
-
-.data-chart-card,
-.tag-card,
-.dataset-list {
+  gap: 12px;
   min-width: 0;
-  min-height: 334px;
-  border: 1px solid #e1e6ee;
-  border-radius: 4px;
+  padding: 18px;
+  border: 1px solid #e7edf6;
+  border-radius: 6px;
   background: #fff;
 }
 
-.data-chart-card {
-  grid-row: auto;
+.section-heading h2 { font-size: 17px; line-height: 24px; }
+.dashboard-grid { display: grid; gap: 18px; min-width: 0; }
+.dashboard-grid-three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.dashboard-grid-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+.dataset-summary { min-width: 0; }
+.dataset-summary h3 { margin: 0; color: #18263b; font-size: 15px; line-height: 22px; }
+.dataset-summary dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 16px 0 0; }
+.dataset-summary dl > div { min-width: 0; padding: 12px; border: 1px solid #edf1f7; border-radius: 4px; background: #fafcff; }
+.dataset-summary dt { overflow: hidden; color: #718096; font-size: 12px; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; }
+.dataset-summary dd { margin: 5px 0 0; color: #26364e; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.dataset-summary .no-buckets { grid-column: 1 / -1; color: #8b98aa; text-align: center; }
+
+.resource-error { margin: -4px 0 0; color: #a66c00; font-size: 12px; line-height: 18px; }
+
+@container workbench (max-width: 1080px) {
+  .dashboard-grid-three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dashboard-grid-three > :last-child { grid-column: 1 / -1; }
 }
 
-.metric-strip {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  margin: 10px 10px 0;
-  border: 1px solid #e4e8ef;
-  background: #f8fafc;
+@container workbench (max-width: 720px) {
+  .workbench-header { align-items: start; flex-direction: column; gap: 0; }
+  .generated-at { margin-top: 2px; white-space: normal; }
+  .dashboard-grid-three,
+  .dashboard-grid-two { grid-template-columns: minmax(0, 1fr); }
+  .dashboard-grid-three > :last-child { grid-column: auto; }
 }
 
-.metric-strip div {
-  display: grid;
-  gap: 4px;
-  justify-items: center;
-  padding: 13px 8px 11px;
-  font-size: 14px;
-}
-
-.metric-strip strong {
-  font-size: 16px;
-  font-weight: 500;
-}
-
-.pie-row {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: clamp(28px, 6cqw, 74px);
-  min-height: 250px;
-  padding: 18px;
-}
-
-.pie-chart {
-  position: relative;
-  width: clamp(168px, 21cqw, 218px);
-  aspect-ratio: 1;
-  height: auto;
-  flex: 0 0 auto;
-}
-
-.pie-chart-loading {
-  border-radius: 50%;
-  background: #edf0f5;
-}
-
-.pie-chart-animated svg {
-  display: block;
-  width: 100%;
-  height: 100%;
-  overflow: visible;
-  animation: pie-reveal 900ms cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-
-.pie-sector-group {
-  transform-box: view-box;
-  transform-origin: 110px 110px;
-  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.pie-sector-group.active {
-  transform: scale(1.065);
-}
-
-.pie-sector {
-  stroke: #ffffff;
-  stroke-width: 1.5;
-  cursor: pointer;
-  outline: none;
-  transform-box: fill-box;
-  transform-origin: center;
-  animation: sector-enter 560ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  animation-delay: calc(var(--segment-index) * 70ms);
-  transition: filter 180ms ease;
-}
-
-.pie-sector:hover,
-.pie-sector:focus-visible {
-  filter: drop-shadow(0 4px 5px rgb(15 23 42 / 20%));
-}
-
-.pie-sector:focus-visible {
-  stroke: #172033;
-  stroke-width: 2.5;
-}
-
-.pie-tooltip {
-  position: absolute;
-  z-index: 3;
-  display: flex;
-  min-height: 34px;
-  align-items: center;
-  gap: 7px;
-  padding: 7px 10px;
-  border: 1px solid #d8dee9;
-  border-radius: 4px;
-  background: #ffffff;
-  box-shadow: 0 5px 14px rgb(15 23 42 / 16%);
-  color: #475467;
-  font-size: 12px;
-  pointer-events: none;
-  transform: translate(-50%, -50%);
-  white-space: nowrap;
-}
-
-.pie-tooltip i {
-  width: 9px;
-  height: 9px;
-  flex: 0 0 9px;
-  border-radius: 50%;
-}
-
-.pie-tooltip strong {
-  margin-left: 6px;
-  color: #172033;
-  font-weight: 600;
-}
-
-.pie-legend {
-  display: grid;
-  gap: 22px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-size: 13px;
-}
-
-.pie-legend li {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.pie-legend i {
-  width: 10px;
-  height: 10px;
-  border-radius: 2px;
-}
-
-.tag-card {
-  padding: 18px 16px 0;
-}
-
-.tag-card h3 {
-  margin: 0 0 12px;
-  color: #1763ff;
-  font-size: 16px;
-  font-weight: 500;
-}
-
-.progress-row {
-  display: grid;
-  grid-template-columns: minmax(72px, 100px) minmax(50px, 1fr) 38px;
-  align-items: center;
-  gap: 10px;
-  min-height: 54px;
-  border-bottom: 1px solid #edf0f4;
-  font-size: 13px;
-}
-
-.progress-track {
-  height: 8px;
-  border-radius: 999px;
-  background: #f1f2f4;
-  overflow: hidden;
-}
-
-.pipeline-track {
-  height: 14px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: #f1f2f4;
-}
-
-.progress-track i,
-.pipeline-track i {
-  display: block;
-  height: 100%;
-  border-radius: 999px;
-  background: #2878ff;
-  transform-origin: left center;
-  animation: bar-grow 760ms cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-
-@keyframes pie-reveal {
-  from { transform: scale(0.92) rotate(-8deg); opacity: 0.35; }
-  to { transform: scale(1) rotate(0); opacity: 1; }
-}
-
-@keyframes sector-enter {
-  from { transform: scale(0.82); opacity: 0; }
-  to { transform: scale(1); opacity: 1; }
-}
-
-@keyframes bar-grow {
-  from { transform: scaleX(0); opacity: 0.35; }
-  to { transform: scaleX(1); opacity: 1; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .pie-chart-animated svg,
-  .pie-sector,
-  .pie-sector-group,
-  .progress-track i,
-  .pipeline-track i {
-    animation: none;
-    transition: none;
-  }
-}
-
-.progress-row strong {
-  color: #1763ff;
-  font-weight: 500;
-}
-
-.dataset-list {
-  display: grid;
-  align-content: start;
-  gap: 8px;
-  min-height: 0;
-  padding: 10px;
-  overflow: hidden;
-}
-
-.dataset-card {
-  border: 1px solid #dfe5ee;
-  border-radius: 4px;
-  padding: 14px 14px 12px;
-}
-
-.dataset-card h3 {
-  overflow: hidden;
-  margin: 0 0 10px;
-  font-size: 14px;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dataset-badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 10px;
-}
-
-.dataset-badges span,
-.service-row strong {
-  border-radius: 999px;
-  padding: 4px 8px;
-  background: #f2f4f7;
-  font-size: 12px;
-  font-weight: 500;
-}
-
-.dataset-badges .success {
-  background: #dcfce7;
-  color: #16a34a;
-}
-
-.dataset-badges .imported {
-  background: #dcfce7;
-  color: #16a34a;
-}
-
-.dataset-card p {
-  margin: 0;
-  color: #4b5563;
-  font-size: 14px;
-}
-
-.dataset-link {
-  margin-left: 8px;
-  border: 0;
-  background: transparent;
-  color: #1763ff;
-  cursor: pointer;
-  padding: 0;
-  text-decoration: none;
-}
-
-.lower-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.08fr) minmax(390px, 0.92fr);
-  gap: 14px;
-  margin-top: 14px;
-}
-
-.lower-grid > *,
-.model-content,
-.status-cards,
-.pipeline-bars,
-.service-table {
-  min-width: 0;
-}
-
-.model-content {
-  display: grid;
-  grid-template-columns: minmax(150px, 184px) minmax(0, 1fr);
-  gap: 24px;
-  padding: 4px 18px 16px;
-}
-
-.status-cards {
-  display: grid;
-  gap: 12px;
-}
-
-.status-card {
-  display: grid;
-  grid-template-columns: 18px 1fr auto;
-  align-items: center;
-  min-height: 58px;
-  padding: 0 14px;
-  box-shadow: 0 6px 18px rgb(30 64 175 / 9%);
-}
-
-.status-card em {
-  font-style: normal;
-  font-size: 13px;
-}
-
-.status-card strong {
-  font-size: 24px;
-  font-weight: 600;
-}
-
-.pipeline-bars {
-  display: grid;
-  gap: 24px;
-  padding: 8px 0 0;
-}
-
-.pipeline-row {
-  display: grid;
-  grid-template-columns: minmax(86px, 120px) minmax(60px, 1fr) 38px;
-  align-items: center;
-  gap: 14px;
-  font-size: 13px;
-}
-
-.service-table {
-  display: grid;
-  gap: 6px;
-  padding: 0 16px 16px;
-}
-
-.service-row {
-  display: grid;
-  grid-template-columns: minmax(100px, 1fr) minmax(132px, auto) minmax(80px, 1fr) 68px;
-  align-items: center;
-  min-height: 50px;
-  padding: 0 10px;
-  background: #f8f5ff;
-  font-size: 13px;
-}
-
-.service-row > span,
-.service-row > time,
-.service-row > strong {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.service-row strong.deploying {
-  background: #f1ddff;
-  color: #8b35eb;
-}
-
-.service-row strong.stopped {
-  background: #dbeafe;
-  color: #1763ff;
-}
-
-.service-row strong.running {
-  background: #dcfce7;
-  color: #16a34a;
-}
-
-.service-row strong.failed {
-  background: #fee2e2;
-  color: #dc2626;
-}
-
-.empty-state {
-  margin: 40px 0;
-  color: #98a2b3;
-  text-align: center;
-}
-
-@container workbench (max-width: 1040px) {
-  .data-grid {
-    grid-template-columns: minmax(0, 1fr) minmax(260px, 0.72fr);
-  }
-
-  .dataset-list {
-    grid-column: 1 / -1;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  .lower-grid {
-    grid-template-columns: 1fr;
-  }
-}
-
-@container workbench (max-width: 760px) {
-  .data-grid,
-  .lower-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .data-chart-card {
-    grid-row: auto;
-  }
-
-  .dataset-list {
-    grid-column: auto;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .service-table {
-    overflow-x: auto;
-  }
-
-  .service-row {
-    min-width: 620px;
-  }
-}
-
-@container workbench (max-width: 520px) {
-  .metric-strip {
-    grid-template-columns: 1fr;
-  }
-
-  .metric-strip div {
-    grid-template-columns: 1fr auto;
-    justify-items: start;
-  }
-
-  .pie-row {
-    flex-direction: column;
-  }
-
-  .pie-legend {
-    grid-template-columns: 1fr;
-    gap: 8px;
-    width: 100%;
-  }
-
-  .dataset-list,
-  .model-content {
-    grid-template-columns: 1fr;
-  }
-
-  .service-table {
-    max-width: 100%;
-    overflow-x: auto;
-  }
+@container workbench (max-width: 460px) {
+  .dashboard-section { padding: 14px; }
+  .dataset-summary dl { grid-template-columns: minmax(0, 1fr); }
 }
 </style>

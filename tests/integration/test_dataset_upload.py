@@ -13,6 +13,7 @@ from sqlalchemy import create_engine, func, inspect, select
 from sqlalchemy.orm import Session, sessionmaker
 
 import visiox_api.main as api_main
+from visiox_api.dependencies.auth import get_current_user
 from visiox_api.main import create_app
 from visiox_api.routes.dataset_samples import (
     _validate_zip_entry,
@@ -28,6 +29,10 @@ from visiox_storage.checksum import sha256_bytes
 from visiox_storage.client import InMemoryObjectStorageClient, MinioObjectStorageClient
 from visiox_yolo26.datasets.analysis import analyze_dataset
 from visiox_yolo26.datasets.validation import validate_dataset_format
+from tests.integration.ownership_test_support import install_legacy_ownership
+
+
+LEGACY_TEST_ACTOR = SimpleNamespace(id="legacy-admin", organization_id="legacy-org", role="admin")
 
 
 @pytest.fixture()
@@ -39,7 +44,9 @@ def session_factory(tmp_path):
     command.upgrade(config, "head")
 
     engine = create_engine(database_url)
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    install_legacy_ownership(factory)
+    return factory
 
 
 @pytest.fixture()
@@ -50,6 +57,7 @@ def storage() -> InMemoryObjectStorageClient:
 @pytest.fixture()
 def client(session_factory, storage: InMemoryObjectStorageClient) -> Generator[TestClient]:
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -551,6 +559,7 @@ def test_upload_rejects_oversized_file_before_storage(
     storage: InMemoryObjectStorageClient,
 ):
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -578,6 +587,7 @@ def test_upload_zip_rejects_too_many_entries(
     storage: InMemoryObjectStorageClient,
 ):
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -605,6 +615,7 @@ def test_upload_zip_rejects_uncompressed_size_before_read(
     storage: InMemoryObjectStorageClient,
 ):
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -1028,5 +1039,7 @@ def test_analyze_and_validate_endpoints_create_terminal_tasks(client: TestClient
     tasks_response = client.get("/tasks")
     assert tasks_response.status_code == 200
     task_types = [task["task_type"] for task in tasks_response.json()["items"]]
-    assert "ANALYZE_DATASET" in task_types
-    assert "VALIDATE_DATASET_FORMAT" in task_types
+    # The task center intentionally exposes training tasks only. Dataset jobs
+    # remain queryable by their returned task IDs but do not appear in this list.
+    assert "ANALYZE_DATASET" not in task_types
+    assert "VALIDATE_DATASET_FORMAT" not in task_types

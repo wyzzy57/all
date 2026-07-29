@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from types import SimpleNamespace
 
 from alembic import command
 from alembic.config import Config
@@ -6,9 +7,14 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from visiox_api.dependencies.auth import get_current_user
 from visiox_api.main import create_app
 from visiox_api.routes.trained_models import get_trained_model_session
 from visiox_db.models import TrainedModel
+from tests.integration.ownership_test_support import install_legacy_ownership
+
+
+LEGACY_TEST_ACTOR = SimpleNamespace(id="legacy-admin", organization_id="legacy-org", role="admin")
 
 
 def test_trained_models_list_supports_filters_and_cors_preflight(tmp_path):
@@ -19,6 +25,7 @@ def test_trained_models_list_supports_filters_and_cors_preflight(tmp_path):
 
     engine = create_engine(database_url)
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    install_legacy_ownership(session_factory)
     with session_factory() as session:
         session.add_all(
             [
@@ -43,6 +50,7 @@ def test_trained_models_list_supports_filters_and_cors_preflight(tmp_path):
         session.commit()
 
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -75,6 +83,7 @@ def test_trained_model_deployment_name_can_be_marked_without_renaming_weight(tmp
 
     engine = create_engine(database_url)
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    install_legacy_ownership(session_factory)
     with session_factory() as session:
         model = TrainedModel(
             id="model-1",
@@ -89,6 +98,7 @@ def test_trained_model_deployment_name_can_be_marked_without_renaming_weight(tmp
         session.commit()
 
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:

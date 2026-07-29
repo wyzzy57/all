@@ -31,7 +31,13 @@ def test_edge_compute_models_persist_inventory_and_event_sequence():
         session.add(NodeEvent(node_id=node.id, sequence=1, event_type="inventory", payload={"ok": True}))
         session.commit()
 
-        assert session.scalar(select(ComputeNode).where(ComputeNode.name == "edge-01")) is not None
+        stored = session.scalar(select(ComputeNode).where(ComputeNode.name == "edge-01"))
+        assert stored is not None
+        assert stored.enabled is True
+        assert stored.labels == {}
+        assert stored.connection_method == "ssh"
+        assert stored.inventory_refreshed_at is None
+        assert stored.resource_revision == 0
 
 
 def test_enrollment_token_hash_is_unique():

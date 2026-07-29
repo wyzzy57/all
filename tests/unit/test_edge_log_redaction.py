@@ -1,6 +1,11 @@
 import pytest
 
-from visiox_edge_executor_worker.redaction import redact, redact_uri, sanitize_error
+from visiox_edge_executor_worker.redaction import (
+    redact,
+    redact_recursive,
+    redact_uri,
+    sanitize_error,
+)
 
 
 def test_redactor_removes_credentials_and_signed_urls() -> None:
@@ -94,3 +99,27 @@ def test_structured_error_sanitizer_replaces_sensitive_codes_and_messages() -> N
     assert code == "EDGE_OPERATION_FAILED"
     assert "code-secret" not in code.casefold()
     assert "message-secret" not in message.casefold()
+
+
+def test_recursive_redactor_preserves_structure_and_redacts_sensitive_values() -> None:
+    value = {
+        "password": "top-secret",
+        "nested": [
+            {"Authorization": "Bearer nested-secret"},
+            "token=string-secret",
+            42,
+        ],
+        "safe": "visible",
+    }
+
+    redacted = redact_recursive(value)
+
+    assert redacted == {
+        "password": "[REDACTED]",
+        "nested": [
+            {"Authorization": "[REDACTED]"},
+            "token=[REDACTED]",
+            42,
+        ],
+        "safe": "visible",
+    }

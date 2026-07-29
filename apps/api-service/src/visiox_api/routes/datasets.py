@@ -1,4 +1,3 @@
-from collections.abc import Generator
 from datetime import UTC, datetime
 import json
 from pathlib import Path, PurePosixPath
@@ -14,8 +13,29 @@ from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
 from visiox_common.tasks import TaskStatus, TaskType
-from visiox_db.models import Annotation, Dataset, DatasetSample, LabelProject, Task, TrainingPipeline
-from visiox_db.session import get_session
+from visiox_db.models import (
+    Annotation,
+    Dataset,
+    DatasetSample,
+    DatasetVersion,
+    LabelProject,
+    Task,
+    TrainingPipeline,
+)
+from visiox_api.dependencies.auth import get_current_user
+from visiox_api.dependencies.authorization import require_resource_permission
+from visiox_api.dependencies.database import get_db_session
+from visiox_api.services.audit import record_audit
+from visiox_api.services.authorization import authorized_resource_predicate
+from visiox_api.services.dataset_versions import publish_labeled_llm_dataset
+from visiox_db.models.identity import (
+    AUDIT_RESULT_FAILED,
+    AUDIT_RESULT_SUCCESS,
+    PERMISSION_DELETE,
+    PERMISSION_EDIT,
+    PERMISSION_VIEW,
+    User,
+)
 from visiox_storage.client import ObjectStorageClient
 from visiox_yolo26.datasets.analysis import analyze_dataset
 from visiox_yolo26.datasets.processing import process_dataset
@@ -40,11 +60,18 @@ class DatasetResponse(BaseModel):
     name: str
     task: str
     status: str
+    format: str
     class_schema: dict[str, Any]
+    schema_config: dict[str, Any]
+    manifest_checksum: str | None
     sample_count: int
     annotation_count: int
     source: str | None
     storage_uri: str | None
+    organization_id: str | None
+    owner_user_id: str | None
+    visibility: str
+    asset_role: str
     created_at: datetime
     updated_at: datetime
 
@@ -82,8 +109,37 @@ class DatasetProcessRequest(BaseModel):
     max_samples: int = Field(default=200, ge=1, le=1000)
 
 
-def get_dataset_session() -> Generator[Session]:
-    yield from get_session()
+class DatasetVersionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    dataset_id: str
+    version: int
+    status: str
+    format: str
+    object_uri: str
+    manifest_uri: str
+    manifest_checksum: str
+    source_revision: str | None
+    total_count: int
+    valid_count: int
+    invalid_count: int
+    skipped_count: int
+    size_bytes: int
+    published_at: datetime
+
+
+class DatasetConversionResponse(BaseModel):
+    version: DatasetVersionResponse
+    reused: bool
+    total_count: int
+    valid_count: int
+    invalid_count: int
+    skipped_count: int
+    issues: list[dict[str, Any]]
+
+
+get_dataset_session = get_db_session
 
 
 def get_dataset_object_storage_client(request: Request) -> ObjectStorageClient:
@@ -105,36 +161,109 @@ def dataset_or_404(session: Session, dataset_id: str) -> Dataset:
 
 
 def _validate_task(task: str) -> None:
-    if task not in SUPPORTED_TASKS:
+    if task not in SUPPORTED_TASKS and task != "llm":
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unsupported task: {task}")
 
 
 @router.post("", response_model=DatasetResponse, status_code=status.HTTP_201_CREATED)
 def create_dataset(
-    request: DatasetCreateRequest,
+    payload: DatasetCreateRequest,
+    request: Request,
     session: Session = Depends(get_dataset_session),
+    actor: User = Depends(get_current_user),
 ) -> Dataset:
-    _validate_task(request.task)
+    _validate_task(payload.task)
     dataset = Dataset(
-        name=request.name,
-        task=request.task,
-        status="preparing" if request.preparation else "created",
-        class_schema=request.class_schema,
-        source=request.source,
+        name=payload.name,
+        task=payload.task,
+        status="preparing" if payload.preparation else "created",
+        class_schema=payload.class_schema,
+        source=payload.source,
+        organization_id=actor.organization_id,
+        owner_user_id=actor.id,
+        visibility="private",
+        asset_role="working" if payload.preparation else "published",
     )
     session.add(dataset)
+    session.flush()
+    record_audit(
+        session,
+        actor,
+        "dataset.create",
+        "dataset",
+        dataset.id,
+        AUDIT_RESULT_SUCCESS,
+        request.headers.get("x-request-id"),
+        {"name": dataset.name, "task": dataset.task, "source": dataset.source},
+    )
     session.commit()
     session.refresh(dataset)
     return dataset
+
+
+@router.post("/{dataset_id}/convert-labeled", response_model=DatasetConversionResponse)
+def convert_labeled_dataset(
+    dataset_id: str,
+    request: Request,
+    session: Session = Depends(get_dataset_session),
+    storage: ObjectStorageClient = Depends(get_dataset_object_storage_client),
+    actor: User = Depends(get_current_user),
+) -> DatasetConversionResponse:
+    dataset = dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_EDIT)
+    try:
+        result = publish_labeled_llm_dataset(session, storage, dataset)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    record_audit(
+        session,
+        actor,
+        "dataset.publish_version",
+        "dataset",
+        dataset.id,
+        AUDIT_RESULT_SUCCESS,
+        request.headers.get("x-request-id"),
+        {"dataset_version_id": result.version.id, "version": result.version.version, "reused": result.reused},
+    )
+    session.commit()
+    return DatasetConversionResponse(
+        version=DatasetVersionResponse.model_validate(result.version),
+        reused=result.reused,
+        total_count=result.total_count,
+        valid_count=result.valid_count,
+        invalid_count=result.invalid_count,
+        skipped_count=result.skipped_count,
+        issues=result.issues,
+    )
+
+
+@router.get("/{dataset_id}/versions", response_model=list[DatasetVersionResponse])
+def list_dataset_versions(
+    dataset_id: str,
+    session: Session = Depends(get_dataset_session),
+    actor: User = Depends(get_current_user),
+) -> list[DatasetVersion]:
+    dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_VIEW)
+    return list(
+        session.scalars(
+            select(DatasetVersion)
+            .where(DatasetVersion.dataset_id == dataset_id)
+            .order_by(DatasetVersion.version.desc())
+        ).all()
+    )
 
 
 @router.post("/{dataset_id}/promote", response_model=DatasetResponse, status_code=status.HTTP_201_CREATED)
 def promote_annotated_dataset(
     dataset_id: str,
     response: Response,
+    request: Request,
     session: Session = Depends(get_dataset_session),
+    actor: User = Depends(get_current_user),
 ) -> Dataset:
     source_dataset = dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_EDIT)
     source_marker = f"preparation://{source_dataset.id}"
     existing = session.scalar(select(Dataset).where(Dataset.storage_uri == source_marker))
     if existing is not None:
@@ -170,6 +299,10 @@ def promote_annotated_dataset(
         annotation_count=sum(len(annotations_by_sample[sample.id]) for sample in annotated_samples),
         source="label_studio",
         storage_uri=source_marker,
+        organization_id=actor.organization_id,
+        owner_user_id=actor.id,
+        visibility="private",
+        asset_role="published",
     )
     session.add(dataset)
     session.flush()
@@ -195,6 +328,16 @@ def promote_annotated_dataset(
                     validation_status="pending",
                 )
             )
+    record_audit(
+        session,
+        actor,
+        "dataset.promote",
+        "dataset",
+        dataset.id,
+        AUDIT_RESULT_SUCCESS,
+        request.headers.get("x-request-id"),
+        {"source_dataset_id": source_dataset.id, "annotation_count": dataset.annotation_count},
+    )
     session.commit()
     session.refresh(dataset)
     return dataset
@@ -217,8 +360,9 @@ def list_datasets(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_dataset_session),
+    actor: User = Depends(get_current_user),
 ) -> DatasetListResponse:
-    filters = []
+    filters = [authorized_resource_predicate(session, actor, Dataset, "dataset", PERMISSION_VIEW)]
     if task is not None:
         filters.append(Dataset.task == task)
     if status_filter is not None:
@@ -240,8 +384,10 @@ def export_dataset(
     dataset_id: str,
     session: Session = Depends(get_dataset_session),
     storage: ObjectStorageClient = Depends(get_dataset_object_storage_client),
+    actor: User = Depends(get_current_user),
 ) -> FileResponse:
     dataset = dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_VIEW)
     samples = session.scalars(
         select(DatasetSample).where(DatasetSample.dataset_id == dataset.id).order_by(DatasetSample.created_at, DatasetSample.id)
     ).all()
@@ -332,17 +478,26 @@ def export_dataset(
 
 
 @router.get("/{dataset_id}", response_model=DatasetResponse)
-def get_dataset(dataset_id: str, session: Session = Depends(get_dataset_session)) -> Dataset:
-    return dataset_or_404(session, dataset_id)
+def get_dataset(
+    dataset_id: str,
+    session: Session = Depends(get_dataset_session),
+    actor: User = Depends(get_current_user),
+) -> Dataset:
+    dataset = dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_VIEW)
+    return dataset
 
 
 @router.delete("/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_dataset(
     dataset_id: str,
+    request: Request,
     session: Session = Depends(get_dataset_session),
     storage: ObjectStorageClient = Depends(get_dataset_object_storage_client),
+    actor: User = Depends(get_current_user),
 ) -> Response:
     dataset = dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_DELETE)
     samples = session.scalars(select(DatasetSample).where(DatasetSample.dataset_id == dataset.id)).all()
     sample_ids = [sample.id for sample in samples]
     label_projects = session.scalars(select(LabelProject).where(LabelProject.dataset_id == dataset.id)).all()
@@ -384,6 +539,16 @@ def delete_dataset(
         session.execute(delete(DatasetSample).where(DatasetSample.id.in_(sample_ids)))
     session.execute(delete(LabelProject).where(LabelProject.dataset_id == dataset.id))
     session.delete(dataset)
+    record_audit(
+        session,
+        actor,
+        "dataset.delete",
+        "dataset",
+        dataset.id,
+        AUDIT_RESULT_SUCCESS,
+        request.headers.get("x-request-id"),
+        {"name": dataset.name},
+    )
     session.commit()
     _delete_storage_objects(storage, object_uris)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -392,9 +557,12 @@ def delete_dataset(
 @router.post("/{dataset_id}/analyze", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 def create_dataset_analysis_task(
     dataset_id: str,
+    request: Request,
     session: Session = Depends(get_dataset_session),
+    actor: User = Depends(get_current_user),
 ) -> Task:
     dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_EDIT)
     result = analyze_dataset(session, dataset_id)
     now = _utc_now()
     task = Task(
@@ -409,6 +577,16 @@ def create_dataset_analysis_task(
         finished_at=now,
     )
     session.add(task)
+    record_audit(
+        session,
+        actor,
+        "dataset.analyze",
+        "dataset",
+        dataset_id,
+        AUDIT_RESULT_SUCCESS,
+        request.headers.get("x-request-id"),
+        {"task_id": task.id},
+    )
     session.commit()
     session.refresh(task)
     return task
@@ -417,20 +595,23 @@ def create_dataset_analysis_task(
 @router.post("/{dataset_id}/process", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 def create_dataset_processing_task(
     dataset_id: str,
-    request: DatasetProcessRequest,
+    payload: DatasetProcessRequest,
+    request: Request,
     session: Session = Depends(get_dataset_session),
     storage: ObjectStorageClient = Depends(get_dataset_object_storage_client),
+    actor: User = Depends(get_current_user),
 ) -> Task:
     dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_EDIT)
     now = _utc_now()
     try:
         result = process_dataset(
             session=session,
             storage=storage,
             dataset_id=dataset_id,
-            augment_rules=request.augment,
-            clean_rules=request.clean,
-            max_samples=request.max_samples,
+            augment_rules=payload.augment,
+            clean_rules=payload.clean,
+            max_samples=payload.max_samples,
         )
         task = Task(
             task_type=TaskType.PROCESS_DATASET.value,
@@ -443,6 +624,7 @@ def create_dataset_processing_task(
             started_at=now,
             finished_at=_utc_now(),
         )
+        audit_result = AUDIT_RESULT_SUCCESS
     except Exception as exc:
         session.rollback()
         task = Task(
@@ -459,7 +641,18 @@ def create_dataset_processing_task(
             started_at=now,
             finished_at=_utc_now(),
         )
+        audit_result = AUDIT_RESULT_FAILED
     session.add(task)
+    record_audit(
+        session,
+        actor,
+        "dataset.process",
+        "dataset",
+        dataset_id,
+        audit_result,
+        request.headers.get("x-request-id"),
+        {"task_id": task.id, "augment": payload.augment, "clean": payload.clean},
+    )
     session.commit()
     session.refresh(task)
     return task
@@ -499,14 +692,18 @@ def _safe_export_name(value: str, fallback_suffix: str) -> str:
 @router.post("/{dataset_id}/validate", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 def create_dataset_validation_task(
     dataset_id: str,
+    request: Request,
     session: Session = Depends(get_dataset_session),
+    actor: User = Depends(get_current_user),
 ) -> Task:
     dataset = dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_EDIT)
     result = validate_dataset_format(session, dataset_id)
     first_error = result["errors"][0]["code"] if result["errors"] else None
     now = _utc_now()
     if result["valid"]:
         dataset.status = "validated"
+        dataset.asset_role = "published"
         session.add(dataset)
     task = Task(
         task_type=TaskType.VALIDATE_DATASET_FORMAT.value,
@@ -522,6 +719,16 @@ def create_dataset_validation_task(
         finished_at=now,
     )
     session.add(task)
+    record_audit(
+        session,
+        actor,
+        "dataset.validate",
+        "dataset",
+        dataset_id,
+        AUDIT_RESULT_SUCCESS if result["valid"] else AUDIT_RESULT_FAILED,
+        request.headers.get("x-request-id"),
+        {"task_id": task.id, "valid": result["valid"]},
+    )
     session.commit()
     session.refresh(task)
     return task

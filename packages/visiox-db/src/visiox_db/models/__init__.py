@@ -1,4 +1,11 @@
-from visiox_db.models.datasets import Annotation, Dataset, DatasetSample, LabelProject
+from visiox_db.models.datasets import (
+    Annotation,
+    Dataset,
+    DatasetSample,
+    DatasetVersion,
+    LabelProject,
+    LabelSyncEvent,
+)
 from visiox_db.models.edge_compute import (
     AgentEnrollmentToken,
     ComputeNode,
@@ -7,6 +14,16 @@ from visiox_db.models.edge_compute import (
     NodeEvent,
     RemoteExecution,
     ResourcePool,
+)
+from visiox_db.models.identity import (
+    AuditLog,
+    Organization,
+    ResourceAllocationPolicy,
+    ResourceGrant,
+    User,
+    UserGroup,
+    UserGroupMembership,
+    UserSession,
 )
 from visiox_db.models.model_space import (
     BaseModel,
@@ -19,6 +36,12 @@ from visiox_db.models.model_space import (
     TrainingJob,
     TrainingPipeline,
 )
+from visiox_db.models.observability import (
+    LogChunk,
+    LogSource,
+    LogStream,
+    LogStreamStatus,
+)
 from visiox_db.models.tasks import Task
 
 __all__ = [
@@ -28,19 +51,33 @@ __all__ = [
     "ComputeNode",
     "Dataset",
     "DatasetSample",
+    "DatasetVersion",
     "DeploymentService",
     "DeploymentInstance",
     "DistributedTrainingRun",
     "EdgeSshCredential",
     "LabelProject",
+    "LabelSyncEvent",
+    "LogChunk",
+    "LogSource",
+    "LogStream",
+    "LogStreamStatus",
+    "Organization",
     "ModelSource",
     "NodeCommand",
     "NodeEvent",
     "PipelineEvaluation",
     "RemoteExecution",
     "ResourcePool",
+    "ResourceAllocationPolicy",
+    "ResourceGrant",
     "Task",
     "TrainedModel",
     "TrainingJob",
     "TrainingPipeline",
+    "User",
+    "UserGroup",
+    "UserGroupMembership",
+    "UserSession",
+    "AuditLog",
 ]

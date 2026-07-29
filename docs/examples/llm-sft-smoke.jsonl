@@ -1,0 +1,8 @@
+{"instruction":"请用一句话解释什么是目标检测。","input":"","output":"目标检测是在图像中定位并识别一个或多个目标的计算机视觉任务。"}
+{"instruction":"用户说设备离线时，给出第一步排查建议。","input":"设备刚才还能连接。","output":"先确认设备电源、网线或无线网络状态，并检查平台是否仍能访问设备地址。"}
+{"instruction":"把下面的状态改写成简洁中文。","input":"The training job completed successfully.","output":"训练任务已成功完成。"}
+{"instruction":"解释 precision 和 recall 的区别。","input":"用于目标检测评估。","output":"Precision 关注预测为目标的结果有多少是正确的，Recall 关注真实目标有多少被模型检出。"}
+{"instruction":"给出一个安全的服务停止流程。","input":"服务运行在边缘 Docker 中。","output":"先停止接收新请求，等待正在处理的请求完成，再停止容器并确认服务端口已释放。"}
+{"instruction":"什么情况下应使用 QLoRA？","input":"GPU 显存有限。","output":"当完整或普通 LoRA 微调占用显存过高时，可使用 4-bit QLoRA 降低基础模型权重的显存占用。"}
+{"instruction":"将错误信息概括为用户可理解的提示。","input":"CUDA out of memory","output":"GPU 显存不足，请减小批量大小或截断长度后重新训练。"}
+{"instruction":"说明训练数据为什么需要校验。","input":"","output":"数据校验可以提前发现空样本、角色顺序错误和缺失回答，避免训练中途失败或学到错误内容。"}

@@ -133,6 +133,57 @@ def test_point_limit_uses_settings_default_and_preserves_explicit_maximum(
         service._point_limit(0)
 
 
+def test_llamafactory_jsonl_fallback_returns_all_metric_and_per_gpu_points(
+    fake_job: SimpleNamespace,
+    test_settings: SimpleNamespace,
+) -> None:
+    run_path = test_settings.training_runs_root / "runs" / "job-123"
+    run_path.mkdir(parents=True)
+    (run_path / "events.out.tfevents.1").touch()
+    (run_path / "visiox-progress.json").write_text("{}", encoding="utf-8")
+    (run_path / "visiox-metrics.jsonl").write_text(
+        '\n'.join(
+            (
+                '{"step":1,"timestamp":1.0,"loss":1.2,"learning_rate":0.0001}',
+                '{"step":2,"timestamp":2.0,"loss":0.9,"learning_rate":0.00008}',
+            )
+        ),
+        encoding="utf-8",
+    )
+    (run_path / "resource_metrics.jsonl").write_text(
+        '{"step":2,"timestamp":2.0,"system.cpu_percent":35,"gpus":['
+        '{"uuid":"GPU-a","index":0,"utilization_percent":82,"memory_used_mb":4096}]}'
+        '\n',
+        encoding="utf-8",
+    )
+    service = TrainingObservabilityService(
+        test_settings,
+        mlflow_client_factory=lambda _: FakeMlflowClient(),
+        event_accumulator_factory=lambda _: FakeEventAccumulator(),
+    )
+
+    scalars = service.get_scalars(
+        fake_job,
+        ["loss", "learning_rate"],
+        None,
+        None,
+        100,
+        engine="llamafactory",
+    )
+    resources = service.get_resources(
+        fake_job,
+        None,
+        None,
+        100,
+        engine="llamafactory",
+    )
+
+    assert [point["value"] for point in scalars["series"]["loss"]] == [1.2, 0.9]
+    assert [point["value"] for point in scalars["series"]["learning_rate"]] == [0.0001, 0.00008]
+    assert resources["series"]["gpu.GPU-a.utilization_percent"][0]["value"] == 82
+    assert resources["series"]["gpu.GPU-a.memory_used_mb"][0]["value"] == 4096
+
+
 def test_scalars_merge_mlflow_history_without_fabricating_missing_series(
     fake_job: SimpleNamespace,
     test_settings: SimpleNamespace,

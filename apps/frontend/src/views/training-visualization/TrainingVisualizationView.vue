@@ -109,6 +109,12 @@
           <div class="dashboard-panels">
             <section v-show="activeTab === 'overview'" class="dashboard-panel" data-testid="overview-panel">
               <div v-if="summaryLoading && !summaryData" class="panel-loading">正在加载训练概览...</div>
+              <LlmTrainingOverview
+                v-else-if="isLlmRun && summaryData"
+                :summary="summaryData"
+                :mlflow-url="mlflowUrl"
+                :tensorboard-url="tensorboardUrl"
+              />
               <template v-else>
                 <div class="overview-band progress-band">
                   <div class="status-cell">
@@ -170,6 +176,8 @@
               class="dashboard-panel chart-panel"
               data-testid="metrics-panel"
             >
+              <LlmTrainingMetrics v-if="isLlmRun" :response="llmMetricResponse" />
+              <template v-else>
               <div class="panel-heading">
                 <div><strong>训练指标</strong><span>Epoch 标量趋势</span></div>
                 <span v-if="metricsUnavailableText" class="source-warning">{{ metricsUnavailableText }}</span>
@@ -219,6 +227,7 @@
                   />
                 </div>
               </template>
+              </template>
             </section>
 
             <section
@@ -227,12 +236,15 @@
               class="dashboard-panel chart-panel"
               data-testid="resources-panel"
             >
+              <LlmTrainingResources v-if="isLlmRun" :response="llmResourceResponse" />
+              <template v-else>
               <div class="panel-heading">
                 <div><strong>资源监控</strong><span>CPU、内存与显存趋势</span></div>
               </div>
               <div v-if="resourcesLoading && !resourcesChartMounted" class="panel-loading">正在加载资源数据...</div>
               <el-empty v-else-if="!resourcesChartMounted" description="该训练暂无资源记录" />
               <MetricLineChart v-if="resourcesChartMounted" :series="resourceSeries" height="420px" />
+              </template>
             </section>
 
             <section
@@ -241,13 +253,31 @@
               class="dashboard-panel"
               data-testid="analysis-panel"
             >
+              <LlmTrainingAnalysis
+                v-if="isLlmRun"
+                :analysis="llmAnalysis"
+                :artifacts="llmArtifacts"
+                @open-artifact="openLlmArtifact"
+              />
               <KeepAlive :max="5">
                 <ArtifactGallery
-                  v-if="activeTab === 'analysis'"
+                  v-if="!isLlmRun && activeTab === 'analysis'"
                   :key="selectedJob.id"
                   :job-id="selectedJob.id"
                 />
               </KeepAlive>
+            </section>
+            <section
+              v-if="activeTab === 'logs'"
+              class="dashboard-panel log-dashboard-panel"
+              data-testid="logs-panel"
+            >
+              <LogStreamViewer
+                v-if="selectedJob.log_stream_id"
+                :key="selectedJob.log_stream_id"
+                :stream-id="selectedJob.log_stream_id"
+              />
+              <el-empty v-else description="该训练暂无实时日志流" />
             </section>
           </div>
         </template>
@@ -266,6 +296,8 @@ import { useRoute } from "vue-router";
 import {
   api,
   type TrainingJobRecord,
+  type TrainingObservabilityAnalysis,
+  type TrainingObservabilityArtifacts,
   type TrainingObservabilityAvailability,
   type TrainingObservabilityResources,
   type TrainingObservabilityScalars,
@@ -273,12 +305,18 @@ import {
   type TrainingPipelineRecord,
 } from "@/api/client";
 import ArtifactGallery from "@/components/training/ArtifactGallery.vue";
+import LogStreamViewer from "@/components/logs/LogStreamViewer.vue";
 import MetricLineChart from "@/components/training/MetricLineChart.vue";
 import TrainingMetricCard from "@/components/training/TrainingMetricCard.vue";
 import TrainingRunComparison from "@/components/training/TrainingRunComparison.vue";
 import { buildMetricCards } from "@/components/training/trainingMetricCatalog";
+import LlmTrainingAnalysis from "@/features/training-observability/llm/LlmTrainingAnalysis.vue";
+import LlmTrainingMetrics from "@/features/training-observability/llm/LlmTrainingMetrics.vue";
+import LlmTrainingOverview from "@/features/training-observability/llm/LlmTrainingOverview.vue";
+import LlmTrainingResources from "@/features/training-observability/llm/LlmTrainingResources.vue";
+import type { LlmArtifact } from "@/features/training-observability/llm/llmMetricCatalog";
 
-type DashboardTab = "overview" | "metrics" | "resources" | "analysis";
+type DashboardTab = "overview" | "metrics" | "resources" | "analysis" | "logs";
 type MetricsMode = "single" | "compare";
 
 const POLL_INTERVAL_MS = 5000;
@@ -291,6 +329,7 @@ const tabs: Array<{ id: DashboardTab; label: string }> = [
   { id: "metrics", label: "指标" },
   { id: "resources", label: "资源" },
   { id: "analysis", label: "分析" },
+  { id: "logs", label: "日志" },
 ];
 
 const jobs = ref<TrainingJobRecord[]>([]);
@@ -300,6 +339,9 @@ const summaryData = ref<TrainingObservabilitySummary | null>(null);
 const scalarSeries = ref<TrainingObservabilityScalars["series"]>({});
 const resourceSeries = ref<TrainingObservabilityResources["series"]>({});
 const scalarAvailability = ref<TrainingObservabilityAvailability>({});
+const resourceAvailability = ref<TrainingObservabilityAvailability>({});
+const llmAnalysis = ref<TrainingObservabilityAnalysis>({ findings: [], availability: {} });
+const llmArtifacts = ref<TrainingObservabilityArtifacts>({ items: [], availability: {} });
 const activeTab = ref<DashboardTab>("overview");
 const metricsMode = ref<MetricsMode>("single");
 const metricSmoothing = ref(0);
@@ -315,10 +357,15 @@ const resourcesChartMounted = ref(false);
 const advancedMenuOpen = ref(false);
 let metricsLoadedJobId: string | null = null;
 let resourcesLoadedJobId: string | null = null;
+let analysisLoadedJobId: string | null = null;
 let generation = 0;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
 const currentStatus = computed(() => summaryData.value?.status || selectedJob.value?.status || "queued");
+const selectedPipeline = computed(() => pipelines.value.find((pipeline) => pipeline.id === selectedJob.value?.pipeline_id));
+const isLlmRun = computed(() => summaryData.value?.engine === "llamafactory" || selectedPipeline.value?.engine === "llamafactory");
+const llmMetricResponse = computed(() => ({ series: scalarSeries.value, availability: scalarAvailability.value }));
+const llmResourceResponse = computed(() => ({ series: resourceSeries.value, availability: resourceAvailability.value }));
 const progressPercent = computed(() => clamp(readNumber(summaryData.value?.progress, ["percent"]) ?? 0, 0, 100));
 const currentEpoch = computed(() => readNumber(summaryData.value?.progress, ["current_epoch"]) ?? 0);
 const totalEpochs = computed(() =>
@@ -512,8 +559,12 @@ function resetSelectedData() {
   scalarSeries.value = {};
   resourceSeries.value = {};
   scalarAvailability.value = {};
+  resourceAvailability.value = {};
+  llmAnalysis.value = { findings: [], availability: {} };
+  llmArtifacts.value = { items: [], availability: {} };
   metricsLoadedJobId = null;
   resourcesLoadedJobId = null;
+  analysisLoadedJobId = null;
 }
 
 function isActiveStatus(status: string) {
@@ -586,6 +637,7 @@ async function loadResources(requestGeneration: number, force = false) {
     const response = await api.getTrainingObservabilityResources(job.id, { max_points: 1000 });
     if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
     resourceSeries.value = response.series;
+    resourceAvailability.value = response.availability;
     resourcesLoadedJobId = job.id;
     if (activeTab.value === "resources" && hasPoints(response.series)) resourcesChartMounted.value = true;
   } catch (error) {
@@ -597,9 +649,38 @@ async function loadResources(requestGeneration: number, force = false) {
   }
 }
 
+async function loadAnalysis(requestGeneration: number, force = false) {
+  const job = selectedJob.value;
+  if (!job || requestGeneration !== generation || !isLlmRun.value) return;
+  if (!force && analysisLoadedJobId === job.id) return;
+  try {
+    const [analysis, artifacts] = await Promise.all([
+      api.getTrainingObservabilityAnalysis(job.id),
+      api.getTrainingObservabilityArtifacts(job.id),
+    ]);
+    if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
+    llmAnalysis.value = analysis;
+    llmArtifacts.value = artifacts;
+    analysisLoadedJobId = job.id;
+  } catch (error) {
+    if (requestGeneration === generation) {
+      ElMessage.error(error instanceof Error ? error.message : "训练分析加载失败");
+    }
+  }
+}
+
+function openLlmArtifact(artifact: LlmArtifact) {
+  if (!artifact.download_url) {
+    ElMessage.warning("该历史制品没有可用的下载地址");
+    return;
+  }
+  window.open(artifact.download_url, "_blank", "noopener,noreferrer");
+}
+
 async function loadActiveTabData(requestGeneration: number, force = false) {
   if (activeTab.value === "metrics") await loadScalars(requestGeneration, force);
   if (activeTab.value === "resources") await loadResources(requestGeneration, force);
+  if (activeTab.value === "analysis") await loadAnalysis(requestGeneration, force);
 }
 
 async function loadSummary(requestGeneration: number) {

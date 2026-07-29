@@ -72,7 +72,9 @@ def _compose_args(project_name: str, override_path: Path) -> list[str]:
 def _write_agent_ca(directory: Path) -> tuple[Path, Path]:
     key = ed25519.Ed25519PrivateKey.generate()
     now = datetime.now(UTC)
-    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Visiox Smoke Agent CA")])
+    subject = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, "Visiox Smoke Agent CA")]
+    )
     certificate = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -182,6 +184,39 @@ def _wait_for_api_health(
     raise SmokeFailure(f"api-service did not become healthy:\n{last_output}")
 
 
+def _wait_for_gateway_dependencies(
+    compose: list[str],
+    env: dict[str, str],
+    timeout_seconds: int = 120,
+) -> None:
+    command = [
+        *compose,
+        "exec",
+        "-T",
+        "label-studio-gateway",
+        "python",
+        "-c",
+        (
+            "import socket, urllib.request; "
+            "socket.create_connection(('label-studio', 8080), timeout=5).close(); "
+            "response=urllib.request.urlopen('http://api-service:8000/health', timeout=5); "
+            "assert response.status == 200"
+        ),
+    ]
+    deadline = time.monotonic() + timeout_seconds
+    last_output = ""
+    while time.monotonic() < deadline:
+        result = _run(command, env=env, check=False)
+        if result.returncode == 0:
+            return
+        last_output = result.stdout[-2_000:]
+        time.sleep(1)
+    raise SmokeFailure(
+        "label-studio-gateway could not reach its internal dependencies:\n"
+        f"{last_output}"
+    )
+
+
 def run_smoke() -> None:
     project_name = f"visioxproduction{uuid.uuid4().hex[:12]}"
     env = os.environ.copy()
@@ -190,9 +225,11 @@ def run_smoke() -> None:
         cert_path, key_path = _write_agent_ca(temp_dir)
         token_path = temp_dir / "management-proxy-token"
         token_path.write_text(f"{'a' * 64}\n", encoding="ascii")
+        edge_key_path = temp_dir / "edge-credential-master-key"
+        edge_key_path.write_bytes(b"b" * 32)
         override_path = temp_dir / "docker-compose.smoke.yml"
         override_path.write_text(
-            """services:
+            f"""services:
   api-migrate:
     environment:
       VISIOX_POSTGRES_DSN: postgresql+psycopg://visiox:visiox@postgres:5432/visiox
@@ -206,6 +243,13 @@ def run_smoke() -> None:
   training-worker:
     environment:
       VISIOX_POSTGRES_DSN: postgresql+psycopg://visiox:visiox@postgres:5432/visiox
+  edge-executor-worker:
+    environment:
+      VISIOX_POSTGRES_DSN: postgresql+psycopg://visiox:visiox@postgres:5432/visiox
+      VISIOX_REDIS_URL: redis://redis:6379/0
+secrets:
+  edge_credential_master_key:
+    file: "{edge_key_path.as_posix()}"
 """,
             encoding="utf-8",
         )
@@ -233,6 +277,8 @@ def run_smoke() -> None:
                     "api-service",
                     "label-sync-worker",
                     "training-worker",
+                    "edge-executor-worker",
+                    "label-studio-gateway",
                 ],
                 env=env,
             )
@@ -240,10 +286,24 @@ def run_smoke() -> None:
             _wait_for_running_services(
                 compose,
                 env,
-                ("postgres", "api-service", "label-sync-worker", "training-worker"),
+                (
+                    "postgres",
+                    "redis",
+                    "api-service",
+                    "label-sync-worker",
+                    "training-worker",
+                    "edge-executor-worker",
+                    "label-studio",
+                    "label-studio-gateway",
+                ),
             )
             _wait_for_api_health(compose, env)
-            for worker_name in ("label-sync-worker", "training-worker"):
+            _wait_for_gateway_dependencies(compose, env)
+            for worker_name in (
+                "label-sync-worker",
+                "training-worker",
+                "edge-executor-worker",
+            ):
                 _run(
                     [
                         *compose,

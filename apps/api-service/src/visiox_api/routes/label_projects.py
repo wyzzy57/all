@@ -1,6 +1,9 @@
 import inspect
 from collections.abc import Generator
 from datetime import UTC, datetime
+import hashlib
+import json
+import secrets
 from typing import Any
 from urllib.parse import quote
 
@@ -10,11 +13,21 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from visiox_api.dependencies.auth import get_current_user
+from visiox_api.dependencies.authorization import require_resource_permission
+from visiox_api.dependencies.database import get_db_session
 from visiox_api.routes.datasets import dataset_or_404
+from visiox_api.services.audit import record_audit
 from visiox_common.settings import Settings, get_settings
 from visiox_common.tasks import TaskCommand, TaskStatus, TaskType
 from visiox_db.models import LabelProject, Task
-from visiox_db.session import get_session
+from visiox_db.models.identity import (
+    AUDIT_RESULT_FAILED,
+    AUDIT_RESULT_SUCCESS,
+    PERMISSION_EDIT,
+    PERMISSION_VIEW,
+    User,
+)
 from visiox_messaging.streams import RedisStreamProducer
 from visiox_yolo26.labelstudio.client import LabelStudioClient, LabelStudioError
 from visiox_yolo26.labelstudio.templates import build_label_config
@@ -67,12 +80,29 @@ class LabelProjectTaskResponse(BaseModel):
     updated_at: datetime
 
 
-def get_label_project_session() -> Generator[Session]:
-    yield from get_session()
+class LabelProjectLaunchResponse(BaseModel):
+    launch_url: str
+    expires_in: int = 60
+
+
+class LabelProjectLaunchExchangeRequest(BaseModel):
+    token: str
+
+
+class LabelProjectLaunchExchangeResponse(BaseModel):
+    destination: str
+    external_project_id: str
+
+
+get_label_project_session = get_db_session
 
 
 def get_label_sync_stream_producer(request: Request) -> RedisStreamProducer:
     return RedisStreamProducer(request.app.state.redis)
+
+
+def get_label_launch_cache(request: Request) -> Any:
+    return request.app.state.redis
 
 
 def get_label_studio_client(settings: Settings = Depends(get_settings)) -> Generator[LabelStudioClient]:
@@ -98,19 +128,22 @@ async def _enqueue(producer: Any, command: TaskCommand) -> str:
 def create_label_project(
     dataset_id: str,
     response: Response,
-    request: LabelProjectCreateRequest | None = None,
+    http_request: Request,
+    payload: LabelProjectCreateRequest | None = None,
     session: Session = Depends(get_label_project_session),
     settings: Settings = Depends(get_settings),
     label_studio: LabelStudioClient = Depends(get_label_studio_client),
+    actor: User = Depends(get_current_user),
 ) -> LabelProjectResponse:
     dataset = dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_EDIT)
     existing = _find_dataset_label_project(session, dataset_id)
     if existing is not None:
         response.status_code = status.HTTP_200_OK
         return _label_project_response(existing, settings)
 
-    request = request or LabelProjectCreateRequest()
-    external_project_id = request.external_project_id
+    payload = payload or LabelProjectCreateRequest()
+    external_project_id = payload.external_project_id
     try:
         if external_project_id:
             _validate_external_project_id(external_project_id)
@@ -142,6 +175,17 @@ def create_label_project(
             return _label_project_response(existing, settings)
         raise
     session.refresh(label_project)
+    record_audit(
+        session,
+        actor,
+        "label_project.create",
+        "dataset",
+        dataset.id,
+        AUDIT_RESULT_SUCCESS,
+        http_request.headers.get("x-request-id"),
+        {"label_project_id": label_project.id, "external_project_id": external_project_id},
+    )
+    session.commit()
     return _label_project_response(label_project, settings)
 
 
@@ -150,8 +194,10 @@ def list_label_projects(
     dataset_id: str,
     session: Session = Depends(get_label_project_session),
     settings: Settings = Depends(get_settings),
+    actor: User = Depends(get_current_user),
 ) -> LabelProjectListResponse:
     dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_VIEW)
     projects = session.scalars(
         select(LabelProject)
         .where(LabelProject.dataset_id == dataset_id, LabelProject.provider == LABEL_STUDIO_PROVIDER)
@@ -170,14 +216,19 @@ def list_label_projects(
 )
 async def create_sync_samples_task(
     project_id: str,
+    request: Request,
     session: Session = Depends(get_label_project_session),
     producer: Any = Depends(get_label_sync_stream_producer),
+    actor: User = Depends(get_current_user),
 ) -> Task:
+    require_resource_permission(session, actor, "label_project", project_id, PERMISSION_EDIT)
     return await _create_label_project_task(
         session=session,
         producer=producer,
         project_id=project_id,
         task_type=TaskType.SYNC_LABEL_STUDIO_DATA,
+        actor=actor,
+        request_id=request.headers.get("x-request-id"),
     )
 
 
@@ -188,14 +239,19 @@ async def create_sync_samples_task(
 )
 async def create_import_annotations_task(
     project_id: str,
+    request: Request,
     session: Session = Depends(get_label_project_session),
     producer: Any = Depends(get_label_sync_stream_producer),
+    actor: User = Depends(get_current_user),
 ) -> Task:
+    require_resource_permission(session, actor, "label_project", project_id, PERMISSION_EDIT)
     return await _create_label_project_task(
         session=session,
         producer=producer,
         project_id=project_id,
         task_type=TaskType.IMPORT_LABEL_STUDIO_ANNOTATION,
+        actor=actor,
+        request_id=request.headers.get("x-request-id"),
     )
 
 
@@ -204,6 +260,8 @@ async def _create_label_project_task(
     producer: Any,
     project_id: str,
     task_type: TaskType,
+    actor: User,
+    request_id: str | None,
 ) -> Task:
     project = _label_project_or_404(session, project_id)
     task = Task(
@@ -234,7 +292,82 @@ async def _create_label_project_task(
         session.add(task)
         session.commit()
         session.refresh(task)
+    record_audit(
+        session,
+        actor,
+        "label_project.sync" if task_type == TaskType.SYNC_LABEL_STUDIO_DATA else "label_project.import",
+        "dataset",
+        project.dataset_id,
+        AUDIT_RESULT_FAILED if task.status == TaskStatus.FAILED.value else AUDIT_RESULT_SUCCESS,
+        request_id,
+        {"label_project_id": project.id, "task_id": task.id},
+    )
+    session.commit()
     return task
+
+
+@router.post("/label-projects/{project_id}/launch", response_model=LabelProjectLaunchResponse)
+async def launch_label_project(
+    project_id: str,
+    request: Request,
+    session: Session = Depends(get_label_project_session),
+    settings: Settings = Depends(get_settings),
+    cache: Any = Depends(get_label_launch_cache),
+    actor: User = Depends(get_current_user),
+) -> LabelProjectLaunchResponse:
+    project = _label_project_or_404(session, project_id)
+    require_resource_permission(session, actor, "label_project", project_id, PERMISSION_VIEW)
+    if not project.external_project_id or not settings.label_studio_public_url:
+        raise HTTPException(status_code=409, detail="Managed Label Studio launch is unavailable")
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    destination = f"/projects/{project.external_project_id}/data"
+    value = json.dumps(
+        {
+            "project_id": project.id,
+            "external_project_id": project.external_project_id,
+            "destination": destination,
+            "user_id": actor.id,
+        },
+        separators=(",", ":"),
+    )
+    stored = await cache.set(f"label-launch:{token_hash}", value, ex=60, nx=True)
+    if not stored:
+        raise HTTPException(status_code=503, detail="Unable to create Label Studio launch session")
+    record_audit(
+        session,
+        actor,
+        "label_project.launch",
+        "label_project",
+        project.id,
+        AUDIT_RESULT_SUCCESS,
+        request.headers.get("x-request-id"),
+        {"external_project_id": project.external_project_id},
+    )
+    session.commit()
+    return LabelProjectLaunchResponse(
+        launch_url=f"{settings.label_studio_public_url.rstrip('/')}/visiox-auth?launch_token={quote(token, safe='')}"
+    )
+
+
+@router.post(
+    "/internal/label-studio/launch/exchange",
+    response_model=LabelProjectLaunchExchangeResponse,
+    include_in_schema=False,
+)
+async def exchange_label_project_launch(
+    payload: LabelProjectLaunchExchangeRequest,
+    cache: Any = Depends(get_label_launch_cache),
+) -> LabelProjectLaunchExchangeResponse:
+    token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
+    raw = await cache.getdel(f"label-launch:{token_hash}")
+    if not raw:
+        raise HTTPException(status_code=401, detail="Label Studio launch token is invalid or expired")
+    data = json.loads(raw)
+    return LabelProjectLaunchExchangeResponse(
+        destination=str(data["destination"]),
+        external_project_id=str(data["external_project_id"]),
+    )
 
 
 def _find_dataset_label_project(session: Session, dataset_id: str) -> LabelProject | None:

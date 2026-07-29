@@ -3,6 +3,19 @@ from typing import Any
 
 
 def build_label_config(task: str, class_schema: dict[str, Any]) -> str:
+    if task == "llm":
+        return "\n".join(
+            [
+                "<View>",
+                '  <Header value="系统提示" />',
+                '  <Text name="system" value="$system" />',
+                '  <Header value="用户输入" />',
+                '  <Text name="user" value="$user" />',
+                '  <Header value="助手回答" />',
+                '  <TextArea name="assistant" toName="user" value="$assistant" rows="8" required="true" />',
+                "</View>",
+            ]
+        )
     names = class_schema.get("names") or []
     labels = "\n".join(f'    <Label value="{escape(str(name))}" />' for name in names)
     choices = "\n".join(f'    <Choice value="{escape(str(name))}" />' for name in names)

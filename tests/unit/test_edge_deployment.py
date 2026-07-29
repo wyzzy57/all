@@ -15,6 +15,8 @@ from visiox_edge_executor_worker.deployment import (
     DeploymentOptions,
     ModelArtifact,
     RollbackDeploymentHandler,
+    RestartDeploymentHandler,
+    StartDeploymentHandler,
     StopDeploymentHandler,
     build_deployment_plan,
     build_deployment_handlers,
@@ -136,13 +138,16 @@ def test_engine_cache_key_uses_only_required_canonical_identity() -> None:
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("ascii")
     ).hexdigest()
 
-    assert engine_cache_key(
-        model_checksum=MODEL_CHECKSUM,
-        tensorrt_version="10.2.0.19-1+cuda12.5",
-        compute_capability="8.9",
-        precision="fp16",
-        input_shape=(1, 3, 960, 960),
-    ) == expected
+    assert (
+        engine_cache_key(
+            model_checksum=MODEL_CHECKSUM,
+            tensorrt_version="10.2.0.19-1+cuda12.5",
+            compute_capability="8.9",
+            precision="fp16",
+            input_shape=(1, 3, 960, 960),
+        )
+        == expected
+    )
 
 
 def test_manual_onnx_fp32_shape_and_gpu_override() -> None:
@@ -242,6 +247,7 @@ def test_deployment_scripts_are_packaged_static_python_drivers() -> None:
     for name in (
         "deploy_inference.sh",
         "inspect_deployment.sh",
+        "start_deployment.sh",
         "stop_deployment.sh",
     ):
         script = load_packaged_script(name).decode("utf-8")
@@ -270,7 +276,9 @@ class DeploymentSshSession:
         self.cleaned_paths: tuple[str, ...] | None = None
         self.closed = False
 
-    def create_private_directory(self, *, timeout_seconds: float) -> RemotePrivateDirectory:
+    def create_private_directory(
+        self, *, timeout_seconds: float
+    ) -> RemotePrivateDirectory:
         assert 0 < timeout_seconds <= 60
         return RemotePrivateDirectory("/home/visiox-edge/.visiox-random", 1000)
 
@@ -604,6 +612,96 @@ def test_stop_handler_uses_stable_instance_label_and_persists_stopped() -> None:
         assert instance.health_status == "stopped"
 
 
+@pytest.mark.parametrize(
+    ("operation", "handler_type", "action"),
+    [
+        ("start_deployment", StartDeploymentHandler, "start"),
+        ("restart_deployment", RestartDeploymentHandler, "restart"),
+    ],
+)
+def test_resume_handlers_validate_existing_revision_and_persist_running(
+    operation: str,
+    handler_type,
+    action: str,
+) -> None:
+    factory, cipher = _deployment_database(prior_healthy=True)
+    with factory() as database:
+        service = database.get(DeploymentService, "service-1")
+        instance = database.get(DeploymentInstance, "instance-1")
+        assert service is not None and instance is not None
+        service.active_revision = 1
+        service.desired_state = "running"
+        service.status = "starting"
+        instance.deployment_revision = 1
+        instance.status = "starting"
+        instance.health_status = "stopped"
+        database.commit()
+    ssh_session = DeploymentSshSession(
+        [
+            _command_result(
+                {
+                    "container_id": "a" * 64,
+                    "port": 18080,
+                    "health_status": "healthy",
+                    "already_running": action == "start",
+                }
+            )
+        ]
+    )
+    handler = handler_type(
+        factory,
+        EdgeExecutorSecurityContext(
+            cipher,
+            DeploymentSshClient(ssh_session),  # type: ignore[arg-type]
+        ),
+    )
+
+    result = handler.execute(_load_execution(factory, operation))
+
+    assert result.status == "succeeded"
+    request_bytes = next(
+        data for data, path in ssh_session.uploads if path.endswith("/request.json")
+    )
+    assert json.loads(request_bytes) == {
+        "action": action,
+        "container_id": "a" * 64,
+        "labels": {"com.visiox.deployment-instance-id": "instance-1"},
+        "port": 18080,
+    }
+    with factory() as database:
+        service = database.get(DeploymentService, "service-1")
+        instance = database.get(DeploymentInstance, "instance-1")
+        assert service is not None and service.status == "running"
+        assert service.desired_state == "running"
+        assert instance is not None and instance.status == "running"
+        assert instance.health_status == "healthy"
+
+
+def test_start_handler_rejects_missing_successful_revision_without_remote_call() -> (
+    None
+):
+    factory, cipher = _deployment_database(prior_healthy=True)
+    with factory() as database:
+        service = database.get(DeploymentService, "service-1")
+        assert service is not None
+        service.active_revision = None
+        database.commit()
+    ssh_session = DeploymentSshSession([])
+    handler = StartDeploymentHandler(
+        factory,
+        EdgeExecutorSecurityContext(
+            cipher,
+            DeploymentSshClient(ssh_session),  # type: ignore[arg-type]
+        ),
+    )
+
+    result = handler.execute(_load_execution(factory, "start_deployment"))
+
+    assert result.status == "failed"
+    assert result.error_code == "EDGE_START_FAILED"
+    assert ssh_session.commands == []
+
+
 def test_rollback_handler_uses_exact_prior_tuple_and_swaps_rollback_metadata() -> None:
     factory, cipher = _deployment_database(prior_healthy=True)
     previous = {
@@ -667,9 +765,17 @@ def test_production_handler_factory_registers_all_deployment_operations() -> Non
         SimpleNamespace(),
     )
 
-    assert set(handlers) == {"deploy", "stop_deployment", "rollback"}
+    assert set(handlers) == {
+        "deploy",
+        "stop_deployment",
+        "start_deployment",
+        "restart_deployment",
+        "rollback",
+    }
     assert isinstance(handlers["deploy"], DeployInferenceHandler)
     assert isinstance(handlers["stop_deployment"], StopDeploymentHandler)
+    assert isinstance(handlers["start_deployment"], StartDeploymentHandler)
+    assert isinstance(handlers["restart_deployment"], RestartDeploymentHandler)
     assert isinstance(handlers["rollback"], RollbackDeploymentHandler)
 
 
@@ -746,13 +852,9 @@ def test_deploy_script_builds_hardened_docker_arguments_from_validated_json() ->
     config_index = args.index("YOLO_CONFIG_DIR=/tmp/visiox-ultralytics")
     assert args[config_index - 1] == "-e"
     mounts = [args[index + 1] for index, value in enumerate(args) if value == "--mount"]
-    assert any(
-        mount.endswith("dst=/models/model.engine,readonly") for mount in mounts
-    )
+    assert any(mount.endswith("dst=/models/model.engine,readonly") for mount in mounts)
     assert any(mount.endswith("dst=/app/config.json,readonly") for mount in mounts)
-    assert ["-p", "127.0.0.1::8080"] == args[
-        args.index("-p") : args.index("-p") + 2
-    ]
+    assert ["-p", "127.0.0.1::8080"] == args[args.index("-p") : args.index("-p") + 2]
     assert args[-1] == IMAGE_DIGEST
     assert f"com.visiox.engine-digest={'f' * 64}" in args
 
@@ -776,7 +878,9 @@ def test_deploy_script_exposes_only_active_container_to_the_lan() -> None:
     ]
 
 
-def test_deploy_script_writes_production_image_only_inference_config(tmp_path: Path) -> None:
+def test_deploy_script_writes_production_image_only_inference_config(
+    tmp_path: Path,
+) -> None:
     namespace = _script_namespace("deploy_inference.sh")
     request = namespace["_validate_request"](_remote_deploy_request())  # type: ignore[operator]
     config_path = tmp_path / "config.json"
@@ -826,7 +930,10 @@ def test_deploy_script_failure_reports_only_safe_stage_and_error_type(
 
     assert namespace["main"]() == 1  # type: ignore[operator]
     stderr = capsys.readouterr().err
-    assert stderr == "deployment operation failed at stage=runtime-image-pull (RuntimeError)\n"
+    assert (
+        stderr
+        == "deployment operation failed at stage=runtime-image-pull (RuntimeError)\n"
+    )
     assert secret not in stderr
 
 

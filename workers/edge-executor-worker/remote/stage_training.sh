@@ -19,6 +19,7 @@ IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}\Z")
 IMAGE_DIGEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,430}@sha256:[a-f0-9]{64}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 ARTIFACT_NAMES = {"model", "dataset", "checkpoint"}
+ENGINES = {"yolo26", "llamafactory"}
 
 
 def invalid():
@@ -33,7 +34,7 @@ def valid_url(value):
 
 
 def validate(request):
-    if not isinstance(request, dict) or set(request) != {"run_id", "attempt", "image_digest", "artifacts"}:
+    if not isinstance(request, dict) or set(request) != {"run_id", "attempt", "engine", "image_digest", "artifacts"}:
         invalid()
     if not isinstance(request["run_id"], str) or not IDENTIFIER.fullmatch(request["run_id"]):
         invalid()
@@ -41,8 +42,10 @@ def validate(request):
         invalid()
     if not isinstance(request["image_digest"], str) or not IMAGE_DIGEST.fullmatch(request["image_digest"]):
         invalid()
+    if request["engine"] not in ENGINES:
+        invalid()
     artifacts = request["artifacts"]
-    if not isinstance(artifacts, list) or not 2 <= len(artifacts) <= 3:
+    if not isinstance(artifacts, list) or not 1 <= len(artifacts) <= 3:
         invalid()
     names = set()
     for artifact in artifacts:
@@ -57,7 +60,8 @@ def validate(request):
         if not isinstance(filename, str) or Path(filename).name != filename or not IDENTIFIER.fullmatch(filename):
             invalid()
         names.add(name)
-    if not {"model", "dataset"}.issubset(names):
+    required = {"model", "dataset"} if request["engine"] == "yolo26" else {"dataset"}
+    if not required.issubset(names) or (request["engine"] == "llamafactory" and "model" in names):
         invalid()
     return request
 

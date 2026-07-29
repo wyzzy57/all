@@ -25,6 +25,7 @@ from visiox_edge_executor_worker.distributed import (
 from visiox_edge_executor_worker.distributed_execution import (
     DistributedTrainingHandler,
     StopDistributedTrainingHandler,
+    _llamafactory_dataset_info,
     _launch_request,
     _set_container_dataset_root,
     _staging_request,
@@ -170,6 +171,7 @@ def test_remote_staging_failure_reports_safe_stage_only(
             {
                 "run_id": "run-1",
                 "attempt": 1,
+                "engine": "yolo26",
                 "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
                 "artifacts": [
                     {
@@ -301,6 +303,7 @@ def test_distributed_training_arguments_remove_global_device_selection() -> None
     arguments = _training_arguments(  # type: ignore[arg-type]
         SimpleNamespace(id="job-1", params={"epochs": 2, "device": "0,1"}),
         SimpleNamespace(payload={"environment": {"workers": 4}}),
+        "yolo26",
     )
 
     assert "model=/workspace/model/base.pt" in arguments
@@ -318,12 +321,14 @@ def test_staging_request_matches_remote_script_contract() -> None:
             attempt=1,
             training_image_digest="registry.local/visiox/train@sha256:" + "a" * 64,
         ),
+        "yolo26",
         artifacts,  # type: ignore[arg-type]
     )
 
     assert request == {
         "run_id": "run-1",
         "attempt": 1,
+        "engine": "yolo26",
         "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
         "artifacts": artifacts,
     }
@@ -353,6 +358,7 @@ def test_launch_request_matches_remote_script_contract() -> None:
         (rank,),  # type: ignore[arg-type]
         stage,
         ["epochs=1"],
+        "yolo26",
     )
 
     assert request["action"] == "launch"
@@ -360,6 +366,7 @@ def test_launch_request_matches_remote_script_contract() -> None:
         "action",
         "run_id",
         "attempt",
+        "engine",
         "image_digest",
         "node_id",
         "gpu_uuids",
@@ -398,6 +405,7 @@ def test_remote_rank_script_rejects_control_characters() -> None:
         "action": "launch",
         "run_id": "run-1",
         "attempt": 1,
+        "engine": "yolo26",
         "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
         "node_id": "node-1",
         "gpu_uuids": ["GPU-one"],
@@ -433,6 +441,7 @@ def test_remote_rank_failure_reports_safe_stage_only(
         "action": "launch",
         "run_id": "run-1",
         "attempt": 1,
+        "engine": "yolo26",
         "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
         "node_id": "node-1",
         "gpu_uuids": ["GPU-one"],
@@ -547,3 +556,87 @@ def test_remote_rank_collect_uploads_ultralytics_visualizations(tmp_path: Path) 
 
     assert uploaded == list(expected.values())
     assert set(result) == set(expected)
+
+
+def test_llm_launch_request_uses_dataset_only_contract() -> None:
+    run = SimpleNamespace(
+        id="run-llm",
+        attempt=1,
+        training_image_digest="registry.local/visiox/llm@sha256:" + "a" * 64,
+        master_addr="10.10.40.10",
+        master_port=29500,
+    )
+    rank = SimpleNamespace(node_id="node-1", gpu_uuids=("GPU-one",), node_rank=0)
+    stage = SimpleNamespace(
+        paths={
+            "dataset": "/home/edge/llm-dataset",
+            "output": "/home/edge/llm-output",
+        }
+    )
+
+    request = _launch_request(  # type: ignore[arg-type]
+        run,
+        rank,
+        (rank,),  # type: ignore[arg-type]
+        stage,
+        [],
+        "llamafactory",
+        model_source="modelscope",
+    )
+
+    assert request["engine"] == "llamafactory"
+    assert request["model_source"] == "modelscope"
+    assert request["training_arguments"] == []
+    assert request["paths"] == stage.paths
+    assert "model" not in request["paths"]
+
+
+def test_alpaca_dataset_info_only_maps_canonical_required_columns() -> None:
+    dataset = SimpleNamespace(format="alpaca")
+
+    info = _llamafactory_dataset_info(dataset)  # type: ignore[arg-type]
+
+    assert info == {
+        "file_name": "train.jsonl",
+        "columns": {
+            "prompt": "instruction",
+            "query": "input",
+            "response": "output",
+        },
+    }
+
+
+def test_remote_rank_script_launches_llm_worker_with_persistent_model_cache() -> None:
+    script = load_packaged_script("launch_rank.sh").decode("utf-8")
+
+    assert 'dst=/workspace/model-cache' in script
+    assert '"HF_HOME=/workspace/model-cache/huggingface"' in script
+    assert '"MODELSCOPE_CACHE=/workspace/model-cache/modelscope"' in script
+    assert '"USE_MODELSCOPE_HUB=1"' in script
+    assert '"visiox_llm_training_worker.entrypoint"' in script
+    assert '"/workspace/dataset/train.yaml"' in script
+
+
+def test_remote_staging_accepts_llm_dataset_without_model() -> None:
+    script = load_packaged_script("stage_training.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "stage_training.sh", "exec"), namespace)
+    validate = namespace["validate"]
+
+    request = {
+        "run_id": "run-llm",
+        "attempt": 1,
+        "engine": "llamafactory",
+        "image_digest": "registry.local/visiox/llm@sha256:" + "a" * 64,
+        "artifacts": [
+            {
+                "name": "dataset",
+                "download_url": "https://minio.internal/dataset?signature=short-lived",
+                "checksum": "b" * 64,
+                "filename": "dataset.tar.gz",
+            }
+        ],
+    }
+
+    assert validate(request) == request  # type: ignore[operator]

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Generator
 from datetime import UTC, datetime
 from io import BytesIO
 import inspect
@@ -26,6 +25,10 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from visiox_api.dependencies.auth import get_current_user
+from visiox_api.dependencies.authorization import require_resource_permission
+from visiox_api.dependencies.database import get_db_session
+from visiox_api.services.authorization import authorized_resource_predicate
 from visiox_api.routes.pipeline_inference import (
     PipelinePredictResponse,
     get_pipeline_inference_storage,
@@ -38,13 +41,21 @@ from visiox_db.models import (
     ComputeNode,
     DeploymentInstance,
     DeploymentService,
+    LogStream,
     RemoteExecution,
     ResourcePool,
     Task,
     TrainedModel,
     TrainingPipeline,
 )
-from visiox_db.session import get_session
+from visiox_db.models.identity import (
+    PERMISSION_DELETE,
+    PERMISSION_EDIT,
+    PERMISSION_INVOKE,
+    PERMISSION_USE,
+    PERMISSION_VIEW,
+    User,
+)
 from visiox_edge_executor_worker.deployment import (
     DeploymentOptions,
     ModelArtifact,
@@ -64,6 +75,8 @@ router = APIRouter(prefix="/services", tags=["services"])
 
 _DEPLOY_OPERATION = "deploy"
 _STOP_OPERATION = "stop_deployment"
+_START_OPERATION = "start_deployment"
+_RESTART_OPERATION = "restart_deployment"
 _ROLLBACK_OPERATION = "rollback"
 _ROLLBACK_FIELDS = {
     "container_id",
@@ -129,10 +142,16 @@ class ServiceResponse(BaseModel):
     instance_name: str
     resource_summary: str
     status: str
+    desired_state: str
+    active_revision: int | None
     endpoint: str
     calls: int
     config: dict[str, Any]
+    organization_id: str | None
+    owner_user_id: str | None
+    visibility: str
     instance_id: str | None
+    deployment_revision: int | None
     node_id: str | None
     container_id: str | None
     image_digest: str | None
@@ -146,6 +165,7 @@ class ServiceResponse(BaseModel):
     remote_execution_id: str | None
     phase: str | None
     log_uri: str | None
+    log_stream_id: str | None
     error_code: str | None
     error_message: str | None
     created_at: datetime
@@ -159,8 +179,7 @@ class ServiceListResponse(BaseModel):
     offset: int
 
 
-def get_service_session() -> Generator[Session]:
-    yield from get_session()
+get_service_session = get_db_session
 
 
 def get_service_stream_producer(request: Request) -> RedisStreamProducer:
@@ -190,10 +209,19 @@ async def create_service(
     session: Session = Depends(get_service_session),
     producer: Any = Depends(get_service_stream_producer),
     storage: ObjectStorageClient = Depends(get_pipeline_inference_storage),
+    actor: User = Depends(get_current_user),
 ) -> ServiceResponse:
     pipeline = session.get(TrainingPipeline, request.pipeline_id)
     if pipeline is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found"
+        )
+    require_resource_permission(session, actor, "pipeline", pipeline.id, PERMISSION_USE)
+    require_resource_permission(session, actor, "node", request.node_id, PERMISSION_USE)
+    if request.trained_model_id:
+        require_resource_permission(
+            session, actor, "trained_model", request.trained_model_id, PERMISSION_USE
+        )
     trained_model, base_model, artifact = _resolve_deployment_artifact(
         session,
         pipeline,
@@ -257,19 +285,29 @@ async def create_service(
         name=request.name.strip(),
         pipeline_id=pipeline.id,
         trained_model_id=trained_model.id if trained_model is not None else None,
-        model_name=base_model.filename if base_model is not None else request.model_name,
-        model_weight=base_model.filename if base_model is not None else request.model_weight,
+        model_name=base_model.filename
+        if base_model is not None
+        else request.model_name,
+        model_weight=base_model.filename
+        if base_model is not None
+        else request.model_weight,
         environment=request.environment,
         instance_count=1,
         instance_name=request.instance_name.strip(),
         resource_summary=request.resource_summary,
         status="queued",
+        desired_state="running",
+        active_revision=None,
         endpoint="pending",
         config=normalized_config,
+        organization_id=actor.organization_id,
+        owner_user_id=actor.id,
+        visibility="private",
     )
     instance = DeploymentInstance(
         id=instance_id,
         deployment_service_id=service_id,
+        deployment_revision=1,
         node_id=node.id,
         instance_name=service.instance_name,
         image_digest=image_digest,
@@ -341,8 +379,13 @@ def list_services(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_service_session),
+    actor: User = Depends(get_current_user),
 ) -> ServiceListResponse:
-    filters = []
+    filters = [
+        authorized_resource_predicate(
+            session, actor, DeploymentService, "service", PERMISSION_VIEW
+        )
+    ]
     if status_filter:
         filters.append(DeploymentService.status == status_filter)
     if pipeline_id:
@@ -369,7 +412,9 @@ def list_services(
 def get_service(
     service_id: str,
     session: Session = Depends(get_service_session),
+    actor: User = Depends(get_current_user),
 ) -> ServiceResponse:
+    require_resource_permission(session, actor, "service", service_id, PERMISSION_VIEW)
     return _service_response(session, service_id)
 
 
@@ -381,12 +426,16 @@ def get_service(
 async def upgrade_service(
     service_id: str,
     request: ServiceUpgradeRequest,
+    actor: User = Depends(get_current_user),
     session: Session = Depends(get_service_session),
     producer: Any = Depends(get_service_stream_producer),
 ) -> ServiceResponse:
+    require_resource_permission(session, actor, "service", service_id, PERMISSION_EDIT)
     service = session.get(DeploymentService, service_id)
     if service is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Service not found"
+        )
     instance = session.scalar(
         select(DeploymentInstance).where(
             DeploymentInstance.deployment_service_id == service_id
@@ -411,6 +460,9 @@ async def upgrade_service(
             status_code=status.HTTP_409_CONFLICT,
             detail="Trained model is not ready for this deployment pipeline",
         )
+    require_resource_permission(
+        session, actor, "trained_model", trained_model.id, PERMISSION_USE
+    )
 
     _node, inventory = _deployment_node(session, instance.node_id)
     try:
@@ -482,7 +534,11 @@ async def upgrade_service(
     service.trained_model_id = trained_model.id
     service.config = config
     service.status = "upgrade_queued"
+    service.desired_state = "running"
     instance.status = "upgrade_queued"
+    instance.deployment_revision = (
+        service.active_revision or instance.deployment_revision
+    ) + 1
     session.add_all([service, instance, task])
     session.flush()
     session.add(execution)
@@ -513,9 +569,11 @@ async def upgrade_service(
 )
 async def stop_service(
     service_id: str,
+    actor: User = Depends(get_current_user),
     session: Session = Depends(get_service_session),
     producer: Any = Depends(get_service_stream_producer),
 ) -> ServiceResponse:
+    require_resource_permission(session, actor, "service", service_id, PERMISSION_EDIT)
     return await _queue_service_operation(
         session,
         producer,
@@ -523,7 +581,65 @@ async def stop_service(
         operation=_STOP_OPERATION,
         task_type=TaskType.EDGE_STOP_DEPLOYMENT,
         service_status="stopping",
+        desired_state="stopped",
         require_rollback=False,
+    )
+
+
+@router.post(
+    "/{service_id}/start",
+    response_model=ServiceResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def start_service(
+    service_id: str,
+    actor: User = Depends(get_current_user),
+    session: Session = Depends(get_service_session),
+    producer: Any = Depends(get_service_stream_producer),
+) -> ServiceResponse:
+    require_resource_permission(session, actor, "service", service_id, PERMISSION_EDIT)
+    service = session.get(DeploymentService, service_id)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Service not found"
+        )
+    if service.status == "running" and service.desired_state == "running":
+        return _service_response(session, service_id)
+    return await _queue_service_operation(
+        session,
+        producer,
+        service_id=service_id,
+        operation=_START_OPERATION,
+        task_type=TaskType.EDGE_START_DEPLOYMENT,
+        service_status="starting",
+        desired_state="running",
+        require_rollback=False,
+        require_active_revision=True,
+    )
+
+
+@router.post(
+    "/{service_id}/restart",
+    response_model=ServiceResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def restart_service(
+    service_id: str,
+    actor: User = Depends(get_current_user),
+    session: Session = Depends(get_service_session),
+    producer: Any = Depends(get_service_stream_producer),
+) -> ServiceResponse:
+    require_resource_permission(session, actor, "service", service_id, PERMISSION_EDIT)
+    return await _queue_service_operation(
+        session,
+        producer,
+        service_id=service_id,
+        operation=_RESTART_OPERATION,
+        task_type=TaskType.EDGE_RESTART_DEPLOYMENT,
+        service_status="restarting",
+        desired_state="running",
+        require_rollback=False,
+        require_active_revision=True,
     )
 
 
@@ -534,9 +650,11 @@ async def stop_service(
 )
 async def rollback_service(
     service_id: str,
+    actor: User = Depends(get_current_user),
     session: Session = Depends(get_service_session),
     producer: Any = Depends(get_service_stream_producer),
 ) -> ServiceResponse:
+    require_resource_permission(session, actor, "service", service_id, PERMISSION_EDIT)
     return await _queue_service_operation(
         session,
         producer,
@@ -544,6 +662,7 @@ async def rollback_service(
         operation=_ROLLBACK_OPERATION,
         task_type=TaskType.EDGE_ROLLBACK,
         service_status="rollback_queued",
+        desired_state="running",
         require_rollback=True,
     )
 
@@ -552,9 +671,11 @@ async def rollback_service(
 async def update_service(
     service_id: str,
     request: ServiceUpdateRequest,
+    actor: User = Depends(get_current_user),
     session: Session = Depends(get_service_session),
     producer: Any = Depends(get_service_stream_producer),
 ) -> ServiceResponse:
+    require_resource_permission(session, actor, "service", service_id, PERMISSION_EDIT)
     if request.status == "stopped":
         return await _queue_service_operation(
             session,
@@ -563,6 +684,7 @@ async def update_service(
             operation=_STOP_OPERATION,
             task_type=TaskType.EDGE_STOP_DEPLOYMENT,
             service_status="stopping",
+            desired_state="stopped",
             require_rollback=False,
         )
     raise HTTPException(
@@ -575,11 +697,17 @@ async def update_service(
 async def predict_service_image(
     service_id: str,
     file: UploadFile = File(...),
+    actor: User = Depends(get_current_user),
     session: Session = Depends(get_service_session),
 ) -> PipelinePredictResponse:
+    require_resource_permission(
+        session, actor, "service", service_id, PERMISSION_INVOKE
+    )
     service = session.get(DeploymentService, service_id)
     if service is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Service not found"
+        )
     if service.status != "running":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -703,7 +831,9 @@ def _render_deployed_predictions(
         text_box = draw.textbbox((coordinates[0], coordinates[1]), caption)
         text_height = max(14, text_box[3] - text_box[1] + 6)
         caption_top = max(0.0, coordinates[1] - text_height)
-        caption_right = min(float(image.width), coordinates[0] + text_box[2] - text_box[0] + 8)
+        caption_right = min(
+            float(image.width), coordinates[0] + text_box[2] - text_box[0] + 8
+        )
         draw.rectangle(
             (coordinates[0], caption_top, caption_right, coordinates[1]),
             fill=color,
@@ -757,11 +887,17 @@ def _optional_float(value: Any) -> float | None:
 @router.delete("/{service_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_service(
     service_id: str,
+    actor: User = Depends(get_current_user),
     session: Session = Depends(get_service_session),
 ) -> Response:
+    require_resource_permission(
+        session, actor, "service", service_id, PERMISSION_DELETE
+    )
     service = session.get(DeploymentService, service_id)
     if service is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Service not found"
+        )
     if service.status != "stopped":
         instance_id = session.scalar(
             select(DeploymentInstance.id).where(
@@ -804,7 +940,9 @@ def _deployment_node(
 ) -> tuple[ComputeNode, InventorySnapshot]:
     node = session.get(ComputeNode, node_id)
     if node is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Node not found"
+        )
     if node.status != "online" or node.resource_pool_id is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -919,7 +1057,9 @@ def _calculate_trained_model_checksum(
         _require_minio_uri(model.artifact_uri, "Trained model artifact")
         bucket, object_name = model.artifact_uri.removeprefix("minio://").split("/", 1)
         with TemporaryDirectory(prefix="visiox-model-checksum-") as temp_dir:
-            artifact_path = Path(temp_dir) / (PurePosixPath(object_name).name or "model.pt")
+            artifact_path = Path(temp_dir) / (
+                PurePosixPath(object_name).name or "model.pt"
+            )
             storage.get_file(bucket, object_name, artifact_path)
             return sha256_file(artifact_path)
     except Exception as error:
@@ -956,11 +1096,15 @@ async def _queue_service_operation(
     operation: str,
     task_type: TaskType,
     service_status: str,
+    desired_state: str,
     require_rollback: bool,
+    require_active_revision: bool = False,
 ) -> ServiceResponse:
     service = session.get(DeploymentService, service_id)
     if service is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Service not found"
+        )
     instance = session.scalar(
         select(DeploymentInstance).where(
             DeploymentInstance.deployment_service_id == service_id
@@ -969,6 +1113,7 @@ async def _queue_service_operation(
     if instance is None:
         if operation == _STOP_OPERATION:
             service.status = "stopped"
+            service.desired_state = "stopped"
             service.endpoint = ""
             service.config = {
                 key: value
@@ -982,9 +1127,21 @@ async def _queue_service_operation(
             status_code=status.HTTP_409_CONFLICT,
             detail="Deployment instance is unavailable",
         )
+    if require_active_revision and (
+        service.active_revision is None
+        or instance.deployment_revision != service.active_revision
+        or instance.container_id is None
+        or instance.port is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No successful deployment revision is available",
+        )
     if require_rollback and (
         set(instance.rollback_metadata) != _ROLLBACK_FIELDS
-        or any(instance.rollback_metadata.get(field) is None for field in _ROLLBACK_FIELDS)
+        or any(
+            instance.rollback_metadata.get(field) is None for field in _ROLLBACK_FIELDS
+        )
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1016,6 +1173,7 @@ async def _queue_service_operation(
         idempotency_key=f"{operation}:{instance.id}:{execution_id}",
     )
     service.status = service_status
+    service.desired_state = desired_state
     service.config = {
         **service.config,
         "current_remote_execution_id": execution_id,
@@ -1093,16 +1251,30 @@ def _instance_has_healthy_tuple(instance: DeploymentInstance) -> bool:
 def _service_response(session: Session, service_id: str) -> ServiceResponse:
     service = session.get(DeploymentService, service_id)
     if service is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Service not found"
+        )
     instance = session.scalar(
         select(DeploymentInstance).where(
             DeploymentInstance.deployment_service_id == service_id
         )
     )
     execution = _current_service_execution(session, service)
+    log_stream_id = session.scalar(
+        select(LogStream.id)
+        .where(
+            LogStream.resource_type == "deployment_service",
+            LogStream.resource_id == service.id,
+        )
+        .order_by(LogStream.created_at.desc(), LogStream.id.desc())
+        .limit(1)
+    )
     return ServiceResponse(
         id=service.id,
         name=service.name,
+        organization_id=service.organization_id,
+        owner_user_id=service.owner_user_id,
+        visibility=service.visibility,
         pipeline_id=service.pipeline_id,
         trained_model_id=service.trained_model_id,
         model_name=service.model_name,
@@ -1112,10 +1284,15 @@ def _service_response(session: Session, service_id: str) -> ServiceResponse:
         instance_name=service.instance_name,
         resource_summary=service.resource_summary,
         status=service.status,
+        desired_state=service.desired_state,
+        active_revision=service.active_revision,
         endpoint=service.endpoint,
         calls=service.calls,
         config=service.config,
         instance_id=instance.id if instance is not None else None,
+        deployment_revision=(
+            instance.deployment_revision if instance is not None else None
+        ),
         node_id=instance.node_id if instance is not None else None,
         container_id=instance.container_id if instance is not None else None,
         image_digest=instance.image_digest if instance is not None else None,
@@ -1129,6 +1306,7 @@ def _service_response(session: Session, service_id: str) -> ServiceResponse:
         remote_execution_id=execution.id if execution is not None else None,
         phase=execution.phase if execution is not None else None,
         log_uri=execution.redacted_log_uri if execution is not None else None,
+        log_stream_id=log_stream_id,
         error_code=execution.error_code if execution is not None else None,
         error_message=execution.error_message if execution is not None else None,
         created_at=service.created_at,

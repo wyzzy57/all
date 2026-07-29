@@ -39,6 +39,13 @@ _SENSITIVE_CODE_MARKERS = (
     "AUTHORIZATION",
 )
 
+_STRUCTURED_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)^(?:password|passwd|credentials?|session[_-]?token|token|api[_-]?key|"
+    r"client[_-]?secret|secret|private[_-]?key|access[_-]?key|awsaccesskeyid|"
+    r"signature|sig|auth|authorization|proxy[-_]?authorization|cookie|set-cookie|"
+    r"registry[_-]?(?:auth|credentials?|password|token))$"
+)
+
 
 def redact(value: object) -> str:
     if isinstance(value, bytes):
@@ -60,6 +67,25 @@ def redact(value: object) -> str:
         lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
         text,
     )
+
+
+def redact_recursive(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: (
+                "[REDACTED]"
+                if _STRUCTURED_SENSITIVE_KEY_RE.fullmatch(str(key))
+                else redact_recursive(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_recursive(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_recursive(item) for item in value)
+    if isinstance(value, (str, bytes)):
+        return redact(value)
+    return value
 
 
 def redact_uri(value: str | None) -> str | None:

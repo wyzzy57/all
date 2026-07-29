@@ -258,7 +258,12 @@ def test_probe_rejects_disabled_pool_that_wins_creation_race(
             HTTPException,
             match="Resource pool does not accept the node inventory",
         ) as exc_info:
-            _get_or_create_inventory_pool(session, snapshot)
+            _get_or_create_inventory_pool(
+                session,
+                snapshot,
+                organization_id="legacy-org",
+                owner_user_id="legacy-admin",
+            )
 
         assert hid_winning_pool is True
         assert exc_info.value.status_code == 409

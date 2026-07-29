@@ -36,6 +36,20 @@
           <footer>
             <span class="service-status" :class="statusTone(service.status)">{{ statusText(service.status) }}</span>
             <button
+              v-if="service.status === 'stopped'"
+              type="button"
+              class="text-action"
+              :data-testid="`start-service-${service.id}`"
+              @click.stop="startService(service)"
+            >恢复</button>
+            <button
+              v-else-if="service.status === 'running'"
+              type="button"
+              class="text-action"
+              :data-testid="`restart-service-${service.id}`"
+              @click.stop="restartService(service)"
+            >重启</button>
+            <button
               type="button"
               class="delete-service"
               title="删除"
@@ -78,12 +92,29 @@
           <p>所属产线：<span>{{ selectedService.pipelineName }}</span></p>
         </div>
         <div class="detail-actions">
+          <button type="button" @click="openServiceSharing(selectedService)">
+            访问配置
+          </button>
           <button
             type="button"
             :disabled="!canStop(selectedService.status) || actionRunning"
             :data-testid="`stop-service-${selectedService.id}`"
             @click="stopService(selectedService)"
           ><VideoPause />停止</button>
+          <button
+            v-if="selectedService.status === 'stopped'"
+            type="button"
+            :disabled="actionRunning"
+            :data-testid="`start-service-${selectedService.id}`"
+            @click="startService(selectedService)"
+          ><VideoPlay />恢复</button>
+          <button
+            v-if="selectedService.status === 'running'"
+            type="button"
+            :disabled="actionRunning"
+            :data-testid="`restart-service-${selectedService.id}`"
+            @click="restartService(selectedService)"
+          ><Refresh />重启</button>
           <button
             type="button"
             :disabled="actionRunning || isActive(selectedService.status)"
@@ -137,6 +168,10 @@
           <button :class="{ active: detailSubtab === 'logs' }" type="button" @click="openLogs">日志</button>
         </div>
         <pre v-if="detailSubtab === 'example'" class="code-panel">{{ selectedService.exampleCode }}</pre>
+        <LogStreamViewer
+          v-else-if="selectedService.logStreamId"
+          :stream-id="selectedService.logStreamId"
+        />
         <div v-else class="log-panel">
           <div class="log-toolbar">
             <span>脱敏执行日志</span>
@@ -152,11 +187,20 @@
         :run-inference="runServiceInference"
       />
     </template>
+
+    <ResourceSharingDialog
+      v-if="sharingService"
+      v-model="sharingDialogVisible"
+      resource-type="service"
+      :resource-id="sharingService.id"
+      :resource-name="sharingService.name"
+      @saved="handleServiceSharingSaved"
+    />
   </section>
 </template>
 
 <script setup lang="ts">
-import { ArrowLeft, Delete, RefreshLeft, Search, VideoPause } from "@element-plus/icons-vue";
+import { ArrowLeft, Delete, Refresh, RefreshLeft, Search, VideoPause, VideoPlay } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
@@ -166,6 +210,8 @@ import ServiceExperiencePanel, {
   type ExperienceInferenceRequest,
   type ExperienceInferenceResponse,
 } from "@/components/ServiceExperiencePanel.vue";
+import LogStreamViewer from "@/components/logs/LogStreamViewer.vue";
+import ResourceSharingDialog from "@/components/sharing/ResourceSharingDialog.vue";
 
 type ServiceTab = "basic" | "experience";
 type DetailSubtab = "example" | "logs";
@@ -188,8 +234,12 @@ type ServiceRecord = {
   healthCheckedAt: string;
   phase: string;
   logUri: string;
+  logStreamId: string;
+  desiredState: string;
+  activeRevision: number | null;
   errorCode: string;
   errorMessage: string;
+  visibility: string;
 };
 
 const route = useRoute();
@@ -203,6 +253,8 @@ const activeTab = ref<ServiceTab>("basic");
 const detailSubtab = ref<DetailSubtab>("example");
 const actionRunning = ref(false);
 const logLoading = ref(false);
+const sharingDialogVisible = ref(false);
+const sharingService = ref<ServiceRecord | null>(null);
 let pollTimer: number | undefined;
 
 const deploymentPhases = [
@@ -268,6 +320,16 @@ function backToList() {
   void router.push("/services");
 }
 
+function openServiceSharing(service: ServiceRecord) {
+  sharingService.value = service;
+  sharingDialogVisible.value = true;
+}
+
+function handleServiceSharingSaved(visibility: string) {
+  if (!sharingService.value) return;
+  sharingService.value.visibility = visibility;
+}
+
 async function loadServices() {
   try {
     const response = await api.listServices({ limit: 200, offset: 0 });
@@ -308,6 +370,30 @@ async function stopService(service: ServiceRecord) {
     ElMessage.success("停止任务已提交");
   } catch (error) {
     ElMessage.error(errorMessage(error, "停止服务失败"));
+  } finally {
+    actionRunning.value = false;
+  }
+}
+
+async function startService(service: ServiceRecord) {
+  actionRunning.value = true;
+  try {
+    mergeService(await api.startService(service.id));
+    ElMessage.success("恢复任务已提交");
+  } catch (error) {
+    ElMessage.error(errorMessage(error, "恢复服务失败"));
+  } finally {
+    actionRunning.value = false;
+  }
+}
+
+async function restartService(service: ServiceRecord) {
+  actionRunning.value = true;
+  try {
+    mergeService(await api.restartService(service.id));
+    ElMessage.success("重启任务已提交");
+  } catch (error) {
+    ElMessage.error(errorMessage(error, "重启服务失败"));
   } finally {
     actionRunning.value = false;
   }
@@ -387,13 +473,17 @@ function serviceFromApi(service: DeploymentServiceRecord): ServiceRecord {
       : "尚未检查",
     phase: service.phase || service.status,
     logUri: service.log_uri || "",
+    logStreamId: service.log_stream_id || "",
+    desiredState: service.desired_state || "running",
+    activeRevision: service.active_revision ?? null,
     errorCode: service.error_code || "",
     errorMessage: service.error_message || "",
+    visibility: service.visibility || "private",
   };
 }
 
 function isActive(status: string) {
-  return ["queued", "deploying", "connecting", "probing", "preparing", "optimizing", "starting", "warming_up", "reconciliation_retry", "upgrade_queued", "stopping", "rollback_queued"].includes(status);
+  return ["queued", "deploying", "connecting", "probing", "preparing", "optimizing", "starting", "restarting", "warming_up", "reconciliation_retry", "upgrade_queued", "stopping", "rollback_queued"].includes(status);
 }
 
 function canStop(status: string) {

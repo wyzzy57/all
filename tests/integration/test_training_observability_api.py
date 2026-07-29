@@ -17,18 +17,42 @@ from sqlalchemy.orm import Session, sessionmaker
 import visiox_api.main as api_main
 from visiox_api.main import create_app
 from visiox_api.routes.training_observability import (
+    _parse_minio_uri,
     get_training_observability_service,
     get_training_observability_session,
 )
+from visiox_api.dependencies.auth import get_current_user
 from visiox_common.settings import Settings
 from visiox_api.services.training_observability import TrainingObservabilityService
 from visiox_db.models import Task, TrainingJob, TrainingPipeline
+from tests.integration.ownership_test_support import install_legacy_ownership
 
 
 class FakeObservabilityService:
     def __init__(self, *, source_failed: bool = False) -> None:
         self.source_failed = source_failed
         self.scalar_keys: list[str] = []
+
+    def for_engine(self, engine: str):
+        service = self
+
+        class Adapter:
+            def summary(self, job, pipeline, task):
+                return service.get_summary(job, pipeline, task)
+
+            def scalars(self, job, keys, start_step, end_step, max_points):
+                return service.get_scalars(job, keys, start_step, end_step, max_points, engine=engine)
+
+            def resources(self, job, start_step, end_step, max_points):
+                return service.get_resources(job, start_step, end_step, max_points, engine=engine)
+
+            def analysis(self, job):
+                return service.get_analysis(job, engine=engine)
+
+            def artifacts(self, job):
+                return service.get_artifacts(job)
+
+        return Adapter()
 
     @property
     def availability(self) -> dict[str, dict[str, bool | str | None]]:
@@ -42,6 +66,7 @@ class FakeObservabilityService:
     def get_summary(self, job: TrainingJob, pipeline: TrainingPipeline, task: Task | None) -> dict[str, Any]:
         return {
             "job_id": job.id,
+            "engine": pipeline.engine,
             "status": job.status,
             "pipeline": {"id": pipeline.id, "name": pipeline.name, "status": pipeline.status},
             "task": {"id": task.id if task else None, "status": task.status if task else None},
@@ -61,8 +86,10 @@ class FakeObservabilityService:
         start_step: int | None,
         end_step: int | None,
         max_points: int | None,
+        *,
+        engine: str = "yolo26",
     ) -> dict[str, Any]:
-        del job, start_step, end_step, max_points
+        del job, start_step, end_step, max_points, engine
         self.scalar_keys = list(keys)
         return {"series": {key: [] for key in keys}, "availability": self.availability}
 
@@ -72,8 +99,10 @@ class FakeObservabilityService:
         start_step: int | None,
         end_step: int | None,
         max_points: int | None,
+        *,
+        engine: str = "yolo26",
     ) -> dict[str, Any]:
-        del job, start_step, end_step, max_points
+        del job, start_step, end_step, max_points, engine
         return {"series": {"system.cpu_percent": []}, "availability": self.availability}
 
     def get_graph(self, job: TrainingJob) -> dict[str, Any]:
@@ -83,6 +112,14 @@ class FakeObservabilityService:
     def get_histogram(self, job: TrainingJob, kind: str, tag: str, step: int) -> dict[str, Any]:
         del job
         return {"kind": kind, "tag": tag, "step": step, "buckets": [], "availability": self.availability}
+
+    def get_analysis(self, job: TrainingJob, *, engine: str = "yolo26") -> dict[str, Any]:
+        del job, engine
+        return {"findings": [], "availability": self.availability}
+
+    def get_artifacts(self, job: TrainingJob) -> dict[str, Any]:
+        del job
+        return {"items": [], "availability": {"artifacts": {"available": True, "reason": None}}}
 
 
 class RouteMlflowClient:
@@ -133,7 +170,9 @@ def session_factory(tmp_path):
     config.set_main_option("sqlalchemy.url", database_url)
     command.upgrade(config, "head")
     engine = create_engine(database_url)
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    install_legacy_ownership(factory)
+    return factory
 
 
 @pytest.fixture()
@@ -172,6 +211,9 @@ def client(session_factory, monkeypatch: pytest.MonkeyPatch) -> Generator[TestCl
 
     app.dependency_overrides[get_training_observability_session] = override_session
     app.dependency_overrides[get_training_observability_service] = FakeObservabilityService
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id="legacy-admin", organization_id="legacy-org", role="admin"
+    )
     with TestClient(app) as test_client:
         yield test_client
 
@@ -228,6 +270,9 @@ def real_service_client(
             yield session
 
     app.dependency_overrides[get_training_observability_session] = override_session
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id="legacy-admin", organization_id="legacy-org", role="admin"
+    )
     app.state.training_observability_service = service
     with TestClient(app) as test_client:
         test_client.app.state.training_observability_service = service
@@ -240,6 +285,7 @@ def test_observability_summary_returns_pipeline_job_and_availability(client, see
     assert response.status_code == 200
     assert response.json() == {
         "job_id": "job-observability",
+        "engine": "yolo26",
         "pipeline_id": "pipeline-observability",
         "pipeline_name": "native-observability",
         "status": "running",
@@ -405,3 +451,43 @@ def test_observability_source_failure_remains_http_200(client, seeded_training_j
     assert response.status_code == 200
     assert response.json()["series"] == {"train.box_loss": []}
     assert response.json()["availability"]["mlflow"] == {"available": False, "reason": "offline"}
+
+
+def test_llm_analysis_and_artifacts_routes_use_authorized_job_context(client, seeded_training_job) -> None:
+    analysis = client.get(f"/training-jobs/{seeded_training_job.id}/observability/analysis")
+    artifacts = client.get(f"/training-jobs/{seeded_training_job.id}/observability/artifacts")
+
+    assert analysis.status_code == 200
+    assert analysis.json()["findings"] == []
+    assert artifacts.status_code == 200
+    assert artifacts.json()["items"] == []
+
+
+def test_observability_rejects_same_organization_user_without_view_permission(
+    client,
+    seeded_training_job,
+) -> None:
+    client.app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id="member-without-grant",
+        organization_id="legacy-org",
+        role="member",
+    )
+
+    response = client.get(f"/training-jobs/{seeded_training_job.id}/observability/summary")
+
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected"),
+    [
+        ("minio://training-artifacts/jobs/job-1/best.pt", ("training-artifacts", "jobs/job-1/best.pt")),
+        ("minio://missing-object", None),
+        ("minio:///missing-bucket", None),
+        ("minio://training-artifacts/", None),
+        ("https://example.test/best.pt", None),
+        (None, None),
+    ],
+)
+def test_parse_minio_uri_rejects_incomplete_artifact_locations(uri, expected) -> None:
+    assert _parse_minio_uri(uri) == expected

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 import shutil
-from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -17,7 +16,11 @@ from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
 from visiox_common.tasks import TaskCommand, TaskStatus, TaskType
-from visiox_common.settings import get_settings
+from visiox_api.dependencies.auth import get_current_user
+from visiox_api.dependencies.authorization import require_resource_permission
+from visiox_api.dependencies.database import get_db_session
+from visiox_api.services.authorization import authorized_resource_predicate
+from visiox_common.settings import Settings, get_settings
 from visiox_db.base import new_id
 from visiox_db.models import (
     ComputeNode,
@@ -30,7 +33,13 @@ from visiox_db.models import (
     TrainingJob,
     TrainingPipeline,
 )
-from visiox_db.session import get_session
+from visiox_db.models.identity import (
+    PERMISSION_DELETE,
+    PERMISSION_EDIT,
+    PERMISSION_USE,
+    PERMISSION_VIEW,
+    User,
+)
 from visiox_edge_executor_worker.deployment import validate_image_digest
 from visiox_edge_executor_worker.distributed import (
     DistributedNode,
@@ -46,7 +55,17 @@ from visiox_yolo26.training.params import (
     merge_training_params,
     validate_training_environment,
 )
-from visiox_yolo26.training.prechecks import TrainingPrecheckError, validate_training_resources
+from visiox_yolo26.training.prechecks import (
+    TrainingPrecheckError,
+    validate_training_resources,
+)
+from visiox_api.services.llm_training import (
+    LlmTrainingConfigError,
+    validate_llamafactory_config,
+    validate_llm_dataset,
+    validate_llm_environment,
+    resolve_llm_dataset_version,
+)
 
 
 router = APIRouter(tags=["training-jobs"])
@@ -56,7 +75,9 @@ class DistributedTrainingRequest(PydanticBaseModel):
     resource_pool_id: str = Field(min_length=1, max_length=128)
     requested_gpus: int = Field(ge=1)
     node_ids: list[str] | None = None
-    training_image_digest: str = Field(min_length=1, max_length=512)
+    training_image_digest: str | None = Field(
+        default=None, min_length=1, max_length=512
+    )
     master_port: int = Field(default=29500, ge=1024, le=65535)
 
 
@@ -73,6 +94,7 @@ class TrainingJobCreateRequest(PydanticBaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     environment: dict[str, Any] = Field(default_factory=dict)
     distributed: DistributedTrainingRequest | None = None
+    dataset_version_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class TrainingJobResponse(PydanticBaseModel):
@@ -85,6 +107,7 @@ class TrainingJobResponse(PydanticBaseModel):
     environment: dict[str, Any] = Field(default_factory=dict)
     metrics: dict[str, Any]
     log_uri: str | None
+    log_stream_id: str | None = None
     started_at: datetime | None
     finished_at: datetime | None
     created_at: datetime
@@ -111,8 +134,7 @@ class TrainingArtifactListResponse(PydanticBaseModel):
     items: list[TrainingArtifactResponse]
 
 
-def get_training_job_session() -> Generator[Session]:
-    yield from get_session()
+get_training_job_session = get_db_session
 
 
 def get_training_stream_producer(request: Request) -> RedisStreamProducer:
@@ -122,7 +144,10 @@ def get_training_stream_producer(request: Request) -> RedisStreamProducer:
 def get_training_object_storage_client(request: Request) -> ObjectStorageClient:
     storage = getattr(request.app.state, "object_storage", None)
     if storage is None:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Object storage is not configured")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Object storage is not configured",
+        )
     return storage
 
 
@@ -166,6 +191,13 @@ def _job_response(
         payload = task.payload or {}
         env_payload = payload.get("environment")
         environment = env_payload if isinstance(env_payload, dict) else {}
+    observability = job.metrics.get("observability", {})
+    log_stream_id = (
+        observability.get("log_stream_id")
+        if isinstance(observability, dict)
+        and isinstance(observability.get("log_stream_id"), str)
+        else None
+    )
     return TrainingJobResponse(
         id=job.id,
         pipeline_id=job.pipeline_id,
@@ -176,6 +208,7 @@ def _job_response(
         environment=environment or {},
         metrics=job.metrics,
         log_uri=job.log_uri,
+        log_stream_id=log_stream_id,
         started_at=job.started_at,
         finished_at=job.finished_at,
         created_at=job.created_at,
@@ -192,12 +225,36 @@ async def create_training_job(
     response: Response,
     session: Session = Depends(get_training_job_session),
     producer: Any = Depends(get_training_stream_producer),
+    settings: Settings = Depends(get_settings),
+    actor: User = Depends(get_current_user),
 ) -> TrainingJobResponse:
     pipeline = session.get(TrainingPipeline, pipeline_id)
     if pipeline is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found"
+        )
+    require_resource_permission(
+        session, actor, "pipeline", pipeline_id, PERMISSION_EDIT
+    )
+    if pipeline.dataset_id:
+        require_resource_permission(
+            session, actor, "dataset", pipeline.dataset_id, PERMISSION_USE
+        )
     if pipeline.status != "ready":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Pipeline is not ready: {pipeline.status}")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Pipeline is not ready: {pipeline.status}",
+        )
+    if pipeline.engine == "llamafactory":
+        return await _create_llm_training_job(
+            session=session,
+            producer=producer,
+            pipeline=pipeline,
+            request=request,
+            response=response,
+            settings=settings,
+            actor=actor,
+        )
     try:
         resources = validate_training_resources(
             session,
@@ -207,26 +264,45 @@ async def create_training_job(
             dataset_id=str(pipeline.dataset_id),
         )
     except TrainingPrecheckError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
     try:
         params = merge_training_params(pipeline.params_template, request.params)
-        environment = {**validate_training_environment(pipeline.default_environment), **validate_training_environment(request.environment)}
+        environment = {
+            **validate_training_environment(pipeline.default_environment),
+            **validate_training_environment(request.environment),
+        }
     except TrainingParamsError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
 
     if request.distributed is not None:
         return await _create_distributed_training_job(
             session=session,
             producer=producer,
             pipeline=pipeline,
-            resources=resources,
+            context_payload={
+                "engine": "yolo26",
+                "dataset_id": resources.dataset.id,
+                "base_model_id": resources.base_model.id,
+            },
             params=params,
             environment=environment,
             distributed=request.distributed,
             response=response,
+            actor=actor,
         )
 
-    job = TrainingJob(pipeline_id=pipeline.id, status="queued", params=params)
+    job = TrainingJob(
+        pipeline_id=pipeline.id,
+        status="queued",
+        params=params,
+        organization_id=actor.organization_id,
+        owner_user_id=actor.id,
+        visibility="private",
+    )
     task = Task(
         task_type=TaskType.TRAIN_MODEL.value,
         status=TaskStatus.QUEUED.value,
@@ -279,24 +355,130 @@ async def create_training_job(
     return _job_response(job, environment, task)
 
 
+async def _create_llm_training_job(
+    *,
+    session: Session,
+    producer: Any,
+    pipeline: TrainingPipeline,
+    request: TrainingJobCreateRequest,
+    response: Response,
+    settings: Settings,
+    actor: User,
+) -> TrainingJobResponse:
+    if request.distributed is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="LLM training requires an edge GPU node",
+        )
+    if (
+        request.distributed.requested_gpus != 1
+        or not request.distributed.node_ids
+        or len(request.distributed.node_ids) != 1
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="the first LLM release supports one node and one GPU",
+        )
+    try:
+        dataset = validate_llm_dataset(session, str(pipeline.dataset_id))
+        dataset_version = resolve_llm_dataset_version(session, dataset.id, request.dataset_version_id)
+        params = validate_llamafactory_config(
+            {**(pipeline.params_template or {}), **request.params}
+        )
+        environment = {
+            **validate_llm_environment(pipeline.default_environment),
+            **validate_llm_environment(request.environment),
+        }
+    except LlmTrainingConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    model_id = params.get("model_id")
+    resolved_revision = params.get("resolved_revision")
+    if not isinstance(model_id, str) or not model_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="LLM model reference is unavailable",
+        )
+    if not isinstance(resolved_revision, str) or not resolved_revision:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="LLM model revision has not been resolved",
+        )
+    if not dataset_version.manifest_checksum:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="LLM dataset manifest is unavailable",
+        )
+    image_digest = settings.llm_training_image_digest.strip()
+    if not image_digest:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM training image is not configured",
+        )
+    return await _create_distributed_training_job(
+        session=session,
+        producer=producer,
+        pipeline=pipeline,
+        context_payload={
+            "engine": "llamafactory",
+            "dataset_id": dataset.id,
+            "dataset_version_id": dataset_version.id,
+            "dataset_version": dataset_version.version,
+            "dataset_uri": dataset_version.object_uri,
+            "dataset_format": dataset_version.format,
+            "dataset_manifest_checksum": dataset_version.manifest_checksum,
+            "model_reference": {
+                "source": params.get("model_source"),
+                "model_id": model_id,
+                "revision": resolved_revision,
+            },
+            "resolved_config": params,
+        },
+        params=params,
+        environment=environment,
+        distributed=request.distributed,
+        response=response,
+        image_digest_override=image_digest,
+        actor=actor,
+    )
+
+
 async def _create_distributed_training_job(
     *,
     session: Session,
     producer: Any,
     pipeline: TrainingPipeline,
-    resources: Any,
+    context_payload: dict[str, Any],
     params: dict[str, Any],
     environment: dict[str, Any],
     distributed: DistributedTrainingRequest,
     response: Response,
+    image_digest_override: str | None = None,
+    actor: User,
 ) -> TrainingJobResponse:
-    plan, image_digest = _distributed_plan(session, distributed)
+    plan, image_digest = _distributed_plan(
+        session,
+        distributed,
+        image_digest_override=image_digest_override,
+    )
+    _authorize_distributed_plan(session, actor, plan)
     job_id = new_id()
     task_id = new_id()
     run_id = new_id()
     execution_id = new_id()
     ranks = _rank_payloads(plan)
-    job = TrainingJob(id=job_id, pipeline_id=pipeline.id, status="queued", params=params)
+    job = TrainingJob(
+        id=job_id,
+        pipeline_id=pipeline.id,
+        status="queued",
+        params=params,
+        metrics={"dataset_snapshot": context_payload} if context_payload.get("dataset_version_id") else {},
+        organization_id=actor.organization_id,
+        owner_user_id=actor.id,
+        visibility="private",
+    )
     task = Task(
         id=task_id,
         task_type=TaskType.EDGE_TRAIN.value,
@@ -308,8 +490,7 @@ async def _create_distributed_training_job(
             "pipeline_id": pipeline.id,
             "training_job_id": job_id,
             "distributed_training_run_id": run_id,
-            "dataset_id": resources.dataset.id,
-            "base_model_id": resources.base_model.id,
+            **context_payload,
             "params": params,
             "environment": environment,
         },
@@ -388,13 +569,22 @@ async def stop_distributed_training_job(
     training_job_id: str,
     session: Session = Depends(get_training_job_session),
     producer: Any = Depends(get_training_stream_producer),
+    actor: User = Depends(get_current_user),
 ) -> TrainingJobResponse:
     job = session.get(TrainingJob, training_job_id)
     if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found"
+        )
+    require_resource_permission(
+        session, actor, "training_job", training_job_id, PERMISSION_EDIT
+    )
     run = _latest_distributed_run(session, job.id)
     if run is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Training job is not distributed")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Training job is not distributed",
+        )
     if run.status not in {"queued", "running", "resuming"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -469,13 +659,22 @@ async def resume_distributed_training_job(
     request: DistributedTrainingResumeRequest,
     session: Session = Depends(get_training_job_session),
     producer: Any = Depends(get_training_stream_producer),
+    actor: User = Depends(get_current_user),
 ) -> TrainingJobResponse:
     job = session.get(TrainingJob, training_job_id)
     if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found"
+        )
+    require_resource_permission(
+        session, actor, "training_job", training_job_id, PERMISSION_EDIT
+    )
     previous = _latest_distributed_run(session, job.id)
     if previous is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Training job is not distributed")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Training job is not distributed",
+        )
     if previous.status not in {"failed", "stopped", "canceled"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -507,15 +706,19 @@ async def resume_distributed_training_job(
             detail="Resume must use the original immutable training image",
         )
     plan, image_digest = _distributed_plan(session, distributed)
+    _authorize_distributed_plan(session, actor, plan)
     context = _distributed_training_context(session, job)
-    attempt = int(
-        session.scalar(
-            select(func.max(DistributedTrainingRun.attempt)).where(
-                DistributedTrainingRun.training_job_id == job.id
+    attempt = (
+        int(
+            session.scalar(
+                select(func.max(DistributedTrainingRun.attempt)).where(
+                    DistributedTrainingRun.training_job_id == job.id
+                )
             )
+            or 0
         )
-        or 0
-    ) + 1
+        + 1
+    )
     run_id = new_id()
     task_id = new_id()
     execution_id = new_id()
@@ -600,19 +803,30 @@ async def resume_distributed_training_job(
 def _distributed_plan(
     session: Session,
     request: DistributedTrainingRequest,
+    *,
+    image_digest_override: str | None = None,
 ) -> tuple[DistributedPlan, str]:
     pool = session.get(ResourcePool, request.resource_pool_id)
     if pool is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource pool not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Resource pool not found"
+        )
     if not pool.enabled:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource pool is disabled")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Resource pool is disabled"
+        )
     try:
-        image_digest = validate_image_digest(request.training_image_digest)
+        image_digest = validate_image_digest(
+            image_digest_override or request.training_image_digest or ""
+        )
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
     requested_node_ids = request.node_ids
     if requested_node_ids is not None and (
-        not requested_node_ids or len(requested_node_ids) != len(set(requested_node_ids))
+        not requested_node_ids
+        or len(requested_node_ids) != len(set(requested_node_ids))
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -625,7 +839,9 @@ def _distributed_plan(
     if requested_node_ids is not None:
         query = query.where(ComputeNode.id.in_(requested_node_ids))
     nodes = session.scalars(query.order_by(ComputeNode.id)).all()
-    if requested_node_ids is not None and {node.id for node in nodes} != set(requested_node_ids):
+    if requested_node_ids is not None and {node.id for node in nodes} != set(
+        requested_node_ids
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="One or more requested nodes are not available",
@@ -671,8 +887,32 @@ def _distributed_plan(
             master_port=request.master_port,
         )
     except (ValueError, IncompatibleResourcePoolError) as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
     return plan, image_digest
+
+
+def _authorize_distributed_plan(
+    session: Session,
+    actor: User,
+    plan: DistributedPlan,
+) -> None:
+    require_resource_permission(
+        session,
+        actor,
+        "resource_pool",
+        plan.resource_pool_id,
+        PERMISSION_USE,
+    )
+    for node in plan.nodes:
+        require_resource_permission(
+            session,
+            actor,
+            "node",
+            node.node_id,
+            PERMISSION_USE,
+        )
 
 
 def _rank_payloads(plan: DistributedPlan) -> list[dict[str, Any]]:
@@ -796,8 +1036,13 @@ def list_training_jobs(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_training_job_session),
+    actor: User = Depends(get_current_user),
 ) -> TrainingJobListResponse:
-    filters = []
+    filters = [
+        authorized_resource_predicate(
+            session, actor, TrainingJob, "training_job", PERMISSION_VIEW
+        )
+    ]
     if pipeline_id is not None:
         filters.append(TrainingJob.pipeline_id == pipeline_id)
     if status_filter is not None:
@@ -824,10 +1069,19 @@ def list_training_jobs(
 
 
 @router.get("/training-jobs/{training_job_id}", response_model=TrainingJobResponse)
-def get_training_job(training_job_id: str, session: Session = Depends(get_training_job_session)) -> TrainingJobResponse:
+def get_training_job(
+    training_job_id: str,
+    session: Session = Depends(get_training_job_session),
+    actor: User = Depends(get_current_user),
+) -> TrainingJobResponse:
     job = session.get(TrainingJob, training_job_id)
     if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found"
+        )
+    require_resource_permission(
+        session, actor, "training_job", training_job_id, PERMISSION_VIEW
+    )
     task = session.get(Task, job.task_id) if job.task_id else None
     run_id, execution_id = _distributed_response_refs(session, job.id)
     return _job_response(
@@ -838,15 +1092,23 @@ def get_training_job(training_job_id: str, session: Session = Depends(get_traini
     )
 
 
-@router.delete("/training-jobs/{training_job_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/training-jobs/{training_job_id}", status_code=status.HTTP_204_NO_CONTENT
+)
 def delete_training_job(
     training_job_id: str,
     session: Session = Depends(get_training_job_session),
     storage: ObjectStorageClient = Depends(get_training_object_storage_client),
+    actor: User = Depends(get_current_user),
 ) -> None:
     job = session.get(TrainingJob, training_job_id)
     if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found"
+        )
+    require_resource_permission(
+        session, actor, "training_job", training_job_id, PERMISSION_DELETE
+    )
     if job.status in {"pending", "queued", "running"}:
         has_execution_link = (
             job.task_id is not None
@@ -885,11 +1147,19 @@ def delete_training_job(
     shutil.rmtree(run_path, ignore_errors=True)
 
     task = session.get(Task, job.task_id) if job.task_id else None
-    for execution in session.scalars(select(RemoteExecution).where(RemoteExecution.training_job_id == job.id)).all():
+    for execution in session.scalars(
+        select(RemoteExecution).where(RemoteExecution.training_job_id == job.id)
+    ).all():
         session.delete(execution)
-    for run in session.scalars(select(DistributedTrainingRun).where(DistributedTrainingRun.training_job_id == job.id)).all():
+    for run in session.scalars(
+        select(DistributedTrainingRun).where(
+            DistributedTrainingRun.training_job_id == job.id
+        )
+    ).all():
         session.delete(run)
-    for model in session.scalars(select(TrainedModel).where(TrainedModel.training_job_id == job.id)).all():
+    for model in session.scalars(
+        select(TrainedModel).where(TrainedModel.training_job_id == job.id)
+    ).all():
         model.training_job_id = None
         session.add(model)
     session.flush()
@@ -905,14 +1175,24 @@ def get_training_job_log(
     training_job_id: str,
     session: Session = Depends(get_training_job_session),
     storage: ObjectStorageClient = Depends(get_training_object_storage_client),
+    actor: User = Depends(get_current_user),
 ) -> FileResponse:
     job = session.get(TrainingJob, training_job_id)
     if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found"
+        )
+    require_resource_permission(
+        session, actor, "training_job", training_job_id, PERMISSION_VIEW
+    )
     if not job.log_uri:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training log not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training log not found"
+        )
     bucket, object_name = _parse_storage_uri(job.log_uri)
-    with NamedTemporaryFile(delete=False, suffix=f"-{training_job_id}.log") as temp_file:
+    with NamedTemporaryFile(
+        delete=False, suffix=f"-{training_job_id}.log"
+    ) as temp_file:
         temp_path = Path(temp_file.name)
     storage.get_file(bucket, object_name, temp_path)
     return FileResponse(
@@ -929,33 +1209,62 @@ def get_training_job_visualization(
     name: str,
     session: Session = Depends(get_training_job_session),
     storage: ObjectStorageClient = Depends(get_training_object_storage_client),
+    actor: User = Depends(get_current_user),
 ) -> FileResponse:
     job = session.get(TrainingJob, training_job_id)
     if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
-    visualizations = job.metrics.get("visualizations") if isinstance(job.metrics, dict) else None
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found"
+        )
+    require_resource_permission(
+        session, actor, "training_job", training_job_id, PERMISSION_VIEW
+    )
+    visualizations = (
+        job.metrics.get("visualizations") if isinstance(job.metrics, dict) else None
+    )
     if not isinstance(visualizations, dict):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training visualization not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Training visualization not found",
+        )
     uri = visualizations.get(name)
     if not isinstance(uri, str):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training visualization not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Training visualization not found",
+        )
     bucket, object_name = _parse_storage_uri(uri)
     suffix = Path(name).suffix or ".png"
-    with NamedTemporaryFile(delete=False, suffix=f"-{_safe_name(name) or 'visualization'}") as temp_file:
+    with NamedTemporaryFile(
+        delete=False, suffix=f"-{_safe_name(name) or 'visualization'}"
+    ) as temp_file:
         temp_path = Path(temp_file.name)
     storage.get_file(bucket, object_name, temp_path)
-    return FileResponse(temp_path, media_type=_media_type(suffix), background=BackgroundTask(temp_path.unlink, missing_ok=True))
+    return FileResponse(
+        temp_path,
+        media_type=_media_type(suffix),
+        background=BackgroundTask(temp_path.unlink, missing_ok=True),
+    )
 
 
-@router.get("/training-jobs/{training_job_id}/artifacts", response_model=TrainingArtifactListResponse)
+@router.get(
+    "/training-jobs/{training_job_id}/artifacts",
+    response_model=TrainingArtifactListResponse,
+)
 def list_training_job_artifacts(
     training_job_id: str,
     session: Session = Depends(get_training_job_session),
     storage: ObjectStorageClient = Depends(get_training_object_storage_client),
+    actor: User = Depends(get_current_user),
 ) -> TrainingArtifactListResponse:
     job = session.get(TrainingJob, training_job_id)
     if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found"
+        )
+    require_resource_permission(
+        session, actor, "training_job", training_job_id, PERMISSION_VIEW
+    )
     artifact_uris = _training_artifact_uris(job, session)
     items: list[TrainingArtifactResponse] = []
     for kind in ("weight", "visualization"):
@@ -979,18 +1288,30 @@ def download_training_job_artifact(
     name: str,
     session: Session = Depends(get_training_job_session),
     storage: ObjectStorageClient = Depends(get_training_object_storage_client),
+    actor: User = Depends(get_current_user),
 ) -> FileResponse:
     job = session.get(TrainingJob, training_job_id)
     if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found"
+        )
+    require_resource_permission(
+        session, actor, "training_job", training_job_id, PERMISSION_VIEW
+    )
     if kind not in {"weight", "visualization"}:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found"
+        )
     uri = _training_artifact_uris(job, session)[kind].get(name)
     if not uri:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found"
+        )
     bucket, object_name = _parse_storage_uri(uri)
     safe_name = _safe_name(name)
-    with NamedTemporaryFile(delete=False, suffix=f"-{safe_name or 'artifact'}") as temp_file:
+    with NamedTemporaryFile(
+        delete=False, suffix=f"-{safe_name or 'artifact'}"
+    ) as temp_file:
         temp_path = Path(temp_file.name)
     storage.get_file(bucket, object_name, temp_path)
     return FileResponse(
@@ -1001,14 +1322,19 @@ def download_training_job_artifact(
     )
 
 
-def _training_artifact_uris(job: TrainingJob, session: Session) -> dict[str, dict[str, str]]:
+def _training_artifact_uris(
+    job: TrainingJob, session: Session
+) -> dict[str, dict[str, str]]:
     metrics = job.metrics if isinstance(job.metrics, dict) else {}
     weights = _string_map(metrics.get("weights"))
     visualizations = _string_map(metrics.get("visualizations"))
     if not weights:
         models = session.scalars(
             select(TrainedModel)
-            .where(TrainedModel.pipeline_id == job.pipeline_id, TrainedModel.status == "ready")
+            .where(
+                TrainedModel.pipeline_id == job.pipeline_id,
+                TrainedModel.status == "ready",
+            )
             .order_by(TrainedModel.created_at.desc(), TrainedModel.id.desc())
         ).all()
         for model in models:
@@ -1017,7 +1343,9 @@ def _training_artifact_uris(job: TrainingJob, session: Session) -> dict[str, dic
             if name and name not in weights:
                 weights[name] = model.artifact_uri
     return {
-        "weight": dict(sorted(weights.items(), key=lambda item: _artifact_sort_key(item[0]))),
+        "weight": dict(
+            sorted(weights.items(), key=lambda item: _artifact_sort_key(item[0]))
+        ),
         "visualization": dict(sorted(visualizations.items())),
     }
 
@@ -1043,16 +1371,25 @@ def _artifact_sort_key(name: str) -> tuple[int, str]:
 def _parse_storage_uri(uri: str) -> tuple[str, str]:
     marker = "://"
     if marker not in uri:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact is not available")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Training artifact is not available",
+        )
     remainder = uri.split(marker, 1)[1]
     bucket, separator, object_name = remainder.partition("/")
     if not separator or not bucket or not object_name:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact is not available")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Training artifact is not available",
+        )
     return bucket, object_name
 
 
 def _safe_name(name: str) -> str:
-    return "".join(character if character.isalnum() or character in {".", "-", "_"} else "_" for character in name)
+    return "".join(
+        character if character.isalnum() or character in {".", "-", "_"} else "_"
+        for character in name
+    )
 
 
 def _media_type(suffix: str) -> str:

@@ -1,11 +1,14 @@
 import { flushPromises, mount } from "@vue/test-utils";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import AsyncState from "@/components/common/AsyncState.vue";
 import WorkbenchView from "@/views/workbench/WorkbenchView.vue";
 import workbenchSource from "@/views/workbench/WorkbenchView.vue?raw";
 
 const pushMock = vi.hoisted(() => vi.fn());
 const apiMock = vi.hoisted(() => ({
+  getWorkbenchStatistics: vi.fn(),
+  getResourceStatistics: vi.fn(),
   listDatasets: vi.fn(),
   listPipelines: vi.fn(),
   listServices: vi.fn(),
@@ -17,112 +20,183 @@ vi.mock("vue-router", () => ({
 
 vi.mock("@/api/client", () => ({ api: apiMock }));
 
-vi.mock("element-plus", async () => {
-  const actual = await vi.importActual<typeof import("element-plus")>("element-plus");
-  return { ...actual, ElMessage: { error: vi.fn() } };
-});
+vi.mock("@/components/dashboard/StatisticSummaryStrip.vue", () => ({
+  default: { props: ["items"], template: '<div data-testid="summary-strip">{{ items.map((item) => item.label + item.value).join("|") }}</div>' },
+}));
+vi.mock("@/components/dashboard/PipelineStatusChart.vue", () => ({
+  default: { props: ["buckets"], template: '<div data-testid="pipeline-chart">{{ buckets.map((item) => item.label + item.value).join("|") }}</div>' },
+}));
+vi.mock("@/components/dashboard/CreationTrendChart.vue", () => ({
+  default: { props: ["trend"], template: '<div data-testid="creation-chart">{{ trend.labels.join("|") }}</div>' },
+}));
+vi.mock("@/components/dashboard/DatasetTrendChart.vue", () => ({
+  default: { props: ["trend"], template: '<div data-testid="dataset-chart">{{ trend.labels.join("|") }}</div>' },
+}));
+vi.mock("@/components/dashboard/ResourceUsagePanel.vue", () => ({
+  default: { props: ["usage", "gpuSeries", "stale"], template: '<div data-testid="resource-panel">{{ usage.map((item) => item.label + item.value).join("|") }}{{ stale ? "stale" : "" }}</div>' },
+}));
+vi.mock("@/components/dashboard/ServiceHealthPanel.vue", () => ({
+  default: { props: ["healthBuckets", "calls", "instances"], template: '<div data-testid="service-panel">{{ calls }}|{{ instances }}|{{ healthBuckets.map((item) => item.label + item.value).join("|") }}</div>' },
+}));
+
+const overview = {
+  generated_at: "2026-07-29T08:00:00Z",
+  totals: { pipelines: 3, datasets: 2, training_jobs: 4, services: 1, nodes: 2, users: 0, groups: 0 },
+  status_buckets: {
+    pipelines: [{ label: "running", value: 1 }, { label: "success", value: 2 }],
+    datasets: [], training_jobs: [], services: [], nodes: [],
+  },
+  creation_trends: {
+    pipelines: { labels: ["2026-06", "2026-07"], values: [1, 2] },
+    datasets: { labels: ["2026-06", "2026-07"], values: [0, 2] },
+    training_jobs: { labels: [], values: [] }, services: { labels: [], values: [] }, nodes: { labels: [], values: [] },
+  },
+};
+
+const resources = {
+  generated_at: "2026-07-29T08:00:01Z",
+  staleness_threshold_seconds: 300,
+  nodes: {
+    status_buckets: [{ label: "online", value: 2 }],
+    freshness: { fresh: 2, stale: 0, unknown: 0, oldest_fresh_at: "2026-07-29T08:00:00Z", newest_fresh_at: "2026-07-29T08:00:01Z" },
+    resource_usage: {
+      cpu_utilization_percent: { value: 12.5, available: 2, unavailable: 0 },
+      memory_utilization_percent: { value: 25, available: 2, unavailable: 0 },
+      disk_utilization_percent: { value: 0, available: 2, unavailable: 0 },
+    },
+  },
+  gpus: { series: [{ key: "gpu:anon", refreshed_at: "2026-07-29T08:00:01Z", utilization_percent: { value: 40, available: true }, memory_used_mib: { value: 2048, available: true }, memory_total_mib: { value: 8192, available: true }, memory_utilization_percent: { value: 25, available: true } }] },
+  services: { calls: 18, instances: 2, health_buckets: [{ label: "healthy", value: 2 }], latest_health_checked_at: "2026-07-29T08:00:01Z" },
+  group_allocation_usage: {
+    policy_count: 0,
+    resource_pool_count: 0,
+    active_training_runs: 0,
+    active_service_instances: 0,
+    active_workloads: 0,
+    limitation: "",
+  },
+};
 
 describe("WorkbenchView", () => {
+  const wrappers: Array<ReturnType<typeof mount>> = [];
+
+  function mountView() {
+    const wrapper = mount(WorkbenchView);
+    wrappers.push(wrapper);
+    return wrapper;
+  }
+
   beforeEach(() => {
+    vi.useFakeTimers();
     vi.clearAllMocks();
-    apiMock.listDatasets.mockResolvedValue({
-      items: [
-        {
-          id: "dataset-1",
-          name: "真实花椒数据集",
-          task: "detect",
-          status: "validated",
-          source: "label_studio",
-          sample_count: 12,
-          annotation_count: 12,
-          created_at: "2026-07-10T08:00:00Z",
-        },
-        {
-          id: "dataset-2",
-          name: "未标注数据",
-          task: "classify",
-          status: "created",
-          source: "upload",
-          sample_count: 8,
-          annotation_count: 0,
-          created_at: "2026-07-10T07:00:00Z",
-        },
-      ],
-    });
-    apiMock.listPipelines.mockResolvedValue({
-      items: [
-        { id: "pipeline-1", name: "真实检测产线", task: "detect", scale: "n", status: "success" },
-        { id: "pipeline-2", name: "配置产线", task: "classify", scale: "n", status: "ready" },
-        { id: "pipeline-3", name: "中止产线", task: "detect", scale: "n", status: "canceled" },
-      ],
-    });
-    apiMock.listServices.mockResolvedValue({
-      items: [
-        {
-          id: "service-1",
-          name: "真实边缘服务",
-          pipeline_id: "pipeline-1",
-          model_name: "yolo26n.pt",
-          model_weight: "best.pt",
-          environment: "cpu",
-          instance_count: 1,
-          instance_name: "edge-prod-01",
-          resource_summary: "CPU",
-          status: "running",
-          endpoint: "/services/service-1/predict/image",
-          calls: 0,
-          config: {},
-          created_at: "2026-07-10T09:00:00Z",
-          updated_at: "2026-07-10T09:00:00Z",
-        },
-      ],
-    });
+    Object.defineProperty(document, "hidden", { configurable: true, value: false });
+    apiMock.getWorkbenchStatistics.mockResolvedValue(overview);
+    apiMock.getResourceStatistics.mockResolvedValue(resources);
   });
 
-  it("renders dashboard panels and quick access links", async () => {
-    const wrapper = mount(WorkbenchView);
+  afterEach(() => {
+    wrappers.splice(0).forEach((wrapper) => wrapper.unmount());
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("uses only permission-scoped statistics endpoints and renders returned aggregates", async () => {
+    const wrapper = mountView();
     await flushPromises();
 
-    expect(wrapper.text()).toContain("工作台");
-    expect(wrapper.text()).toContain("数据准备分析");
-    expect(wrapper.text()).toContain("模型空间分析");
-    expect(wrapper.text()).toContain("服务列表分析");
-    expect(wrapper.text()).toContain("真实花椒数据集");
-    expect(wrapper.text()).toContain("真实边缘服务");
-    expect(wrapper.text()).toContain("真实检测产线");
-    expect(wrapper.text()).not.toContain("千问3");
-    expect(wrapper.find(".pie-chart-animated").exists()).toBe(true);
-    const pieSectors = wrapper.findAll(".pie-sector");
-    expect(pieSectors).toHaveLength(2);
-    expect(wrapper.find(".pie-tooltip").exists()).toBe(false);
-    await pieSectors[0].trigger("mouseenter");
-    expect(wrapper.find(".pie-sector-group.active").exists()).toBe(true);
-    expect(wrapper.get(".pie-tooltip").text()).toContain("1");
-    await wrapper.get(".pie-chart-animated").trigger("mouseleave");
-    expect(wrapper.find(".pie-tooltip").exists()).toBe(false);
-    expect(wrapper.findAll(".progress-track i, .pipeline-track i").length).toBeGreaterThan(0);
-    const stoppedStatus = wrapper.findAll(".status-card").find((card) => card.text().includes("运行中止"));
-    expect(stoppedStatus?.text()).toContain("1");
+    expect(apiMock.getWorkbenchStatistics).toHaveBeenCalledTimes(1);
+    expect(apiMock.getResourceStatistics).toHaveBeenCalledTimes(1);
+    expect(apiMock.listDatasets).not.toHaveBeenCalled();
+    expect(apiMock.listPipelines).not.toHaveBeenCalled();
+    expect(apiMock.listServices).not.toHaveBeenCalled();
+    expect(wrapper.get("[data-testid='summary-strip']").text()).toContain("产线数量3");
+    expect(wrapper.get("[data-testid='pipeline-chart']").text()).toContain("success2");
+    expect(wrapper.get("[data-testid='resource-panel']").text()).toContain("CPU12.5");
+    expect(wrapper.get("[data-testid='service-panel']").text()).toContain("18|2|healthy2");
+  });
 
+  it("polls resource statistics every five seconds, pauses hidden pages, and refreshes when visible", async () => {
+    mountView();
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(apiMock.getResourceStatistics).toHaveBeenCalledTimes(2);
+
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(apiMock.getResourceStatistics).toHaveBeenCalledTimes(2);
+
+    Object.defineProperty(document, "hidden", { configurable: true, value: false });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await flushPromises();
+    expect(apiMock.getResourceStatistics).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the last resource snapshot after a refresh error and exposes retryable errors", async () => {
+    const wrapper = mountView();
+    await flushPromises();
+    apiMock.getResourceStatistics.mockRejectedValueOnce(new Error("resource endpoint unavailable"));
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+
+    expect(wrapper.get("[data-testid='resource-panel']").text()).toContain("CPU12.5");
+    expect(wrapper.get("[role='alert']").text()).toContain("resource endpoint unavailable");
+  });
+
+  it("shows an overview loading, error, and empty state without rendering invented data", async () => {
+    let resolveOverview: (value: typeof overview) => void;
+    apiMock.getWorkbenchStatistics.mockImplementationOnce(() => new Promise((resolve) => { resolveOverview = resolve; }));
+    const loading = mountView();
+    expect(loading.get("[data-testid='workbench-loading']").text()).toContain("正在加载工作台统计");
+    expect(loading.getComponent(AsyncState).props("state")).toBe("loading");
+    resolveOverview!(overview);
+    await flushPromises();
+
+    apiMock.getWorkbenchStatistics.mockRejectedValueOnce(new Error("overview unavailable"));
+    const failure = mountView();
+    await flushPromises();
+    expect(failure.get("[role='alert']").text()).toContain("overview unavailable");
+    expect(failure.getComponent(AsyncState).props("state")).toBe("error");
+    await failure.get(".async-state__retry").trigger("click");
+    await flushPromises();
+    expect(apiMock.getWorkbenchStatistics).toHaveBeenCalledTimes(3);
+    expect(failure.get("[data-testid='summary-strip']").text()).toContain("产线数量3");
+
+    apiMock.getWorkbenchStatistics.mockRejectedValueOnce(Object.assign(new Error("denied"), { status: 403 }));
+    const denied = mountView();
+    await flushPromises();
+    expect(denied.getComponent(AsyncState).props("state")).toBe("denied");
+    expect(denied.find("button").exists()).toBe(false);
+
+    apiMock.getWorkbenchStatistics.mockResolvedValueOnce({ ...overview, totals: { pipelines: 0, datasets: 0, training_jobs: 0, services: 0, nodes: 0, users: 0, groups: 0 } });
+    const empty = mountView();
+    await flushPromises();
+    expect(empty.get("[data-testid='workbench-empty']").text()).toContain("暂无可访问的资源");
+    expect(empty.getComponent(AsyncState).props("state")).toBe("empty");
+  });
+
+  it("keeps the three approved quick navigation targets", async () => {
+    const wrapper = mountView();
+    await flushPromises();
     const quickLinks = wrapper.findAll(".quick-link");
     expect(quickLinks).toHaveLength(3);
-
     await quickLinks[0].trigger("click");
     await quickLinks[1].trigger("click");
     await quickLinks[2].trigger("click");
-
     expect(pushMock).toHaveBeenNthCalledWith(1, "/data-preparation");
     expect(pushMock).toHaveBeenNthCalledWith(2, "/data-preparation");
     expect(pushMock).toHaveBeenNthCalledWith(3, "/services");
   });
 
-  it("responds to its content container instead of the browser viewport", () => {
+  it("uses stable responsive containers and has no legacy resource list calls", () => {
+    expect(workbenchSource).toContain('import AsyncState from "@/components/common/AsyncState.vue"');
+    expect(workbenchSource).toContain("<AsyncState");
     expect(workbenchSource).toContain("container: workbench / inline-size");
-    expect(workbenchSource).toContain("@container workbench (max-width: 760px)");
-    expect(workbenchSource).not.toContain("@media (max-width: 1280px)");
-    expect(workbenchSource).toContain("@keyframes pie-reveal");
-    expect(workbenchSource).toContain("@keyframes sector-enter");
-    expect(workbenchSource).toContain("@keyframes bar-grow");
-    expect(workbenchSource).toContain(".pipeline-track {\n  height: 14px;");
+    expect(workbenchSource).toContain("@container workbench");
+    expect(workbenchSource).not.toContain("api.listDatasets");
+    expect(workbenchSource).not.toContain("api.listPipelines");
+    expect(workbenchSource).not.toContain("api.listServices");
+    expect(workbenchSource).toMatch(/\.quick-link::before\s*\{[^}]*width:\s*44px;[^}]*height:\s*44px/s);
   });
 });

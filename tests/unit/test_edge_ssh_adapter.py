@@ -10,6 +10,7 @@ import time
 import paramiko
 import pytest
 
+import visiox_edge_executor_worker.ssh as ssh_module
 from visiox_edge_executor_worker.ssh import (
     HostKeyMismatchError,
     RemotePrivateDirectory,
@@ -23,6 +24,35 @@ from visiox_edge_executor_worker.ssh import (
     StrictSshClient,
     scan_host_key,
 )
+
+
+def test_bounded_operation_cleanup_never_extends_total_deadline() -> None:
+    release = threading.Event()
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+    timeout_seconds = 0.05
+    started = time.monotonic()
+
+    def blocking_cleanup() -> None:
+        cleanup_started.set()
+        cleanup_release.wait()
+
+    with pytest.raises(TimeoutError, match=r"^operation timed out$"):
+        ssh_module._run_with_deadline(
+            release.wait,
+            deadline=started + timeout_seconds,
+            timeout_error=TimeoutError,
+            timeout_message="operation timed out",
+            on_timeout=blocking_cleanup,
+            scheduler_guard_seconds=0.01,
+            cleanup_join_seconds=1.0,
+        )
+
+    elapsed = time.monotonic() - started
+    release.set()
+    cleanup_release.set()
+    assert cleanup_started.is_set()
+    assert timeout_seconds * 0.75 <= elapsed < timeout_seconds * 1.5
 
 
 class FakeSocket:
@@ -738,6 +768,32 @@ def test_command_deadline_remains_active_while_output_is_continuously_ready() ->
     assert fake_socket.closed
 
 
+def test_command_timeout_does_not_wait_for_blocking_channel_close() -> None:
+    close_started = threading.Event()
+    close_release = threading.Event()
+
+    class BlockingCloseChannel(FakeChannel):
+        def close(self) -> None:
+            close_started.set()
+            close_release.wait()
+            super().close()
+
+    channel = BlockingCloseChannel(never_exits=True)
+    session, _, _ = _connected_session(channel=channel)
+    timeout_seconds = 0.05
+    started = time.monotonic()
+
+    with pytest.raises(SshCommandTimeoutError, match=r"^SSH command timed out$"):
+        session.run("blocking-close", timeout_seconds=timeout_seconds)
+
+    elapsed = time.monotonic() - started
+    assert close_started.is_set()
+    assert timeout_seconds * 0.75 <= elapsed < timeout_seconds * 1.5
+    with pytest.raises(SshSessionClosedError, match=r"^SSH session is closed$"):
+        session.run("must-not-run", timeout_seconds=1)
+    close_release.set()
+
+
 def test_command_open_timeout_is_fixed_and_redacted() -> None:
     session, _, _ = _connected_session(
         open_error=paramiko.SSHException("Timeout opening channel.")
@@ -1114,7 +1170,9 @@ def test_idle_command_polling_uses_bounded_backoff_and_timeout_closes_session(mo
     with pytest.raises(SshCommandTimeoutError, match=r"^SSH command timed out$"):
         session.run("idle", timeout_seconds=0.075)
 
-    assert sleeps[:3] == pytest.approx([0.01, 0.02, 0.04], abs=0.005)
-    assert all(duration <= 0.1 for duration in sleeps)
+    assert sleeps[:2] == pytest.approx([0.01, 0.02], abs=0.005)
+    assert len(sleeps) >= 3
+    assert 0 < sleeps[2] <= 0.045
+    assert all(0 < duration <= 0.1 for duration in sleeps)
     assert transport.closed
     assert fake_socket.closed

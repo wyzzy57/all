@@ -41,7 +41,18 @@ COLLECTABLE_ARTIFACTS = {
     "val_batch2_pred.jpg",
     "visiox-progress.json",
     "events.out.tfevents.remote",
+    "adapter_model.safetensors",
+    "adapter_config.json",
+    "trainer_state.json",
+    "trainer_log.jsonl",
+    "train_results.json",
+    "all_results.json",
+    "training_args.yaml",
+    "artifact-manifest.json",
+    "visiox-metrics.jsonl",
+    "resource_metrics.jsonl",
 }
+ENGINES = {"yolo26", "llamafactory"}
 
 
 class RequestValidationError(ValueError):
@@ -59,6 +70,10 @@ def validate(request):
         if set(request) != {"action", "container_id"} or not isinstance(request["container_id"], str) or not CONTAINER_ID.fullmatch(request["container_id"]):
             invalid("inspect-request")
         return request
+    if isinstance(request, dict) and request.get("action") == "logs":
+        if set(request) != {"action", "container_id"} or not isinstance(request["container_id"], str) or not CONTAINER_ID.fullmatch(request["container_id"]):
+            invalid("logs-request")
+        return request
     if isinstance(request, dict) and request.get("action") == "collect":
         if set(request) != {"action", "output_path", "uploads"} or not isinstance(request["output_path"], str) or not Path(request["output_path"]).is_absolute():
             invalid("collect-request")
@@ -70,14 +85,21 @@ def validate(request):
             if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
                 invalid("collect-url")
         return request
-    expected = {"run_id", "attempt", "image_digest", "node_id", "gpu_uuids", "node_rank", "nnodes", "nproc_per_node", "master_addr", "master_port", "training_arguments", "paths"}
-    if not isinstance(request, dict) or request.get("action") != "launch" or set(request) != expected | {"action"}:
+    expected = {"run_id", "attempt", "engine", "image_digest", "node_id", "gpu_uuids", "node_rank", "nnodes", "nproc_per_node", "master_addr", "master_port", "training_arguments", "paths"}
+    expected_shape = expected | {"action"}
+    if isinstance(request, dict) and request.get("engine") == "llamafactory":
+        expected_shape.add("model_source")
+    if not isinstance(request, dict) or request.get("action") != "launch" or set(request) != expected_shape:
         invalid("launch-shape")
     for key in ("run_id", "node_id"):
         if not isinstance(request[key], str) or not IDENTIFIER.fullmatch(request[key]):
             invalid("identifier")
     if not isinstance(request["image_digest"], str) or not IMAGE_DIGEST.fullmatch(request["image_digest"]):
         invalid("image-digest")
+    if request["engine"] not in ENGINES:
+        invalid("engine")
+    if request["engine"] == "llamafactory" and request["model_source"] not in {"huggingface", "modelscope"}:
+        invalid("model-source")
     integer_limits = {"attempt": (1, 100000), "node_rank": (0, 1023), "nnodes": (1, 1024), "nproc_per_node": (1, 64), "master_port": (1024, 65535)}
     for key, (minimum, maximum) in integer_limits.items():
         value = request[key]
@@ -91,10 +113,15 @@ def validate(request):
     if not isinstance(request["master_addr"], str) or not LAN_ADDRESS.fullmatch(request["master_addr"]) or ".." in request["master_addr"]:
         invalid("master-address")
     arguments = request["training_arguments"]
-    if not isinstance(arguments, list) or not arguments or any(not isinstance(item, str) or not item or any(char in item for char in "\x00\r\n") for item in arguments):
+    if not isinstance(arguments, list) or (request["engine"] == "yolo26" and not arguments) or any(not isinstance(item, str) or not item or any(char in item for char in "\x00\r\n") for item in arguments):
         invalid("training-arguments")
     paths = request["paths"]
-    if not isinstance(paths, dict) or set(paths) not in ({"model", "dataset", "output"}, {"model", "dataset", "checkpoint", "output"}):
+    valid_path_shapes = (
+        ({"model", "dataset", "output"}, {"model", "dataset", "checkpoint", "output"})
+        if request["engine"] == "yolo26"
+        else ({"dataset", "output"}, {"dataset", "checkpoint", "output"})
+    )
+    if not isinstance(paths, dict) or set(paths) not in valid_path_shapes:
         invalid("paths-shape")
     for value in paths.values():
         if not isinstance(value, str) or not Path(value).is_absolute() or any(char in value for char in "\x00\r\n"):
@@ -119,11 +146,22 @@ def inspect_container(container_id):
     return {"running": state["Running"], "exit_code": exit_code}
 
 
+def collect_logs(container_id):
+    result = subprocess.run(
+        ["docker", "logs", "--timestamps", container_id],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return {"stdout": result.stdout, "stderr": result.stderr}
+
+
 def collect_artifacts(output_path, uploads):
     root = Path(output_path).resolve()
     results = {}
     for name, url in uploads.items():
-        pattern = "runs/**/events.out.tfevents.*" if name == "events.out.tfevents.remote" else f"runs/**/{name}"
+        pattern = "**/events.out.tfevents.*" if name == "events.out.tfevents.remote" else f"**/{name}"
         matches = sorted(root.glob(pattern))
         if not matches:
             if name in {"best.pt", "last.pt"}:
@@ -156,6 +194,10 @@ def main():
             stage = "container-inspect"
             print(json.dumps(inspect_container(request["container_id"]), ensure_ascii=True, separators=(",", ":"), sort_keys=True))
             return 0
+        if request["action"] == "logs":
+            stage = "container-logs"
+            print(json.dumps(collect_logs(request["container_id"]), ensure_ascii=True, separators=(",", ":"), sort_keys=True))
+            return 0
         if request["action"] == "collect":
             stage = "artifact-collect"
             artifacts = collect_artifacts(request["output_path"], request["uploads"])
@@ -173,7 +215,6 @@ def main():
             "--label", f"com.visiox.training-run-id={request['run_id']}",
             "--label", f"com.visiox.training-attempt={request['attempt']}",
             "--label", f"com.visiox.training-node-rank={request['node_rank']}",
-            "--mount", f"type=bind,src={request['paths']['model']},dst=/workspace/model/base.pt,readonly",
             "--mount", f"type=bind,src={request['paths']['dataset']},dst=/workspace/dataset",
             "--mount", f"type=bind,src={request['paths']['output']},dst=/workspace/output",
             "-e", "HOME=/tmp",
@@ -185,19 +226,36 @@ def main():
             "-e", f"VISIOX_DISTRIBUTED_RUN_ID={request['run_id']}",
             "-e", f"VISIOX_DISTRIBUTED_ATTEMPT={request['attempt']}",
         ]
-        if "checkpoint" in request["paths"]:
-            command.extend(["--mount", f"type=bind,src={request['paths']['checkpoint']},dst=/workspace/checkpoint/last.pt,readonly"])
-        command.extend([
-            request["image_digest"],
-            "torchrun",
-            f"--nnodes={request['nnodes']}",
-            f"--nproc-per-node={request['nproc_per_node']}",
-            f"--node-rank={request['node_rank']}",
-            f"--master-addr={request['master_addr']}",
-            f"--master-port={request['master_port']}",
-            "-m", "visiox_training_worker.train_entrypoint",
-            *request["training_arguments"],
-        ])
+        if request["engine"] == "yolo26":
+            command.extend(["--mount", f"type=bind,src={request['paths']['model']},dst=/workspace/model/base.pt,readonly"])
+            if "checkpoint" in request["paths"]:
+                command.extend(["--mount", f"type=bind,src={request['paths']['checkpoint']},dst=/workspace/checkpoint/last.pt,readonly"])
+            command.extend([
+                request["image_digest"],
+                "torchrun",
+                f"--nnodes={request['nnodes']}",
+                f"--nproc-per-node={request['nproc_per_node']}",
+                f"--node-rank={request['node_rank']}",
+                f"--master-addr={request['master_addr']}",
+                f"--master-port={request['master_port']}",
+                "-m", "visiox_training_worker.train_entrypoint",
+                *request["training_arguments"],
+            ])
+        else:
+            cache_root = Path.home() / ".cache" / "visiox" / "models"
+            cache_root.mkdir(mode=0o750, parents=True, exist_ok=True)
+            command.extend([
+                "--mount", f"type=bind,src={cache_root},dst=/workspace/model-cache",
+                "-e", "HF_HOME=/workspace/model-cache/huggingface",
+                "-e", "MODELSCOPE_CACHE=/workspace/model-cache/modelscope",
+            ])
+            if request["model_source"] == "modelscope":
+                command.extend(["-e", "USE_MODELSCOPE_HUB=1"])
+            command.extend([
+                request["image_digest"],
+                "python", "-m", "visiox_llm_training_worker.entrypoint",
+                "/workspace/dataset/train.yaml",
+            ])
         stage = "container-launch"
         result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
         container_id = result.stdout.strip()

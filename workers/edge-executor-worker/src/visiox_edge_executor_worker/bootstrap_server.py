@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from visiox_common.settings import Settings, get_settings
-from visiox_db.models import ComputeNode, EdgeSshCredential
+from visiox_db.models import ComputeNode, EdgeSshCredential, Organization, User
 from visiox_db.session import create_session_factory
 
 from .crypto import EncryptedSecret
@@ -587,9 +587,26 @@ class BootstrapOperations:
             try:
                 node = session.scalar(select(ComputeNode).where(ComputeNode.name == node_name))
                 if node is None:
+                    organization = session.scalar(
+                        select(Organization).where(Organization.slug == "default")
+                    )
+                    owner = session.scalar(
+                        select(User).where(
+                            User.organization_id == organization.id,
+                            User.role == "admin",
+                            User.status == "active",
+                        )
+                    ) if organization is not None else None
+                    if organization is None or owner is None:
+                        raise BootstrapOperationError(
+                            "BOOTSTRAP_IDENTITY_UNAVAILABLE",
+                            "Platform bootstrap identity is unavailable",
+                        )
                     node = ComputeNode(
                         id=node_id,
                         name=node_name,
+                        organization_id=organization.id,
+                        owner_user_id=owner.id,
                         status="online",
                         architecture="unknown",
                         platform_kind=_SSH_PLATFORM_KIND,

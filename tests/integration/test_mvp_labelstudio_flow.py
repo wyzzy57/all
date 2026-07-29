@@ -5,6 +5,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from alembic import command
@@ -15,6 +16,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from visiox_api.main import create_app
+from visiox_api.dependencies.auth import get_current_user
 from visiox_api.routes.dataset_samples import get_dataset_sample_session, get_object_storage_client
 from visiox_api.routes.datasets import get_dataset_session
 from visiox_api.routes.label_projects import (
@@ -25,9 +27,26 @@ from visiox_api.routes.label_projects import (
 from visiox_api.routes.tasks import get_task_session
 from visiox_common.settings import Settings, get_settings
 from visiox_common.tasks import TaskStatus, TaskType
-from visiox_db.models import Annotation, Dataset, DatasetSample, LabelProject, Task
+from visiox_db.models import (
+    Annotation,
+    Dataset,
+    DatasetSample,
+    LabelProject,
+    Organization,
+    Task,
+    User,
+)
 from visiox_label_sync_worker.main import import_label_project_annotations, sync_label_project_samples
 from visiox_storage.client import InMemoryObjectStorageClient
+
+
+TEST_ORGANIZATION_ID = "mvp-labelstudio-org"
+TEST_OWNER_USER_ID = "mvp-labelstudio-owner"
+TEST_ACTOR = SimpleNamespace(
+    id=TEST_OWNER_USER_ID,
+    organization_id=TEST_ORGANIZATION_ID,
+    role="admin",
+)
 
 
 class FakeStreamProducer:
@@ -128,7 +147,31 @@ def _session_factory(tmp_path):
     command.upgrade(config, "head")
 
     engine = create_engine(database_url)
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    with factory() as session:
+        session.add(
+            Organization(
+                id=TEST_ORGANIZATION_ID,
+                name="MVP Label Studio Tests",
+                slug="mvp-labelstudio-tests",
+                status="active",
+            )
+        )
+        session.add(
+            User(
+                id=TEST_OWNER_USER_ID,
+                organization_id=TEST_ORGANIZATION_ID,
+                username="mvp-labelstudio-owner",
+                display_name="MVP Label Studio Owner",
+                email="mvp-labelstudio-owner@example.test",
+                password_hash="test-only",
+                role="admin",
+                status="active",
+                must_change_password=False,
+            )
+        )
+        session.commit()
+    return factory
 
 
 @contextmanager
@@ -139,6 +182,7 @@ def _client(
     stream_producer: FakeStreamProducer,
 ) -> Generator[TestClient]:
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -161,10 +205,12 @@ def _client(
 
 
 def _create_dataset_with_sample(client: TestClient) -> tuple[dict[str, Any], str, str]:
-    dataset = client.post(
+    create_response = client.post(
         "/datasets",
         json={"name": "mvp-labelstudio-dataset", "task": "detect", "class_schema": {"names": ["ok", "defect"]}},
-    ).json()
+    )
+    assert create_response.status_code == 201, create_response.text
+    dataset = create_response.json()
     upload = client.post(
         f"/datasets/{dataset['id']}/samples:upload",
         files={"file": ("part.png", _image_bytes(), "image/png")},

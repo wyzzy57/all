@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from visiox_db.base import Base
-from visiox_db.models import ComputeNode, EdgeSshCredential
+from visiox_db.models import ComputeNode, EdgeSshCredential, Organization, User
 from visiox_edge_executor_worker.bootstrap_server import BootstrapOperations
 from visiox_edge_executor_worker.crypto import CredentialCipher
 from visiox_edge_executor_worker.ssh import CommandResult, RemotePrivateDirectory, ScannedHostKey
@@ -168,7 +168,29 @@ def _session_factory(tmp_path) -> sessionmaker[Session]:
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    _seed_platform_identity(factory)
+    return factory
+
+
+def _seed_platform_identity(factory: sessionmaker[Session]) -> None:
+    with factory() as session:
+        organization = Organization(name="Default", slug="default", status="active")
+        session.add(organization)
+        session.flush()
+        session.add(
+            User(
+                organization_id=organization.id,
+                username="admin",
+                display_name="Administrator",
+                email="admin@example.test",
+                password_hash="test-only-hash",
+                role="admin",
+                status="active",
+                must_change_password=False,
+            )
+        )
+        session.commit()
 
 
 def _request(*, host: str = "EDGE.EXAMPLE.COM.", node_name: str = "edge-a") -> dict[str, Any]:

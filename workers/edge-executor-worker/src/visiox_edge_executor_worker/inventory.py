@@ -33,6 +33,10 @@ class GpuInventory(BaseModel):
     name: str
     uuid: str | None
     memory_total_mib: int | None
+    memory_used_mib: int | None = None
+    utilization_percent: float | None = None
+    temperature_celsius: float | None = None
+    power_draw_watts: float | None = None
     compute_capability: str | None
 
 
@@ -48,7 +52,11 @@ class InventorySnapshot(BaseModel):
     os_pretty_name: str | None
     kernel_release: str | None
     cpu_logical_cores: int | None
+    cpu_utilization_percent: float | None = None
     memory_total_kib: int | None
+    memory_available_kib: int | None = None
+    disk_total_bytes: int | None = None
+    disk_available_bytes: int | None = None
     docker: DockerInventory
     gpus: tuple[GpuInventory, ...]
     driver_version: str | None
@@ -71,6 +79,7 @@ def parse_inventory(value: Mapping[str, Any] | bytes | str) -> InventorySnapshot
     uname = _mapping(raw.get("uname"))
     cpu = _mapping(raw.get("cpu"))
     memory = _mapping(raw.get("memory"))
+    disk = _mapping(raw.get("disk"))
     docker_raw = _mapping(raw.get("docker"))
     nvidia = _mapping(raw.get("nvidia"))
     cuda = _mapping(raw.get("cuda"))
@@ -177,7 +186,11 @@ def parse_inventory(value: Mapping[str, Any] | bytes | str) -> InventorySnapshot
         os_pretty_name=_text(os_release.get("pretty_name")),
         kernel_release=kernel_release,
         cpu_logical_cores=_integer(cpu.get("logical_cores")),
+        cpu_utilization_percent=_number(cpu.get("utilization_percent")),
         memory_total_kib=_integer(memory.get("total_kib")),
+        memory_available_kib=_integer(memory.get("available_kib")),
+        disk_total_bytes=_integer(disk.get("total_bytes")),
+        disk_available_bytes=_integer(disk.get("available_bytes")),
         docker=docker,
         gpus=gpus,
         driver_version=_text(nvidia.get("driver_version")),
@@ -266,6 +279,12 @@ def _integer(value: Any) -> int | None:
     return value
 
 
+def _number(value: Any) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        return None
+    return float(value)
+
+
 def _normalize_architecture(value: str) -> str:
     return {
         "amd64": "x86_64",
@@ -287,6 +306,10 @@ def _parse_gpus(value: Any) -> list[GpuInventory]:
                 name=name,
                 uuid=_text(gpu.get("uuid")),
                 memory_total_mib=_integer(gpu.get("memory_total_mib")),
+                memory_used_mib=_integer(gpu.get("memory_used_mib")),
+                utilization_percent=_number(gpu.get("utilization_percent")),
+                temperature_celsius=_number(gpu.get("temperature_celsius")),
+                power_draw_watts=_number(gpu.get("power_draw_watts")),
                 compute_capability=_normalize_compute_capability(
                     _text(gpu.get("compute_capability"))
                 ),

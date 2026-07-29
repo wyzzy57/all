@@ -1,7 +1,9 @@
 from collections.abc import Generator
+from datetime import UTC, datetime
 from hashlib import sha256
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from alembic import command
@@ -13,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from visiox_api.main import create_app
+from visiox_api.dependencies.auth import get_current_user
 from visiox_api.routes.pipelines import get_pipeline_session
 from visiox_api.routes.tasks import get_task_session
 from visiox_api.routes.training_jobs import (
@@ -21,26 +24,35 @@ from visiox_api.routes.training_jobs import (
     get_training_stream_producer,
 )
 from visiox_common.tasks import TaskStatus, TaskType
+from visiox_common.settings import Settings, get_settings
 from visiox_db.models import (
     Annotation,
     BaseModel,
     ComputeNode,
     Dataset,
     DatasetSample,
+    DatasetVersion,
     DistributedTrainingRun,
     EdgeSshCredential,
+    LogStream,
     RemoteExecution,
     ResourcePool,
     Task,
     TrainedModel,
     TrainingJob,
     TrainingPipeline,
+    Organization,
+    User,
 )
 from visiox_edge_executor_worker.inventory import compatibility_key, compatibility_policy, parse_inventory
 from visiox_storage.client import InMemoryObjectStorageClient
+from tests.integration.ownership_test_support import install_legacy_ownership
 import visiox_training_worker.main as training_worker_main
 from visiox_training_worker.main import CommandResult, run_training_job
 from visiox_training_worker.runner import SubprocessTrainingRunner, run_pending_training_tasks
+
+
+LEGACY_TEST_ACTOR = SimpleNamespace(id="legacy-admin", organization_id="legacy-org", role="admin")
 
 
 class FakeStreamProducer:
@@ -149,7 +161,28 @@ def session_factory(tmp_path):
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
 
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    with Session(engine) as session:
+        session.add(
+            Organization(id="legacy-org", name="Legacy", slug="legacy")
+        )
+        session.add(
+            User(
+                id="legacy-admin",
+                organization_id="legacy-org",
+                username="legacy-admin",
+                display_name="Legacy Admin",
+                email="legacy-admin@example.test",
+                password_hash="test",
+                role="admin",
+                status="active",
+                must_change_password=False,
+            )
+        )
+        session.commit()
+
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    install_legacy_ownership(factory)
+    return factory
 
 
 @pytest.fixture()
@@ -160,6 +193,7 @@ def stream_producer() -> FakeStreamProducer:
 @pytest.fixture()
 def client(session_factory, stream_producer: FakeStreamProducer) -> Generator[TestClient]:
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -169,6 +203,10 @@ def client(session_factory, stream_producer: FakeStreamProducer) -> Generator[Te
     app.dependency_overrides[get_task_session] = override_session
     app.dependency_overrides[get_training_job_session] = override_session
     app.dependency_overrides[get_training_stream_producer] = lambda: stream_producer
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None,
+        llm_training_image_digest=f"registry.example/visiox/llm-training@sha256:{'b' * 64}",
+    )
 
     with TestClient(app) as test_client:
         yield test_client
@@ -384,6 +422,107 @@ def test_create_pipeline_without_training_resources_persists_draft(client: TestC
     assert partial.status_code == 422
     assert duplicate.status_code == 409
     assert duplicate.json()["detail"] == "产线名称已存在，请使用其他名称"
+
+
+def test_create_and_update_llamafactory_pipeline_without_yolo_base_model(client: TestClient, session_factory):
+    created = client.post(
+        "/pipelines",
+        json={
+            "name": "llm-sft-draft",
+            "engine": "llamafactory",
+            "task": "llm",
+            "scale": "llm",
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json()["engine"] == "llamafactory"
+    assert created.json()["status"] == "draft"
+    assert created.json()["base_model_id"] is None
+
+    with session_factory() as session:
+        dataset = Dataset(
+            name="alpaca-sft",
+            task="llm",
+            status="validated",
+            class_schema={"format": "alpaca"},
+            sample_count=12,
+            annotation_count=12,
+            source="upload",
+            storage_uri="memory://datasets/alpaca.json",
+        )
+        session.add(dataset)
+        session.commit()
+        dataset_id = dataset.id
+
+    updated = client.patch(
+        f"/pipelines/{created.json()['id']}",
+        json={
+            "engine": "llamafactory",
+            "task": "llm",
+            "scale": "llm",
+            "dataset_id": dataset_id,
+            "params_template": {
+                "model_source": "huggingface",
+                "model_id": "Qwen/Qwen3-0.6B",
+                "model_revision": "main",
+                "stage": "sft",
+                "finetuning_type": "lora",
+                "quantization_bit": 4,
+                "learning_rate": 0.0001,
+                "num_train_epochs": 3,
+                "cutoff_len": 1024,
+                "per_device_train_batch_size": 1,
+                "gradient_accumulation_steps": 8,
+            },
+            "default_environment": {"device": "remote", "workers": 0},
+        },
+    )
+
+    assert updated.status_code == 200
+    body = updated.json()
+    assert body["status"] == "ready"
+    assert body["dataset_id"] == dataset_id
+    assert body["params_template"]["model_id"] == "Qwen/Qwen3-0.6B"
+
+
+def test_llamafactory_pipeline_rejects_managed_fields_and_non_llm_dataset(client: TestClient, session_factory):
+    with session_factory() as session:
+        dataset = Dataset(
+            name="image-dataset",
+            task="detect",
+            status="validated",
+            sample_count=2,
+            annotation_count=2,
+        )
+        session.add(dataset)
+        session.commit()
+        dataset_id = dataset.id
+
+    managed = client.post(
+        "/pipelines",
+        json={
+            "name": "managed-field",
+            "engine": "llamafactory",
+            "task": "llm",
+            "params_template": {"model_name_or_path": "C:/models/qwen"},
+        },
+    )
+    wrong_dataset = client.post(
+        "/pipelines",
+        json={
+            "name": "wrong-dataset",
+            "engine": "llamafactory",
+            "task": "llm",
+            "dataset_id": dataset_id,
+            "params_template": {"model_id": "Qwen/Qwen3-0.6B"},
+        },
+    )
+
+    assert managed.status_code == 422
+    assert "managed LLaMA-Factory fields" in managed.json()["detail"]
+    assert wrong_dataset.status_code == 422
+    assert wrong_dataset.json()["detail"] == "dataset task must be llm"
 
 
 def test_create_pipeline_with_uploaded_base_model_persists_draft(client: TestClient, session_factory):
@@ -664,6 +803,103 @@ def test_create_distributed_training_job_persists_plan_and_enqueues_id_only_edge
     assert detail.status_code == 200
     assert detail.json()["distributed_run_id"] == run.id
     assert detail.json()["remote_execution_id"] == execution.id
+
+
+def test_create_llm_training_job_uses_platform_image_and_model_reference(
+    client: TestClient,
+    session_factory,
+    stream_producer: FakeStreamProducer,
+):
+    with session_factory() as session:
+        dataset = Dataset(
+            name="llm-job-dataset",
+            task="llm",
+            status="validated",
+            format="alpaca",
+            class_schema={"format": "alpaca"},
+            schema_config={"prompt": "instruction", "response": "output"},
+            manifest_checksum="c" * 64,
+            sample_count=8,
+            annotation_count=8,
+            source="llm_upload",
+            storage_uri="memory://datasets/llm/train.jsonl",
+        )
+        session.add(dataset)
+        session.flush()
+        dataset_version = DatasetVersion(
+            dataset_id=dataset.id,
+            version=1,
+            status="published",
+            format="openai_messages",
+            object_uri="memory://datasets/llm/versions/1/train.jsonl",
+            manifest_uri="memory://datasets/llm/versions/1/manifest.json",
+            manifest_checksum="c" * 64,
+            source_revision="e" * 64,
+            total_count=8,
+            valid_count=8,
+            invalid_count=0,
+            skipped_count=0,
+            size_bytes=128,
+            schema_snapshot={},
+            published_at=datetime.now(UTC),
+        )
+        session.add(dataset_version)
+        pipeline = TrainingPipeline(
+            name="llm-real-job",
+            engine="llamafactory",
+            task="llm",
+            scale="llm",
+            dataset_id=dataset.id,
+            params_template={
+                "model_source": "huggingface",
+                "model_id": "Qwen/Qwen3-0.6B",
+                "model_revision": "main",
+                "resolved_revision": "d" * 40,
+                "stage": "sft",
+                "finetuning_type": "lora",
+                "quantization_bit": 4,
+                "learning_rate": 0.0001,
+                "num_train_epochs": 1,
+                "cutoff_len": 1024,
+                "per_device_train_batch_size": 1,
+                "gradient_accumulation_steps": 4,
+            },
+            default_environment={"device": "remote", "workers": 0},
+            status="ready",
+        )
+        session.add(pipeline)
+        session.commit()
+        pipeline_id = pipeline.id
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+
+    response = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "environment": {"resource_pool_id": pool_id, "node_id": node_ids[0]},
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 1,
+                "node_ids": [node_ids[0]],
+            },
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["status"] == "queued"
+    assert len(stream_producer.edge_commands) == 1
+    with session_factory() as session:
+        task = session.get(Task, body["task_id"])
+        run = session.get(DistributedTrainingRun, body["distributed_run_id"])
+    assert task.payload["engine"] == "llamafactory"
+    assert task.payload["dataset_manifest_checksum"] == "c" * 64
+    assert task.payload["dataset_version_id"] == dataset_version.id
+    assert task.payload["model_reference"] == {
+        "source": "huggingface",
+        "model_id": "Qwen/Qwen3-0.6B",
+        "revision": "d" * 40,
+    }
+    assert run.training_image_digest == f"registry.example/visiox/llm-training@sha256:{'b' * 64}"
 
 
 def test_delete_pipeline_removes_distributed_training_dependencies(
@@ -1013,6 +1249,7 @@ def test_create_training_job_revalidates_pipeline_resources(client: TestClient, 
 
 def test_create_training_job_marks_job_and_task_failed_when_enqueue_fails(session_factory):
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -1118,6 +1355,12 @@ def test_worker_runs_training_exports_dataset_and_registers_model(session_factor
         trained_model = session.get(TrainedModel, result.trained_model_id)
         pipeline = session.get(TrainingPipeline, job.pipeline_id)
         trained_models = session.scalars(select(TrainedModel).where(TrainedModel.pipeline_id == pipeline.id)).all()
+        log_stream = session.scalar(
+            select(LogStream).where(
+                LogStream.resource_type == "training_job",
+                LogStream.resource_id == job_id,
+            )
+        )
 
     assert job.status == "success"
     assert pipeline.status == "success"
@@ -1128,6 +1371,10 @@ def test_worker_runs_training_exports_dataset_and_registers_model(session_factor
     assert job.metrics["observability"]["mlflow_run_name"] == f"job-{job_id}"
     assert set(job.metrics["weights"]) == {"best.pt", "last.pt"}
     assert job.log_uri.startswith("memory://training/")
+    assert log_stream is not None
+    assert log_stream.status == "completed"
+    assert log_stream.line_count == 1
+    assert log_stream.redacted_log_uri.startswith("memory://logs/")
     assert task.status == TaskStatus.SUCCESS.value
     assert task.progress == 100
     assert {model.name for model in trained_models} == {"best.pt", "last.pt"}
@@ -1171,6 +1418,7 @@ def test_training_job_artifacts_can_be_listed_and_downloaded(session_factory, tm
         session.commit()
 
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -1231,6 +1479,7 @@ def test_training_job_artifacts_use_stored_filename_for_legacy_model_rows(sessio
         session.commit()
 
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:

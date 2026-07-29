@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from pathlib import Path
+from types import SimpleNamespace
 
 from alembic import command
 from alembic.config import Config
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from visiox_api.dependencies.auth import get_current_user
 from visiox_api.main import create_app
 from visiox_api.routes import pipeline_evaluation
 from visiox_api.routes.pipeline_evaluation import (
@@ -19,6 +21,10 @@ from visiox_api.routes.pipeline_evaluation import (
 )
 from visiox_db.models import BaseModel, Dataset, TrainedModel, TrainingPipeline
 from visiox_storage.client import InMemoryObjectStorageClient
+from tests.integration.ownership_test_support import install_legacy_ownership
+
+
+LEGACY_TEST_ACTOR = SimpleNamespace(id="legacy-admin", organization_id="legacy-org", role="admin")
 
 
 class FakePipelineEvaluator:
@@ -44,6 +50,7 @@ def test_pipeline_evaluation_uses_custom_dataset_weight_and_environment(tmp_path
     command.upgrade(config, "head")
     engine = create_engine(f"sqlite:///{database_path}")
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    install_legacy_ownership(session_factory)
     storage = InMemoryObjectStorageClient()
     evaluator = FakePipelineEvaluator()
 
@@ -120,6 +127,7 @@ def test_pipeline_evaluation_uses_custom_dataset_weight_and_environment(tmp_path
     monkeypatch.setattr(pipeline_evaluation, "export_yolo26_dataset", fake_export_dataset)
 
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:

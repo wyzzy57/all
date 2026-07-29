@@ -23,12 +23,264 @@ export type DatasetRecord = {
   name: string;
   task: string;
   status: string;
-  class_schema?: { names?: unknown[] };
+  format?: "yolo" | "alpaca" | "sharegpt" | "openai_messages" | string;
+  class_schema?: { names?: unknown[]; format?: string };
+  schema_config?: Record<string, unknown>;
+  manifest_checksum?: string | null;
   sample_count: number;
   annotation_count: number;
   source?: string;
   created_at?: string;
   updated_at?: string;
+  visibility?: "private" | "shared" | "organization" | string;
+  owner_user_id?: string | null;
+  asset_role?: "working" | "published" | string;
+  storage_uri?: string | null;
+};
+
+export type DatasetVersionRecord = {
+  id: string;
+  dataset_id: string;
+  version: number;
+  status: string;
+  format: string;
+  object_uri: string;
+  manifest_uri: string;
+  manifest_checksum: string;
+  source_revision?: string | null;
+  total_count: number;
+  valid_count: number;
+  invalid_count: number;
+  skipped_count: number;
+  size_bytes: number;
+  published_at: string;
+};
+
+export type DatasetConversionResult = {
+  version: DatasetVersionRecord;
+  reused: boolean;
+  total_count: number;
+  valid_count: number;
+  invalid_count: number;
+  skipped_count: number;
+  issues: Array<{ sample_id?: string; code: string; message: string }>;
+};
+
+export type PagedResponse<T> = {
+  items: T[];
+  total: number;
+};
+
+export type AuthenticatedUser = {
+  id: string;
+  username: string;
+  display_name: string;
+  email: string;
+  role: "admin" | "member";
+  status: string;
+  must_change_password: boolean;
+};
+
+export type LoginResponse = {
+  access_token: string;
+  token_type: "bearer";
+  expires_in: number;
+  user: AuthenticatedUser;
+};
+
+export type UserRecord = AuthenticatedUser & {
+  temporary_password?: string;
+};
+
+export type UserGroupRecord = {
+  id: string;
+  name: string;
+  description: string | null;
+  status: string;
+  member_ids: string[];
+  member_count: number;
+};
+
+export type ResourceGrantRecord = {
+  id: string;
+  resource_type: string;
+  resource_id: string;
+  principal_type: "user" | "group" | "organization";
+  principal_id: string;
+  permissions: string[];
+  expires_at: string | null;
+};
+
+export type ResourceSharingRecord = {
+  resource_type: string;
+  resource_id: string;
+  visibility: "private" | "shared" | "organization" | string;
+  grants: ResourceGrantRecord[];
+};
+
+export type SharingPrincipalList = {
+  organization: { id: string; name: string };
+  users: Array<{ id: string; username: string; display_name: string }>;
+  groups: Array<{ id: string; name: string }>;
+};
+
+export type ResourceSharingGrantInput = {
+  principal_type: "user" | "group" | "organization";
+  principal_id: string;
+  permissions: string[];
+  expires_at?: string | null;
+};
+
+export type ResourceAllocationRecord = {
+  id: string;
+  principal_type: "user" | "group";
+  principal_id: string;
+  resource_pool_id: string;
+  max_concurrent_training_jobs: number | null;
+  max_gpu_count: number | null;
+  max_service_instances: number | null;
+  expires_at: string | null;
+};
+
+export type AuditLogRecord = {
+  id: string;
+  actor_user_id: string | null;
+  action: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  result: string;
+  request_id: string | null;
+  metadata_json: Record<string, unknown>;
+  created_at: string;
+};
+
+export type UserListResponse = PagedResponse<UserRecord>;
+export type UserGroupListResponse = PagedResponse<UserGroupRecord>;
+export type ResourceGrantListResponse = PagedResponse<ResourceGrantRecord>;
+export type ResourceAllocationListResponse = PagedResponse<ResourceAllocationRecord>;
+export type AuditLogListResponse = PagedResponse<AuditLogRecord> & {
+  next_cursor: string | null;
+};
+
+export type StatisticsBucket = {
+  label: string;
+  value: number;
+};
+
+export type StatisticsTrend = {
+  labels: string[];
+  values: number[];
+};
+
+export type WorkbenchStatistics = {
+  generated_at: string;
+  totals: {
+    pipelines: number;
+    datasets: number;
+    training_jobs: number;
+    services: number;
+    nodes: number;
+    users: number;
+    groups: number;
+  };
+  status_buckets: Record<string, StatisticsBucket[]>;
+  creation_trends: Record<string, StatisticsTrend>;
+};
+
+export type RecentFailure = {
+  resource_type: "pipeline" | "training_job" | "service" | "node";
+  resource_id: string;
+  name: string;
+  status: string;
+  updated_at: string;
+};
+
+export type AdminStatistics = WorkbenchStatistics & {
+  recent_failures: RecentFailure[];
+};
+
+export type ResourceMetric = {
+  value: number | null;
+  available: number;
+  unavailable: number;
+};
+
+export type GpuMetric = {
+  value: number | null;
+  available: boolean;
+};
+
+export type ResourceStatistics = {
+  generated_at: string;
+  staleness_threshold_seconds: number;
+  nodes: {
+    status_buckets: StatisticsBucket[];
+    freshness: {
+      fresh: number;
+      stale: number;
+      unknown: number;
+      oldest_fresh_at: string | null;
+      newest_fresh_at: string | null;
+    };
+    resource_usage: Record<string, ResourceMetric>;
+  };
+  gpus: {
+    series: Array<{
+      key: string;
+      refreshed_at: string;
+      utilization_percent: GpuMetric;
+      memory_used_mib: GpuMetric;
+      memory_total_mib: GpuMetric;
+      memory_utilization_percent: GpuMetric;
+    }>;
+  };
+  services: {
+    calls: number;
+    instances: number;
+    health_buckets: StatisticsBucket[];
+    latest_health_checked_at: string | null;
+  };
+  group_allocation_usage: {
+    policy_count: number;
+    resource_pool_count: number;
+    active_training_runs: number;
+    active_service_instances: number;
+    active_workloads: number;
+    limitation: string;
+  };
+};
+
+export type LlmDatasetMessage = {
+  role: string;
+  content: string;
+};
+
+export type LlmDatasetPreview = {
+  dataset_id: string;
+  format: string;
+  manifest_checksum: string;
+  samples: Array<{
+    index: number;
+    messages: LlmDatasetMessage[];
+    character_count: number;
+    token_estimate: number;
+  }>;
+  token_analysis: {
+    method: string;
+    exact: boolean;
+    sample_count: number;
+    minimum: number;
+    maximum: number;
+    average: number;
+  };
+};
+
+export type LlmDatasetValidation = {
+  dataset: DatasetRecord;
+  total_count: number;
+  valid_count: number;
+  invalid_count: number;
+  issues: Array<{ index: number; code: string; message: string }>;
 };
 
 export type DatasetSampleRecord = {
@@ -66,6 +318,7 @@ export type LabelProjectRecord = {
 export type TrainingPipelineRecord = {
   id: string;
   name: string;
+  engine?: "yolo26" | "llamafactory";
   task: string;
   scale: string;
   status: string;
@@ -75,9 +328,25 @@ export type TrainingPipelineRecord = {
   default_environment?: Record<string, unknown>;
   is_public?: boolean;
   public_scope?: Record<string, unknown>;
+  visibility?: "private" | "shared" | "organization" | string;
+  owner_user_id?: string | null;
   is_favorite?: boolean;
   created_at?: string;
   updated_at?: string;
+};
+
+export type LlmModelResolution = {
+  source: "huggingface" | "modelscope";
+  model_id: string;
+  requested_revision: string;
+  resolved_revision: string;
+  immutable_revision: boolean;
+  pipeline_tag?: string | null;
+  library_name?: string | null;
+  license?: string | null;
+  gated: boolean;
+  private: boolean;
+  size_bytes?: number | null;
 };
 
 export type TrainingJobRecord = {
@@ -92,6 +361,7 @@ export type TrainingJobRecord = {
   params?: Record<string, unknown>;
   metrics: Record<string, unknown>;
   log_uri?: string | null;
+  log_stream_id?: string | null;
   started_at?: string | null;
   finished_at?: string | null;
   created_at?: string;
@@ -162,6 +432,7 @@ export type TrainingObservabilityHistogram = {
 
 export type TrainingObservabilitySummary = {
   job_id: string;
+  engine: "yolo26" | "llamafactory";
   pipeline_id: string;
   pipeline_name: string;
   status: string;
@@ -171,6 +442,33 @@ export type TrainingObservabilitySummary = {
   latest_metrics: Record<string, number>;
   available_scalar_keys: string[];
   available_histograms: Record<"weight" | "gradient", string[]>;
+  availability: TrainingObservabilityAvailability;
+};
+
+export type TrainingObservabilityFinding = {
+  code: string;
+  severity: "info" | "warning" | "critical" | string;
+  title: string;
+  message: string;
+  metric_names: string[];
+  step_range: number[] | null;
+  observed_values: Record<string, number | null>;
+};
+
+export type TrainingObservabilityAnalysis = {
+  findings: TrainingObservabilityFinding[];
+  availability: TrainingObservabilityAvailability;
+};
+
+export type TrainingObservabilityArtifact = {
+  path: string;
+  size_bytes: number;
+  sha256: string;
+  download_url: string;
+};
+
+export type TrainingObservabilityArtifacts = {
+  items: TrainingObservabilityArtifact[];
   availability: TrainingObservabilityAvailability;
 };
 
@@ -237,10 +535,13 @@ export type DeploymentServiceRecord = {
   instance_name: string;
   resource_summary: string;
   status: string;
+  desired_state?: "running" | "stopped" | string;
+  active_revision?: number | null;
   endpoint: string;
   calls: number;
   config: Record<string, unknown>;
   instance_id?: string | null;
+  deployment_revision?: number | null;
   node_id?: string | null;
   container_id?: string | null;
   image_digest?: string | null;
@@ -254,10 +555,40 @@ export type DeploymentServiceRecord = {
   remote_execution_id?: string | null;
   phase?: string | null;
   log_uri?: string | null;
+  log_stream_id?: string | null;
   error_code?: string | null;
   error_message?: string | null;
   created_at: string;
   updated_at: string;
+  visibility?: "private" | "shared" | "organization" | string;
+  owner_user_id?: string | null;
+};
+
+export type LogStreamRecord = {
+  id: string;
+  resource_type: string;
+  resource_id: string;
+  source: string;
+  status: string;
+  total_bytes: number;
+  line_count: number;
+  redacted_log_uri?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type LogLineRecord = {
+  timestamp?: string | null;
+  source?: string | null;
+  level?: string | null;
+  message: unknown;
+};
+
+export type LogChunkPage = {
+  lines: LogLineRecord[];
+  next_cursor: string | null;
+  has_more: boolean;
+  bytes_read: number;
 };
 
 export type ResourcePoolRecord = {
@@ -280,10 +611,42 @@ export type ComputeNodeRecord = {
   resources: Record<string, unknown>;
   fingerprint: Record<string, unknown>;
   agent_version: string;
+  enabled: boolean;
+  labels: Record<string, string>;
+  connection_method: "ssh" | "agent" | string;
+  inventory_refreshed_at?: string | null;
+  resource_revision: number;
   certificate_expires_at?: string | null;
   last_seen_at?: string | null;
   created_at?: string;
   updated_at?: string;
+};
+
+export type SshHostKeyRecord = {
+  status: string;
+  host_key_type: string;
+  fingerprint: string;
+};
+
+export type ManualNodePayload = {
+  name: string;
+  host: string;
+  port: number;
+  administrator: string;
+  password: string;
+  confirmed_fingerprint: string;
+  labels: Record<string, string>;
+  resource_pool_id?: string;
+};
+
+export type NodeProbeRecord = {
+  status: string;
+  node_id: string;
+  supported: boolean;
+  unsupported_reasons: string[];
+  compatibility_key: string;
+  resource_pool_id?: string | null;
+  inventory: Record<string, unknown>;
 };
 
 export type ServiceCreatePayload = {
@@ -324,23 +687,206 @@ export type TaskRecord = {
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+let accessToken: string | null = null;
+let authEpoch = 0;
+let tokenGeneration = 0;
+let refreshFlight: {
+  epoch: number;
+  tokenGeneration: number;
+  operations: Set<AuthOperation>;
+  promise: Promise<LoginResponse>;
+} | null = null;
+export type AuthOperation = symbol;
+export type AuthSessionEvent = { operations: ReadonlySet<AuthOperation> };
+type AuthSessionSubscriber = (session: LoginResponse | null, event: AuthSessionEvent) => void;
+const sessionSubscribers = new Set<AuthSessionSubscriber>();
+const NO_AUTH_OPERATIONS: ReadonlySet<AuthOperation> = new Set();
+
+export function setAccessToken(token: string): void {
+  authEpoch += 1;
+  tokenGeneration += 1;
+  accessToken = token;
+}
+
+export function clearAccessToken(): void {
+  invalidateSession(true);
+}
+
+export function subscribeAuthSession(subscriber: AuthSessionSubscriber): () => void {
+  sessionSubscribers.add(subscriber);
+  return () => sessionSubscribers.delete(subscriber);
+}
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  replayed = false,
+  operation?: AuthOperation,
+): Promise<T> {
+  const requestEpoch = authEpoch;
+  const requestTokenGeneration = tokenGeneration;
+  const requestToken = accessToken;
   const isFormData = init?.body instanceof FormData;
+  const headers = buildHeaders(init?.headers, isFormData, requestToken);
   const response = await fetch(`${API_BASE_URL}${path}`, {
-    headers: isFormData
-      ? init?.headers
-      : {
-          "Content-Type": "application/json",
-          ...(init?.headers ?? {})
-        },
-    ...init
+    ...init,
+    credentials: "include",
+    headers,
   });
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(readErrorDetail(detail) || `HTTP ${response.status}`);
+    const error = await responseError(response);
+    if (response.status === 401 && !replayed && !isAuthRequest(path)) {
+      if (requestEpoch !== authEpoch) throw new StaleAuthSessionError();
+      if (requestTokenGeneration !== tokenGeneration) {
+        if (accessToken) return request<T>(path, init, true, operation);
+        throw new StaleAuthSessionError();
+      }
+      try {
+        await sharedRefresh(requestEpoch, requestTokenGeneration, operation);
+      } catch (refreshError) {
+        throw refreshError instanceof Error ? refreshError : error;
+      }
+      return request<T>(path, init, true, operation);
+    }
+    throw error;
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+function buildHeaders(
+  initial: HeadersInit | undefined,
+  isFormData: boolean,
+  token: string | null,
+): Record<string, string> | undefined {
+  const headers: Record<string, string> = {};
+  if (initial instanceof Headers) {
+    initial.forEach((value, key) => {
+      headers[key] = value;
+    });
+  } else if (Array.isArray(initial)) {
+    initial.forEach(([key, value]) => {
+      headers[key] = value;
+    });
+  } else if (initial) {
+    Object.entries(initial).forEach(([key, value]) => {
+      headers[key] = String(value);
+    });
+  }
+  if (!isFormData && !hasHeader(headers, "content-type")) headers["Content-Type"] = "application/json";
+  if (token && !hasHeader(headers, "authorization")) headers.Authorization = `Bearer ${token}`;
+  return Object.keys(headers).length ? headers : undefined;
+}
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+  return Object.keys(headers).some((key) => key.toLowerCase() === name);
+}
+
+function isAuthRequest(path: string): boolean {
+  return path === "/auth/login" || path === "/auth/refresh" || path === "/auth/logout";
+}
+
+async function responseError(response: Response): Promise<ApiError> {
+  const detail = await response.text();
+  return new ApiError(readErrorDetail(detail) || `HTTP ${response.status}`, response.status);
+}
+
+class StaleAuthSessionError extends Error {
+  constructor() {
+    super("Authentication session changed while the request was in flight");
+    this.name = "StaleAuthSessionError";
+  }
+}
+
+function publishSession(
+  session: LoginResponse | null,
+  operations: ReadonlySet<AuthOperation> = NO_AUTH_OPERATIONS,
+): void {
+  const event = { operations };
+  sessionSubscribers.forEach((subscriber) => subscriber(session, event));
+}
+
+function invalidateSession(
+  publish: boolean,
+  operations: ReadonlySet<AuthOperation> = NO_AUTH_OPERATIONS,
+): void {
+  authEpoch += 1;
+  tokenGeneration += 1;
+  accessToken = null;
+  if (publish) publishSession(null, operations);
+}
+
+function installSession(
+  response: LoginResponse,
+  expectedEpoch: number,
+  expectedTokenGeneration: number,
+  operations: ReadonlySet<AuthOperation> = NO_AUTH_OPERATIONS,
+): LoginResponse {
+  if (authEpoch !== expectedEpoch || tokenGeneration !== expectedTokenGeneration) {
+    throw new StaleAuthSessionError();
+  }
+  accessToken = response.access_token;
+  tokenGeneration += 1;
+  publishSession(response, operations);
+  return response;
+}
+
+function failSession(
+  expectedEpoch: number,
+  expectedTokenGeneration: number,
+  operations: ReadonlySet<AuthOperation>,
+): void {
+  if (authEpoch !== expectedEpoch || tokenGeneration !== expectedTokenGeneration) return;
+  invalidateSession(true, operations);
+}
+
+function sharedRefresh(
+  expectedEpoch = authEpoch,
+  expectedTokenGeneration = tokenGeneration,
+  operation?: AuthOperation,
+): Promise<LoginResponse> {
+  if (
+    refreshFlight
+    && refreshFlight.epoch === expectedEpoch
+    && refreshFlight.tokenGeneration === expectedTokenGeneration
+  ) {
+    if (operation) refreshFlight.operations.add(operation);
+    return refreshFlight.promise;
+  }
+
+  const operations = new Set<AuthOperation>();
+  if (operation) operations.add(operation);
+  const flight = {
+    epoch: expectedEpoch,
+    tokenGeneration: expectedTokenGeneration,
+    operations,
+    promise: Promise.resolve(undefined as unknown as LoginResponse),
+  };
+  flight.promise = request<LoginResponse>("/auth/refresh", { method: "POST" })
+      .then((response) => {
+        return installSession(response, expectedEpoch, expectedTokenGeneration, operations);
+      })
+      .catch((error) => {
+        if (!(error instanceof StaleAuthSessionError)) {
+          failSession(expectedEpoch, expectedTokenGeneration, operations);
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (refreshFlight === flight) refreshFlight = null;
+      });
+  refreshFlight = flight;
+  return flight.promise;
 }
 
 async function requestText(url: string): Promise<string> {
@@ -373,6 +919,113 @@ function query(params: Record<string, string | number | undefined>): string {
 }
 
 export const api = {
+  login: async (payload: { username: string; password: string }, operation?: AuthOperation) => {
+    const operations = operation ? new Set([operation]) : NO_AUTH_OPERATIONS;
+    invalidateSession(true, operations);
+    const expectedEpoch = authEpoch;
+    const expectedTokenGeneration = tokenGeneration;
+    const response = await request<LoginResponse>("/auth/login", { method: "POST", body: JSON.stringify(payload) });
+    return installSession(response, expectedEpoch, expectedTokenGeneration, operations);
+  },
+  refresh: (operation?: AuthOperation) => sharedRefresh(authEpoch, tokenGeneration, operation),
+  logout: async (operation?: AuthOperation) => {
+    invalidateSession(true, operation ? new Set([operation]) : NO_AUTH_OPERATIONS);
+    await request<void>("/auth/logout", { method: "POST" });
+  },
+  me: () => request<AuthenticatedUser>("/auth/me"),
+  updateProfile: (payload: { display_name?: string; email?: string }, operation?: AuthOperation) =>
+    request<AuthenticatedUser>(
+      "/account/profile",
+      { method: "PATCH", body: JSON.stringify(payload) },
+      false,
+      operation,
+    ),
+  changePassword: async (
+    payload: { current_password: string; new_password: string },
+    operation?: AuthOperation,
+  ) => {
+    authEpoch += 1;
+    const passwordChangeEpoch = authEpoch;
+    await request<void>(
+      "/account/change-password",
+      { method: "POST", body: JSON.stringify(payload) },
+      false,
+      operation,
+    );
+    if (authEpoch === passwordChangeEpoch) {
+      invalidateSession(true, operation ? new Set([operation]) : NO_AUTH_OPERATIONS);
+    }
+  },
+  listUsers: (params: { search?: string; status?: string; role?: string; limit?: number; offset?: number } = {}) =>
+    request<UserListResponse>(`/admin/users${query(params)}`),
+  createUser: (payload: {
+    username: string;
+    display_name: string;
+    email: string;
+    role: "admin" | "member";
+    temporary_password?: string;
+  }) => request<UserRecord>("/admin/users", { method: "POST", body: JSON.stringify(payload) }),
+  updateUser: (userId: string, payload: Partial<Pick<UserRecord, "display_name" | "email" | "role" | "status">>) =>
+    request<UserRecord>(`/admin/users/${userId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  resetUserPassword: (userId: string, payload: { temporary_password?: string } = {}) =>
+    request<{ user: UserRecord; temporary_password: string }>(`/admin/users/${userId}/reset-password`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  deleteUser: (userId: string) => request<void>(`/admin/users/${userId}`, { method: "DELETE" }),
+  listUserGroups: (params: { limit?: number; offset?: number } = {}) =>
+    request<UserGroupListResponse>(`/admin/groups${query(params)}`),
+  createUserGroup: (payload: { name: string; description?: string | null }) =>
+    request<UserGroupRecord>("/admin/groups", { method: "POST", body: JSON.stringify(payload) }),
+  updateUserGroup: (groupId: string, payload: { name?: string; description?: string | null }) =>
+    request<UserGroupRecord>(`/admin/groups/${groupId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  replaceUserGroupMembers: (groupId: string, userIds: string[]) =>
+    request<UserGroupRecord>(`/admin/groups/${groupId}/members`, {
+      method: "PUT",
+      body: JSON.stringify({ user_ids: userIds }),
+    }),
+  deleteUserGroup: (groupId: string) => request<void>(`/admin/groups/${groupId}`, { method: "DELETE" }),
+  listResourceGrants: (params: { limit?: number; offset?: number } = {}) =>
+    request<ResourceGrantListResponse>(`/admin/resource-grants${query(params)}`),
+  upsertResourceGrant: (payload: Omit<ResourceGrantRecord, "id">) =>
+    request<ResourceGrantRecord>("/admin/resource-grants", { method: "PUT", body: JSON.stringify(payload) }),
+  deleteResourceGrant: (grantId: string) =>
+    request<void>(`/admin/resource-grants/${grantId}`, { method: "DELETE" }),
+  listResourceAllocations: (params: { limit?: number; offset?: number } = {}) =>
+    request<ResourceAllocationListResponse>(`/admin/resource-allocations${query(params)}`),
+  upsertResourceAllocation: (payload: Omit<ResourceAllocationRecord, "id">) =>
+    request<ResourceAllocationRecord>("/admin/resource-allocations", { method: "PUT", body: JSON.stringify(payload) }),
+  deleteResourceAllocation: (allocationId: string) =>
+    request<void>(`/admin/resource-allocations/${allocationId}`, { method: "DELETE" }),
+  listAuditLogs: (params: {
+    actor_user_id?: string;
+    resource_type?: string;
+    resource_id?: string;
+    action?: string;
+    result?: string;
+    created_from?: string;
+    created_to?: string;
+    cursor?: string;
+    limit?: number;
+  } = {}) =>
+    request<AuditLogListResponse>(`/admin/audit-logs${query(params)}`),
+  getWorkbenchStatistics: () => request<WorkbenchStatistics>("/statistics/workbench"),
+  getResourceStatistics: () => request<ResourceStatistics>("/statistics/resources"),
+  getAdminOverviewStatistics: () => request<AdminStatistics>("/admin/statistics/overview"),
+  getAdminResourceStatistics: () => request<ResourceStatistics>("/admin/statistics/resources"),
+  listSharingPrincipals: () => request<SharingPrincipalList>("/resources/sharing-principals"),
+  getResourceSharing: (resourceType: string, resourceId: string) =>
+    request<ResourceSharingRecord>(`/resources/${resourceType}/${resourceId}/sharing`),
+  replaceResourceSharing: (
+    resourceType: string,
+    resourceId: string,
+    payload: { grants: ResourceSharingGrantInput[] },
+  ) => request<ResourceSharingRecord>(`/resources/${resourceType}/${resourceId}/sharing`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  }),
+  resolveLlmModel: (payload: { source: "huggingface" | "modelscope"; model_id: string; revision: string }) =>
+    request<LlmModelResolution>("/llm/models/resolve", { method: "POST", body: JSON.stringify(payload) }),
   listBaseModels: (params: { task?: string; status?: string } = {}) =>
     request<ListResponse<BaseModelRecord>>(`/base-models${query(params)}`),
   uploadBaseModel: (file: File, payload: { task: string; scale: string }) => {
@@ -393,7 +1046,22 @@ export const api = {
     request<ListResponse<DatasetRecord>>(`/datasets${query(params)}`),
   createDataset: (payload: { name: string; task: string; class_schema: Record<string, unknown>; source?: string; preparation?: boolean }) =>
     request<DatasetRecord>("/datasets", { method: "POST", body: JSON.stringify(payload) }),
+  uploadLlmDataset: (payload: { name: string; file: File; format?: string }) => {
+    const formData = new FormData();
+    formData.set("name", payload.name);
+    formData.set("format", payload.format || "auto");
+    formData.set("file", payload.file, payload.file.name);
+    return request<LlmDatasetValidation>("/datasets/llm/upload", { method: "POST", body: formData });
+  },
+  previewLlmDataset: (datasetId: string, limit = 5) =>
+    request<LlmDatasetPreview>("/datasets/llm/preview", {
+      method: "POST",
+      body: JSON.stringify({ dataset_id: datasetId, limit }),
+    }),
   promoteDataset: (id: string) => request<DatasetRecord>(`/datasets/${id}/promote`, { method: "POST" }),
+  convertLabeledDataset: (id: string) =>
+    request<DatasetConversionResult>(`/datasets/${id}/convert-labeled`, { method: "POST" }),
+  listDatasetVersions: (id: string) => request<DatasetVersionRecord[]>(`/datasets/${id}/versions`),
   deleteDataset: (id: string) => request<void>(`/datasets/${id}`, { method: "DELETE" }),
   listDatasetSamples: (datasetId: string, params: { split?: string; limit?: number; offset?: number } = {}) =>
     request<ListResponse<DatasetSampleRecord>>(`/datasets/${datasetId}/samples${query(params)}`),
@@ -444,6 +1112,8 @@ export const api = {
     request<TaskRecord>(`/label-projects/${projectId}/sync-samples`, { method: "POST" }),
   importLabelProjectAnnotations: (projectId: string) =>
     request<TaskRecord>(`/label-projects/${projectId}/import-annotations`, { method: "POST" }),
+  launchLabelProject: (projectId: string) =>
+    request<{ launch_url: string; expires_in: number }>(`/label-projects/${projectId}/launch`, { method: "POST" }),
   getTask: (id: string) => request<TaskRecord>(`/tasks/${id}`),
   createPipeline: (payload: Record<string, unknown>) =>
     request<TrainingPipelineRecord>("/pipelines", { method: "POST", body: JSON.stringify(payload) }),
@@ -481,6 +1151,10 @@ export const api = {
     request<TrainingObservabilityHistogram>(
       `/training-jobs/${trainingJobId}/observability/histograms${query(params)}`
     ),
+  getTrainingObservabilityAnalysis: (trainingJobId: string) =>
+    request<TrainingObservabilityAnalysis>(`/training-jobs/${trainingJobId}/observability/analysis`),
+  getTrainingObservabilityArtifacts: (trainingJobId: string) =>
+    request<TrainingObservabilityArtifacts>(`/training-jobs/${trainingJobId}/observability/artifacts`),
   trainingJobLogUrl: (trainingJobId: string) => `${API_BASE_URL}/training-jobs/${trainingJobId}/log`,
   trainingJobVisualizationUrl: (trainingJobId: string, name: string) =>
     `${API_BASE_URL}/training-jobs/${trainingJobId}/visualizations/${encodeURIComponent(name)}`,
@@ -510,6 +1184,28 @@ export const api = {
     request<ListResponse<PipelineEvaluationResponse>>(`/pipelines/${pipelineId}/evaluations${query(params)}`),
   listResourcePools: () => request<{ items: ResourcePoolRecord[]; total: number }>("/resource-pools"),
   listNodes: () => request<{ items: ComputeNodeRecord[]; total: number }>("/nodes"),
+  scanNodeHostKey: (payload: { host: string; port: number }) =>
+    request<SshHostKeyRecord>("/edge-nodes/scan-host-key", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  createManualNode: (payload: ManualNodePayload) =>
+    request<ComputeNodeRecord>("/nodes/manual", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  refreshNode: (nodeId: string) =>
+    request<NodeProbeRecord>(`/nodes/${nodeId}/refresh`, { method: "POST" }),
+  enableNode: (nodeId: string) =>
+    request<ComputeNodeRecord>(`/nodes/${nodeId}/enable`, { method: "POST" }),
+  disableNode: (nodeId: string) =>
+    request<ComputeNodeRecord>(`/nodes/${nodeId}/disable`, { method: "POST" }),
+  deleteNode: (nodeId: string) => request<void>(`/nodes/${nodeId}`, { method: "DELETE" }),
+  assignNodePool: (nodeId: string, resourcePoolId: string) =>
+    request<ComputeNodeRecord>(`/nodes/${nodeId}/resource-pool`, {
+      method: "PUT",
+      body: JSON.stringify({ resource_pool_id: resourcePoolId }),
+    }),
   createService: (payload: ServiceCreatePayload) =>
     request<DeploymentServiceRecord>("/services", { method: "POST", body: JSON.stringify(payload) }),
   listServices: (params: { status?: string; pipeline_id?: string; limit?: number; offset?: number } = {}) =>
@@ -517,9 +1213,24 @@ export const api = {
   getService: (serviceId: string) => request<DeploymentServiceRecord>(`/services/${serviceId}`),
   stopService: (serviceId: string) =>
     request<DeploymentServiceRecord>(`/services/${serviceId}/stop`, { method: "POST" }),
+  startService: (serviceId: string) =>
+    request<DeploymentServiceRecord>(`/services/${serviceId}/start`, { method: "POST" }),
+  restartService: (serviceId: string) =>
+    request<DeploymentServiceRecord>(`/services/${serviceId}/restart`, { method: "POST" }),
   rollbackService: (serviceId: string) =>
     request<DeploymentServiceRecord>(`/services/${serviceId}/rollback`, { method: "POST" }),
   readServiceLog: (logUri: string) => requestText(logUri),
+  getLogStream: (streamId: string) => request<LogStreamRecord>(`/log-streams/${streamId}`),
+  getLogChunks: (streamId: string, cursor?: string | null) =>
+    request<LogChunkPage>(`/log-streams/${streamId}/chunks${query({ cursor: cursor || undefined })}`),
+  downloadLogStream: async (streamId: string) => {
+    const response = await fetch(`${API_BASE_URL}/log-streams/${streamId}/download`, {
+      credentials: "include",
+      headers: buildHeaders(undefined, true, accessToken),
+    });
+    if (!response.ok) throw await responseError(response);
+    return response.blob();
+  },
   updateService: (serviceId: string, payload: { status: "running" | "stopped" }) =>
     request<DeploymentServiceRecord>(`/services/${serviceId}`, { method: "PATCH", body: JSON.stringify(payload) }),
   deleteService: (serviceId: string) => request<void>(`/services/${serviceId}`, { method: "DELETE" }),

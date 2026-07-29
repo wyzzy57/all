@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
   "albumentations>=1.4,<2.0",
   "alembic>=1.17.1,<2.0",
+  "argon2-cffi>=23.1,<26.0",
   "cleanvision>=0.3,<0.4",
   "cryptography>=45,<47",
   "fastapi>=0.115,<1.0",
@@ -22,6 +23,7 @@ dependencies = [
   "pydantic-settings>=2.4,<3.0",
   "psycopg[binary]>=3.2,<4.0",
   "psutil>=6.0,<8.0",
+  "PyJWT>=2.9,<3.0",
   "pyyaml>=6.0,<7.0",
   "redis>=5.0,<6.0",
   "sqlalchemy>=2.0,<3.0",
@@ -53,6 +55,7 @@ packages = [
   "workers/label-sync-worker/src/visiox_label_sync_worker",
   "workers/edge-executor-worker/src/visiox_edge_executor_worker",
   "workers/training-worker/src/visiox_training_worker",
+  "workers/llm-training-worker/src/visiox_llm_training_worker",
 ]
 
 [tool.hatch.build.targets.wheel.force-include]
@@ -61,6 +64,7 @@ packages = [
 "workers/edge-executor-worker/remote/inspect_deployment.sh" = "visiox_edge_executor_worker/remote/inspect_deployment.sh"
 "workers/edge-executor-worker/remote/inspect_runtime.sh" = "visiox_edge_executor_worker/remote/inspect_runtime.sh"
 "workers/edge-executor-worker/remote/stop_deployment.sh" = "visiox_edge_executor_worker/remote/stop_deployment.sh"
+"workers/edge-executor-worker/remote/start_deployment.sh" = "visiox_edge_executor_worker/remote/start_deployment.sh"
 "workers/edge-executor-worker/remote/stage_training.sh" = "visiox_edge_executor_worker/remote/stage_training.sh"
 "workers/edge-executor-worker/remote/launch_rank.sh" = "visiox_edge_executor_worker/remote/launch_rank.sh"
 "workers/edge-executor-worker/remote/stop_training.sh" = "visiox_edge_executor_worker/remote/stop_training.sh"
@@ -77,5 +81,6 @@ pythonpath = [
   "workers/label-sync-worker/src",
   "workers/edge-executor-worker/src",
   "workers/training-worker/src",
+  "workers/llm-training-worker/src",
 ]
 testpaths = ["tests"]

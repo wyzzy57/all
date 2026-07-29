@@ -1,5 +1,8 @@
 <template>
-  <el-container class="app-shell" direction="vertical">
+  <div v-if="isLoginRoute" class="auth-route">
+    <router-view />
+  </div>
+  <el-container v-else class="app-shell" direction="vertical">
     <el-header class="app-header">
       <a class="brand" href="/workbench" aria-label="VisioX 首页" @click.prevent="$router.push('/workbench')">
         <span class="brand-word">Visio</span><span class="brand-x">X</span>
@@ -14,13 +17,13 @@
       <el-aside
         :width="sidebarWidth"
         class="app-sidebar"
-        :class="{ collapsed: sidebarCollapsed }"
+        :class="{ collapsed: effectiveCollapsed, 'mobile-expanded': isMobile && !effectiveCollapsed }"
       >
         <nav class="sidebar-nav" aria-label="主导航">
           <div v-for="(group, groupIndex) in navGroups" :key="groupIndex" class="nav-group">
             <el-menu
               :default-active="$route.path"
-              :collapse="sidebarCollapsed"
+              :collapse="effectiveCollapsed"
               router
               class="nav-menu"
             >
@@ -38,14 +41,18 @@
           </div>
         </nav>
 
+        <div class="sidebar-account">
+          <UserAccountMenu :collapsed="effectiveCollapsed" />
+        </div>
+
         <button
           class="sidebar-toggle"
           type="button"
-          :aria-label="sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'"
-          :title="sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'"
+          :aria-label="effectiveCollapsed ? '展开侧边栏' : '收起侧边栏'"
+          :title="effectiveCollapsed ? '展开侧边栏' : '收起侧边栏'"
           @click="toggleSidebar"
         >
-          <el-icon><ArrowRight v-if="sidebarCollapsed" /><ArrowLeft v-else /></el-icon>
+          <el-icon><ArrowRight v-if="effectiveCollapsed" /><ArrowLeft v-else /></el-icon>
         </button>
       </el-aside>
 
@@ -69,14 +76,36 @@ import {
   Tickets,
   TrendCharts,
 } from "@element-plus/icons-vue";
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { useRoute } from "vue-router";
 
-const sidebarCollapsed = ref(window.localStorage.getItem("visiox.sidebar.collapsed") === "true");
-const sidebarWidth = computed(() => (sidebarCollapsed.value ? "64px" : "184px"));
+import UserAccountMenu from "@/components/account/UserAccountMenu.vue";
+
+const route = useRoute();
+const isLoginRoute = computed(() => route.name === "login" || route.path.replace(/\/+$/, "") === "/login");
+
+const mobileMedia = window.matchMedia?.("(max-width: 720px)") ?? null;
+const isMobile = ref(mobileMedia?.matches ?? false);
+const userCollapsed = ref(window.localStorage.getItem("visiox.sidebar.collapsed") === "true");
+const mobileExpanded = ref(false);
+const effectiveCollapsed = computed(() => isMobile.value ? !mobileExpanded.value : userCollapsed.value);
+const sidebarWidth = computed(() => (effectiveCollapsed.value ? "64px" : "184px"));
+
+function handleMobileChange(event: MediaQueryListEvent) {
+  isMobile.value = event.matches;
+  mobileExpanded.value = false;
+}
+
+onMounted(() => mobileMedia?.addEventListener("change", handleMobileChange));
+onBeforeUnmount(() => mobileMedia?.removeEventListener("change", handleMobileChange));
 
 function toggleSidebar() {
-  sidebarCollapsed.value = !sidebarCollapsed.value;
-  window.localStorage.setItem("visiox.sidebar.collapsed", String(sidebarCollapsed.value));
+  if (isMobile.value) {
+    mobileExpanded.value = !mobileExpanded.value;
+    return;
+  }
+  userCollapsed.value = !userCollapsed.value;
+  window.localStorage.setItem("visiox.sidebar.collapsed", String(userCollapsed.value));
 }
 
 const navGroups = [

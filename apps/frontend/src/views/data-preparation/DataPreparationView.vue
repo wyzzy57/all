@@ -16,6 +16,9 @@
           <el-button type="primary" @click="openDatasetProcessing(datasetDetail)">
             数据处理
           </el-button>
+          <el-button plain @click="openDatasetSharing(datasetDetail)">
+            访问配置
+          </el-button>
           <el-button plain @click="confirmDeleteDataset(datasetDetail)">
             <Delete />
             删除
@@ -154,110 +157,44 @@
       </div>
 
       <div v-loading="loading" class="dataset-grid" :class="{ 'dataset-grid-compact': activeTab === 'datasets' }">
-        <article
+        <DataAssetCard
           v-for="dataset in filteredDatasets"
           :key="dataset.id"
-          class="dataset-card"
-          :class="{ 'prepare-card': activeTab === 'prepare', 'library-card': activeTab === 'datasets' }"
-          role="button"
-          tabindex="0"
-          @click="handleDatasetCardClick(dataset)"
-          @keydown.enter.prevent="handleDatasetCardClick(dataset)"
-          @keydown.space.prevent="handleDatasetCardClick(dataset)"
-        >
-          <div class="dataset-actions" @click.stop>
-            <button
-              class="dataset-more-button"
-              type="button"
-              :aria-label="`更多操作：${dataset.name || dataset.id}`"
-              :data-testid="`dataset-more-${dataset.id}`"
-              @click="toggleDatasetMenu(dataset.id)"
-            >
-              <MoreFilled />
-            </button>
-            <div v-if="activeDatasetMenuId === dataset.id" class="dataset-action-menu">
-              <button v-if="activeTab === 'datasets'" type="button">编辑</button>
-              <button v-if="activeTab === 'datasets'" type="button">公开配置</button>
-              <button
-                v-if="activeTab === 'prepare'"
-                type="button"
-                :disabled="convertingDatasetId === dataset.id"
-                @click="convertToDataset(dataset)"
-              >
-                {{ convertingDatasetId === dataset.id ? "转换中" : "转为数据集" }}
-              </button>
-              <button
-                class="danger"
-                type="button"
-                :data-testid="`delete-dataset-${dataset.id}`"
-                :disabled="deletingDatasetId === dataset.id"
-                @click="confirmDeleteDataset(dataset)"
-              >
-                删除
-              </button>
-            </div>
-          </div>
-
-          <template v-if="activeTab === 'prepare'">
-            <div class="prepare-card-head">
-              <span class="status-dot"></span>
-              <strong>{{ dataset.name || dataset.id }}</strong>
-            </div>
-            <div class="chip-row">
-              <span class="chip chip-success">✓ {{ datasetStatusText(dataset.status) }}</span>
-              <span class="chip chip-success">▣ {{ importSourceText(dataset) }}</span>
-              <span class="chip">{{ taskText(dataset.task) }}</span>
-            </div>
-            <div class="dataset-meta">
-              <span>{{ formatTime(dataset.updated_at || dataset.created_at) }}</span>
-              <a href="#" @click.prevent.stop="openDatasetLabelStudio(dataset)">
-                <Link />
-                Label Studio
-              </a>
-            </div>
-            <div class="dataset-stats">
-              <span>样本 {{ numberValue(dataset.sample_count) }}</span>
-              <span>标注 {{ numberValue(dataset.annotation_count) }}</span>
-            </div>
-          </template>
-
-          <template v-else>
-            <header class="library-card-head">
-              <strong>{{ dataset.name || dataset.id }}</strong>
-              <span>label</span>
-            </header>
-            <div class="library-tags">
-              <span>{{ primaryLabelProject(dataset) ? "labelstudio导入" : importSourceText(dataset) }}</span>
-            </div>
-            <p>{{ taskText(dataset.task) }}数据集，共 {{ numberValue(dataset.sample_count) }} 个文件</p>
-            <time>{{ formatTime(dataset.updated_at || dataset.created_at) }}</time>
-            <div class="dataset-stats">
-              <span>标注 {{ numberValue(dataset.annotation_count) }}</span>
-              <button
-                v-if="canValidateDataset(dataset)"
-                class="dataset-inline-action"
-                type="button"
-                :data-testid="`validate-dataset-${dataset.id}`"
-                :disabled="validatingDatasetId === dataset.id"
-                @click.prevent.stop="validateDataset(dataset)"
-              >
-                {{ validateDatasetButtonText(dataset) }}
-              </button>
-              <button
-                class="dataset-inline-action"
-                type="button"
-                :data-testid="`process-dataset-${dataset.id}`"
-                @click.prevent.stop="openDatasetProcessing(dataset)"
-              >
-                数据处理
-              </button>
-            </div>
-          </template>
-        </article>
+          :asset="dataset"
+          :mode="activeTab"
+          :status-text="datasetStatusText(dataset.status)"
+          :source-text="primaryLabelProject(dataset) ? 'Label Studio 导入' : importSourceText(dataset)"
+          :task-text="taskText(dataset.task)"
+          :formatted-time="formatTime(dataset.updated_at || dataset.created_at)"
+          :label-studio-available="activeTab === 'prepare'"
+          :menu-open="activeDatasetMenuId === dataset.id"
+          :converting="convertingDatasetId === dataset.id"
+          :deleting="deletingDatasetId === dataset.id"
+          :validating="validatingDatasetId === dataset.id"
+          :can-validate="canValidateDataset(dataset)"
+          :validate-text="validateDatasetButtonText(dataset)"
+          @select="handleDatasetCardClick(dataset)"
+          @toggle-menu="toggleDatasetMenu(dataset.id)"
+          @share="openDatasetSharing(dataset)"
+          @convert="convertToDataset(dataset)"
+          @delete="confirmDeleteDataset(dataset)"
+          @label-studio="openDatasetLabelStudio(dataset)"
+          @validate="validateDataset(dataset)"
+          @process="openDatasetProcessing(dataset)"
+        />
 
         <el-empty v-if="!loading && filteredDatasets.length === 0" description="暂无数据集" />
       </div>
     </template>
+
+    <ResourceSharingDialog
+      v-if="sharingDataset"
+      v-model="sharingDialogVisible"
+      resource-type="dataset"
+      :resource-id="sharingDataset.id"
+      :resource-name="sharingDataset.name || sharingDataset.id"
+      @saved="handleDatasetSharingSaved"
+    />
 
     <el-dialog v-model="importDialogVisible" title="新增对应的数据集" width="760px" class="import-dialog">
       <h2 class="import-dialog-title">新增对应的数据集</h2>
@@ -514,8 +451,6 @@ import {
   Delete,
   Edit,
   FolderOpened,
-  Link,
-  MoreFilled,
   Search,
   Star,
   Upload,
@@ -525,6 +460,8 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onMounted, ref } from "vue";
 
 import { api, type DatasetSampleRecord, type LabelProjectRecord } from "@/api/client";
+import DataAssetCard from "@/components/data/DataAssetCard.vue";
+import ResourceSharingDialog from "@/components/sharing/ResourceSharingDialog.vue";
 
 type AnyRecord = Record<string, unknown>;
 type ImportMode = "unlabeled" | "labeled" | "video";
@@ -541,6 +478,8 @@ interface DatasetRow extends AnyRecord {
   annotation_count?: number;
   created_at?: string;
   updated_at?: string;
+  visibility?: string;
+  asset_role?: string;
 }
 
 type DatasetAnalysis = {
@@ -588,6 +527,8 @@ const deletingDatasetId = ref("");
 const validatingDatasetId = ref("");
 const convertingDatasetId = ref("");
 const activeDatasetMenuId = ref("");
+const sharingDialogVisible = ref(false);
+const sharingDataset = ref<DatasetRow | null>(null);
 const processingDrawerVisible = ref(false);
 const processingLoading = ref(false);
 const splittingDataset = ref(false);
@@ -645,7 +586,7 @@ const operationState = ref({
 
 const filteredDatasets = computed(() => {
   const rows = datasets.value.filter((dataset) =>
-    activeTab.value === "prepare" ? isPreparationRecord(dataset) : dataset.status !== "preparing",
+    activeTab.value === "prepare" ? isPreparationRecord(dataset) : isPublishedRecord(dataset),
   );
   const term = keyword.value.trim().toLowerCase();
   if (!term) return rows;
@@ -659,10 +600,16 @@ const filteredDatasets = computed(() => {
 });
 
 function isPreparationRecord(dataset: DatasetRow) {
+  if (dataset.asset_role) return dataset.asset_role === "working";
   if (dataset.status === "preparing") return true;
   const storageUri = dataset.storage_uri || "";
   if (storageUri.startsWith("preparation://")) return false;
   return dataset.source !== "label_studio";
+}
+
+function isPublishedRecord(dataset: DatasetRow) {
+  if (dataset.asset_role) return dataset.asset_role === "published";
+  return dataset.status !== "preparing";
 }
 
 const uploadPreview = computed(() =>
@@ -786,6 +733,23 @@ function openImportDialog(mode: ImportMode) {
   importDialogVisible.value = true;
 }
 
+function openDatasetSharing(dataset: DatasetRow) {
+  activeDatasetMenuId.value = "";
+  sharingDataset.value = dataset;
+  sharingDialogVisible.value = true;
+}
+
+function handleDatasetSharingSaved(visibility: string) {
+  if (!sharingDataset.value) return;
+  datasets.value = datasets.value.map((dataset) =>
+    dataset.id === sharingDataset.value?.id ? { ...dataset, visibility } : dataset,
+  );
+  if (datasetDetail.value?.id === sharingDataset.value.id) {
+    datasetDetail.value = { ...datasetDetail.value, visibility };
+  }
+  sharingDataset.value = { ...sharingDataset.value, visibility };
+}
+
 function handleDatasetCardClick(dataset: DatasetRow) {
   activeDatasetMenuId.value = "";
   if (activeTab.value === "prepare") {
@@ -807,14 +771,23 @@ async function convertToDataset(dataset: DatasetRow) {
     if (completedTask.status !== "SUCCESS") {
       throw new Error(completedTask.error_message || "Label Studio 标注导入失败");
     }
-    updateOperation(2, "正在筛选有标注的样本");
-    const promoted = await api.promoteDataset(dataset.id);
-    updateOperation(3, "训练数据集已生成");
-    finishOperation(`已生成 ${promoted.sample_count} 个有标注样本的数据集`);
+    updateOperation(2, "正在筛选有效标注样本");
+    if (dataset.task === "llm") {
+      const conversion = await api.convertLabeledDataset(dataset.id);
+      updateOperation(3, `训练数据集版本 v${conversion.version.version} 已生成`);
+      finishOperation(
+        `已发布 ${conversion.valid_count} 条有效对话，跳过 ${conversion.skipped_count} 条，无效 ${conversion.invalid_count} 条`,
+      );
+      ElMessage.success(`大模型训练数据集 v${conversion.version.version} 已发布`);
+    } else {
+      const promoted = await api.promoteDataset(dataset.id);
+      updateOperation(3, "训练数据集已生成");
+      finishOperation(`已生成 ${promoted.sample_count} 个有标注样本的数据集`);
+      datasetDetail.value = promoted;
+      ElMessage.success("已将有标注的样本转为数据集");
+    }
     await loadDatasets();
     activeTab.value = "datasets";
-    datasetDetail.value = promoted;
-    ElMessage.success("已将有标注的样本转为数据集");
   } catch (error) {
     failOperation(getErrorMessage(error, "转为数据集失败"));
     ElMessage.error(getErrorMessage(error, "没有可转换的有效标注"));
@@ -905,11 +878,8 @@ function primaryLabelProject(dataset: DatasetRow) {
 async function openDatasetLabelStudio(row: DatasetRow) {
   try {
     const project = await ensureLabelProject(row);
-    if (!project.project_url) {
-      ElMessage.warning("Label Studio 项目已创建，但缺少可打开的项目地址。");
-      return;
-    }
-    window.open(project.project_url, "_blank", "noopener,noreferrer");
+    const launch = await api.launchLabelProject(project.id);
+    window.open(launch.launch_url, "_blank", "noopener,noreferrer");
   } catch (error) {
     ElMessage.error(getErrorMessage(error, "Label Studio 项目打开失败"));
   }
@@ -1503,7 +1473,7 @@ function getErrorMessage(error: unknown, fallback: string) {
 .dataset-grid {
   display: grid;
   gap: 14px;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   min-height: 220px;
 }
 
@@ -1515,6 +1485,7 @@ function getErrorMessage(error: unknown, fallback: string) {
   background: #ffffff;
   border: 1px solid #dce3ee;
   border-radius: 4px;
+  box-sizing: border-box;
   cursor: pointer;
   min-height: 138px;
   padding: 18px 18px 16px;
@@ -1538,6 +1509,16 @@ function getErrorMessage(error: unknown, fallback: string) {
 .library-card {
   min-height: 122px;
   padding: 16px 16px 14px;
+}
+
+.prepare-card {
+  height: 220px;
+}
+
+.prepare-card-layout {
+  display: grid;
+  grid-template-rows: 26px 58px 24px 20px;
+  row-gap: 8px;
 }
 
 .dataset-actions {
@@ -1620,7 +1601,8 @@ function getErrorMessage(error: unknown, fallback: string) {
   align-items: center;
   display: flex;
   gap: 8px;
-  margin-bottom: 12px;
+  min-width: 0;
+  padding-right: 34px;
 }
 
 .prepare-card-head strong,
@@ -1629,6 +1611,12 @@ function getErrorMessage(error: unknown, fallback: string) {
   font-size: 16px;
   line-height: 1.25;
   word-break: break-word;
+}
+
+.prepare-card-head strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-dot {
@@ -1649,6 +1637,12 @@ function getErrorMessage(error: unknown, fallback: string) {
   flex-wrap: wrap;
   gap: 6px;
   margin-bottom: 10px;
+}
+
+.prepare-card-layout .chip-row {
+  align-content: flex-start;
+  margin-bottom: 0;
+  overflow: hidden;
 }
 
 .chip,
@@ -1673,9 +1667,10 @@ function getErrorMessage(error: unknown, fallback: string) {
   align-items: center;
   color: #58677a;
   display: flex;
-  flex-wrap: wrap;
   font-size: 13px;
   gap: 8px;
+  min-width: 0;
+  white-space: nowrap;
 }
 
 .dataset-meta a {
@@ -1699,6 +1694,10 @@ function getErrorMessage(error: unknown, fallback: string) {
   font-size: 12px;
   gap: 10px;
   margin-top: 10px;
+}
+
+.prepare-card-layout .dataset-stats {
+  margin-top: 0;
 }
 
 .dataset-inline-action {
@@ -2307,6 +2306,17 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 @container data-preparation (max-width: 1120px) {
   .import-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dataset-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@container data-preparation (max-width: 840px) {
+  .dataset-grid,
+  .dataset-grid-compact {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

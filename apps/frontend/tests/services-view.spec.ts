@@ -11,6 +11,8 @@ const apiMock = vi.hoisted(() => ({
   getService: vi.fn(),
   updateService: vi.fn(),
   stopService: vi.fn(),
+  startService: vi.fn(),
+  restartService: vi.fn(),
   rollbackService: vi.fn(),
   readServiceLog: vi.fn(),
   deleteService: vi.fn(),
@@ -53,6 +55,11 @@ function mountView() {
 }
 
 describe("ServicesView", () => {
+  it("uses the shared resource dialog for service access", () => {
+    expect(servicesViewSource).toContain("ResourceSharingDialog");
+    expect(servicesViewSource).toContain("openServiceSharing(selectedService)");
+  });
+
   it("keeps functional pagination anchored in list mode", () => {
     expect(servicesViewSource).toContain("v-for=\"service in pagedServices\"");
     expect(servicesViewSource).toContain("'list-mode': !selectedService");
@@ -129,6 +136,8 @@ describe("ServicesView", () => {
       updated_at: "2026-07-10T10:00:00Z",
     });
     apiMock.stopService.mockResolvedValue(serviceResult("stopping", "queued"));
+    apiMock.startService.mockResolvedValue(serviceResult("starting", "queued"));
+    apiMock.restartService.mockResolvedValue(serviceResult("restarting", "queued"));
     apiMock.rollbackService.mockResolvedValue(serviceResult("rollback_queued", "queued"));
     apiMock.readServiceLog.mockResolvedValue("[INFO] 已完成模型预热\n[INFO] 服务健康检查通过");
     apiMock.deleteService.mockResolvedValue(undefined);
@@ -302,5 +311,38 @@ describe("ServicesView", () => {
     await flushPromises();
     expect(rollbackWrapper.text()).toContain("选择测试图像");
     expect(rollbackWrapper.text()).toContain("运行结果");
+  });
+
+  it("shows resume only for stopped services and restart only for running services", async () => {
+    routeState.params = { serviceId: "service-real" };
+    const runningWrapper = mountView();
+    await flushPromises();
+
+    expect(runningWrapper.find('[data-testid="restart-service-service-real"]').exists()).toBe(true);
+    expect(runningWrapper.find('[data-testid="start-service-service-real"]').exists()).toBe(false);
+    await runningWrapper.get('[data-testid="restart-service-service-real"]').trigger("click");
+    await flushPromises();
+    expect(apiMock.restartService).toHaveBeenCalledWith("service-real");
+    runningWrapper.unmount();
+
+    apiMock.listServices.mockResolvedValueOnce({
+      items: [{
+        ...(await apiMock.listServices()).items[0],
+        status: "stopped",
+        desired_state: "stopped",
+        active_revision: 1,
+      }],
+      total: 1,
+      limit: 200,
+      offset: 0,
+    });
+    const stoppedWrapper = mountView();
+    await flushPromises();
+
+    expect(stoppedWrapper.find('[data-testid="start-service-service-real"]').exists()).toBe(true);
+    expect(stoppedWrapper.find('[data-testid="restart-service-service-real"]').exists()).toBe(false);
+    await stoppedWrapper.get('[data-testid="start-service-service-real"]').trigger("click");
+    await flushPromises();
+    expect(apiMock.startService).toHaveBeenCalledWith("service-real");
   });
 });

@@ -5,10 +5,13 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from threading import Lock
 from typing import Any
+import json
 import math
 import re
+from urllib.parse import quote
 
 from visiox_common.settings import Settings
+from visiox_api.services.llm_training_analysis import analyze_llm_training
 
 
 _DEFAULT_MAX_POINTS = 2_000
@@ -91,6 +94,16 @@ class TrainingObservabilityService:
         self._event_accumulators: OrderedDict[tuple[Path, int], Any] = OrderedDict()
         self._event_accumulator_lock = Lock()
 
+    def for_engine(self, engine: str) -> Any:
+        from visiox_api.services.observability import (
+            LlamaFactoryObservabilityAdapter,
+            UltralyticsObservabilityAdapter,
+        )
+
+        if engine == "llamafactory":
+            return LlamaFactoryObservabilityAdapter(self)
+        return UltralyticsObservabilityAdapter(self)
+
     def get_summary(self, job: Any, pipeline: Any, task: Any) -> dict[str, Any]:
         snapshot: dict[str, Any] = {}
         try:
@@ -142,8 +155,20 @@ class TrainingObservabilityService:
                 if isinstance(value, int | float):
                     latest_metrics[str(name)] = float(value)
                     scalar_keys.add(_normalize_metric_name(str(name)))
+        if getattr(pipeline, "engine", "yolo26") == "llamafactory":
+            metric_samples = self._jsonl_samples(job, "visiox-metrics.jsonl")
+            if metric_samples:
+                for name, value in metric_samples[-1].items():
+                    if name in {"step", "timestamp"} or not isinstance(value, int | float):
+                        continue
+                    latest_metrics[str(name)] = float(value)
+                for sample in metric_samples:
+                    for name, value in sample.items():
+                        if name not in {"step", "timestamp"} and isinstance(value, int | float):
+                            scalar_keys.add(_normalize_metric_name(str(name)))
         return {
             "job_id": str(job.id),
+            "engine": str(getattr(pipeline, "engine", "yolo26")),
             "status": getattr(job, "status", None),
             "pipeline": {
                 "id": getattr(pipeline, "id", None),
@@ -178,6 +203,8 @@ class TrainingObservabilityService:
         start_step: int | None,
         end_step: int | None,
         max_points: int | None,
+        *,
+        engine: str = "yolo26",
     ) -> dict[str, Any]:
         normalized_keys = list(dict.fromkeys(_normalize_metric_name(key) for key in keys))
         series = {key: [] for key in normalized_keys}
@@ -207,7 +234,22 @@ class TrainingObservabilityService:
             tensorboard_available = False
             tensorboard_reason = str(exc)
 
-        if not any(series.values()):
+        if engine == "llamafactory":
+            jsonl_keys = {key for key, points in series.items() if not points}
+            for sample in self._jsonl_samples(job, "visiox-metrics.jsonl"):
+                step = sample.get("step")
+                timestamp = sample.get("timestamp")
+                if not isinstance(step, int | float) or not isinstance(timestamp, int | float):
+                    continue
+                for name, value in sample.items():
+                    normalized = _normalize_metric_name(str(name))
+                    if normalized in jsonl_keys and isinstance(value, int | float):
+                        series[normalized].append(
+                            {"step": float(step), "value": float(value), "timestamp": float(timestamp)}
+                        )
+
+        progress_keys = {key for key, points in series.items() if not points}
+        if progress_keys:
             try:
                 samples = self._progress_snapshot(job).get("metric_samples", [])
                 if isinstance(samples, list):
@@ -220,7 +262,7 @@ class TrainingObservabilityService:
                             continue
                         for name, value in sample.items():
                             normalized = _normalize_metric_name(str(name))
-                            if normalized in series and isinstance(value, int | float):
+                            if normalized in progress_keys and isinstance(value, int | float):
                                 series[normalized].append(
                                     {"step": float(step), "value": float(value), "timestamp": float(timestamp)}
                                 )
@@ -246,6 +288,8 @@ class TrainingObservabilityService:
         start_step: int | None,
         end_step: int | None,
         max_points: int | None,
+        *,
+        engine: str = "yolo26",
     ) -> dict[str, Any]:
         progress_available = True
         progress_reason: str | None = None
@@ -274,6 +318,14 @@ class TrainingObservabilityService:
             progress_available = False
             progress_reason = exc.message
 
+        if engine == "llamafactory":
+            jsonl_series = self._resource_series_from_samples(
+                self._jsonl_samples(job, "resource_metrics.jsonl")
+            )
+            for name, points in jsonl_series.items():
+                if points:
+                    series[name] = points
+
         limit = self._point_limit(max_points)
         for name, points in series.items():
             series[name] = _downsample_points(self._filter_points(points, start_step, end_step), limit)
@@ -284,6 +336,73 @@ class TrainingObservabilityService:
                 tensorboard=self._event_availability(job),
                 progress=(progress_available, progress_reason),
             ),
+        }
+
+    def get_analysis(self, job: Any, *, engine: str = "yolo26") -> dict[str, Any]:
+        if engine != "llamafactory":
+            return {"findings": [], "availability": self._availability(
+                mlflow=self._mlflow_availability(job),
+                tensorboard=self._event_availability(job),
+                progress=self._progress_availability(job),
+            )}
+        metric_samples = self._jsonl_samples(job, "visiox-metrics.jsonl")
+        resource_samples = self._jsonl_samples(job, "resource_metrics.jsonl")
+        scalar_names = {
+            _normalize_metric_name(str(name))
+            for sample in metric_samples
+            for name, value in sample.items()
+            if name not in {"step", "timestamp"} and isinstance(value, int | float)
+        }
+        scalar_series = {
+            name: self._series_from_samples(metric_samples, name)
+            for name in scalar_names
+        }
+        resource_series = self._resource_series_from_samples(resource_samples)
+        return {
+            "findings": analyze_llm_training(scalar_series, resource_series),
+            "availability": self._availability(
+                mlflow=self._mlflow_availability(job),
+                tensorboard=self._event_availability(job),
+                progress=self._progress_availability(job),
+            ),
+        }
+
+    def get_artifacts(self, job: Any) -> dict[str, Any]:
+        path = self._run_path(job) / "artifact-manifest.json"
+        artifacts: list[dict[str, Any]] = []
+        reason: str | None = None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            values = payload.get("artifacts") if isinstance(payload, dict) else None
+            if not isinstance(values, list):
+                raise ValueError("artifact manifest is invalid")
+            metrics = getattr(job, "metrics", {})
+            available_names = set()
+            if isinstance(metrics, dict):
+                artifact_uris = metrics.get("artifacts")
+                if isinstance(artifact_uris, dict):
+                    available_names.update(str(name) for name in artifact_uris)
+                if isinstance(metrics.get("adapter"), str):
+                    available_names.add("adapter_model.safetensors")
+            artifacts = [
+                {
+                    **item,
+                    "download_url": (
+                        f"/training-jobs/{job.id}/observability/artifacts/"
+                        f"{quote(str(item.get('path', '')), safe='')}"
+                    ),
+                }
+                for item in values
+                if isinstance(item, dict)
+                and str(item.get("path", "")).rsplit("/", 1)[-1] in available_names
+            ]
+        except (OSError, ValueError) as exc:
+            reason = str(exc)
+        return {
+            "items": artifacts,
+            "availability": {
+                "artifacts": {"available": reason is None, "reason": reason},
+            },
         }
 
     def get_graph(self, job: Any) -> dict[str, Any]:
@@ -451,6 +570,66 @@ class TrainingObservabilityService:
         if not isinstance(data, dict):
             raise ObservabilitySourceError("progress", "progress snapshot is invalid")
         return data
+
+    def _jsonl_samples(self, job: Any, filename: str) -> list[dict[str, Any]]:
+        path = self._run_path(job) / filename
+        if not path.is_file():
+            return []
+        samples: list[dict[str, Any]] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict):
+                    samples.append(payload)
+        except OSError:
+            return []
+        return samples
+
+    @staticmethod
+    def _series_from_samples(samples: list[dict[str, Any]], name: str) -> list[dict[str, float]]:
+        points: list[dict[str, float]] = []
+        for sample in samples:
+            step = sample.get("step")
+            timestamp = sample.get("timestamp")
+            value = sample.get(name)
+            if all(isinstance(item, int | float) and not isinstance(item, bool) for item in (step, timestamp, value)):
+                points.append({"step": float(step), "timestamp": float(timestamp), "value": float(value)})
+        return points
+
+    @classmethod
+    def _resource_series_from_samples(cls, samples: list[dict[str, Any]]) -> dict[str, list[dict[str, float]]]:
+        series: dict[str, list[dict[str, float]]] = {}
+        for sample in samples:
+            step = sample.get("step")
+            timestamp = sample.get("timestamp")
+            if not isinstance(step, int | float) or not isinstance(timestamp, int | float):
+                continue
+            for name, value in sample.items():
+                if name in {"step", "timestamp", "gpus"} or not isinstance(value, int | float):
+                    continue
+                series.setdefault(str(name), []).append(
+                    {"step": float(step), "timestamp": float(timestamp), "value": float(value)}
+                )
+            gpus = sample.get("gpus")
+            if not isinstance(gpus, list):
+                continue
+            for gpu in gpus:
+                if not isinstance(gpu, dict):
+                    continue
+                identifier = gpu.get("uuid") or gpu.get("index")
+                if identifier is None:
+                    continue
+                for name, value in gpu.items():
+                    if name in {"uuid", "index"} or not isinstance(value, int | float):
+                        continue
+                    key = f"gpu.{identifier}.{name}"
+                    series.setdefault(key, []).append(
+                        {"step": float(step), "timestamp": float(timestamp), "value": float(value)}
+                    )
+        return series
 
     def _run_path(self, job: Any) -> Path:
         job_id = str(getattr(job, "id", ""))

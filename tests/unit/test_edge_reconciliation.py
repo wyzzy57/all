@@ -19,7 +19,10 @@ from visiox_db.models import (
 )
 from visiox_db.session import create_session_factory
 from visiox_edge_executor_worker.crypto import CredentialCipher
-from visiox_edge_executor_worker.reconciliation import DockerLabels, RemoteRuntimeReconciler
+from visiox_edge_executor_worker.reconciliation import (
+    DockerLabels,
+    RemoteRuntimeReconciler,
+)
 from visiox_edge_executor_worker.runner import build_application
 from visiox_edge_executor_worker.scripts import load_packaged_script
 from visiox_edge_executor_worker.ssh import CommandResult, RemotePrivateDirectory
@@ -28,17 +31,21 @@ from visiox_edge_executor_worker.state import ExecutionResult, RemoteExecutionRe
 
 
 class RecordingSshSession:
-    def __init__(self, response: dict[str, object]) -> None:
-        self.response = response
+    def __init__(self, response: dict[str, object] | list[dict[str, object]]) -> None:
+        self.responses = list(response) if isinstance(response, list) else [response]
         self.uploads: list[tuple[str, bytes]] = []
         self.validated: list[str] = []
         self.commands: list[str] = []
         self.cleaned: list[tuple[str, ...]] = []
         self.closed = False
 
-    def create_private_directory(self, *, timeout_seconds: float) -> RemotePrivateDirectory:
+    def create_private_directory(
+        self, *, timeout_seconds: float
+    ) -> RemotePrivateDirectory:
         assert timeout_seconds > 0
-        return RemotePrivateDirectory("/home/visiox-edge/.visiox-0123456789abcdef0123456789abcdef", 1000)
+        return RemotePrivateDirectory(
+            "/home/visiox-edge/.visiox-0123456789abcdef0123456789abcdef", 1000
+        )
 
     def upload_bytes_exclusive(
         self,
@@ -64,9 +71,12 @@ class RecordingSshSession:
 
     def run(self, command: str, *, timeout_seconds: float) -> CommandResult:
         self.commands.append(command)
+        response = (
+            self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+        )
         return CommandResult(
             exit_status=0,
-            stdout=json.dumps(self.response).encode("ascii"),
+            stdout=json.dumps(response).encode("ascii"),
             stderr=b"",
         )
 
@@ -303,7 +313,9 @@ def test_build_application_installs_concrete_reconciler(tmp_path, monkeypatch) -
     assert isinstance(application.reconciler, RemoteRuntimeReconciler)
 
 
-def test_static_reconciliation_script_is_packaged_and_uses_structured_docker_calls() -> None:
+def test_static_reconciliation_script_is_packaged_and_uses_structured_docker_calls() -> (
+    None
+):
     script = load_packaged_script("inspect_runtime.sh").decode("utf-8")
 
     assert "subprocess.run" in script
@@ -313,7 +325,7 @@ def test_static_reconciliation_script_is_packaged_and_uses_structured_docker_cal
     assert "len(container_ids) >" not in script
 
 
-def _deployment_runtime(response: dict[str, object]):
+def _deployment_runtime(response: dict[str, object] | list[dict[str, object]]):
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     session_factory = create_session_factory(engine)
@@ -359,12 +371,15 @@ def _deployment_runtime(response: dict[str, object]):
             instance_count=1,
             instance_name="pepper-prod-01",
             status="running",
+            desired_state="running",
+            active_revision=1,
             endpoint="pending",
             config={},
         )
         instance = DeploymentInstance(
             id="instance-1",
             deployment_service_id=service.id,
+            deployment_revision=1,
             node_id=node.id,
             instance_name=service.instance_name,
             container_id="a" * 64,
@@ -466,6 +481,113 @@ def test_reconciler_recovers_running_deployment_from_exact_observed_tuple() -> N
         "expected_container_id": "a" * 64,
         "port": 18080,
     }
+
+
+def test_reconciler_recovers_failed_deployment_when_remote_container_is_healthy() -> (
+    None
+):
+    image_digest = "registry.internal/visiox/yolo26-inference@sha256:" + "b" * 64
+    reconciler, factory, _ssh_client, _ = _deployment_runtime(
+        _healthy_deployment_response(image_digest)
+    )
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        execution = session.get(RemoteExecution, "exec-deploy")
+        assert service is not None
+        assert instance is not None
+        assert execution is not None
+        service.status = "failed"
+        instance.status = "failed"
+        instance.health_status = "unhealthy"
+        execution.phase = "reconciliation_failed"
+        execution.error_code = "REMOTE_DEPLOYMENT_UNHEALTHY"
+        execution.error_message = "Remote deployment is not healthy"
+        session.add_all([service, instance, execution])
+        session.commit()
+
+    assert reconciler.reconcile_deployments() == 1
+
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        execution = session.get(RemoteExecution, "exec-deploy")
+        assert service is not None and service.status == "running"
+        assert instance is not None and instance.status == "running"
+        assert instance.health_status == "healthy"
+        assert execution is not None and execution.phase == "reconciled_running"
+        assert execution.error_code is None
+
+
+def test_reconciler_preserves_user_stopped_service_without_remote_inspection() -> None:
+    reconciler, factory, ssh_client, _ = _deployment_runtime({"containers": []})
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        assert service is not None and instance is not None
+        service.status = "stopped"
+        service.desired_state = "stopped"
+        instance.status = "stopped"
+        instance.health_status = "stopped"
+        session.commit()
+
+    assert reconciler.reconcile_deployments() == 0
+    assert ssh_client.connections == []
+
+
+def test_reconciler_starts_stopped_container_when_desired_state_is_running() -> None:
+    image_digest = "registry.internal/visiox/yolo26-inference@sha256:" + "b" * 64
+    stopped = _healthy_deployment_response(image_digest)
+    stopped["containers"][0]["status"] = "exited"  # type: ignore[index]
+    stopped["containers"][0]["health"] = None  # type: ignore[index]
+    stopped["containers"][0]["endpoint_reachable"] = False  # type: ignore[index]
+    started = {
+        "already_running": False,
+        "container_id": "a" * 64,
+        "health_status": "healthy",
+        "port": 18080,
+    }
+    reconciler, factory, ssh_client, _ = _deployment_runtime([stopped, started])
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        assert service is not None and instance is not None
+        service.status = "stopped"
+        service.desired_state = "running"
+        instance.status = "stopped"
+        instance.health_status = "stopped"
+        session.commit()
+
+    assert reconciler.reconcile_deployments() == 1
+
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        assert service is not None and service.status == "running"
+        assert instance is not None and instance.status == "running"
+        assert instance.health_status == "healthy"
+    assert any(
+        "start_deployment.sh" in command for command in ssh_client.ssh_session.commands
+    )
+
+
+def test_reconciler_retries_deployment_while_container_health_is_starting() -> None:
+    image_digest = "registry.internal/visiox/yolo26-inference@sha256:" + "b" * 64
+    response = _healthy_deployment_response(image_digest)
+    response["containers"][0]["health"] = "starting"  # type: ignore[index]
+    response["containers"][0]["endpoint_reachable"] = False  # type: ignore[index]
+    reconciler, factory, _ssh_client, _ = _deployment_runtime(response)
+
+    assert reconciler.reconcile_deployments() == 1
+
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        execution = session.get(RemoteExecution, "exec-deploy")
+        assert service is not None and service.status == "reconciliation_retry"
+        assert instance is not None and instance.status == "reconciliation_retry"
+        assert instance.health_status == "unknown"
+        assert execution is not None and execution.phase == "reconciliation_retry"
 
 
 def test_reconciler_persists_deterministic_failure_for_mismatched_deployment() -> None:

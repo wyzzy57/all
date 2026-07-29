@@ -11,6 +11,8 @@ const apiMock = vi.hoisted(() => ({
   getTrainingObservabilityResources: vi.fn(),
   getTrainingObservabilityScalars: vi.fn(),
   getTrainingObservabilitySummary: vi.fn(),
+  getTrainingObservabilityAnalysis: vi.fn(),
+  getTrainingObservabilityArtifacts: vi.fn(),
   listTrainingJobArtifacts: vi.fn(),
   listPipelines: vi.fn(),
   listTrainingJobs: vi.fn(),
@@ -68,6 +70,7 @@ const jobs = [
 function summary(overrides: Record<string, unknown> = {}) {
   return {
     job_id: "job-1",
+    engine: "yolo26",
     pipeline_id: "pipeline-1",
     pipeline_name: "花椒检测",
     status: "running",
@@ -100,6 +103,10 @@ function mountView() {
     global: {
       stubs: {
         MetricLineChart: MetricLineChartStub,
+        LlmTrainingOverview: { props: ["summary"], template: '<div data-testid="llm-overview-stub">{{ summary.pipeline_name }}</div>' },
+        LlmTrainingMetrics: { props: ["response"], template: '<div data-testid="llm-metrics-stub">{{ Object.keys(response.series).join(",") }}</div>' },
+        LlmTrainingResources: { props: ["response"], template: '<div data-testid="llm-resources-stub">{{ Object.keys(response.series).join(",") }}</div>' },
+        LlmTrainingAnalysis: { props: ["analysis", "artifacts"], template: '<div data-testid="llm-analysis-stub">{{ analysis.findings.length }} / {{ artifacts.items.length }}</div>' },
         "el-dialog": {
           props: ["modelValue", "title"],
           template: '<section v-if="modelValue" class="el-dialog-stub"><h2>{{ title }}</h2><slot /><slot name="footer" /></section>',
@@ -146,6 +153,14 @@ describe("TrainingVisualizationView", () => {
     });
     apiMock.getTrainingObservabilityResources.mockResolvedValue({
       series: { "system.cpu_percent": [{ step: 1, value: 36, timestamp: 100 }] },
+      availability: summary().availability,
+    });
+    apiMock.getTrainingObservabilityAnalysis.mockResolvedValue({
+      findings: [],
+      availability: summary().availability,
+    });
+    apiMock.getTrainingObservabilityArtifacts.mockResolvedValue({
+      items: [],
       availability: summary().availability,
     });
     apiMock.listTrainingJobArtifacts.mockResolvedValue({
@@ -226,6 +241,39 @@ describe("TrainingVisualizationView", () => {
     expect(text).toContain("可用");
 
     wrapper.unmount();
+  });
+
+  it("selects dedicated LLM overview, metrics, resources and analysis by engine", async () => {
+    apiMock.listPipelines.mockResolvedValue({
+      items: [{ id: "pipeline-1", name: "Qwen SFT", engine: "llamafactory", task: "llm", scale: "7b", status: "training" }],
+      total: 1,
+      limit: 100,
+      offset: 0,
+    });
+    apiMock.listTrainingJobs.mockResolvedValue({ items: [jobs[0]], total: 1, limit: 200, offset: 0 });
+    apiMock.getTrainingObservabilitySummary.mockResolvedValue(summary({
+      engine: "llamafactory",
+      pipeline_name: "Qwen SFT",
+      available_scalar_keys: ["loss", "learning_rate"],
+    }));
+
+    const wrapper = mountView();
+    await flushPromises();
+    expect(wrapper.get('[data-testid="llm-overview-stub"]').text()).toContain("Qwen SFT");
+
+    await wrapper.get('[data-testid="tab-metrics"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="llm-metrics-stub"]').exists()).toBe(true);
+
+    await wrapper.get('[data-testid="tab-resources"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="llm-resources-stub"]').exists()).toBe(true);
+
+    await wrapper.get('[data-testid="tab-analysis"]').trigger("click");
+    await flushPromises();
+    expect(apiMock.getTrainingObservabilityAnalysis).toHaveBeenCalledWith("job-1");
+    expect(apiMock.getTrainingObservabilityArtifacts).toHaveBeenCalledWith("job-1");
+    expect(wrapper.find('[data-testid="llm-analysis-stub"]').exists()).toBe(true);
   });
 
   it("renders TensorBoard-style semantic metric cards and switches to run comparison", async () => {

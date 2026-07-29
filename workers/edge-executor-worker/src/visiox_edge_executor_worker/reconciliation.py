@@ -9,7 +9,7 @@ import re
 import shlex
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session
 
 from visiox_db.models import (
@@ -40,6 +40,7 @@ _RECONCILABLE_DEPLOYMENT_STATUSES = frozenset(
         "reconciliation_retry",
     }
 )
+_RECOVERABLE_STOPPED_STATUSES = frozenset({"stopped", "failed"})
 _DEPLOYMENT_LABELS = frozenset(
     {
         "com.visiox.deployment-instance-id",
@@ -109,6 +110,7 @@ class RemoteRuntimeReconciler:
         self._security = security
         self._script = load_packaged_script(_SCRIPT_NAME)
         self._deployment_script = load_packaged_script("inspect_deployment.sh")
+        self._start_deployment_script = load_packaged_script("start_deployment.sh")
 
     def reconcile_startup(
         self,
@@ -154,8 +156,29 @@ class RemoteRuntimeReconciler:
     def _list_reconcilable_deployments(self) -> list[str]:
         statement = (
             select(DeploymentInstance.id)
+            .join(
+                DeploymentService,
+                DeploymentService.id == DeploymentInstance.deployment_service_id,
+            )
             .where(
-                DeploymentInstance.status.in_(_RECONCILABLE_DEPLOYMENT_STATUSES)
+                or_(
+                    DeploymentInstance.status.in_(_RECONCILABLE_DEPLOYMENT_STATUSES),
+                    and_(
+                        DeploymentService.desired_state == "running",
+                        DeploymentInstance.status.in_(_RECOVERABLE_STOPPED_STATUSES),
+                    ),
+                    and_(
+                        DeploymentInstance.status == "failed",
+                        exists(
+                            select(RemoteExecution.id).where(
+                                RemoteExecution.resource_type == "deployment_instance",
+                                RemoteExecution.resource_id == DeploymentInstance.id,
+                                RemoteExecution.error_code
+                                == "REMOTE_DEPLOYMENT_UNHEALTHY",
+                            )
+                        ),
+                    ),
+                )
             )
             .order_by(DeploymentInstance.updated_at, DeploymentInstance.id)
         )
@@ -167,11 +190,14 @@ class RemoteRuntimeReconciler:
             instance = session.get(DeploymentInstance, instance_id)
             if (
                 instance is None
-                or instance.status not in _RECONCILABLE_DEPLOYMENT_STATUSES
+                or instance.status
+                not in _RECONCILABLE_DEPLOYMENT_STATUSES | _RECOVERABLE_STOPPED_STATUSES
             ):
                 return
             service = session.get(DeploymentService, instance.deployment_service_id)
             if service is None:
+                return
+            if service.desired_state == "stopped":
                 return
             expected = {
                 "container_id": instance.container_id,
@@ -182,7 +208,19 @@ class RemoteRuntimeReconciler:
                 "port": instance.port,
                 "service_id": service.id,
                 "node_id": instance.node_id,
+                "active_revision": service.active_revision,
+                "deployment_revision": instance.deployment_revision,
             }
+        if (
+            expected["active_revision"] is None
+            or expected["active_revision"] != expected["deployment_revision"]
+        ):
+            self._persist_deployment_failure(
+                instance_id,
+                error_code="DEPLOYMENT_REVISION_UNAVAILABLE",
+                error_message="No successful deployment revision is available",
+            )
+            return
         if any(
             expected[field] is None
             for field in (
@@ -238,6 +276,40 @@ class RemoteRuntimeReconciler:
                 error_code="REMOTE_DEPLOYMENT_MISMATCH",
                 error_message="Remote deployment state did not match",
             )
+            return
+        if observed["status"] == "exited":
+            try:
+                started = self._start_deployment(
+                    target,
+                    {
+                        "action": "start",
+                        "container_id": expected["container_id"],
+                        "labels": {
+                            DockerLabels.DEPLOYMENT_INSTANCE_ID: instance_id,
+                        },
+                        "port": expected["port"],
+                    },
+                )
+                if (
+                    not isinstance(started, dict)
+                    or started.get("container_id") != expected["container_id"]
+                    or started.get("port") != expected["port"]
+                    or started.get("health_status") != "healthy"
+                ):
+                    raise ValueError("remote start response is invalid")
+            except Exception:
+                self._persist_deployment_retry(instance_id)
+                return
+            self._persist_deployment_running(
+                instance_id,
+                endpoint=_endpoint(target.host, int(expected["port"])),
+            )
+            return
+        if (
+            observed["status"] in {"created", "restarting"}
+            or observed["health"] == "starting"
+        ):
+            self._persist_deployment_retry(instance_id)
             return
         if not (
             observed["status"] == "running"
@@ -434,6 +506,64 @@ class RemoteRuntimeReconciler:
         finally:
             ssh_session.close()
 
+    def _start_deployment(
+        self,
+        target: _SshTarget,
+        request_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        ssh_session = self._security.ssh_client.connect(
+            host=target.host,
+            port=target.port,
+            username=target.username,
+            private_key=target.private_key,
+            expected_fingerprint=target.expected_fingerprint,
+            timeout_seconds=INSPECTION_TIMEOUT_SECONDS,
+        )
+        try:
+            workspace = ssh_session.create_private_directory(
+                timeout_seconds=INSPECTION_TIMEOUT_SECONDS
+            )
+            script_path = str(PurePosixPath(workspace.path) / "start_deployment.sh")
+            request_path = str(PurePosixPath(workspace.path) / _REQUEST_NAME)
+            remote_paths = (script_path, request_path)
+            request = json.dumps(
+                request_data,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+            try:
+                for data, path in (
+                    (self._start_deployment_script, script_path),
+                    (request, request_path),
+                ):
+                    ssh_session.upload_bytes_exclusive(
+                        data,
+                        path,
+                        expected_owner_uid=workspace.owner_uid,
+                        timeout_seconds=INSPECTION_TIMEOUT_SECONDS,
+                    )
+                    ssh_session.validate_remote_file(
+                        path,
+                        expected_owner_uid=workspace.owner_uid,
+                        timeout_seconds=INSPECTION_TIMEOUT_SECONDS,
+                    )
+                result = ssh_session.run(
+                    f"/bin/bash {shlex.quote(script_path)} {shlex.quote(request_path)}",
+                    timeout_seconds=60.0,
+                )
+                if result.exit_status != 0:
+                    raise RuntimeError("remote deployment start failed")
+                return json.loads(result.stdout)
+            finally:
+                ssh_session.cleanup_private_directory(
+                    workspace,
+                    remote_paths,
+                    timeout_seconds=INSPECTION_TIMEOUT_SECONDS,
+                )
+        finally:
+            ssh_session.close()
+
     def _persist_deployment_running(self, instance_id: str, *, endpoint: str) -> None:
         now = datetime.now(UTC)
         with self._session_factory() as session:
@@ -448,6 +578,7 @@ class RemoteRuntimeReconciler:
             instance.health_checked_at = now
             instance.endpoint = endpoint
             service.status = "running"
+            service.desired_state = "running"
             service.endpoint = endpoint
             execution = self._latest_deployment_execution(session, service.id)
             if execution is not None:

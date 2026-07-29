@@ -3,7 +3,7 @@ import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vite";
 
 const apiProxy = {
-  target: "http://127.0.0.1:8000",
+  target: "http://[::1]:8000",
   changeOrigin: true
 };
 
@@ -17,14 +17,20 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      "/account": apiProxy,
+      "/admin": apiProxy,
+      "/auth": apiProxy,
       "/base-models": apiProxy,
       "/datasets": apiProxy,
       "/health": apiProxy,
       "/label-projects": apiProxy,
+      "/log-streams": apiProxy,
+      "/llm": apiProxy,
       "/nodes": apiProxy,
       "/pipelines": apiProxy,
       "/resource-pools": apiProxy,
       "/services": apiProxy,
+      "/statistics": apiProxy,
       "/tasks": apiProxy,
       "/trained-models": apiProxy,
       "/training-jobs": apiProxy,

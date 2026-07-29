@@ -14,7 +14,20 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from visiox_common.tasks import TaskStatus, TaskType
-from visiox_db.models import BaseModel, Dataset, Task, TrainedModel, TrainingJob, TrainingPipeline
+from visiox_api.services.log_streams import (
+    LogEntry,
+    append_lines,
+    close_stream,
+    open_stream,
+)
+from visiox_db.models import (
+    BaseModel,
+    Dataset,
+    Task,
+    TrainedModel,
+    TrainingJob,
+    TrainingPipeline,
+)
 from visiox_storage.client import ObjectStorageClient
 from visiox_storage.checksum import sha256_file
 from visiox_yolo26.converters import export_yolo26_dataset
@@ -23,7 +36,11 @@ from visiox_yolo26.training.commands import build_train_command
 from visiox_yolo26.training.prechecks import validate_training_resources
 
 
-TERMINAL_TASK_STATUSES = {TaskStatus.SUCCESS.value, TaskStatus.FAILED.value, TaskStatus.CANCELED.value}
+TERMINAL_TASK_STATUSES = {
+    TaskStatus.SUCCESS.value,
+    TaskStatus.FAILED.value,
+    TaskStatus.CANCELED.value,
+}
 
 
 class TrainingWorkerError(RuntimeError):
@@ -76,8 +93,15 @@ def run_training_job(
     task = _require_task(session, task_id, training_job_id)
     job = _require_job(session, training_job_id, task_id)
     if job.status == "success" and job.trained_model_id is not None:
-        return TrainingResult(training_job_id=job.id, trained_model_id=job.trained_model_id, status=job.status)
-    if task.status in TERMINAL_TASK_STATUSES and task.status != TaskStatus.SUCCESS.value:
+        return TrainingResult(
+            training_job_id=job.id,
+            trained_model_id=job.trained_model_id,
+            status=job.status,
+        )
+    if (
+        task.status in TERMINAL_TASK_STATUSES
+        and task.status != TaskStatus.SUCCESS.value
+    ):
         raise TrainingWorkerError(f"task is terminal: {task.status}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -85,14 +109,22 @@ def run_training_job(
     claimed = session.execute(
         update(Task)
         .where(Task.id == task.id, Task.status == TaskStatus.QUEUED.value)
-        .values(status=TaskStatus.RUNNING.value, stage="prepare", started_at=task.started_at or now)
+        .values(
+            status=TaskStatus.RUNNING.value,
+            stage="prepare",
+            started_at=task.started_at or now,
+        )
     ).rowcount
     if claimed != 1:
         session.rollback()
         task = _require_task(session, task_id, training_job_id)
         job = _require_job(session, training_job_id, task_id)
         if job.status == "success" and job.trained_model_id is not None:
-            return TrainingResult(training_job_id=job.id, trained_model_id=job.trained_model_id, status=job.status)
+            return TrainingResult(
+                training_job_id=job.id,
+                trained_model_id=job.trained_model_id,
+                status=job.status,
+            )
         raise TrainingWorkerError(f"task is already claimed: {task.status}")
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     job.status = "running"
@@ -105,11 +137,36 @@ def run_training_job(
     task = _require_task(session, task_id, training_job_id)
     job = _require_job(session, training_job_id, task_id)
     stored_objects: list[tuple[str, str]] = []
+    log_stream_id: str | None = None
 
     try:
         pipeline = session.get(TrainingPipeline, job.pipeline_id)
         if pipeline is None:
             raise TrainingWorkerError("training pipeline not found")
+        organization_id = job.organization_id or pipeline.organization_id
+        if organization_id is None:
+            raise TrainingWorkerError("training job organization is missing")
+        log_stream = open_stream(
+            session,
+            organization_id=organization_id,
+            resource_type="training_job",
+            resource_id=job.id,
+            source="training",
+        )
+        log_stream_id = log_stream.id
+        job.metrics = {
+            **(job.metrics or {}),
+            "observability": {
+                **(
+                    job.metrics.get("observability", {})
+                    if isinstance(job.metrics.get("observability"), dict)
+                    else {}
+                ),
+                "log_stream_id": log_stream_id,
+            },
+        }
+        session.add(job)
+        session.commit()
         base_model = session.get(BaseModel, pipeline.base_model_id)
         dataset = session.get(Dataset, pipeline.dataset_id)
         if base_model is None or dataset is None:
@@ -123,7 +180,9 @@ def run_training_job(
         )
         _validate_task_payload(task, job, pipeline, base_model, dataset)
 
-        base_model_path = _stage_base_model(storage, base_model, work_dir / "base-model" / "base.pt")
+        base_model_path = _stage_base_model(
+            storage, base_model, work_dir / "base-model" / "base.pt"
+        )
         dataset_dir = work_dir / "dataset"
         task.stage = "export_dataset"
         session.add(task)
@@ -151,18 +210,50 @@ def run_training_job(
         job.metrics = {
             **(job.metrics or {}),
             "observability": {
+                **(
+                    job.metrics.get("observability", {})
+                    if isinstance(job.metrics.get("observability"), dict)
+                    else {}
+                ),
                 "mlflow_run_name": run_name,
                 "tensorboard_run_name": run_name,
             },
         }
         session.add(job)
         session.commit()
-        instrumented_command = [sys.executable, "-m", "visiox_training_worker.train_entrypoint", *command.argv[2:]]
-        result = runner.run(instrumented_command, work_dir, should_cancel=lambda: _task_is_canceled(session, task_id))
+        instrumented_command = [
+            sys.executable,
+            "-m",
+            "visiox_training_worker.train_entrypoint",
+            *command.argv[2:],
+        ]
+        result = runner.run(
+            instrumented_command,
+            work_dir,
+            should_cancel=lambda: _task_is_canceled(session, task_id),
+        )
+        append_lines(
+            session,
+            storage,
+            log_stream_id,
+            [
+                *(
+                    LogEntry(message=line, source="stdout")
+                    for line in result.stdout.splitlines()
+                ),
+                *(
+                    LogEntry(message=line, source="stderr", level="error")
+                    for line in result.stderr.splitlines()
+                ),
+            ],
+        )
+        session.commit()
         if _task_is_canceled(session, task_id):
             raise TrainingCanceledError("training canceled")
         if result.exit_code != 0:
-            raise TrainingWorkerError(f"training command failed with exit code {result.exit_code}: {result.stderr}")
+            raise TrainingWorkerError(
+                f"training command failed with exit code {result.exit_code}: {result.stderr}"
+            )
         if result.artifact_path is None:
             raise TrainingWorkerError("training artifact path is missing")
 
@@ -177,6 +268,9 @@ def run_training_job(
             model_metrics = {**metrics, "checksum": sha256_file(weight_path)}
             model = TrainedModel(
                 pipeline_id=pipeline.id,
+                organization_id=job.organization_id or pipeline.organization_id,
+                owner_user_id=job.owner_user_id or pipeline.owner_user_id,
+                visibility="private",
                 training_job_id=job.id if trained_model is None else None,
                 name=weight_name,
                 version=weight_name,
@@ -198,9 +292,13 @@ def run_training_job(
         log_path = work_dir / "training.log"
         log_path.write_text(_format_log(result), encoding="utf-8")
         log_object = f"jobs/{job.id}/training.log"
-        log_uri = storage.put_file("training", log_object, log_path, content_type="text/plain")
+        log_uri = storage.put_file(
+            "training", log_object, log_path, content_type="text/plain"
+        )
         stored_objects.append(("training", log_object))
-        visualization_uris = _store_visualizations(storage, job.id, result.visualization_paths or {}, stored_objects)
+        visualization_uris = _store_visualizations(
+            storage, job.id, result.visualization_paths or {}, stored_objects
+        )
         if weight_uris:
             metrics = {**metrics, "weights": weight_uris}
         if visualization_uris:
@@ -222,24 +320,39 @@ def run_training_job(
         task.error_message = None
         task.retryable = False
         session.add_all([job, pipeline, task])
+        close_stream(session, storage, log_stream_id, status="completed")
         try:
             session.commit()
         except IntegrityError:
             session.rollback()
             existing_model = _trained_model_for_job(session, job.id)
             if existing_model is not None:
-                return TrainingResult(training_job_id=job.id, trained_model_id=existing_model.id, status="success")
+                return TrainingResult(
+                    training_job_id=job.id,
+                    trained_model_id=existing_model.id,
+                    status="success",
+                )
             raise
-        return TrainingResult(training_job_id=job.id, trained_model_id=trained_model.id, status=job.status)
+        return TrainingResult(
+            training_job_id=job.id, trained_model_id=trained_model.id, status=job.status
+        )
     except Exception as exc:
         session.rollback()
         _cleanup_stored_objects(storage, stored_objects)
         task = session.get(Task, task_id)
         job = session.get(TrainingJob, training_job_id)
-        canceled = isinstance(exc, TrainingCanceledError) or (task is not None and task.status == TaskStatus.CANCELED.value)
+        canceled = isinstance(exc, TrainingCanceledError) or (
+            task is not None and task.status == TaskStatus.CANCELED.value
+        )
         if task is not None:
-            task.status = TaskStatus.CANCELED.value if canceled else TaskStatus.FAILED.value
-            task.error_code = "INVALID_TASK_PAYLOAD" if isinstance(exc, InvalidTaskPayloadError) else "TRAINING_FAILED"
+            task.status = (
+                TaskStatus.CANCELED.value if canceled else TaskStatus.FAILED.value
+            )
+            task.error_code = (
+                "INVALID_TASK_PAYLOAD"
+                if isinstance(exc, InvalidTaskPayloadError)
+                else "TRAINING_FAILED"
+            )
             if canceled:
                 task.error_code = "TRAINING_CANCELED"
             task.error_message = str(exc)
@@ -255,6 +368,22 @@ def run_training_job(
             if pipeline is not None:
                 pipeline.status = "canceled" if canceled else "failed"
                 session.add(pipeline)
+        if log_stream_id is not None:
+            try:
+                append_lines(
+                    session,
+                    storage,
+                    log_stream_id,
+                    [LogEntry(message=str(exc), source="worker", level="error")],
+                )
+                close_stream(
+                    session,
+                    storage,
+                    log_stream_id,
+                    status="cancelled" if canceled else "failed",
+                )
+            except Exception:
+                session.rollback()
         session.commit()
         raise
 
@@ -282,19 +411,27 @@ def _require_job(session: Session, training_job_id: str, task_id: str) -> Traini
     return job
 
 
-def _stage_base_model(storage: ObjectStorageClient, base_model: BaseModel, destination: Path) -> Path:
+def _stage_base_model(
+    storage: ObjectStorageClient, base_model: BaseModel, destination: Path
+) -> Path:
     bucket, object_name = parse_storage_uri(str(base_model.local_uri))
     staged_path = storage.get_file(bucket, object_name, destination)
     if _needs_real_base_model(staged_path):
-        downloaded_path = _download_base_model_asset(str(base_model.filename), destination.parent)
+        downloaded_path = _download_base_model_asset(
+            str(base_model.filename), destination.parent
+        )
         shutil.copyfile(downloaded_path, staged_path)
-        storage.put_file(bucket, object_name, staged_path, content_type="application/octet-stream")
+        storage.put_file(
+            bucket, object_name, staged_path, content_type="application/octet-stream"
+        )
     return staged_path
 
 
 def _needs_real_base_model(path: Path) -> bool:
     header = path.read_bytes()[:256].lower()
-    return header.startswith(b"visiox prepared") or header.startswith(b"version https://git-lfs")
+    return header.startswith(b"visiox prepared") or header.startswith(
+        b"version https://git-lfs"
+    )
 
 
 def _download_base_model_asset(filename: str, target_dir: Path) -> Path:
@@ -366,8 +503,14 @@ def _rewrite_data_yaml_path(data_yaml_path: Path, dataset_dir: Path) -> None:
     data_yaml_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _trained_model_for_job(session: Session, training_job_id: str) -> TrainedModel | None:
-    return session.query(TrainedModel).filter(TrainedModel.training_job_id == training_job_id).one_or_none()
+def _trained_model_for_job(
+    session: Session, training_job_id: str
+) -> TrainedModel | None:
+    return (
+        session.query(TrainedModel)
+        .filter(TrainedModel.training_job_id == training_job_id)
+        .one_or_none()
+    )
 
 
 def _training_weight_paths(result: CommandResult) -> dict[str, Path]:
@@ -378,7 +521,11 @@ def _training_weight_paths(result: CommandResult) -> dict[str, Path]:
             if path.exists() and path.is_file()
         }
         if weights:
-            return dict(sorted(weights.items(), key=lambda item: 0 if item[0] == "best.pt" else 1))
+            return dict(
+                sorted(
+                    weights.items(), key=lambda item: 0 if item[0] == "best.pt" else 1
+                )
+            )
     if result.artifact_path is not None and result.artifact_path.exists():
         return {_safe_weight_name(result.artifact_path.name): result.artifact_path}
     return {}
@@ -407,14 +554,18 @@ def _validate_task_payload(
     }
     for key, value in expected.items():
         if payload.get(key) != value:
-            raise InvalidTaskPayloadError(f"task payload {key} does not match training job")
+            raise InvalidTaskPayloadError(
+                f"task payload {key} does not match training job"
+            )
     if payload.get("params") != (job.params or {}):
         raise InvalidTaskPayloadError("task payload params do not match training job")
     if "environment" in payload and not isinstance(payload["environment"], dict):
         raise InvalidTaskPayloadError("task payload environment must be an object")
 
 
-def _cleanup_stored_objects(storage: ObjectStorageClient, stored_objects: list[tuple[str, str]]) -> None:
+def _cleanup_stored_objects(
+    storage: ObjectStorageClient, stored_objects: list[tuple[str, str]]
+) -> None:
     for bucket, object_name in reversed(stored_objects):
         try:
             storage.delete_file(bucket, object_name)
@@ -435,13 +586,18 @@ def _store_visualizations(
         safe_name = _safe_artifact_name(name)
         object_name = f"jobs/{training_job_id}/visualizations/{safe_name}"
         content_type = "image/png" if path.suffix.lower() == ".png" else None
-        uris[safe_name] = storage.put_file("training", object_name, path, content_type=content_type)
+        uris[safe_name] = storage.put_file(
+            "training", object_name, path, content_type=content_type
+        )
         stored_objects.append(("training", object_name))
     return uris
 
 
 def _safe_artifact_name(name: str) -> str:
-    cleaned = "".join(character if character.isalnum() or character in {".", "-", "_"} else "_" for character in name)
+    cleaned = "".join(
+        character if character.isalnum() or character in {".", "-", "_"} else "_"
+        for character in name
+    )
     return cleaned or "artifact"
 
 

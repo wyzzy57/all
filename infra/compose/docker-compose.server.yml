@@ -1,0 +1,86 @@
+services:
+  ownership-backfill:
+    image: 10.10.40.2:5000/visiox/platform-api:server-20260727
+
+  frontend:
+    image: 10.10.40.2:5000/visiox/platform-frontend:server-20260727
+    build:
+      context: ../..
+      dockerfile: apps/frontend/Dockerfile
+    depends_on:
+      api-service:
+        condition: service_started
+    ports:
+      - "5174:80"
+    restart: unless-stopped
+
+  api-service:
+    image: 10.10.40.2:5000/visiox/platform-api:server-20260727
+    restart: unless-stopped
+
+  edge-executor-worker:
+    image: 10.10.40.2:5000/visiox/platform-api:server-20260727
+    restart: unless-stopped
+
+  label-sync-worker:
+    image: 10.10.40.2:5000/visiox/platform-api:server-20260727
+    restart: unless-stopped
+
+  training-worker:
+    image: 10.10.40.2:5000/visiox/platform-api:server-20260727
+    restart: unless-stopped
+
+  mlflow:
+    image: 10.10.40.2:5000/visiox/platform-observability:server-20260727
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --allowed-hosts
+      - mlflow,mlflow:5000,localhost,localhost:5001,127.0.0.1,127.0.0.1:5001,10.10.13.20,10.10.13.20:5001
+      - --cors-allowed-origins
+      - http://127.0.0.1:5174,http://localhost:5174,http://10.10.13.20:5174
+      - --x-frame-options
+      - NONE
+      - --backend-store-uri
+      - sqlite:////mlflow/mlflow.db
+      - --artifacts-destination
+      - /mlflow/artifacts
+      - --serve-artifacts
+    restart: unless-stopped
+
+  tensorboard:
+    image: 10.10.40.2:5000/visiox/platform-observability:server-20260727
+    restart: unless-stopped
+
+  postgres:
+    image: 10.10.40.2:5000/visiox/platform-postgres:16-alpine
+    ports: !reset []
+    restart: unless-stopped
+
+  redis:
+    image: 10.10.40.2:5000/visiox/platform-redis:7-alpine
+    ports: !reset []
+    restart: unless-stopped
+
+  minio:
+    image: 10.10.40.2:5000/visiox/platform-minio:2025-09-07
+    restart: unless-stopped
+
+  registry:
+    image: 10.10.40.2:5000/visiox/platform-registry:2
+    restart: unless-stopped
+
+  label-studio:
+    image: 10.10.40.2:5000/visiox/platform-label-studio:latest
+    ports: !reset []
+    restart: unless-stopped
+
+  label-studio-gateway:
+    image: 10.10.40.2:5000/visiox/platform-label-gateway:server-20260727
+    ports: !override
+      - "8081:8081"
+    restart: unless-stopped

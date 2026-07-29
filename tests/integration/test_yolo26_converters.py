@@ -9,10 +9,14 @@ from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from visiox_db.models import Annotation, Dataset, DatasetSample
+from visiox_db.models import Annotation, Dataset, DatasetSample, Organization, User
 from visiox_storage.client import InMemoryObjectStorageClient
 from visiox_yolo26.converters import ConversionError, export_yolo26_dataset
 from visiox_yolo26.tasks import YOLO26_SCALES, YOLO26_TASKS, task_scale_key
+
+
+TEST_ORGANIZATION_ID = "yolo26-test-org"
+TEST_OWNER_USER_ID = "yolo26-test-owner"
 
 
 @pytest.fixture()
@@ -24,7 +28,31 @@ def session_factory(tmp_path):
     command.upgrade(config, "head")
 
     engine = create_engine(database_url)
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    with factory() as session:
+        session.add(
+            Organization(
+                id=TEST_ORGANIZATION_ID,
+                name="YOLO26 Converter Tests",
+                slug="yolo26-converter-tests",
+                status="active",
+            )
+        )
+        session.add(
+            User(
+                id=TEST_OWNER_USER_ID,
+                organization_id=TEST_ORGANIZATION_ID,
+                username="yolo26-test-owner",
+                display_name="YOLO26 Test Owner",
+                email="yolo26-test-owner@example.test",
+                password_hash="test-only",
+                role="admin",
+                status="active",
+                must_change_password=False,
+            )
+        )
+        session.commit()
+    return factory
 
 
 @pytest.fixture()
@@ -64,6 +92,8 @@ def _create_dataset(
     with session_factory() as session:
         dataset = Dataset(
             name=f"{task}-{uuid4()}",
+            organization_id=TEST_ORGANIZATION_ID,
+            owner_user_id=TEST_OWNER_USER_ID,
             task=task,
             status="created",
             class_schema=class_schema or {"names": ["ok", "defect"]},
@@ -107,6 +137,8 @@ def _create_dataset_with_two_same_basename_samples(session_factory) -> str:
     with session_factory() as session:
         dataset = Dataset(
             name=f"detect-{uuid4()}",
+            organization_id=TEST_ORGANIZATION_ID,
+            owner_user_id=TEST_OWNER_USER_ID,
             task="detect",
             status="created",
             class_schema={"names": ["ok", "defect"]},

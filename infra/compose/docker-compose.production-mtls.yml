@@ -43,6 +43,19 @@ services:
       api-migrate:
         condition: service_completed_successfully
 
+  edge-executor-worker:
+    environment:
+      VISIOX_ENV: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api-migrate:
+        condition: service_completed_successfully
+    networks:
+      application-internal:
+
   label-sync-worker:
     environment:
       VISIOX_ENV: production
@@ -106,6 +119,11 @@ services:
     ports: !reset []
     networks:
       application-internal:
+      api-dependencies:
+
+  label-studio-gateway:
+    ports: !reset []
+    networks:
       api-dependencies:
 
   management-proxy:

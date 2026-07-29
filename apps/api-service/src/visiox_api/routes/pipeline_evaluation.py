@@ -10,13 +10,16 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from visiox_api.dependencies.auth import get_current_user
+from visiox_api.dependencies.authorization import require_resource_permission
+from visiox_api.dependencies.database import get_db_session
 from visiox_api.routes.pipeline_inference import (
     _download_storage_uri,
     _normalize_ultralytics_device,
     _resolve_weight_uri,
 )
 from visiox_db.models import Dataset, PipelineEvaluation, TrainingPipeline
-from visiox_db.session import get_session
+from visiox_db.models.identity import PERMISSION_EDIT, PERMISSION_USE, PERMISSION_VIEW, User
 from visiox_storage.client import ObjectStorageClient
 from visiox_yolo26.converters import export_yolo26_dataset
 
@@ -89,8 +92,7 @@ class UltralyticsPipelineEvaluator:
         return PipelineEvaluationResult(score=_read_score(metric_values), metrics=metric_values)
 
 
-def get_pipeline_evaluation_session() -> Generator[Session]:
-    yield from get_session()
+get_pipeline_evaluation_session = get_db_session
 
 
 def get_pipeline_evaluation_storage(request: Request) -> ObjectStorageClient:
@@ -111,11 +113,14 @@ def evaluate_pipeline(
     session: Session = Depends(get_pipeline_evaluation_session),
     storage: ObjectStorageClient = Depends(get_pipeline_evaluation_storage),
     evaluator: PipelineEvaluator = Depends(get_pipeline_evaluator),
+    actor: User = Depends(get_current_user),
 ) -> PipelineEvaluationResponse:
     pipeline = session.get(TrainingPipeline, pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    require_resource_permission(session, actor, "pipeline", pipeline_id, PERMISSION_EDIT)
     dataset_id = _evaluation_dataset_id(pipeline, payload)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_USE)
     dataset = session.get(Dataset, dataset_id)
     if dataset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Evaluation dataset not found")
@@ -161,9 +166,11 @@ def list_pipeline_evaluations(
     limit: int = 50,
     offset: int = 0,
     session: Session = Depends(get_pipeline_evaluation_session),
+    actor: User = Depends(get_current_user),
 ) -> PipelineEvaluationListResponse:
     if session.get(TrainingPipeline, pipeline_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    require_resource_permission(session, actor, "pipeline", pipeline_id, PERMISSION_VIEW)
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     total = session.scalar(select(func.count()).select_from(PipelineEvaluation).where(PipelineEvaluation.pipeline_id == pipeline_id)) or 0

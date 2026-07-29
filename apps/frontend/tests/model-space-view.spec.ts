@@ -5,6 +5,8 @@ import ModelSpaceView from "@/views/model-space/ModelSpaceView.vue";
 import modelSpaceViewSource from "@/views/model-space/ModelSpaceView.vue?raw";
 
 const pushMock = vi.hoisted(() => vi.fn());
+const replaceMock = vi.hoisted(() => vi.fn());
+const routeMock = vi.hoisted(() => ({ query: {} as Record<string, string> }));
 const apiMock = vi.hoisted(() => ({
   listBaseModels: vi.fn(),
   uploadBaseModel: vi.fn(),
@@ -31,7 +33,8 @@ const apiMock = vi.hoisted(() => ({
 }));
 
 vi.mock("vue-router", () => ({
-  useRouter: () => ({ push: pushMock }),
+  useRoute: () => routeMock,
+  useRouter: () => ({ push: pushMock, replace: replaceMock }),
 }));
 
 vi.mock("@/api/client", () => ({
@@ -118,6 +121,12 @@ function mockDeployablePipeline() {
 }
 
 describe("ModelSpaceView", () => {
+  it("uses the real shared resource dialog instead of hard-coded public scopes", () => {
+    expect(modelSpaceViewSource).toContain("ResourceSharingDialog");
+    expect(modelSpaceViewSource).not.toContain('const scopeOptions = [');
+    expect(modelSpaceViewSource).not.toContain("confirmPublicConfig");
+  });
+
   it("anchors the list pagination and styles its selected page", () => {
     expect(modelSpaceViewSource).toContain("'list-mode': viewMode === 'list'");
     expect(modelSpaceViewSource).toContain("position: sticky");
@@ -127,6 +136,10 @@ describe("ModelSpaceView", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    routeMock.query = {};
+    replaceMock.mockImplementation(async (location: { query?: Record<string, string> }) => {
+      routeMock.query = location.query ?? {};
+    });
     apiMock.listBaseModels.mockResolvedValue({
       items: [
         {
@@ -378,7 +391,7 @@ describe("ModelSpaceView", () => {
     await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
     await flushPromises();
 
-    expect(apiMock.createPipeline).toHaveBeenCalledWith({ name: "新建产线", task: "detect", scale: "n" });
+    expect(apiMock.createPipeline).toHaveBeenCalledWith({ name: "新建产线", engine: "yolo26", task: "detect", scale: "n" });
     expect(wrapper.text()).toContain("选择产线");
     expect(wrapper.text()).toContain("数据准备");
     expect(wrapper.text()).toContain("参数准备");
@@ -400,11 +413,99 @@ describe("ModelSpaceView", () => {
     expect(apiMock.uploadBaseModel).toHaveBeenCalledWith(file, { task: "detect", scale: "n" });
     expect(apiMock.createPipeline).toHaveBeenCalledWith({
       name: "新建产线",
+      engine: "yolo26",
       task: "detect",
       scale: "n",
       base_model_id: "custom-model-1",
     });
     expect(wrapper.text()).toContain("选择产线");
+  });
+
+  it("uses the dedicated LLM wizard instead of YOLO fields", async () => {
+    apiMock.listDatasets.mockResolvedValueOnce({
+      items: [
+        {
+          id: "llm-dataset-1",
+          name: "equipment-sft",
+          task: "llm",
+          status: "validated",
+          sample_count: 120,
+          annotation_count: 120,
+          class_schema: { format: "sharegpt" },
+        },
+      ],
+    });
+    apiMock.createPipeline.mockResolvedValueOnce({
+      id: "pipeline-llm",
+      name: "新建产线",
+      task: "llm",
+      scale: "llm",
+      status: "draft",
+      params_template: {},
+      default_environment: {},
+    });
+    apiMock.updatePipeline.mockResolvedValueOnce({
+      id: "pipeline-llm",
+      name: "新建产线",
+      task: "llm",
+      scale: "llm",
+      status: "draft",
+      params_template: { engine: "llamafactory" },
+      default_environment: { device: "remote" },
+    });
+
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
+    await wrapper.get('[data-testid="create-pipeline"]').trigger("click");
+    await wrapper.findAll("button").find((button) => button.text().includes("大模型训练"))?.trigger("click");
+    await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.createPipeline).toHaveBeenCalledWith({ name: "新建产线", engine: "llamafactory", task: "llm", scale: "llm" });
+    expect(wrapper.get('[data-testid="llm-pipeline-wizard"]').text()).toContain("监督微调 SFT");
+    expect(wrapper.text()).not.toContain("直接部署");
+
+    await wrapper.findAll("button").find((button) => button.text() === "下一步")?.trigger("click");
+    await flushPromises();
+
+    const draftPatch = apiMock.updatePipeline.mock.calls[apiMock.updatePipeline.mock.calls.length - 1]?.[1];
+    expect(draftPatch?.params_template).not.toHaveProperty("model_id");
+    expect(draftPatch?.default_environment).not.toHaveProperty("resource_pool_id");
+    expect(draftPatch?.default_environment).not.toHaveProperty("node_id");
+    expect(wrapper.text()).toContain("模型与数据");
+    expect(wrapper.text()).toContain("Hugging Face");
+    expect(wrapper.text()).toContain("ModelScope");
+    expect(wrapper.text()).not.toContain("类别数量(Class Num)");
+    expect(wrapper.text()).not.toContain("数据切分");
+    expect(replaceMock).toHaveBeenLastCalledWith({
+      path: "/model-space",
+      query: { pipeline: "pipeline-llm", step: "data" },
+    });
+  });
+
+  it("restores an LLM draft and its step from the URL", async () => {
+    routeMock.query = { pipeline: "pipeline-llm-existing", step: "data" };
+    apiMock.listPipelines.mockResolvedValueOnce({
+      items: [
+        {
+          id: "pipeline-llm-existing",
+          name: "LLM draft",
+          engine: "llamafactory",
+          task: "llm",
+          scale: "llm",
+          status: "draft",
+          params_template: {},
+          default_environment: {},
+        },
+      ],
+    });
+
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("模型与数据");
+    expect(wrapper.find('[data-testid="llm-pipeline-wizard"]').exists()).toBe(true);
   });
 
   it("reuses dataset processing visualization tabs in the training wizard", async () => {

@@ -24,6 +24,7 @@ _MAX_POLL_INTERVAL_SECONDS = 0.1
 _DEADLINE_SCHEDULER_GUARD_SECONDS = 0.01
 _SSH_HANDSHAKE_SCHEDULER_GUARD_SECONDS = 0.02
 _OPERATION_JOIN_SECONDS = 0.001
+_COMMAND_OPERATION_JOIN_SECONDS = _DEADLINE_SCHEDULER_GUARD_SECONDS * 2
 
 
 class HostKeyMismatchError(Exception):
@@ -153,6 +154,7 @@ def _run_with_deadline(
     timeout_message: str,
     on_timeout: Callable[[], None],
     scheduler_guard_seconds: float = _DEADLINE_SCHEDULER_GUARD_SECONDS,
+    cleanup_join_seconds: float = _OPERATION_JOIN_SECONDS,
 ) -> Any:
     outcome = _OperationOutcome()
     completed = threading.Event()
@@ -174,8 +176,18 @@ def _run_with_deadline(
     remaining = deadline - time.monotonic()
     wait_seconds = max(0.0, remaining - scheduler_guard_seconds)
     if remaining <= 0 or not completed.wait(wait_seconds):
-        on_timeout()
-        worker.join(_OPERATION_JOIN_SECONDS)
+        cleanup_worker = threading.Thread(
+            target=on_timeout,
+            name="visiox-ssh-bounded-cleanup",
+            daemon=True,
+        )
+        cleanup_worker.start()
+        cleanup_budget = min(cleanup_join_seconds, max(0.0, deadline - time.monotonic()))
+        if cleanup_budget > 0:
+            cleanup_worker.join(cleanup_budget)
+        worker_budget = min(cleanup_join_seconds, max(0.0, deadline - time.monotonic()))
+        if worker_budget > 0:
+            worker.join(worker_budget)
         raise timeout_error(timeout_message)
     if outcome.error is not None:
         raise outcome.error
@@ -419,6 +431,7 @@ class StrictSshSession:
         self._sftp_client_factory = sftp_client_factory
         self._state_lock = threading.Lock()
         self._closed = False
+        self._active_command_channel: Any | None = None
 
     def run(
         self,
@@ -440,17 +453,18 @@ class StrictSshSession:
                 timeout_error=SshCommandTimeoutError,
                 timeout_message="SSH command timed out",
                 on_timeout=self.close,
+                cleanup_join_seconds=_COMMAND_OPERATION_JOIN_SECONDS,
             )
         except SshSessionClosedError:
             raise
         except SshCommandOutputLimitError:
             raise
         except SshCommandTimeoutError:
-            self.close()
+            self._close_in_background()
             raise SshCommandTimeoutError("SSH command timed out") from None
         except Exception as error:
             if _is_timeout_error(error):
-                self.close()
+                self._close_in_background()
                 raise SshCommandTimeoutError("SSH command timed out") from None
             raise SshCommandError("SSH command failed") from None
 
@@ -460,11 +474,13 @@ class StrictSshSession:
             channel = self._transport.open_session(
                 timeout=_remaining(deadline, SshCommandTimeoutError, "SSH command timed out")
             )
+            self._register_command_channel(channel)
             channel.settimeout(_remaining(deadline, SshCommandTimeoutError, "SSH command timed out"))
             channel.exec_command(command)
             return self._collect_command_result(channel, deadline)
         finally:
             _close_quietly(channel)
+            self._clear_command_channel(channel)
 
     def _collect_command_result(self, channel: Any, deadline: float) -> CommandResult:
         stdout_chunks: list[bytes] = []
@@ -534,11 +550,11 @@ class StrictSshSession:
         except SshSessionClosedError:
             raise
         except SftpTransferTimeoutError:
-            self.close()
+            self._close_in_background()
             raise SftpTransferTimeoutError("SFTP upload timed out") from None
         except Exception as error:
             if _is_timeout_error(error):
-                self.close()
+                self._close_in_background()
                 raise SftpTransferTimeoutError("SFTP upload timed out") from None
             raise SftpTransferError("SFTP upload failed") from None
 
@@ -723,11 +739,11 @@ class StrictSshSession:
         except SshSessionClosedError:
             raise
         except SftpTransferTimeoutError:
-            self.close()
+            self._close_in_background()
             raise SftpTransferTimeoutError(timeout_message) from None
         except Exception as error:
             if _is_timeout_error(error):
-                self.close()
+                self._close_in_background()
                 raise SftpTransferTimeoutError(timeout_message) from None
             raise SftpTransferError(error_message) from None
 
@@ -776,11 +792,46 @@ class StrictSshSession:
             _close_quietly(channel)
 
     def close(self) -> None:
+        resources = self._claim_close_resources()
+        if resources is not None:
+            self._close_claimed_resources(resources)
+
+    def _close_in_background(self) -> None:
+        resources = self._claim_close_resources()
+        if resources is None:
+            return
+        threading.Thread(
+            target=self._close_claimed_resources,
+            args=(resources,),
+            name="visiox-ssh-session-cleanup",
+            daemon=True,
+        ).start()
+
+    def _claim_close_resources(self) -> tuple[Any | None, Any, Any] | None:
         with self._state_lock:
             if self._closed:
-                return
+                return None
             self._closed = True
-        _close_transport_and_socket(self._transport, self._opened_socket)
+            active_command_channel = self._active_command_channel
+        return active_command_channel, self._transport, self._opened_socket
+
+    @staticmethod
+    def _close_claimed_resources(resources: tuple[Any | None, Any, Any]) -> None:
+        active_command_channel, transport, opened_socket = resources
+        _close_quietly(active_command_channel)
+        _close_transport_and_socket(transport, opened_socket)
+
+    def _register_command_channel(self, channel: Any) -> None:
+        with self._state_lock:
+            if self._closed:
+                _close_quietly(channel)
+                raise SshSessionClosedError("SSH session is closed")
+            self._active_command_channel = channel
+
+    def _clear_command_channel(self, channel: Any | None) -> None:
+        with self._state_lock:
+            if self._active_command_channel is channel:
+                self._active_command_channel = None
 
     def _ensure_open(self) -> None:
         with self._state_lock:

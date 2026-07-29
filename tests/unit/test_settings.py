@@ -68,6 +68,60 @@ def test_edge_credential_master_key_requires_existing_exact_32_byte_docker_secre
         missing_settings.read_edge_credential_master_key()
 
 
+def test_auth_secrets_are_read_from_docker_secret_files(tmp_path) -> None:
+    jwt_secret_path = tmp_path / "auth-jwt-secret"
+    admin_password_path = tmp_path / "bootstrap-admin-password"
+    jwt_secret_path.write_bytes(b"j" * 32)
+    admin_password_path.write_text("  correct horse battery staple\n", encoding="utf-8")
+    settings = Settings(
+        _env_file=None,
+        auth_jwt_secret_file=jwt_secret_path,
+        bootstrap_admin_password_file=admin_password_path,
+    )
+
+    assert settings.read_auth_jwt_secret() == b"j" * 32
+    assert settings.read_bootstrap_admin_password() == "correct horse battery staple"
+
+
+def test_auth_secret_readers_reject_missing_files(tmp_path) -> None:
+    settings = Settings(
+        _env_file=None,
+        auth_jwt_secret_file=tmp_path / "missing-jwt-secret",
+        bootstrap_admin_password_file=tmp_path / "missing-admin-password",
+    )
+
+    with pytest.raises(ValueError, match="JWT secret is unavailable"):
+        settings.read_auth_jwt_secret()
+    with pytest.raises(ValueError, match="bootstrap admin password is unavailable"):
+        settings.read_bootstrap_admin_password()
+
+
+def test_auth_jwt_secret_requires_at_least_32_bytes_without_leaking_value(tmp_path) -> None:
+    secret_path = tmp_path / "auth-jwt-secret"
+    secret_path.write_bytes(b"too-short-secret")
+    settings = Settings(_env_file=None, auth_jwt_secret_file=secret_path)
+
+    with pytest.raises(ValueError, match="at least 32 bytes") as exc_info:
+        settings.read_auth_jwt_secret()
+
+    assert "too-short-secret" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("password", ["", " \t\r\n"])
+def test_bootstrap_admin_password_rejects_empty_values_without_leaking_value(
+    tmp_path,
+    password: str,
+) -> None:
+    password_path = tmp_path / "bootstrap-admin-password"
+    password_path.write_text(password, encoding="utf-8")
+    settings = Settings(_env_file=None, bootstrap_admin_password_file=password_path)
+
+    with pytest.raises(ValueError, match="bootstrap admin password is invalid") as exc_info:
+        settings.read_bootstrap_admin_password()
+
+    assert str(exc_info.value) == "bootstrap admin password is invalid"
+
+
 @pytest.mark.parametrize("max_output_bytes", [0, 4 * 1024 * 1024 + 1])
 def test_edge_ssh_max_output_bytes_rejects_values_outside_hard_bounds(
     max_output_bytes: int,

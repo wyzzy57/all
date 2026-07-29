@@ -1,5 +1,6 @@
 from collections.abc import Generator
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -11,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from visiox_api.main import create_app
+from visiox_api.dependencies.auth import get_current_user
 from visiox_api.routes.datasets import get_dataset_session
 from visiox_api.routes.label_projects import (
     get_label_project_session,
@@ -26,6 +28,10 @@ from visiox_yolo26.labelstudio.importer import normalize_label_studio_task
 from visiox_yolo26.labelstudio.templates import build_label_config
 from visiox_label_sync_worker.main import import_label_project_annotations, sync_label_project_samples
 from visiox_label_sync_worker.runner import run_pending_label_sync_tasks
+from tests.integration.ownership_test_support import install_legacy_ownership
+
+
+LEGACY_TEST_ACTOR = SimpleNamespace(id="legacy-admin", organization_id="legacy-org", role="admin")
 
 
 class FakeStreamProducer:
@@ -88,7 +94,9 @@ def session_factory(tmp_path):
     command.upgrade(config, "head")
 
     engine = create_engine(database_url)
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    install_legacy_ownership(factory)
+    return factory
 
 
 @pytest.fixture()
@@ -108,6 +116,7 @@ def client(
     stream_producer: FakeStreamProducer,
 ) -> Generator[TestClient]:
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -283,6 +292,7 @@ def test_label_project_response_uses_public_url_when_configured(
     stream_producer: FakeStreamProducer,
 ):
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -353,6 +363,26 @@ def test_sync_samples_endpoint_creates_task_and_enqueues_command(
     assert stream_producer.commands[0].task_type == TaskType.SYNC_LABEL_STUDIO_DATA
 
 
+def test_sync_samples_endpoint_rejects_user_without_dataset_edit_permission(
+    client: TestClient,
+    session_factory,
+    stream_producer: FakeStreamProducer,
+):
+    dataset_id = create_dataset_row(session_factory)
+    project = client.post(f"/datasets/{dataset_id}/label-projects").json()
+    stream_producer.commands.clear()
+    client.app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id="other-user",
+        organization_id="legacy-org",
+        role="member",
+    )
+
+    response = client.post(f"/label-projects/{project['id']}/sync-samples")
+
+    assert response.status_code == 403
+    assert stream_producer.commands == []
+
+
 def test_database_rejects_duplicate_label_project_for_dataset_provider(session_factory):
     dataset_id = create_dataset_row(session_factory)
     with session_factory() as session:
@@ -378,6 +408,7 @@ def test_database_rejects_duplicate_label_project_for_dataset_provider(session_f
 
 def test_sync_samples_endpoint_marks_task_failed_when_enqueue_fails(session_factory, label_client):
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:
@@ -479,6 +510,129 @@ def test_label_sync_runner_processes_queued_sync_tasks(session_factory, label_cl
     with session_factory() as session:
         assert session.get(Task, task_id).status == TaskStatus.SUCCESS.value
         assert session.get(LabelProject, project_id).sync_status == "synced"
+
+
+def test_worker_round_trips_llm_samples_and_marks_invalid_assistant(session_factory):
+    storage = InMemoryObjectStorageClient()
+    label_client = FakeLabelStudioClient()
+    with session_factory() as session:
+        dataset = Dataset(
+            name="llm-label-loop",
+            task="llm",
+            status="created",
+            format="openai_messages",
+            class_schema={},
+            sample_count=2,
+            source="llm_upload",
+        )
+        session.add(dataset)
+        session.flush()
+        samples = []
+        for index in (1, 2):
+            object_name = f"{dataset.id}/llm/samples/row-{index}.json"
+            storage.objects[("datasets", object_name)] = json.dumps(
+                {
+                    "source_row_id": f"row-{index}",
+                    "messages": [
+                        {"role": "user", "content": f"问题 {index}"},
+                        {"role": "assistant", "content": f"草稿 {index}"},
+                    ],
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            sample = DatasetSample(
+                dataset_id=dataset.id,
+                file_uri=f"memory://datasets/{object_name}",
+                checksum=f"llm-{index}",
+                annotation_status="unlabeled",
+            )
+            session.add(sample)
+            samples.append(sample)
+        project = LabelProject(
+            dataset_id=dataset.id,
+            provider="label_studio",
+            external_project_id="9001",
+            sync_status="pending",
+        )
+        sync_task = Task(
+            task_type=TaskType.SYNC_LABEL_STUDIO_DATA.value,
+            status=TaskStatus.QUEUED.value,
+            resource_type="label_project",
+            payload={},
+        )
+        session.add_all([project, sync_task])
+        session.commit()
+        project_id = project.id
+        dataset_id = dataset.id
+        sample_ids = [sample.id for sample in samples]
+        sync_task.payload = {"label_project_id": project_id}
+        session.add(sync_task)
+        session.commit()
+        sync_task_id = sync_task.id
+
+    with session_factory() as session:
+        sync_label_project_samples(session, label_client, sync_task_id, project_id, storage)
+
+    imported = {
+        task["data"]["source_row_id"]: task["data"]
+        for task in label_client.imported_tasks[0]["tasks"]
+    }
+    assert imported["row-1"]["user"] == "问题 1"
+    assert imported["row-1"]["assistant"] == "草稿 1"
+
+    label_client.export_payload = [
+        {
+            "data": {
+                "visiox_sample_id": sample_ids[0],
+                "source_row_id": "row-1",
+                "system": "",
+                "user": "问题 1",
+            },
+            "annotations": [
+                {"result": [{"from_name": "assistant", "value": {"text": ["最终答案"]}}]}
+            ],
+        },
+        {
+            "data": {
+                "visiox_sample_id": sample_ids[1],
+                "source_row_id": "row-2",
+                "system": "",
+                "user": "问题 2",
+            },
+            "annotations": [
+                {"result": [{"from_name": "assistant", "value": {"text": [""]}}]}
+            ],
+        },
+    ]
+    with session_factory() as session:
+        import_task = Task(
+            task_type=TaskType.IMPORT_LABEL_STUDIO_ANNOTATION.value,
+            status=TaskStatus.QUEUED.value,
+            resource_type="label_project",
+            payload={"label_project_id": project_id},
+        )
+        session.add(import_task)
+        session.commit()
+        import_task_id = import_task.id
+
+    with session_factory() as session:
+        import_label_project_annotations(session, storage, label_client, import_task_id, project_id)
+
+    with session_factory() as session:
+        first = session.get(DatasetSample, sample_ids[0])
+        second = session.get(DatasetSample, sample_ids[1])
+        valid_annotation = session.scalar(
+            select(Annotation).where(Annotation.dataset_sample_id == sample_ids[0])
+        )
+        invalid_annotation = session.scalar(
+            select(Annotation).where(Annotation.dataset_sample_id == sample_ids[1])
+        )
+        assert first.annotation_status == "labeled"
+        assert second.annotation_status == "invalid"
+        assert valid_annotation.validation_status == "valid"
+        assert valid_annotation.internal_payload["messages"][-1]["content"] == "最终答案"
+        assert invalid_annotation.validation_status == "invalid"
+        assert session.get(Dataset, dataset_id).annotation_count == 1
 
 
 def test_worker_converts_minio_sample_uri_to_public_url(

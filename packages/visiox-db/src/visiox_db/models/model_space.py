@@ -38,6 +38,10 @@ class TrainingPipeline(IdMixin, TimestampMixin, Base):
     __tablename__ = "training_pipelines"
 
     name: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    organization_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), index=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True)
+    visibility: Mapped[str] = mapped_column(String(24), nullable=False, default="private", index=True)
+    engine: Mapped[str] = mapped_column(String(40), nullable=False, default="yolo26", index=True)
     task: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     scale: Mapped[str] = mapped_column(String(8), nullable=False)
     base_model_id: Mapped[str | None] = mapped_column(ForeignKey("base_models.id"))
@@ -54,6 +58,9 @@ class TrainingJob(IdMixin, TimestampMixin, Base):
     __tablename__ = "training_jobs"
 
     pipeline_id: Mapped[str] = mapped_column(ForeignKey("training_pipelines.id"), nullable=False)
+    organization_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), index=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True)
+    visibility: Mapped[str] = mapped_column(String(24), nullable=False, default="private", index=True)
     task_id: Mapped[str | None] = mapped_column(ForeignKey("tasks.id"))
     trained_model_id: Mapped[str | None] = mapped_column(String(36))
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="pending", index=True)
@@ -90,6 +97,9 @@ class TrainedModel(IdMixin, TimestampMixin, Base):
     )
 
     pipeline_id: Mapped[str | None] = mapped_column(ForeignKey("training_pipelines.id"))
+    organization_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), index=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True)
+    visibility: Mapped[str] = mapped_column(String(24), nullable=False, default="private", index=True)
     training_job_id: Mapped[str | None] = mapped_column(ForeignKey("training_jobs.id"))
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     version: Mapped[str] = mapped_column(String(80), nullable=False)
@@ -103,6 +113,9 @@ class DeploymentService(IdMixin, TimestampMixin, Base):
     __tablename__ = "deployment_services"
 
     name: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    organization_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), index=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True)
+    visibility: Mapped[str] = mapped_column(String(24), nullable=False, default="private", index=True)
     pipeline_id: Mapped[str] = mapped_column(ForeignKey("training_pipelines.id"), nullable=False, index=True)
     trained_model_id: Mapped[str | None] = mapped_column(ForeignKey("trained_models.id"))
     model_name: Mapped[str] = mapped_column(String(160), nullable=False)
@@ -112,6 +125,10 @@ class DeploymentService(IdMixin, TimestampMixin, Base):
     instance_name: Mapped[str] = mapped_column(String(160), nullable=False, default="default")
     resource_summary: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="running", index=True)
+    desired_state: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="running", index=True
+    )
+    active_revision: Mapped[int | None] = mapped_column(Integer)
     endpoint: Mapped[str] = mapped_column(Text, nullable=False)
     calls: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
@@ -122,6 +139,7 @@ class DeploymentInstance(IdMixin, TimestampMixin, Base):
     __table_args__ = (UniqueConstraint("deployment_service_id", "node_id", "instance_name"),)
 
     deployment_service_id: Mapped[str] = mapped_column(ForeignKey("deployment_services.id"), nullable=False, index=True)
+    deployment_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     node_id: Mapped[str] = mapped_column(ForeignKey("compute_nodes.id"), nullable=False, index=True)
     instance_name: Mapped[str] = mapped_column(String(160), nullable=False)
     container_id: Mapped[str | None] = mapped_column(String(128), unique=True)

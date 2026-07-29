@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from pathlib import Path
+from types import SimpleNamespace
 
 from alembic import command
 from alembic.config import Config
@@ -10,6 +11,7 @@ from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from visiox_api.dependencies.auth import get_current_user
 from visiox_api.main import create_app
 from visiox_api.routes.pipeline_inference import (
     PipelineInferenceResult,
@@ -21,6 +23,10 @@ from visiox_api.routes.pipeline_inference import (
 )
 from visiox_db.models import BaseModel, Dataset, TrainedModel, TrainingPipeline
 from visiox_storage.client import InMemoryObjectStorageClient
+from tests.integration.ownership_test_support import install_legacy_ownership
+
+
+LEGACY_TEST_ACTOR = SimpleNamespace(id="legacy-admin", organization_id="legacy-org", role="admin")
 
 
 class FakePipelinePredictor:
@@ -49,6 +55,7 @@ def test_pipeline_predict_image_uses_selected_trained_weight_and_environment(tmp
     command.upgrade(config, "head")
     engine = create_engine(f"sqlite:///{database_path}")
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    install_legacy_ownership(session_factory)
     storage = InMemoryObjectStorageClient()
     predictor = FakePipelinePredictor()
 
@@ -107,6 +114,7 @@ def test_pipeline_predict_image_uses_selected_trained_weight_and_environment(tmp
         trained_id = trained.id
 
     app = create_app()
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
     def override_session() -> Generator[Session]:
         with session_factory() as session:

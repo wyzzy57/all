@@ -9,6 +9,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
+from visiox_api.dependencies.auth import require_admin
 from visiox_api.services.edge_bootstrap import (
     BootstrapChannelError,
     BootstrapRequestRejected,
@@ -16,6 +17,7 @@ from visiox_api.services.edge_bootstrap import (
 )
 from visiox_api.services.management_proxy import require_management_proxy
 from visiox_common.settings import Settings, get_settings
+from visiox_db.models import User
 
 
 router = APIRouter(
@@ -128,6 +130,7 @@ async def scan_host_key(
     http_request: Request,
     deadline: RequestDeadlineDependency,
     service: BootstrapServiceDependency,
+    _actor: User = Depends(require_admin),
 ) -> dict[str, Any]:
     request = await _read_request_model(
         http_request,
@@ -161,6 +164,7 @@ async def bootstrap(
     http_request: Request,
     deadline: RequestDeadlineDependency,
     service: BootstrapServiceDependency,
+    _actor: User = Depends(require_admin),
 ) -> dict[str, Any]:
     request = await _read_request_model(
         http_request,
@@ -246,25 +250,32 @@ async def _invoke_with_deadline(call: Any, deadline: float) -> dict[str, Any]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_SERVICE_BUSY_DETAIL,
         ) from None
-    future.add_done_callback(lambda _: _BACKGROUND_CAPACITY.release())
+    loop = asyncio.get_running_loop()
+    completed = asyncio.Event()
+
+    def notify_completion(_: Any) -> None:
+        _BACKGROUND_CAPACITY.release()
+        try:
+            loop.call_soon_threadsafe(completed.set)
+        except RuntimeError:
+            pass
+
+    future.add_done_callback(notify_completion)
     try:
-        return await asyncio.wait_for(
-            asyncio.wrap_future(future),
-            timeout=wait_timeout,
-        )
+        await asyncio.wait_for(completed.wait(), timeout=wait_timeout)
     except TimeoutError:
-        future.cancel()
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=_REQUEST_TIMEOUT_DETAIL,
         ) from None
+    return future.result()
 
 
 def _wait_timeout(deadline: float) -> float:
-    return max(
-        0.0,
-        _remaining(deadline) - _DEADLINE_SCHEDULER_GUARD_SECONDS,
-    )
+    remaining = _remaining(deadline)
+    if remaining <= 0.1:
+        return 0.0
+    return max(0.0, remaining - _DEADLINE_SCHEDULER_GUARD_SECONDS)
 
 
 @router.post("/{id}/test-connection", response_model=EdgeNodeOperationResponse)
@@ -272,6 +283,7 @@ async def test_connection(
     id: str,
     deadline: RequestDeadlineDependency,
     service: BootstrapServiceDependency,
+    _actor: User = Depends(require_admin),
 ) -> dict[str, Any]:
     return await _invoke_with_deadline(
         lambda: _invoke(lambda: service.test_connection(node_id=id, deadline=deadline)),
@@ -284,6 +296,7 @@ async def rotate_key(
     id: str,
     deadline: RequestDeadlineDependency,
     service: BootstrapServiceDependency,
+    _actor: User = Depends(require_admin),
 ) -> dict[str, Any]:
     return await _invoke_with_deadline(
         lambda: _invoke(lambda: service.rotate_key(node_id=id, deadline=deadline)),

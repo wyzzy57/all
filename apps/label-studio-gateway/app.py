@@ -13,6 +13,7 @@ from fastapi.responses import RedirectResponse, Response
 UPSTREAM = os.getenv("LABEL_STUDIO_UPSTREAM", "http://label-studio:8080").rstrip("/")
 USERNAME = os.getenv("LABEL_STUDIO_USERNAME", "")
 PASSWORD = os.getenv("LABEL_STUDIO_PASSWORD", "")
+VISIOX_API_INTERNAL_URL = os.getenv("VISIOX_API_INTERNAL_URL", "").rstrip("/")
 _CSRF_PATTERN = re.compile(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"')
 _HOP_HEADERS = {
     "connection",
@@ -37,8 +38,19 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/visiox-auth")
-async def automatic_login(next: str = "/") -> RedirectResponse:
+async def automatic_login(next: str = "/", launch_token: str | None = None) -> RedirectResponse:
     destination = _safe_destination(next)
+    if VISIOX_API_INTERNAL_URL:
+        if not launch_token:
+            raise HTTPException(status_code=401, detail="VisiOX launch token is required")
+        async with httpx.AsyncClient(base_url=VISIOX_API_INTERNAL_URL, timeout=10) as visiox:
+            exchange = await visiox.post(
+                "/internal/label-studio/launch/exchange",
+                json={"token": launch_token},
+            )
+        if exchange.status_code != 200:
+            raise HTTPException(status_code=401, detail="VisiOX launch token is invalid or expired")
+        destination = _safe_destination(str(exchange.json().get("destination") or "/"))
     if not USERNAME or not PASSWORD:
         raise HTTPException(status_code=503, detail="Label Studio service account is not configured")
 

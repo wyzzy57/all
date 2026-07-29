@@ -12,6 +12,10 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from visiox_api.dependencies.auth import get_current_user
+from visiox_api.dependencies.authorization import require_resource_permission
+from visiox_api.dependencies.database import get_db_session
+from visiox_api.services.authorization import authorized_resource_predicate
 from visiox_db.models import (
     BaseModel,
     DeploymentService,
@@ -23,13 +27,25 @@ from visiox_db.models import (
     TrainingJob,
     TrainingPipeline,
 )
-from visiox_db.session import get_session
+from visiox_db.models.identity import (
+    PERMISSION_DELETE,
+    PERMISSION_EDIT,
+    PERMISSION_USE,
+    PERMISSION_VIEW,
+    User,
+)
 from visiox_yolo26.training.params import (
     TrainingParamsError,
     validate_training_environment,
     validate_training_params,
 )
 from visiox_yolo26.training.prechecks import TrainingPrecheckError, validate_training_resources
+from visiox_api.services.llm_training import (
+    LlmTrainingConfigError,
+    validate_llamafactory_config,
+    validate_llm_dataset,
+    validate_llm_environment,
+)
 
 
 router = APIRouter(prefix="/pipelines", tags=["pipelines"])
@@ -37,6 +53,7 @@ router = APIRouter(prefix="/pipelines", tags=["pipelines"])
 
 class PipelineCreateRequest(PydanticBaseModel):
     name: str
+    engine: str = Field(default="yolo26", pattern=r"^(yolo26|llamafactory)$")
     task: str
     scale: str = "n"
     base_model_id: str | None = None
@@ -47,6 +64,7 @@ class PipelineCreateRequest(PydanticBaseModel):
 
 class PipelineUpdateRequest(PydanticBaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
+    engine: str | None = Field(default=None, pattern=r"^(yolo26|llamafactory)$")
     task: str | None = None
     scale: str | None = None
     base_model_id: str | None = None
@@ -63,6 +81,7 @@ class PipelineResponse(PydanticBaseModel):
 
     id: str
     name: str
+    engine: str
     task: str
     scale: str
     base_model_id: str | None
@@ -73,6 +92,9 @@ class PipelineResponse(PydanticBaseModel):
     is_public: bool
     public_scope: dict[str, Any]
     is_favorite: bool
+    organization_id: str | None
+    owner_user_id: str | None
+    visibility: str
     created_at: datetime
     updated_at: datetime
 
@@ -84,8 +106,7 @@ class PipelineListResponse(PydanticBaseModel):
     offset: int
 
 
-def get_pipeline_session() -> Generator[Session]:
-    yield from get_session()
+get_pipeline_session = get_db_session
 
 
 def _unprocessable(message: str) -> HTTPException:
@@ -97,7 +118,45 @@ def create_pipeline(
     request: PipelineCreateRequest,
     response: Response,
     session: Session = Depends(get_pipeline_session),
+    actor: User = Depends(get_current_user),
 ) -> TrainingPipeline:
+    if request.dataset_id:
+        require_resource_permission(session, actor, "dataset", request.dataset_id, PERMISSION_USE)
+    if request.engine == "llamafactory":
+        if request.task != "llm":
+            raise _unprocessable("LLaMA-Factory pipelines must use task llm")
+        if request.base_model_id is not None:
+            raise _unprocessable("LLaMA-Factory pipelines use an external model reference")
+        try:
+            params_template = validate_llamafactory_config(request.params_template)
+            default_environment = validate_llm_environment(request.default_environment)
+            if request.dataset_id:
+                validate_llm_dataset(session, request.dataset_id)
+        except LlmTrainingConfigError as exc:
+            raise _unprocessable(str(exc)) from exc
+        pipeline = TrainingPipeline(
+            name=request.name,
+            engine=request.engine,
+            task=request.task,
+            scale=request.scale,
+            dataset_id=request.dataset_id,
+            params_template=params_template,
+            default_environment=default_environment,
+            status="ready" if request.dataset_id and params_template.get("model_id") else "draft",
+            organization_id=actor.organization_id,
+            owner_user_id=actor.id,
+            visibility="private",
+        )
+        session.add(pipeline)
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Pipeline name already exists") from exc
+        session.refresh(pipeline)
+        response.status_code = status.HTTP_201_CREATED
+        return pipeline
+
     if request.dataset_id is not None and request.base_model_id is None:
         raise _unprocessable("base_model_id is required when dataset_id is provided")
     if request.base_model_id and not request.dataset_id:
@@ -127,6 +186,7 @@ def create_pipeline(
 
     pipeline = TrainingPipeline(
         name=request.name,
+        engine=request.engine,
         task=request.task,
         scale=request.scale,
         base_model_id=request.base_model_id,
@@ -134,6 +194,9 @@ def create_pipeline(
         params_template=params_template,
         default_environment=default_environment,
         status="ready" if request.base_model_id and request.dataset_id else "draft",
+        organization_id=actor.organization_id,
+        owner_user_id=actor.id,
+        visibility="private",
     )
     session.add(pipeline)
     try:
@@ -153,8 +216,13 @@ def list_pipelines(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_pipeline_session),
+    actor: User = Depends(get_current_user),
 ) -> PipelineListResponse:
-    filters = []
+    filters = [
+        authorized_resource_predicate(
+            session, actor, TrainingPipeline, "pipeline", PERMISSION_VIEW
+        )
+    ]
     if task is not None:
         filters.append(TrainingPipeline.task == task)
     if status_filter is not None:
@@ -170,10 +238,15 @@ def list_pipelines(
 
 
 @router.get("/{pipeline_id}", response_model=PipelineResponse)
-def get_pipeline(pipeline_id: str, session: Session = Depends(get_pipeline_session)) -> TrainingPipeline:
+def get_pipeline(
+    pipeline_id: str,
+    session: Session = Depends(get_pipeline_session),
+    actor: User = Depends(get_current_user),
+) -> TrainingPipeline:
     pipeline = session.get(TrainingPipeline, pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    require_resource_permission(session, actor, "pipeline", pipeline_id, PERMISSION_VIEW)
     return pipeline
 
 
@@ -182,14 +255,20 @@ def update_pipeline(
     pipeline_id: str,
     request: PipelineUpdateRequest,
     session: Session = Depends(get_pipeline_session),
+    actor: User = Depends(get_current_user),
 ) -> TrainingPipeline:
+    if request.dataset_id:
+        require_resource_permission(session, actor, "dataset", request.dataset_id, PERMISSION_USE)
     pipeline = session.get(TrainingPipeline, pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    require_resource_permission(session, actor, "pipeline", pipeline_id, PERMISSION_EDIT)
+    engine = request.engine or pipeline.engine
     touches_training_config = any(
         value is not None
         for value in (
             request.task,
+            request.engine,
             request.scale,
             request.base_model_id,
             request.dataset_id,
@@ -202,6 +281,43 @@ def update_pipeline(
 
     if request.name is not None:
         pipeline.name = request.name.strip()
+    if request.engine is not None and request.engine != pipeline.engine and pipeline.status != "draft":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Training engine can only be changed on a draft pipeline")
+    if engine == "llamafactory":
+        task = request.task or pipeline.task
+        if task != "llm":
+            raise _unprocessable("LLaMA-Factory pipelines must use task llm")
+        if request.base_model_id is not None:
+            raise _unprocessable("LLaMA-Factory pipelines use an external model reference")
+        params = request.params_template if request.params_template is not None else pipeline.params_template
+        environment = request.default_environment if request.default_environment is not None else pipeline.default_environment
+        dataset_id = request.dataset_id if "dataset_id" in request.model_fields_set else pipeline.dataset_id
+        try:
+            params = validate_llamafactory_config(params)
+            environment = validate_llm_environment(environment)
+            if dataset_id:
+                validate_llm_dataset(session, dataset_id)
+        except LlmTrainingConfigError as exc:
+            raise _unprocessable(str(exc)) from exc
+        pipeline.engine = engine
+        pipeline.task = task
+        pipeline.scale = request.scale or pipeline.scale
+        pipeline.base_model_id = None
+        pipeline.dataset_id = dataset_id
+        pipeline.params_template = params
+        pipeline.default_environment = environment
+        pipeline.status = "ready" if dataset_id and params.get("model_id") else "draft"
+        if request.is_public is not None:
+            pipeline.is_public = request.is_public
+        if request.public_scope is not None:
+            pipeline.public_scope = request.public_scope
+        if request.is_favorite is not None:
+            pipeline.is_favorite = request.is_favorite
+        session.add(pipeline)
+        session.commit()
+        session.refresh(pipeline)
+        return pipeline
+
     if request.base_model_id is not None or request.dataset_id is not None or request.task is not None or request.scale is not None:
         base_model_id = request.base_model_id or pipeline.base_model_id
         dataset_id = request.dataset_id or pipeline.dataset_id
@@ -256,10 +372,15 @@ def update_pipeline(
 
 
 @router.delete("/{pipeline_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_pipeline(pipeline_id: str, session: Session = Depends(get_pipeline_session)) -> None:
+def delete_pipeline(
+    pipeline_id: str,
+    session: Session = Depends(get_pipeline_session),
+    actor: User = Depends(get_current_user),
+) -> None:
     pipeline = session.get(TrainingPipeline, pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    require_resource_permission(session, actor, "pipeline", pipeline_id, PERMISSION_DELETE)
 
     if session.scalar(
         select(DeploymentService.id).where(DeploymentService.pipeline_id == pipeline_id).limit(1)

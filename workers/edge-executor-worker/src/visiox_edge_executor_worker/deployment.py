@@ -29,6 +29,7 @@ from visiox_storage.client import ObjectStorageClient
 
 from .crypto import EncryptedSecret
 from .inventory import InventorySnapshot
+from .log_capture import DurableLogCapture
 from .redaction import redact
 from .scripts import load_packaged_script
 from .startup import EdgeExecutorSecurityContext
@@ -39,9 +40,7 @@ ModelFormat = Literal["pt", "onnx", "engine"]
 RequestedFormat = Literal["auto", "pt", "onnx", "engine"]
 Precision = Literal["auto", "fp32", "fp16", "int8"]
 
-_IMAGE_DIGEST = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,430}@sha256:[a-f0-9]{64}\Z"
-)
+_IMAGE_DIGEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,430}@sha256:[a-f0-9]{64}\Z")
 _SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 _GPU_UUID = re.compile(r"GPU-[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z")
 _CONTAINER_ID = re.compile(r"[a-f0-9]{12,64}\Z")
@@ -284,6 +283,22 @@ class _StopResult(BaseModel):
         return value
 
 
+class _StartResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    container_id: str
+    port: int = Field(ge=1024, le=65535)
+    health_status: Literal["healthy"]
+    already_running: bool
+
+    @field_validator("container_id")
+    @classmethod
+    def _validate_container_id(cls, value: str) -> str:
+        if not _CONTAINER_ID.fullmatch(value):
+            raise ValueError("container identifier is invalid")
+        return value
+
+
 @dataclass(frozen=True)
 class _DeploymentContext:
     execution_id: str
@@ -351,10 +366,14 @@ class _DeploymentHandlerBase:
         self,
         session_factory: Callable[[], Session],
         security: EdgeExecutorSecurityContext,
+        storage: ObjectStorageClient | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._security = security
         self._script = load_packaged_script(self.script_name)
+        self._log_capture = (
+            DurableLogCapture(session_factory, storage) if storage is not None else None
+        )
 
     def _load_context(self, execution: RemoteExecution) -> _DeploymentContext:
         with self._session_factory() as session:
@@ -426,6 +445,7 @@ class _DeploymentHandlerBase:
             "starting": 70,
             "warming_up": 85,
             "stopping": 60,
+            "restarting": 70,
             "rollback_starting": 60,
             "rollback_warming_up": 85,
             "running": 100,
@@ -457,6 +477,8 @@ class _DeploymentHandlerBase:
         self,
         target: _SshTarget,
         request: Mapping[str, Any],
+        *,
+        context: _DeploymentContext | None = None,
     ) -> object:
         ssh_session = self._security.ssh_client.connect(
             host=target.host,
@@ -497,20 +519,23 @@ class _DeploymentHandlerBase:
                         timeout_seconds=_TRANSFER_TIMEOUT_SECONDS,
                     )
                 command = (
-                    f"/bin/bash {shlex.quote(script_path)} "
-                    f"{shlex.quote(request_path)}"
+                    f"/bin/bash {shlex.quote(script_path)} {shlex.quote(request_path)}"
                 )
                 result = ssh_session.run(
                     command,
                     timeout_seconds=_DEPLOYMENT_TIMEOUT_SECONDS,
                 )
                 if result.exit_status != 0:
+                    self._capture_result(
+                        context, result.stdout, result.stderr, "failed"
+                    )
                     logger.error(
                         "Remote deployment script failed with exit code %s: %s",
                         result.exit_status,
                         redact(result.stderr.decode("utf-8", errors="replace")),
                     )
                     raise RuntimeError("remote deployment script failed")
+                self._capture_result(context, result.stdout, result.stderr, "completed")
                 return json.loads(result.stdout)
             finally:
                 ssh_session.cleanup_private_directory(
@@ -520,6 +545,42 @@ class _DeploymentHandlerBase:
                 )
         finally:
             ssh_session.close()
+
+    def _capture_result(
+        self,
+        context: _DeploymentContext | None,
+        stdout: bytes,
+        stderr: bytes,
+        status: str,
+    ) -> None:
+        if (
+            context is None
+            or self._log_capture is None
+            or context.service.organization_id is None
+        ):
+            return
+        try:
+            stream_id = self._log_capture.open(
+                organization_id=context.service.organization_id,
+                resource_type="deployment_service",
+                resource_id=context.service_id,
+                source="remote_execution",
+            )
+            self._log_capture.capture_text(
+                stream_id,
+                stdout=stdout,
+                stderr=stderr,
+                timestamp=datetime.now(UTC),
+            )
+            uri = self._log_capture.close(stream_id, status=status)
+            with self._session_factory() as session:
+                execution = session.get(RemoteExecution, context.execution_id)
+                if execution is not None:
+                    execution.redacted_log_uri = uri
+                    session.add(execution)
+                    session.commit()
+        except Exception:
+            logger.exception("Durable deployment log capture failed")
 
     def _fail(
         self,
@@ -544,10 +605,18 @@ class _DeploymentHandlerBase:
             execution.error_message = self.failure_message
             if service is not None:
                 service.status = "running" if restore_healthy else "failed"
+                if restore_healthy:
+                    service.desired_state = "running"
                 session.add(service)
             if instance is not None:
                 instance.status = "running" if restore_healthy else "failed"
                 instance.health_status = "healthy" if restore_healthy else "unhealthy"
+                if (
+                    restore_healthy
+                    and service is not None
+                    and service.active_revision is not None
+                ):
+                    instance.deployment_revision = service.active_revision
                 instance.health_checked_at = now
                 session.add(instance)
             if task is not None:
@@ -577,7 +646,7 @@ class DeployInferenceHandler(_DeploymentHandlerBase):
         security: EdgeExecutorSecurityContext,
         storage: ObjectStorageClient,
     ) -> None:
-        super().__init__(session_factory, security)
+        super().__init__(session_factory, security, storage)
         self._storage = storage
 
     def execute(self, execution: RemoteExecution) -> ExecutionResult:
@@ -610,7 +679,7 @@ class DeployInferenceHandler(_DeploymentHandlerBase):
                 previous_container_id=(prior or {}).get("container_id"),
             )
             self._transition(context, "optimizing")
-            response = self._run_script(target, request)
+            response = self._run_script(target, request, context=context)
             self._transition(context, "starting")
             deployed = _DeploymentResult.model_validate(response)
             _require_deployment_matches(deployed, desired, plan)
@@ -650,6 +719,7 @@ class StopDeploymentHandler(_DeploymentHandlerBase):
             response = self._run_script(
                 target,
                 {"labels": {DeploymentLabels.INSTANCE_ID: context.instance_id}},
+                context=context,
             )
             _StopResult.model_validate(response)
             _persist_stopped(self._session_factory, context)
@@ -658,10 +728,77 @@ class StopDeploymentHandler(_DeploymentHandlerBase):
             return self._fail(
                 execution.id,
                 restore_healthy=(
-                    context is not None
-                    and _healthy_tuple(context.instance) is not None
+                    context is not None and _healthy_tuple(context.instance) is not None
                 ),
             )
+
+
+class _ResumeDeploymentHandler(_DeploymentHandlerBase):
+    script_name = "start_deployment.sh"
+    action: Literal["start", "restart"]
+    transition_phase: str
+
+    def execute(self, execution: RemoteExecution) -> ExecutionResult:
+        context: _DeploymentContext | None = None
+        try:
+            context = self._load_context(execution)
+            if (
+                context.service.active_revision is None
+                or context.instance.deployment_revision
+                != context.service.active_revision
+                or context.instance.container_id is None
+                or context.instance.port is None
+            ):
+                raise ValueError("successful deployment revision is unavailable")
+            self._transition(context, "connecting")
+            target = self._load_target(context.node_id)
+            self._transition(context, self.transition_phase)
+            response = self._run_script(
+                target,
+                {
+                    "action": self.action,
+                    "container_id": context.instance.container_id,
+                    "labels": {
+                        DeploymentLabels.INSTANCE_ID: context.instance_id,
+                    },
+                    "port": context.instance.port,
+                },
+                context=context,
+            )
+            resumed = _StartResult.model_validate(response)
+            if (
+                resumed.container_id != context.instance.container_id
+                or resumed.port != context.instance.port
+            ):
+                raise ValueError("remote deployment result did not match revision")
+            _persist_resumed(
+                self._session_factory,
+                context,
+                endpoint=_endpoint(target.host, resumed.port),
+            )
+            return ExecutionResult.succeeded(phase="running")
+        except Exception as error:
+            logger.error(
+                "Deployment %s execution %s failed: %s",
+                self.action,
+                execution.id,
+                redact(error),
+            )
+            return self._fail(execution.id, restore_healthy=False)
+
+
+class StartDeploymentHandler(_ResumeDeploymentHandler):
+    action = "start"
+    transition_phase = "starting"
+    failure_code = "EDGE_START_FAILED"
+    failure_message = "Edge deployment could not be started"
+
+
+class RestartDeploymentHandler(_ResumeDeploymentHandler):
+    action = "restart"
+    transition_phase = "restarting"
+    failure_code = "EDGE_RESTART_FAILED"
+    failure_message = "Edge deployment could not be restarted"
 
 
 class RollbackDeploymentHandler(_DeploymentHandlerBase):
@@ -687,6 +824,7 @@ class RollbackDeploymentHandler(_DeploymentHandlerBase):
                     "labels": _deployment_labels(context),
                     "target": target_tuple,
                 },
+                context=context,
             )
             rolled_back = _DeploymentResult.model_validate(response)
             _require_rollback_matches(rolled_back, target_tuple)
@@ -713,8 +851,12 @@ def build_deployment_handlers(
 ) -> dict[str, _DeploymentHandlerBase]:
     return {
         "deploy": DeployInferenceHandler(session_factory, security, storage),
-        "stop_deployment": StopDeploymentHandler(session_factory, security),
-        "rollback": RollbackDeploymentHandler(session_factory, security),
+        "stop_deployment": StopDeploymentHandler(session_factory, security, storage),
+        "start_deployment": StartDeploymentHandler(session_factory, security, storage),
+        "restart_deployment": RestartDeploymentHandler(
+            session_factory, security, storage
+        ),
+        "rollback": RollbackDeploymentHandler(session_factory, security, storage),
     }
 
 
@@ -759,9 +901,7 @@ def _deployment_labels(context: _DeploymentContext) -> dict[str, str]:
         DeploymentLabels.SERVICE_ID: context.service_id,
         DeploymentLabels.NODE_ID: context.node_id,
     }
-    if any(
-        not _LABEL_VALUE.fullmatch(value) for value in dynamic_labels.values()
-    ):
+    if any(not _LABEL_VALUE.fullmatch(value) for value in dynamic_labels.values()):
         raise ValueError("deployment label value is invalid")
     return {
         DeploymentLabels.MANAGED: "true",
@@ -866,10 +1006,7 @@ def _require_rollback_matches(
     deployed: _DeploymentResult,
     target: Mapping[str, Any],
 ) -> None:
-    if any(
-        getattr(deployed, field) != value
-        for field, value in target.items()
-    ):
+    if any(getattr(deployed, field) != value for field, value in target.items()):
         raise ValueError("remote rollback result did not match the prior tuple")
 
 
@@ -897,6 +1034,8 @@ def _persist_running(
         execution.error_code = None
         execution.error_message = None
         service.status = "running"
+        service.desired_state = "running"
+        service.active_revision = instance.deployment_revision
         service.endpoint = endpoint
         instance.container_id = deployed.container_id
         instance.image_digest = deployed.image_digest
@@ -937,6 +1076,7 @@ def _persist_stopped(
         assert task is not None
         execution.phase = "stopped"
         service.status = "stopped"
+        service.desired_state = "stopped"
         service.endpoint = "pending"
         instance.status = "stopped"
         instance.health_status = "stopped"
@@ -945,6 +1085,44 @@ def _persist_stopped(
         task.status = "SUCCESS"
         task.progress = 100
         task.stage = "stopped"
+        task.finished_at = now
+        session.add_all([execution, service, instance, task])
+        session.commit()
+
+
+def _persist_resumed(
+    session_factory: Callable[[], Session],
+    context: _DeploymentContext,
+    *,
+    endpoint: str,
+) -> None:
+    now = datetime.now(UTC)
+    with session_factory() as session:
+        execution = session.get(RemoteExecution, context.execution_id)
+        service = session.get(DeploymentService, context.service_id)
+        instance = session.get(DeploymentInstance, context.instance_id)
+        task = session.get(Task, context.task_id)
+        if not all((execution, service, instance, task)):
+            raise ValueError("deployment resources are incomplete")
+        assert execution is not None
+        assert service is not None
+        assert instance is not None
+        assert task is not None
+        execution.phase = "running"
+        execution.error_code = None
+        execution.error_message = None
+        service.status = "running"
+        service.desired_state = "running"
+        service.endpoint = endpoint
+        instance.status = "running"
+        instance.health_status = "healthy"
+        instance.health_checked_at = now
+        instance.endpoint = endpoint
+        task.status = "SUCCESS"
+        task.progress = 100
+        task.stage = "running"
+        task.error_code = None
+        task.error_message = None
         task.finished_at = now
         session.add_all([execution, service, instance, task])
         session.commit()

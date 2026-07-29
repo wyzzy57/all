@@ -117,6 +117,8 @@ def test_edge_task_types_use_identifier_only_stream_payload():
         TaskType.EDGE_PROBE,
         TaskType.EDGE_DEPLOY,
         TaskType.EDGE_STOP_DEPLOYMENT,
+        TaskType.EDGE_START_DEPLOYMENT,
+        TaskType.EDGE_RESTART_DEPLOYMENT,
         TaskType.EDGE_ROLLBACK,
         TaskType.EDGE_TRAIN,
         TaskType.EDGE_STOP_TRAINING,

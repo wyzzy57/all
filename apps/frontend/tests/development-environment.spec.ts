@@ -18,4 +18,24 @@ describe("frontend development environment", () => {
     expect(source).toContain('"/nodes": apiProxy');
     expect(source).toContain('"/resource-pools": apiProxy');
   });
+
+  it("proxies LLM model resolution APIs in local development", () => {
+    const source = readFileSync(resolve(process.cwd(), "vite.config.ts"), "utf8");
+
+    expect(source).toContain('"/llm": apiProxy');
+  });
+
+  it("proxies identity and account APIs in local development", () => {
+    const source = readFileSync(resolve(process.cwd(), "vite.config.ts"), "utf8");
+
+    expect(source).toContain('"/auth": apiProxy');
+    expect(source).toContain('"/account": apiProxy');
+    expect(source).toContain('"/admin": apiProxy');
+  });
+
+  it("proxies workbench statistics APIs in local development", () => {
+    const source = readFileSync(resolve(process.cwd(), "vite.config.ts"), "utf8");
+
+    expect(source).toContain('"/statistics": apiProxy');
+  });
 });

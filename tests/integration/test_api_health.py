@@ -4,7 +4,7 @@ from visiox_common.settings import get_settings
 from visiox_api.main import create_app
 
 
-def test_health_returns_service_status_and_dependency_configuration(monkeypatch, tmp_path):
+def test_health_returns_service_status_without_dependency_secrets(monkeypatch, tmp_path):
     get_settings.cache_clear()
     try:
         management_proxy_token_file = tmp_path / "management-proxy-auth-token"
@@ -29,12 +29,15 @@ def test_health_returns_service_status_and_dependency_configuration(monkeypatch,
             "status": "ok",
             "environment": "test",
             "dependencies": {
-                "postgres": "postgresql+psycopg://visiox:visiox@postgres:5432/visiox",
-                "redis": "redis://redis:6379/0",
-                "minio": "minio:9000",
-                "registry": "registry:5000",
-                "label_studio": "http://label-studio:8080",
+                "postgres": "configured",
+                "redis": "configured",
+                "minio": "configured",
+                "registry": "configured",
+                "label_studio": "configured",
             },
         }
+        serialized = response.text.lower()
+        assert "visiox:visiox" not in serialized
+        assert "postgresql+psycopg" not in serialized
     finally:
         get_settings.cache_clear()

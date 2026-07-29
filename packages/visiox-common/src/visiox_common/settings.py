@@ -15,6 +15,16 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="VISIOX_", env_file=".env", extra="ignore")
 
     environment: str = Field(default="local", validation_alias="VISIOX_ENV")
+    auth_jwt_secret_file: Path = Path("/run/secrets/visiox-auth-jwt-secret")
+    auth_access_token_minutes: int = Field(default=15, ge=5, le=60)
+    auth_refresh_token_days: int = Field(default=7, ge=1, le=30)
+    auth_refresh_cookie_name: str = "visiox_refresh"
+    auth_cookie_secure: bool = True
+    bootstrap_admin_username: str = "admin"
+    bootstrap_admin_email: str = "admin@localhost"
+    bootstrap_admin_password_file: Path = Path(
+        "/run/secrets/visiox-bootstrap-admin-password"
+    )
     postgres_dsn: str = "postgresql+psycopg://visiox:visiox@postgres:5432/visiox"
     redis_url: str = "redis://redis:6379/0"
     minio_endpoint: str = "minio:9000"
@@ -33,12 +43,15 @@ class Settings(BaseSettings):
     label_studio_public_url: str | None = None
     label_studio_token: str = ""
     label_studio_sync_stream: str = "stream:label_sync.commands"
+    label_studio_webhook_secret: str = ""
+    label_studio_reconcile_seconds: int = Field(default=300, ge=30, le=86400)
     seed_base_models_on_startup: bool = False
     mlflow_tracking_uri: str = "http://mlflow:5000"
     mlflow_public_url: str = "http://127.0.0.1:5001"
     tensorboard_public_url: str = "http://127.0.0.1:6006"
     tensorboard_histogram_interval: int = 5
     training_runs_root: Path = Path("/workspace/training-runs")
+    llm_training_image_digest: str = ""
     observability_max_points: int = 2000
     observability_event_cache_size: int = 32
     observability_live_poll_seconds: int = 5
@@ -66,6 +79,24 @@ class Settings(BaseSettings):
     @property
     def is_local_environment(self) -> bool:
         return self.environment == "local"
+
+    def read_auth_jwt_secret(self) -> bytes:
+        try:
+            secret = self.auth_jwt_secret_file.read_bytes()
+        except OSError as error:
+            raise ValueError("authentication JWT secret is unavailable") from error
+        if len(secret) < 32:
+            raise ValueError("authentication JWT secret must contain at least 32 bytes")
+        return secret
+
+    def read_bootstrap_admin_password(self) -> str:
+        try:
+            password = self.bootstrap_admin_password_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as error:
+            raise ValueError("bootstrap admin password is unavailable or invalid") from error
+        if not password:
+            raise ValueError("bootstrap admin password is invalid")
+        return password
 
     def read_management_proxy_auth_token(self) -> str:
         if self.is_local_environment:

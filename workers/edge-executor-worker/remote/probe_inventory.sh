@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import time
 
 
 def read_text(path):
@@ -58,6 +60,33 @@ def memory_total_kib():
     return None
 
 
+def memory_available_kib():
+    for line in (read_text("/proc/meminfo") or "").splitlines():
+        match = re.fullmatch(r"MemAvailable:\s+(\d+)\s+kB", line)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def cpu_utilization_percent():
+    def sample():
+        fields = (read_text("/proc/stat") or "").splitlines()[0].split()[1:]
+        values = [int(value) for value in fields]
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        return sum(values), idle
+
+    try:
+        total_a, idle_a = sample()
+        time.sleep(0.1)
+        total_b, idle_b = sample()
+        total_delta = total_b - total_a
+        if not total_delta:
+            return 0.0
+        return round(100.0 * (1.0 - (idle_b - idle_a) / total_delta), 2)
+    except (IndexError, ValueError, OSError):
+        return None
+
+
 def docker_inventory():
     version = run(["docker", "version", "--format", "{{.Server.Version}}"])
     runtime_json = run(["docker", "info", "--format", "{{json .Runtimes}}"])
@@ -82,25 +111,35 @@ def nvidia_inventory():
     summary = run(["nvidia-smi"])
     query = run([
         "nvidia-smi",
-        "--query-gpu=name,uuid,memory.total,compute_cap,driver_version",
+        "--query-gpu=name,uuid,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,compute_cap,driver_version",
         "--format=csv,noheader,nounits",
     ])
     gpus = []
     driver_version = None
     for line in (query or "").splitlines():
         fields = [field.strip() for field in line.split(",")]
-        if len(fields) != 5:
+        if len(fields) != 9:
             continue
         try:
             memory_mib = int(fields[2])
         except ValueError:
             memory_mib = None
-        driver_version = driver_version or fields[4]
+        def number(value):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+
+        driver_version = driver_version or fields[8]
         gpus.append({
             "name": fields[0],
             "uuid": fields[1],
             "memory_total_mib": memory_mib,
-            "compute_capability": fields[3],
+            "memory_used_mib": int(number(fields[3])) if number(fields[3]) is not None else None,
+            "utilization_percent": number(fields[4]),
+            "temperature_celsius": number(fields[5]),
+            "power_draw_watts": number(fields[6]),
+            "compute_capability": fields[7],
         })
     cuda_match = re.search(r"CUDA Version:\s*([0-9.]+)", summary or "")
     return {
@@ -162,8 +201,18 @@ inventory = {
         "architecture": run(["uname", "-m"]),
         "kernel_release": run(["uname", "-r"]),
     },
-    "cpu": {"logical_cores": os.cpu_count()},
-    "memory": {"total_kib": memory_total_kib()},
+    "cpu": {
+        "logical_cores": os.cpu_count(),
+        "utilization_percent": cpu_utilization_percent(),
+    },
+    "memory": {
+        "total_kib": memory_total_kib(),
+        "available_kib": memory_available_kib(),
+    },
+    "disk": {
+        "total_bytes": shutil.disk_usage("/").total,
+        "available_bytes": shutil.disk_usage("/").free,
+    },
     "docker": docker_inventory(),
     "nvidia": nvidia_inventory(),
     "cuda": cuda_inventory(),

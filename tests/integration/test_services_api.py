@@ -7,6 +7,7 @@ from hashlib import sha256
 from io import BytesIO
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from alembic import command
@@ -22,6 +23,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from visiox_api.routes import services as services_route
+from visiox_api.dependencies.auth import get_current_user
 from visiox_api.routes.pipeline_inference import PipelinePredictResponse
 from visiox_api.routes.services import (
     get_service_session,
@@ -39,14 +41,20 @@ from visiox_db.models import (
     Task,
     TrainedModel,
     TrainingPipeline,
+    Organization,
+    User,
 )
 from visiox_edge_executor_worker.inventory import compatibility_policy, parse_inventory
 from visiox_storage.client import InMemoryObjectStorageClient
+from tests.integration.ownership_test_support import install_legacy_ownership
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "edge_inventory"
 MODEL_CHECKSUM = "a" * 64
 IMAGE_DIGEST = "registry.internal/visiox/yolo26-inference@sha256:" + "b" * 64
+LEGACY_TEST_ACTOR = SimpleNamespace(
+    id="legacy-admin", organization_id="legacy-org", role="admin"
+)
 
 
 class FakeEdgeProducer:
@@ -73,13 +81,30 @@ def service_runtime(tmp_path):
 
     engine = create_engine(database_url)
     factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    install_legacy_ownership(factory)
     inventory = parse_inventory(
         json.loads((FIXTURES / "x86.json").read_text(encoding="utf-8"))
     )
     with factory() as session:
+        session.add(Organization(id="legacy-org", name="Legacy", slug="legacy"))
+        session.add(
+            User(
+                id="legacy-admin",
+                organization_id="legacy-org",
+                username="legacy-admin",
+                display_name="Legacy Admin",
+                email="legacy-admin@example.test",
+                password_hash="test",
+                role="admin",
+                status="active",
+                must_change_password=False,
+            )
+        )
         pool = ResourcePool(
             id="pool-x86",
             name="x86-production",
+            organization_id="legacy-org",
+            owner_user_id="legacy-admin",
             kind=inventory.platform_kind,
             selector=compatibility_policy(inventory),
             compatibility_policy=compatibility_policy(inventory),
@@ -88,6 +113,8 @@ def service_runtime(tmp_path):
         pipeline = TrainingPipeline(
             id="pipeline-1",
             name="pepper-detect",
+            organization_id="legacy-org",
+            owner_user_id="legacy-admin",
             task="detect",
             scale="n",
             params_template={},
@@ -97,6 +124,8 @@ def service_runtime(tmp_path):
         model = TrainedModel(
             id="model-1",
             pipeline_id=pipeline.id,
+            organization_id="legacy-org",
+            owner_user_id="legacy-admin",
             name="best.pt",
             version="best.pt",
             task="detect",
@@ -119,6 +148,8 @@ def service_runtime(tmp_path):
         node = ComputeNode(
             id="node-1",
             name="gpu-node-1",
+            organization_id="legacy-org",
+            owner_user_id="legacy-admin",
             resource_pool_id=pool.id,
             status="online",
             architecture=inventory.architecture,
@@ -146,6 +177,7 @@ def service_runtime(tmp_path):
 
     app.dependency_overrides[get_service_session] = override_session
     app.dependency_overrides[get_service_stream_producer] = lambda: producer
+    app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
     return app, factory, producer
 
 
@@ -245,7 +277,9 @@ def test_running_service_inference_uses_deployed_endpoint(
             latency_ms=12.5,
         )
 
-    monkeypatch.setattr(services_route, "_request_deployed_prediction", fake_remote_prediction)
+    monkeypatch.setattr(
+        services_route, "_request_deployed_prediction", fake_remote_prediction
+    )
     with TestClient(app) as client:
         response = client.post(
             f"/services/{service_id}/predict/image",
@@ -324,9 +358,9 @@ def test_deployed_prediction_adapter_returns_annotated_image(service_runtime) ->
     assert result.environment == "RTX 4090"
     encoded_image = result.result_image.split(",", 1)[1]
     with Image.open(BytesIO(base64.b64decode(encoded_image))) as annotated:
-        assert annotated.convert("RGB").getpixel((5, 32)) != annotated.convert("RGB").getpixel(
-            (35, 32)
-        )
+        assert annotated.convert("RGB").getpixel((5, 32)) != annotated.convert(
+            "RGB"
+        ).getpixel((35, 32))
 
 
 def test_create_service_resolves_system_image_and_trained_checksum(
@@ -458,6 +492,61 @@ def test_stop_service_creates_real_stop_execution_and_dedicated_command(
             "remote_execution_id": body["remote_execution_id"],
         }
     ]
+
+
+def test_stopped_service_can_start_and_running_service_can_restart(
+    service_runtime,
+) -> None:
+    app, factory, producer = service_runtime
+    with TestClient(app) as client:
+        created = client.post("/services", json=_request()).json()
+        with factory() as session:
+            service = session.get(DeploymentService, created["id"])
+            instance = session.get(DeploymentInstance, created["instance_id"])
+            assert service is not None and instance is not None
+            service.status = "stopped"
+            service.desired_state = "stopped"
+            service.active_revision = 1
+            instance.status = "stopped"
+            instance.health_status = "stopped"
+            instance.deployment_revision = 1
+            instance.container_id = "a" * 64
+            session.commit()
+
+        producer.enqueued.clear()
+        started = client.post(f"/services/{created['id']}/start")
+        assert started.status_code == 202
+        assert started.json()["status"] == "starting"
+        assert started.json()["desired_state"] == "running"
+        assert started.json()["active_revision"] == 1
+        assert producer.enqueued[-1]["task_type"] == TaskType.EDGE_START_DEPLOYMENT
+
+        with factory() as session:
+            service = session.get(DeploymentService, created["id"])
+            instance = session.get(DeploymentInstance, created["instance_id"])
+            assert service is not None and instance is not None
+            service.status = "running"
+            instance.status = "running"
+            instance.health_status = "healthy"
+            session.commit()
+
+        restarted = client.post(f"/services/{created['id']}/restart")
+
+    assert restarted.status_code == 202
+    assert restarted.json()["status"] == "restarting"
+    assert producer.enqueued[-1]["task_type"] == TaskType.EDGE_RESTART_DEPLOYMENT
+
+
+def test_start_service_requires_a_successful_deployment_revision(
+    service_runtime,
+) -> None:
+    app, _factory, _producer = service_runtime
+    with TestClient(app) as client:
+        created = client.post("/services", json=_request()).json()
+        response = client.post(f"/services/{created['id']}/start")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "No successful deployment revision is available"
 
 
 def test_stop_service_without_instance_converges_and_can_be_deleted(
@@ -612,7 +701,7 @@ def test_rollback_without_prior_healthy_tuple_is_rejected(service_runtime) -> No
     [
         ({"image_digest": "registry/image:latest"}, "immutable"),
         ({"precision": "int8"}, "calibration"),
-        ({"node_id": "node-missing"}, "Node not found"),
+        ({"node_id": "node-missing"}, "Resource not found"),
     ],
 )
 def test_create_service_rejects_invalid_production_request(
@@ -629,7 +718,9 @@ def test_create_service_rejects_invalid_production_request(
     assert producer.enqueued == []
 
 
-def test_service_deployment_rejects_model_from_another_pipeline(service_runtime) -> None:
+def test_service_deployment_rejects_model_from_another_pipeline(
+    service_runtime,
+) -> None:
     app, factory, producer = service_runtime
     with factory() as session:
         session.add_all(

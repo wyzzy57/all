@@ -2,14 +2,22 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from datetime import datetime
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from visiox_api.services.training_observability import TrainingObservabilityService
-from visiox_db.models import Task, TrainingJob, TrainingPipeline
+from visiox_api.dependencies.auth import get_current_user
+from visiox_api.dependencies.authorization import require_resource_permission
+from visiox_db.models import Task, TrainingJob, TrainingPipeline, User
+from visiox_db.models.identity import PERMISSION_VIEW
+from visiox_storage.client import ObjectStorageClient
 from visiox_db.session import get_session
 
 
@@ -74,6 +82,7 @@ class HistogramResponse(BaseModel):
 
 class SummaryResponse(BaseModel):
     job_id: str
+    engine: str
     pipeline_id: str
     pipeline_name: str
     status: str
@@ -88,6 +97,33 @@ class SummaryResponse(BaseModel):
     availability: AvailabilityResponse
 
 
+class AnalysisFindingResponse(BaseModel):
+    code: str
+    severity: str
+    title: str
+    message: str
+    metric_names: list[str]
+    step_range: list[float] | None
+    observed_values: dict[str, float | None]
+
+
+class AnalysisResponse(BaseModel):
+    findings: list[AnalysisFindingResponse]
+    availability: AvailabilityResponse
+
+
+class ObservabilityArtifactResponse(BaseModel):
+    path: str
+    size_bytes: int
+    sha256: str
+    download_url: str
+
+
+class ObservabilityArtifactsResponse(BaseModel):
+    items: list[ObservabilityArtifactResponse]
+    availability: AvailabilityResponse
+
+
 def get_training_observability_session() -> Generator[Session]:
     yield from get_session()
 
@@ -96,10 +132,30 @@ def get_training_observability_service(request: Request) -> TrainingObservabilit
     return request.app.state.training_observability_service
 
 
-def _get_training_job(session: Session, training_job_id: str) -> TrainingJob:
+def get_training_observability_storage(request: Request) -> ObjectStorageClient:
+    storage = getattr(request.app.state, "object_storage", None)
+    if storage is None:
+        raise RuntimeError("Object storage is not configured")
+    return storage
+
+
+def _parse_minio_uri(uri: object) -> tuple[str, str] | None:
+    if not isinstance(uri, str) or not uri.startswith("minio://"):
+        return None
+    location = uri.removeprefix("minio://")
+    if "/" not in location:
+        return None
+    bucket, object_name = location.split("/", 1)
+    if not bucket or not object_name:
+        return None
+    return bucket, object_name
+
+
+def _get_training_job(session: Session, actor: User, training_job_id: str) -> TrainingJob:
     job = session.get(TrainingJob, training_job_id)
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found")
+    require_resource_permission(session, actor, "training_job", job.id, PERMISSION_VIEW)
     return job
 
 
@@ -139,14 +195,15 @@ def _serialize_datetime(value: datetime) -> str:
 def get_training_observability_summary(
     training_job_id: str,
     session: Session = Depends(get_training_observability_session),
+    actor: User = Depends(get_current_user),
     service: TrainingObservabilityService = Depends(get_training_observability_service),
 ) -> SummaryResponse:
-    job = _get_training_job(session, training_job_id)
+    job = _get_training_job(session, actor, training_job_id)
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
     task = session.get(Task, job.task_id) if job.task_id else None
-    summary = service.get_summary(job, pipeline, task)
+    summary = service.for_engine(pipeline.engine).summary(job, pipeline, task)
     pipeline_data = summary.get("pipeline") if isinstance(summary.get("pipeline"), dict) else {}
     summary_timing = summary.get("timing") if isinstance(summary.get("timing"), dict) else {}
     timing = {**_default_timing(job), **summary_timing}
@@ -154,6 +211,7 @@ def get_training_observability_summary(
     summary_metrics = summary.get("latest_metrics") if isinstance(summary.get("latest_metrics"), dict) else {}
     return SummaryResponse(
         job_id=str(summary.get("job_id", job.id)),
+        engine=str(summary.get("engine", pipeline.engine)),
         pipeline_id=str(pipeline_data.get("id", job.pipeline_id)),
         pipeline_name=str(pipeline_data.get("name", getattr(pipeline, "name", job.pipeline_id))),
         status=str(summary.get("status", job.status)),
@@ -179,13 +237,19 @@ def get_training_observability_scalars(
     end_step: int | None = Query(default=None, ge=0),
     max_points: int | None = Query(default=None, ge=10, le=10_000),
     session: Session = Depends(get_training_observability_session),
+    actor: User = Depends(get_current_user),
     service: TrainingObservabilityService = Depends(get_training_observability_service),
 ) -> ScalarsResponse:
-    job = _get_training_job(session, training_job_id)
+    job = _get_training_job(session, actor, training_job_id)
+    pipeline = session.get(TrainingPipeline, job.pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
     scalar_keys = _parse_scalar_keys(keys)
     if not scalar_keys:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="At least one scalar key is required")
-    return ScalarsResponse.model_validate(service.get_scalars(job, scalar_keys, start_step, end_step, max_points))
+    return ScalarsResponse.model_validate(
+        service.for_engine(pipeline.engine).scalars(job, scalar_keys, start_step, end_step, max_points)
+    )
 
 
 @router.get("/resources", response_model=ResourcesResponse)
@@ -195,19 +259,26 @@ def get_training_observability_resources(
     end_step: int | None = Query(default=None, ge=0),
     max_points: int | None = Query(default=None, ge=10, le=10_000),
     session: Session = Depends(get_training_observability_session),
+    actor: User = Depends(get_current_user),
     service: TrainingObservabilityService = Depends(get_training_observability_service),
 ) -> ResourcesResponse:
-    job = _get_training_job(session, training_job_id)
-    return ResourcesResponse.model_validate(service.get_resources(job, start_step, end_step, max_points))
+    job = _get_training_job(session, actor, training_job_id)
+    pipeline = session.get(TrainingPipeline, job.pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    return ResourcesResponse.model_validate(
+        service.for_engine(pipeline.engine).resources(job, start_step, end_step, max_points)
+    )
 
 
 @router.get("/graph", response_model=GraphResponse)
 def get_training_observability_graph(
     training_job_id: str,
     session: Session = Depends(get_training_observability_session),
+    actor: User = Depends(get_current_user),
     service: TrainingObservabilityService = Depends(get_training_observability_service),
 ) -> GraphResponse:
-    job = _get_training_job(session, training_job_id)
+    job = _get_training_job(session, actor, training_job_id)
     return GraphResponse.model_validate(service.get_graph(job))
 
 
@@ -218,7 +289,71 @@ def get_training_observability_histogram(
     tag: str = Query(min_length=1),
     step: int = Query(ge=0),
     session: Session = Depends(get_training_observability_session),
+    actor: User = Depends(get_current_user),
     service: TrainingObservabilityService = Depends(get_training_observability_service),
 ) -> HistogramResponse:
-    job = _get_training_job(session, training_job_id)
+    job = _get_training_job(session, actor, training_job_id)
     return HistogramResponse.model_validate(service.get_histogram(job, kind, tag, step))
+
+
+@router.get("/analysis", response_model=AnalysisResponse)
+def get_training_observability_analysis(
+    training_job_id: str,
+    session: Session = Depends(get_training_observability_session),
+    actor: User = Depends(get_current_user),
+    service: TrainingObservabilityService = Depends(get_training_observability_service),
+) -> AnalysisResponse:
+    job = _get_training_job(session, actor, training_job_id)
+    pipeline = session.get(TrainingPipeline, job.pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    return AnalysisResponse.model_validate(service.for_engine(pipeline.engine).analysis(job))
+
+
+@router.get("/artifacts", response_model=ObservabilityArtifactsResponse)
+def get_training_observability_artifacts(
+    training_job_id: str,
+    session: Session = Depends(get_training_observability_session),
+    actor: User = Depends(get_current_user),
+    service: TrainingObservabilityService = Depends(get_training_observability_service),
+) -> ObservabilityArtifactsResponse:
+    job = _get_training_job(session, actor, training_job_id)
+    pipeline = session.get(TrainingPipeline, job.pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    return ObservabilityArtifactsResponse.model_validate(service.for_engine(pipeline.engine).artifacts(job))
+
+
+@router.get("/artifacts/{artifact_path:path}")
+def download_training_observability_artifact(
+    training_job_id: str,
+    artifact_path: str,
+    session: Session = Depends(get_training_observability_session),
+    actor: User = Depends(get_current_user),
+    service: TrainingObservabilityService = Depends(get_training_observability_service),
+    storage: ObjectStorageClient = Depends(get_training_observability_storage),
+) -> FileResponse:
+    job = _get_training_job(session, actor, training_job_id)
+    pipeline = session.get(TrainingPipeline, job.pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    listed = service.for_engine(pipeline.engine).artifacts(job)
+    if artifact_path not in {item.get("path") for item in listed.get("items", [])}:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found")
+    name = Path(artifact_path).name
+    metrics = job.metrics if isinstance(job.metrics, dict) else {}
+    artifact_uris = metrics.get("artifacts") if isinstance(metrics.get("artifacts"), dict) else {}
+    uri = metrics.get("adapter") if name == "adapter_model.safetensors" else artifact_uris.get(name)
+    location = _parse_minio_uri(uri)
+    if location is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found")
+    bucket, object_name = location
+    with NamedTemporaryFile(delete=False, suffix=f"-{name}") as temporary:
+        destination = Path(temporary.name)
+    storage.get_file(bucket, object_name, destination)
+    return FileResponse(
+        destination,
+        filename=name,
+        media_type="application/octet-stream",
+        background=BackgroundTask(destination.unlink, missing_ok=True),
+    )

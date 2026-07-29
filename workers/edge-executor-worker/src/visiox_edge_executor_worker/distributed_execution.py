@@ -30,6 +30,7 @@ from visiox_yolo26.converters import export_yolo26_dataset
 from visiox_yolo26.training.commands import build_train_command
 
 from .deployment import _DeploymentHandlerBase, validate_image_digest
+from .log_capture import DurableLogCapture
 from .startup import EdgeExecutorSecurityContext
 from .state import ExecutionResult
 
@@ -101,6 +102,13 @@ class _InspectResult(BaseModel):
     exit_code: int
 
 
+class _ContainerLogs(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stdout: str
+    stderr: str
+
+
 class _CollectedArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -137,39 +145,56 @@ class DistributedTrainingHandler:
     ) -> None:
         self._session_factory = session_factory
         self._storage = storage
+        self._log_capture = DurableLogCapture(session_factory, storage)
         self._stage = _ScriptRunner("stage_training.sh", session_factory, security)
         self._launch = _ScriptRunner("launch_rank.sh", session_factory, security)
         self._stop = _ScriptRunner("stop_training.sh", session_factory, security)
 
     def execute(self, execution: RemoteExecution) -> ExecutionResult:
         launched: list[tuple[str, int]] = []
+        log_stream_id: str | None = None
+        log_job_id: str | None = None
         try:
             if self._converge_existing_success(execution.id):
                 return ExecutionResult.succeeded(phase="succeeded")
             context = self._load(execution)
             run, job, task, pipeline, base_model, dataset = context
+            log_job_id = job.id
+            log_stream_id = self._ensure_log_stream(job, pipeline)
             ranks = tuple(_Rank.model_validate(item) for item in run.ranks)
             if not ranks or {rank.node_id for rank in ranks} != set(run.node_ids):
                 raise ValueError("distributed rank plan is incomplete")
             self._transition(execution.id, "staging", 20)
-            artifacts = self._prepare_artifacts(run, base_model, dataset)
+            artifacts = self._prepare_artifacts(
+                run, job, task, pipeline, base_model, dataset
+            )
             staged: dict[str, _StageResult] = {}
             for rank in ranks:
                 target = self._stage._load_target(rank.node_id)
                 response = self._stage._run_script(
                     target,
-                    _staging_request(run, artifacts),
+                    _staging_request(run, pipeline.engine, artifacts),
                 )
                 staged[rank.node_id] = _StageResult.model_validate(response)
 
             self._transition(execution.id, "launching", 55)
-            arguments = _training_arguments(job, task)
+            arguments = _training_arguments(job, task, pipeline.engine)
             for rank in ranks:
                 stage = staged[rank.node_id]
                 target = self._launch._load_target(rank.node_id)
                 response = self._launch._run_script(
                     target,
-                    _launch_request(run, rank, ranks, stage, arguments),
+                    _launch_request(
+                        run,
+                        rank,
+                        ranks,
+                        stage,
+                        arguments,
+                        pipeline.engine,
+                        model_source=_llm_model_source(task)
+                        if pipeline.engine == "llamafactory"
+                        else None,
+                    ),
                 )
                 launched_rank = _LaunchResult.model_validate(response)
                 if launched_rank.node_rank != rank.node_rank:
@@ -184,25 +209,35 @@ class DistributedTrainingHandler:
                     ranks, self._container_ids(run.id), strict=True
                 )
             )
-            if not self._wait_for_completion(execution.id, containers, staged):
+            if not self._wait_for_completion(
+                execution.id,
+                containers,
+                staged,
+                log_stream_id=log_stream_id,
+            ):
                 if self._cancel_requested(execution.id):
+                    self._close_log_stream(log_stream_id, "cancelled", log_job_id)
                     return ExecutionResult.succeeded(phase="canceled")
                 self._stop_peers(execution, launched)
                 self._try_collect_checkpoint(run, ranks[0], staged[ranks[0].node_id])
                 self._mark_failed(execution.id)
+                self._close_log_stream(log_stream_id, "failed", log_job_id)
                 return ExecutionResult.failed(
                     error_code="EDGE_TRAIN_FAILED",
                     error_message="Distributed edge training failed",
                     phase="failed",
                 )
             collected = self._collect_rank_zero(
-                run, job, ranks[0], staged[ranks[0].node_id]
+                run, job, pipeline, ranks[0], staged[ranks[0].node_id]
             )
+            self._cache_final_observability(job.id, collected)
             self._mark_succeeded(execution.id, collected)
+            self._close_log_stream(log_stream_id, "completed", log_job_id)
             return ExecutionResult.succeeded(phase="succeeded")
         except Exception:
             self._stop_peers(execution, launched)
             self._mark_failed(execution.id)
+            self._close_log_stream(log_stream_id, "failed", log_job_id)
             return ExecutionResult.failed(
                 error_code="EDGE_TRAIN_FAILED",
                 error_message="Distributed edge training failed",
@@ -225,6 +260,12 @@ class DistributedTrainingHandler:
                 job.metrics if job is not None and isinstance(job.metrics, dict) else {}
             )
             weights = metrics.get("weights") if isinstance(metrics, dict) else None
+            engine_artifacts_ok = (
+                bool(metrics.get("adapter"))
+                if pipeline is not None and pipeline.engine == "llamafactory"
+                else isinstance(weights, dict)
+                and {"best.pt", "last.pt"}.issubset(weights)
+            )
             completed = bool(
                 execution
                 and run
@@ -233,8 +274,7 @@ class DistributedTrainingHandler:
                 and pipeline
                 and job.finished_at
                 and job.trained_model_id
-                and isinstance(weights, dict)
-                and {"best.pt", "last.pt"}.issubset(weights)
+                and engine_artifacts_ok
             )
             if not completed:
                 return False
@@ -271,21 +311,32 @@ class DistributedTrainingHandler:
             job = session.get(TrainingJob, current.training_job_id)
             task = session.get(Task, current.task_id)
             pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
-            base_model = session.get(
-                StoredBaseModel, pipeline.base_model_id if pipeline else None
+            base_model = (
+                session.get(StoredBaseModel, pipeline.base_model_id)
+                if pipeline and pipeline.base_model_id
+                else None
             )
             dataset = session.get(Dataset, pipeline.dataset_id if pipeline else None)
-            if not all((run, job, task, pipeline, base_model, dataset)):
+            if not all((run, job, task, pipeline, dataset)):
                 raise ValueError("distributed training resources are incomplete")
+            if pipeline.engine == "yolo26" and base_model is None:
+                raise ValueError("distributed YOLO training model is incomplete")
             session.expunge_all()
             return run, job, task, pipeline, base_model, dataset
 
     def _prepare_artifacts(
         self,
         run: DistributedTrainingRun,
-        base_model: StoredBaseModel,
+        job: TrainingJob,
+        task: Task,
+        pipeline: TrainingPipeline,
+        base_model: StoredBaseModel | None,
         dataset: Dataset,
     ) -> list[dict[str, str]]:
+        if pipeline.engine == "llamafactory":
+            return self._prepare_llm_artifacts(run, job, task, dataset)
+        if base_model is None:
+            raise ValueError("base model is unavailable")
         checksum = (base_model.checksum or "").lower()
         if len(checksum) != 64 or any(
             char not in "0123456789abcdef" for char in checksum
@@ -341,6 +392,96 @@ class DistributedTrainingHandler:
             )
         return artifacts
 
+    def _prepare_llm_artifacts(
+        self,
+        run: DistributedTrainingRun,
+        job: TrainingJob,
+        task: Task,
+        dataset: Dataset,
+    ) -> list[dict[str, str]]:
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        manifest_checksum = str(payload.get("dataset_manifest_checksum") or "").lower()
+        if len(manifest_checksum) != 64 or any(
+            char not in "0123456789abcdef" for char in manifest_checksum
+        ):
+            raise ValueError("LLM dataset manifest checksum is unavailable")
+        if not dataset.storage_uri:
+            raise ValueError("LLM dataset artifact is unavailable")
+        with TemporaryDirectory(prefix="visiox-llm-distributed-") as temporary:
+            root = Path(temporary)
+            dataset_dir = root / "dataset"
+            dataset_dir.mkdir(parents=True)
+            train_path = dataset_dir / "train.jsonl"
+            self._download_storage_uri(dataset.storage_uri, train_path)
+            if _sha256(train_path) != manifest_checksum:
+                raise ValueError("LLM dataset manifest checksum did not match")
+            config = _llamafactory_config(job, task, dataset)
+            (dataset_dir / "train.yaml").write_text(
+                yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
+            )
+            (dataset_dir / "dataset_info.json").write_text(
+                json.dumps(
+                    {"visiox_train": _llamafactory_dataset_info(dataset)},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            model_reference = payload.get("model_reference")
+            if not isinstance(model_reference, Mapping):
+                raise ValueError("LLM model reference is unavailable")
+            (dataset_dir / "visiox-run.json").write_text(
+                json.dumps(
+                    {
+                        "training_job_id": job.id,
+                        "distributed_run_id": run.id,
+                        "attempt": run.attempt,
+                        "organization_id": job.organization_id,
+                        "owner_user_id": job.owner_user_id,
+                        "pipeline_id": job.pipeline_id,
+                        "node_ids": list(run.node_ids),
+                        "model_revision": model_reference.get("revision"),
+                        "dataset_version_id": payload.get("dataset_version_id"),
+                        "dataset_checksum": manifest_checksum,
+                        "training_image_digest": run.training_image_digest,
+                        "mlflow_tracking_uri": get_settings().mlflow_public_url,
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            archive = Path(
+                shutil.make_archive(str(root / "dataset"), "gztar", dataset_dir)
+            )
+            archive_checksum = _sha256(archive)
+            dataset_uri = self._storage.put_file(
+                "training",
+                f"distributed/{run.id}/{run.attempt}/llm-dataset.tar.gz",
+                archive,
+                content_type="application/gzip",
+            )
+        return [
+            {
+                "name": "dataset",
+                "download_url": self._storage.presigned_get_url(
+                    dataset_uri, expires=_PRESIGNED_URL_TTL
+                ),
+                "checksum": archive_checksum,
+                "filename": "dataset.tar.gz",
+            }
+        ]
+
+    def _download_storage_uri(self, uri: str, destination: Path) -> None:
+        remainder = uri.removeprefix("minio://")
+        if remainder == uri or "/" not in remainder:
+            raise ValueError("LLM dataset must use durable object storage")
+        bucket, object_name = remainder.split("/", 1)
+        if not bucket or not object_name:
+            raise ValueError("LLM dataset storage URI is invalid")
+        self._storage.get_file(bucket, object_name, destination)
+
     def _transition(self, execution_id: str, phase: str, progress: int) -> None:
         with self._session_factory() as session:
             execution = session.get(RemoteExecution, execution_id)
@@ -390,6 +531,8 @@ class DistributedTrainingHandler:
         execution_id: str,
         containers: tuple[tuple[_Rank, str], ...],
         staged: dict[str, _StageResult],
+        *,
+        log_stream_id: str | None,
     ) -> bool:
         while True:
             if self._cancel_requested(execution_id):
@@ -407,12 +550,107 @@ class DistributedTrainingHandler:
                 )
                 if result.running:
                     continue
+                self._capture_container_log(log_stream_id, rank, container_id)
                 if result.exit_code != 0:
                     return False
                 completed += 1
             if completed == len(containers):
                 return True
             time.sleep(5)
+
+    def _ensure_log_stream(
+        self,
+        job: TrainingJob,
+        pipeline: TrainingPipeline,
+    ) -> str | None:
+        organization_id = job.organization_id or pipeline.organization_id
+        if organization_id is None:
+            return None
+        observability = (
+            job.metrics.get("observability", {})
+            if isinstance(job.metrics, dict)
+            else {}
+        )
+        existing = (
+            observability.get("log_stream_id")
+            if isinstance(observability, dict)
+            else None
+        )
+        if isinstance(existing, str):
+            return existing
+        stream_id = self._log_capture.open(
+            organization_id=organization_id,
+            resource_type="training_job",
+            resource_id=job.id,
+            source="remote_execution",
+        )
+        with self._session_factory() as session:
+            current = session.get(TrainingJob, job.id)
+            if current is not None:
+                current_observability = (
+                    current.metrics.get("observability", {})
+                    if isinstance(current.metrics, dict)
+                    else {}
+                )
+                current.metrics = {
+                    **(current.metrics or {}),
+                    "observability": {
+                        **(
+                            current_observability
+                            if isinstance(current_observability, dict)
+                            else {}
+                        ),
+                        "log_stream_id": stream_id,
+                    },
+                }
+                session.add(current)
+                session.commit()
+        return stream_id
+
+    def _capture_container_log(
+        self,
+        stream_id: str | None,
+        rank: _Rank,
+        container_id: str,
+    ) -> None:
+        if stream_id is None:
+            return
+        try:
+            target = self._launch._load_target(rank.node_id)
+            output = _ContainerLogs.model_validate(
+                self._launch._run_script(
+                    target,
+                    {"action": "logs", "container_id": container_id},
+                )
+            )
+            self._log_capture.capture_text(
+                stream_id,
+                stdout=output.stdout,
+                stderr=output.stderr,
+                timestamp=datetime.now(UTC),
+            )
+        except Exception:
+            return
+
+    def _close_log_stream(
+        self,
+        stream_id: str | None,
+        status: str,
+        job_id: str | None,
+    ) -> None:
+        if stream_id is None:
+            return
+        try:
+            uri = self._log_capture.close(stream_id, status=status)
+            if job_id is not None:
+                with self._session_factory() as session:
+                    job = session.get(TrainingJob, job_id)
+                    if job is not None:
+                        job.log_uri = uri
+                        session.add(job)
+                        session.commit()
+        except Exception:
+            return
 
     def _sync_observability(
         self,
@@ -432,6 +670,8 @@ class DistributedTrainingHandler:
             object_names = {
                 "visiox-progress.json": f"jobs/{job_id}/observability/visiox-progress.json",
                 "events.out.tfevents.remote": f"jobs/{job_id}/observability/events.out.tfevents.remote",
+                "visiox-metrics.jsonl": f"jobs/{job_id}/observability/visiox-metrics.jsonl",
+                "resource_metrics.jsonl": f"jobs/{job_id}/observability/resource_metrics.jsonl",
             }
             uploads = {
                 name: self._storage.presigned_put_url(
@@ -473,8 +713,11 @@ class DistributedTrainingHandler:
             job = session.get(
                 TrainingJob, execution.training_job_id if execution else None
             )
+            run = session.get(
+                DistributedTrainingRun, execution.resource_id if execution else None
+            )
             task = session.get(Task, execution.task_id if execution else None)
-            if job is None or task is None:
+            if job is None or run is None or task is None:
                 return
             progress = (
                 snapshot.get("progress")
@@ -489,8 +732,13 @@ class DistributedTrainingHandler:
             job.metrics = {
                 **(job.metrics or {}),
                 "observability": {
-                    "mlflow_run_name": f"job-{job.id}",
-                    "tensorboard_run_name": f"job-{job.id}",
+                    **(
+                        job.metrics.get("observability", {})
+                        if isinstance(job.metrics.get("observability"), dict)
+                        else {}
+                    ),
+                    "mlflow_run_name": f"visiox-{job.id}-attempt-{run.attempt}",
+                    "tensorboard_run_name": f"visiox-{job.id}-attempt-{run.attempt}",
                 },
                 "observability_snapshot": snapshot,
             }
@@ -509,21 +757,38 @@ class DistributedTrainingHandler:
         self,
         run: DistributedTrainingRun,
         job: TrainingJob,
+        pipeline: TrainingPipeline,
         rank: _Rank,
         staged: _StageResult,
     ) -> _CollectResult:
-        uris = {
-            "best.pt": f"minio://models/trained/{job.id}/best.pt",
-            "last.pt": f"minio://models/trained/{job.id}/last.pt",
-            "visiox-progress.json": f"minio://training/jobs/{job.id}/observability/visiox-progress.json",
-            "events.out.tfevents.remote": f"minio://training/jobs/{job.id}/observability/events.out.tfevents.remote",
-        }
-        uris.update(
-            {
-                name: f"minio://training/jobs/{job.id}/visualizations/{name}"
-                for name in _VISUALIZATION_ARTIFACTS
+        if pipeline.engine == "llamafactory":
+            uris = {
+                "adapter_model.safetensors": f"minio://models/trained/{job.id}/adapter_model.safetensors",
+                "adapter_config.json": f"minio://models/trained/{job.id}/adapter_config.json",
+                "trainer_state.json": f"minio://training/jobs/{job.id}/artifacts/trainer_state.json",
+                "trainer_log.jsonl": f"minio://training/jobs/{job.id}/artifacts/trainer_log.jsonl",
+                "train_results.json": f"minio://training/jobs/{job.id}/artifacts/train_results.json",
+                "all_results.json": f"minio://training/jobs/{job.id}/artifacts/all_results.json",
+                "training_args.yaml": f"minio://training/jobs/{job.id}/artifacts/training_args.yaml",
+                "artifact-manifest.json": f"minio://training/jobs/{job.id}/artifacts/artifact-manifest.json",
+                "visiox-metrics.jsonl": f"minio://training/jobs/{job.id}/observability/visiox-metrics.jsonl",
+                "resource_metrics.jsonl": f"minio://training/jobs/{job.id}/observability/resource_metrics.jsonl",
+                "visiox-progress.json": f"minio://training/jobs/{job.id}/observability/visiox-progress.json",
+                "events.out.tfevents.remote": f"minio://training/jobs/{job.id}/observability/events.out.tfevents.remote",
             }
-        )
+        else:
+            uris = {
+                "best.pt": f"minio://models/trained/{job.id}/best.pt",
+                "last.pt": f"minio://models/trained/{job.id}/last.pt",
+                "visiox-progress.json": f"minio://training/jobs/{job.id}/observability/visiox-progress.json",
+                "events.out.tfevents.remote": f"minio://training/jobs/{job.id}/observability/events.out.tfevents.remote",
+            }
+            uris.update(
+                {
+                    name: f"minio://training/jobs/{job.id}/visualizations/{name}"
+                    for name in _VISUALIZATION_ARTIFACTS
+                }
+            )
         uploads = {
             name: self._storage.presigned_put_url(uri, expires=_PRESIGNED_URL_TTL)
             for name, uri in uris.items()
@@ -539,8 +804,13 @@ class DistributedTrainingHandler:
                 },
             )
         )
-        if not {"best.pt", "last.pt"}.issubset(result.artifacts):
-            raise ValueError("rank zero did not upload required weights")
+        required = (
+            {"adapter_model.safetensors", "adapter_config.json"}
+            if pipeline.engine == "llamafactory"
+            else {"best.pt", "last.pt"}
+        )
+        if not required.issubset(result.artifacts):
+            raise ValueError("rank zero did not upload required training artifacts")
         return result
 
     def _try_collect_checkpoint(
@@ -594,6 +864,59 @@ class DistributedTrainingHandler:
             pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
             if not all((execution, run, job, task, pipeline)):
                 raise ValueError("distributed completion state is incomplete")
+            if pipeline.engine == "llamafactory":
+                adapter_uri = (
+                    f"minio://models/trained/{job.id}/adapter_model.safetensors"
+                )
+                adapter = TrainedModel(
+                    pipeline_id=pipeline.id,
+                    organization_id=job.organization_id or pipeline.organization_id,
+                    owner_user_id=job.owner_user_id or pipeline.owner_user_id,
+                    visibility="private",
+                    training_job_id=job.id,
+                    name="adapter_model.safetensors",
+                    version="adapter",
+                    task=pipeline.task,
+                    artifact_uri=adapter_uri,
+                    metrics={},
+                    status="ready",
+                )
+                session.add(adapter)
+                session.flush()
+                job.trained_model_id = adapter.id
+                job.status = "success"
+                job.metrics = {
+                    **(job.metrics or {}),
+                    "adapter": adapter_uri,
+                    "artifacts": {
+                        name: (
+                            f"minio://models/trained/{job.id}/{name}"
+                            if name == "adapter_config.json"
+                            else f"minio://training/jobs/{job.id}/artifacts/{name}"
+                        )
+                        for name in collected.artifacts
+                        if name
+                        not in {
+                            "adapter_model.safetensors",
+                            "visiox-progress.json",
+                            "events.out.tfevents.remote",
+                            "visiox-metrics.jsonl",
+                            "resource_metrics.jsonl",
+                        }
+                    },
+                }
+                job.finished_at = now
+                run.status = "succeeded"
+                run.finished_at = now
+                task.status = "SUCCESS"
+                task.stage = "completed"
+                task.progress = 100
+                task.finished_at = now
+                pipeline.status = "success"
+                execution.phase = "succeeded"
+                session.add_all([execution, run, job, task, pipeline])
+                session.commit()
+                return
             weights = {
                 name: f"minio://models/trained/{job.id}/{name}"
                 for name in ("best.pt", "last.pt")
@@ -605,6 +928,9 @@ class DistributedTrainingHandler:
             }
             best = TrainedModel(
                 pipeline_id=pipeline.id,
+                organization_id=job.organization_id or pipeline.organization_id,
+                owner_user_id=job.owner_user_id or pipeline.owner_user_id,
+                visibility="private",
                 training_job_id=job.id,
                 name="best.pt",
                 version="best.pt",
@@ -615,6 +941,9 @@ class DistributedTrainingHandler:
             )
             last = TrainedModel(
                 pipeline_id=pipeline.id,
+                organization_id=job.organization_id or pipeline.organization_id,
+                owner_user_id=job.owner_user_id or pipeline.owner_user_id,
+                visibility="private",
                 training_job_id=None,
                 name="last.pt",
                 version="last.pt",
@@ -643,6 +972,24 @@ class DistributedTrainingHandler:
             execution.phase = "succeeded"
             session.add_all([execution, run, job, task, pipeline])
             session.commit()
+
+    def _cache_final_observability(self, job_id: str, collected: _CollectResult) -> None:
+        run_path = get_settings().training_runs_root / "runs" / f"job-{job_id}"
+        run_path.mkdir(parents=True, exist_ok=True)
+        object_names = {
+            "artifact-manifest.json": f"jobs/{job_id}/artifacts/artifact-manifest.json",
+            "visiox-metrics.jsonl": f"jobs/{job_id}/observability/visiox-metrics.jsonl",
+            "resource_metrics.jsonl": f"jobs/{job_id}/observability/resource_metrics.jsonl",
+            "visiox-progress.json": f"jobs/{job_id}/observability/visiox-progress.json",
+            "events.out.tfevents.remote": f"jobs/{job_id}/observability/events.out.tfevents.remote",
+        }
+        for name, object_name in object_names.items():
+            if name not in collected.artifacts:
+                continue
+            try:
+                self._storage.get_file("training", object_name, run_path / name)
+            except Exception:
+                continue
 
     def _stop_peers(
         self, execution: RemoteExecution, launched: list[tuple[str, int]]
@@ -772,7 +1119,9 @@ def build_distributed_handlers(
     }
 
 
-def _training_arguments(job: TrainingJob, task: Task) -> list[str]:
+def _training_arguments(job: TrainingJob, task: Task, engine: str) -> list[str]:
+    if engine == "llamafactory":
+        return []
     params: dict[str, Any] = dict(job.params or {})
     environment = (task.payload or {}).get("environment")
     if isinstance(environment, Mapping):
@@ -790,11 +1139,13 @@ def _training_arguments(job: TrainingJob, task: Task) -> list[str]:
 
 def _staging_request(
     run: DistributedTrainingRun,
+    engine: str,
     artifacts: list[dict[str, str]],
 ) -> dict[str, Any]:
     return {
         "run_id": run.id,
         "attempt": run.attempt,
+        "engine": engine,
         "image_digest": validate_image_digest(str(run.training_image_digest)),
         "artifacts": artifacts,
     }
@@ -806,11 +1157,15 @@ def _launch_request(
     ranks: tuple[_Rank, ...],
     stage: _StageResult,
     arguments: list[str],
+    engine: str,
+    *,
+    model_source: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    request = {
         "action": "launch",
         "run_id": run.id,
         "attempt": run.attempt,
+        "engine": engine,
         "image_digest": validate_image_digest(str(run.training_image_digest)),
         "node_id": rank.node_id,
         "gpu_uuids": list(rank.gpu_uuids),
@@ -821,6 +1176,105 @@ def _launch_request(
         "master_port": run.master_port,
         "training_arguments": arguments,
         "paths": stage.paths,
+    }
+    if engine == "llamafactory":
+        if model_source not in {"huggingface", "modelscope"}:
+            raise ValueError("LLM model source is unavailable")
+        request["model_source"] = model_source
+    return request
+
+
+def _llm_model_source(task: Task) -> str:
+    payload = task.payload if isinstance(task.payload, dict) else {}
+    model_reference = payload.get("model_reference")
+    if not isinstance(model_reference, Mapping):
+        raise ValueError("LLM model reference is unavailable")
+    source = model_reference.get("source")
+    if source not in {"huggingface", "modelscope"}:
+        raise ValueError("LLM model source is unavailable")
+    return str(source)
+
+
+def _llamafactory_config(
+    job: TrainingJob,
+    task: Task,
+    dataset: Dataset,
+) -> dict[str, Any]:
+    payload = task.payload if isinstance(task.payload, dict) else {}
+    model_reference = payload.get("model_reference")
+    if not isinstance(model_reference, Mapping):
+        raise ValueError("LLM model reference is unavailable")
+    model_id = model_reference.get("model_id")
+    revision = model_reference.get("revision")
+    if not isinstance(model_id, str) or not model_id:
+        raise ValueError("LLM model id is unavailable")
+    if not isinstance(revision, str) or not revision:
+        raise ValueError("LLM model revision is unavailable")
+    internal_fields = {
+        "model_source",
+        "model_id",
+        "model_revision",
+        "resolved_revision",
+        "auto_optimize",
+    }
+    config = {
+        key: value
+        for key, value in dict(job.params or {}).items()
+        if key not in internal_fields and value is not None
+    }
+    config.update(
+        {
+            "model_name_or_path": model_id,
+            "model_revision": revision,
+            "dataset": "visiox_train",
+            "dataset_dir": "/workspace/dataset",
+            "output_dir": f"/workspace/output/job-{job.id}",
+            "logging_dir": f"/workspace/output/job-{job.id}/runs",
+            "report_to": "tensorboard",
+            "overwrite_output_dir": True,
+            "do_train": True,
+            "plot_loss": True,
+        }
+    )
+    if dataset.format not in {"alpaca", "sharegpt", "openai_messages"}:
+        raise ValueError("LLM dataset format is unsupported")
+    return config
+
+
+def _llamafactory_dataset_info(dataset: Dataset) -> dict[str, Any]:
+    if dataset.format == "alpaca":
+        return {
+            "file_name": "train.jsonl",
+            "columns": {
+                "prompt": "instruction",
+                "query": "input",
+                "response": "output",
+            },
+        }
+    if dataset.format == "openai_messages":
+        return {
+            "file_name": "train.jsonl",
+            "formatting": "sharegpt",
+            "columns": {"messages": "messages"},
+            "tags": {
+                "role_tag": "role",
+                "content_tag": "content",
+                "user_tag": "user",
+                "assistant_tag": "assistant",
+                "system_tag": "system",
+            },
+        }
+    return {
+        "file_name": "train.jsonl",
+        "formatting": "sharegpt",
+        "columns": {"messages": "conversations"},
+        "tags": {
+            "role_tag": "from",
+            "content_tag": "value",
+            "user_tag": "human",
+            "assistant_tag": "gpt",
+            "system_tag": "system",
+        },
     }
 
 

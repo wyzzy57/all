@@ -11,10 +11,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from visiox_api.dependencies.auth import get_current_user
+from visiox_api.dependencies.authorization import require_resource_permission
+from visiox_api.dependencies.database import get_db_session
 from visiox_api.routes.datasets import dataset_or_404
 from visiox_common.settings import Settings, get_settings
 from visiox_db.models import Annotation, Dataset, DatasetSample
-from visiox_db.session import get_session
+from visiox_db.models.identity import PERMISSION_EDIT, PERMISSION_VIEW, User
 from visiox_storage.checksum import sha256_bytes
 from visiox_storage.client import ObjectStorageClient
 
@@ -72,8 +75,7 @@ class SplitRatioRequest(BaseModel):
     test_ratio: int = Field(ge=0, le=100)
 
 
-def get_dataset_sample_session() -> Generator[Session]:
-    yield from get_session()
+get_dataset_sample_session = get_db_session
 
 
 def get_object_storage_client(request: Request) -> ObjectStorageClient:
@@ -94,8 +96,10 @@ async def upload_samples(
     session: Session = Depends(get_dataset_sample_session),
     storage: ObjectStorageClient = Depends(get_object_storage_client),
     settings: Settings = Depends(get_settings),
+    actor: User = Depends(get_current_user),
 ) -> SampleUploadResponse:
     dataset = dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_EDIT)
     filename = file.filename or "upload"
     data = await file.read()
     _ensure_size_within_limit(len(data), settings.max_dataset_upload_bytes, "Upload file is too large")
@@ -139,8 +143,10 @@ async def upload_sample_batch(
     session: Session = Depends(get_dataset_sample_session),
     storage: ObjectStorageClient = Depends(get_object_storage_client),
     settings: Settings = Depends(get_settings),
+    actor: User = Depends(get_current_user),
 ) -> SampleUploadResponse:
     dataset = dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_EDIT)
     if len(files) > settings.max_dataset_zip_entries:
         raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Upload has too many files")
 
@@ -184,8 +190,10 @@ def list_samples(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_dataset_sample_session),
+    actor: User = Depends(get_current_user),
 ) -> DatasetSampleListResponse:
     dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_VIEW)
     filters = [DatasetSample.dataset_id == dataset_id]
     if split is not None:
         filters.append(DatasetSample.split == split)
@@ -205,8 +213,10 @@ def get_sample_content(
     sample_id: str,
     session: Session = Depends(get_dataset_sample_session),
     storage: ObjectStorageClient = Depends(get_object_storage_client),
+    actor: User = Depends(get_current_user),
 ) -> FileResponse:
     dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_VIEW)
     sample = session.get(DatasetSample, sample_id)
     if sample is None or sample.dataset_id != dataset_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sample not found")
@@ -223,8 +233,10 @@ def assign_splits(
     dataset_id: str,
     request: SplitAssignmentRequest,
     session: Session = Depends(get_dataset_sample_session),
+    actor: User = Depends(get_current_user),
 ) -> DatasetSampleListResponse:
     dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_EDIT)
     sample_ids = [assignment.sample_id for assignment in request.assignments]
     samples_by_id = {
         sample.id: sample
@@ -254,8 +266,10 @@ def assign_splits_by_ratio(
     dataset_id: str,
     request: SplitRatioRequest,
     session: Session = Depends(get_dataset_sample_session),
+    actor: User = Depends(get_current_user),
 ) -> DatasetSampleListResponse:
     dataset_or_404(session, dataset_id)
+    require_resource_permission(session, actor, "dataset", dataset_id, PERMISSION_EDIT)
     ratio_total = request.train_ratio + request.val_ratio + request.test_ratio
     if ratio_total != 100:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Split ratios must add up to 100")

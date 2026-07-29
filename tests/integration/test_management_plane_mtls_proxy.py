@@ -24,7 +24,9 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 PROXY_CONFIG = ROOT / "infra" / "proxy" / "nginx.conf"
 PRODUCTION_OVERLAY = ROOT / "infra" / "compose" / "docker-compose.production-mtls.yml"
-TEST_COMPOSE = ROOT / "tests" / "integration" / "management_plane_mtls" / "docker-compose.test.yml"
+TEST_COMPOSE = (
+    ROOT / "tests" / "integration" / "management_plane_mtls" / "docker-compose.test.yml"
+)
 
 MANAGEMENT_REQUESTS = (
     ("POST", "/agent/v1/enrollment-tokens"),
@@ -59,7 +61,9 @@ def run_command(
     )
     if check and result.returncode:
         detail = "output redacted" if redact_output else result.stdout.strip()
-        raise CommandError(f"command failed ({result.returncode}): {' '.join(args)}\n{detail}")
+        raise CommandError(
+            f"command failed ({result.returncode}): {' '.join(args)}\n{detail}"
+        )
     return result
 
 
@@ -79,7 +83,9 @@ class ManagementPlaneMtlsProxyIntegrationTest(unittest.TestCase):
         cls.project_name = f"visioxmtls{uuid.uuid4().hex[:12]}"
         cls.compose_env = os.environ.copy()
         cls.compose_env["VISIOX_MTLS_TEST_CERT_DIR"] = str(cls.temp_dir)
-        cls.compose_env["VISIOX_MTLS_TEST_PROXY_TOKEN_PATH"] = str(cls.temp_dir / "management-proxy-token")
+        cls.compose_env["VISIOX_MTLS_TEST_PROXY_TOKEN_PATH"] = str(
+            cls.temp_dir / "management-proxy-token"
+        )
         cls.addClassCleanup(cls._cleanup_resources)
         cls._generate_certificates()
         cls._validate_production_compose()
@@ -91,7 +97,9 @@ class ManagementPlaneMtlsProxyIntegrationTest(unittest.TestCase):
     def _assert_production_assets_exist(cls) -> None:
         for path in (PROXY_CONFIG, PRODUCTION_OVERLAY, TEST_COMPOSE):
             if not path.is_file():
-                raise AssertionError(f"required management-plane mTLS asset is missing: {path}")
+                raise AssertionError(
+                    f"required management-plane mTLS asset is missing: {path}"
+                )
 
     @classmethod
     def _ensure_compose_env_file(cls) -> None:
@@ -162,7 +170,9 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             ],
             redact_output=True,
         )
-        (cls.temp_dir / "management-proxy-token").write_text(f"{PROXY_AUTH_TOKEN}\n", encoding="ascii")
+        (cls.temp_dir / "management-proxy-token").write_text(
+            f"{PROXY_AUTH_TOKEN}\n", encoding="ascii"
+        )
 
     @classmethod
     def _validate_production_compose(cls) -> None:
@@ -171,7 +181,9 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             {
                 "VISIOX_MANAGEMENT_TLS_CERT_PATH": str(cls.temp_dir / "server.crt"),
                 "VISIOX_MANAGEMENT_TLS_KEY_PATH": str(cls.temp_dir / "server.key"),
-                "VISIOX_MANAGEMENT_OPERATOR_CA_PATH": str(cls.temp_dir / "operator-ca.crt"),
+                "VISIOX_MANAGEMENT_OPERATOR_CA_PATH": str(
+                    cls.temp_dir / "operator-ca.crt"
+                ),
                 "VISIOX_AGENT_PUBLIC_WS_URL": "wss://visiox-control.test/agent/v1/connect",
                 "VISIOX_AGENT_CA_CERT_HOST_PATH": str(cls.temp_dir / "agent-ca.crt"),
                 "VISIOX_AGENT_CA_KEY_HOST_PATH": str(cls.temp_dir / "agent-ca.key"),
@@ -198,7 +210,9 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             check=False,
         )
         if missing_wss_result.returncode == 0:
-            raise AssertionError("production overlay must require VISIOX_AGENT_PUBLIC_WS_URL")
+            raise AssertionError(
+                "production overlay must require VISIOX_AGENT_PUBLIC_WS_URL"
+            )
         result = run_command(
             [
                 "docker",
@@ -216,7 +230,9 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         try:
             resolved = json.loads(result.stdout)
         except json.JSONDecodeError as error:
-            raise AssertionError("production Compose did not render JSON configuration") from error
+            raise AssertionError(
+                "production Compose did not render JSON configuration"
+            ) from error
 
         services = resolved["services"]
         api_service = services["api-service"]
@@ -232,20 +248,33 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         }
         for name, expected_value in expected_api_environment.items():
             if api_environment.get(name) != expected_value:
-                raise AssertionError(f"production api-service must set {name}={expected_value!r}")
-        if any(volume.get("target") == "/var/lib/visiox/pki" for volume in api_service.get("volumes", [])):
-            raise AssertionError("production api-service must not retain the writable agent PKI volume")
-        api_secrets = {secret.get("target"): secret for secret in api_service.get("secrets", [])}
+                raise AssertionError(
+                    f"production api-service must set {name}={expected_value!r}"
+                )
+        if any(
+            volume.get("target") == "/var/lib/visiox/pki"
+            for volume in api_service.get("volumes", [])
+        ):
+            raise AssertionError(
+                "production api-service must not retain the writable agent PKI volume"
+            )
+        api_secrets = {
+            secret.get("target"): secret for secret in api_service.get("secrets", [])
+        }
         for target in (
             "agent_ca_certificate",
             "agent_ca_private_key",
             "management_proxy_auth_token",
         ):
             if target not in api_secrets:
-                raise AssertionError(f"production api-service secret is missing: {target}")
+                raise AssertionError(
+                    f"production api-service secret is missing: {target}"
+                )
         migration = services.get("api-migrate")
         if migration is None:
-            raise AssertionError("production overlay must define the Alembic migration job")
+            raise AssertionError(
+                "production overlay must define the Alembic migration job"
+            )
         if migration.get("command") != ["alembic", "upgrade", "head"]:
             raise AssertionError("migration job must run alembic upgrade head")
         if migration.get("restart") not in {"no", ""}:
@@ -255,23 +284,40 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         migration_environment = migration.get("environment", {})
         if migration_environment.get("VISIOX_ENV") != "production":
             raise AssertionError("migration job must use production configuration")
-        migration_postgres_dependency = migration.get("depends_on", {}).get("postgres", {})
+        migration_postgres_dependency = migration.get("depends_on", {}).get(
+            "postgres", {}
+        )
         if migration_postgres_dependency.get("condition") != "service_healthy":
             raise AssertionError("migration job must wait for healthy PostgreSQL")
         migration_dependency = api_service.get("depends_on", {}).get("api-migrate", {})
         if migration_dependency.get("condition") != "service_completed_successfully":
-            raise AssertionError("api-service must wait for the migration job to complete")
+            raise AssertionError(
+                "api-service must wait for the migration job to complete"
+            )
         postgres_healthcheck = services["postgres"].get("healthcheck", {})
         postgres_healthcheck_test = postgres_healthcheck.get("test", [])
-        if "pg_isready" not in " ".join(str(part) for part in postgres_healthcheck_test):
-            raise AssertionError("production PostgreSQL must expose a pg_isready healthcheck")
+        if "pg_isready" not in " ".join(
+            str(part) for part in postgres_healthcheck_test
+        ):
+            raise AssertionError(
+                "production PostgreSQL must expose a pg_isready healthcheck"
+            )
         for worker_name in ("label-sync-worker", "training-worker"):
             worker = services[worker_name]
             if worker.get("environment", {}).get("VISIOX_ENV") != "production":
-                raise AssertionError(f"production {worker_name} must set VISIOX_ENV=production")
-            worker_migration_dependency = worker.get("depends_on", {}).get("api-migrate", {})
-            if worker_migration_dependency.get("condition") != "service_completed_successfully":
-                raise AssertionError(f"production {worker_name} must wait for migrations")
+                raise AssertionError(
+                    f"production {worker_name} must set VISIOX_ENV=production"
+                )
+            worker_migration_dependency = worker.get("depends_on", {}).get(
+                "api-migrate", {}
+            )
+            if (
+                worker_migration_dependency.get("condition")
+                != "service_completed_successfully"
+            ):
+                raise AssertionError(
+                    f"production {worker_name} must wait for migrations"
+                )
             worker_secret_targets = {
                 secret.get("target") for secret in worker.get("secrets", [])
             }
@@ -279,13 +325,52 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
                 raise AssertionError(
                     f"production {worker_name} must not receive the management proxy secret"
                 )
+        edge_executor = services["edge-executor-worker"]
+        if edge_executor.get("environment", {}).get("VISIOX_ENV") != "production":
+            raise AssertionError(
+                "production edge-executor-worker must set VISIOX_ENV=production"
+            )
+        edge_networks = set(edge_executor.get("networks", {}))
+        if edge_networks != {"application-internal"}:
+            raise AssertionError(
+                "edge-executor-worker must use only the application-internal network: "
+                f"{edge_networks}"
+            )
+        for dependency_name in ("postgres", "redis"):
+            dependency = edge_executor.get("depends_on", {}).get(dependency_name, {})
+            if dependency.get("condition") != "service_healthy":
+                raise AssertionError(
+                    "production edge-executor-worker must wait for healthy "
+                    f"{dependency_name}"
+                )
+        edge_migration_dependency = edge_executor.get("depends_on", {}).get(
+            "api-migrate", {}
+        )
+        if (
+            edge_migration_dependency.get("condition")
+            != "service_completed_successfully"
+        ):
+            raise AssertionError(
+                "production edge-executor-worker must wait for migrations"
+            )
+        gateway = services["label-studio-gateway"]
+        gateway_networks = set(gateway.get("networks", {}))
+        if gateway_networks != {"api-dependencies"}:
+            raise AssertionError(
+                "label-studio-gateway must share only the API dependency network: "
+                f"{gateway_networks}"
+            )
+        if gateway.get("ports"):
+            raise AssertionError("label-studio-gateway must not publish a host port")
         published_ports = {
             service_name: service.get("ports", [])
             for service_name, service in services.items()
             if service.get("ports")
         }
         if set(published_ports) != {"management-proxy"}:
-            raise AssertionError(f"production merge publishes non-proxy ports: {published_ports}")
+            raise AssertionError(
+                f"production merge publishes non-proxy ports: {published_ports}"
+            )
         if len(published_ports["management-proxy"]) != 1:
             raise AssertionError("management-proxy must publish exactly one port")
         published_proxy_port = published_ports["management-proxy"][0]
@@ -314,6 +399,7 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             "registry",
             "label-studio",
             "mlflow",
+            "label-studio-gateway",
         }
         if api_dependency_services != expected_api_dependency_services:
             raise AssertionError(
@@ -330,10 +416,17 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         ):
             volume = proxy_volumes.get(target_path)
             if volume is None or not volume.get("read_only"):
-                raise AssertionError(f"required read-only proxy mount missing: {target_path}")
-        proxy_secrets = {secret.get("target"): secret for secret in services["management-proxy"].get("secrets", [])}
+                raise AssertionError(
+                    f"required read-only proxy mount missing: {target_path}"
+                )
+        proxy_secrets = {
+            secret.get("target"): secret
+            for secret in services["management-proxy"].get("secrets", [])
+        }
         if "management_proxy_auth_token" not in proxy_secrets:
-            raise AssertionError("management-proxy must receive the proxy authentication token as a Docker secret")
+            raise AssertionError(
+                "management-proxy must receive the proxy authentication token as a Docker secret"
+            )
         root_secrets = resolved.get("secrets", {})
         for secret_name in (
             "agent_ca_certificate",
@@ -341,14 +434,18 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             "management_proxy_auth_token",
         ):
             if not root_secrets.get(secret_name, {}).get("file"):
-                raise AssertionError(f"production Docker secret must be backed by a required host file: {secret_name}")
+                raise AssertionError(
+                    f"production Docker secret must be backed by a required host file: {secret_name}"
+                )
         networks = resolved.get("networks", {})
         if not networks.get("management-backend", {}).get("internal"):
             raise AssertionError("management-backend must be an internal network")
         if not networks.get("api-dependencies", {}).get("internal"):
             raise AssertionError("api-dependencies must be an internal network")
         if networks.get("management-public", {}).get("internal"):
-            raise AssertionError("management-public must allow the TLS proxy to accept edge traffic")
+            raise AssertionError(
+                "management-public must allow the TLS proxy to accept edge traffic"
+            )
 
     @classmethod
     def _start_proxy(cls) -> None:
@@ -403,7 +500,9 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         try:
             return int(published.rsplit(":", 1)[1])
         except (IndexError, ValueError) as error:
-            raise AssertionError(f"could not parse published proxy port: {published}") from error
+            raise AssertionError(
+                f"could not parse published proxy port: {published}"
+            ) from error
 
     @classmethod
     def _wait_until_ready(cls) -> None:
@@ -481,7 +580,9 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             f"{cls.project_name}_api-dependencies",
             f"{cls.project_name}_management-backend",
         ):
-            remaining = run_command(["docker", "network", "inspect", network], check=False)
+            remaining = run_command(
+                ["docker", "network", "inspect", network], check=False
+            )
             if remaining.returncode == 0:
                 cleanup_errors.append(f"test network remains: {network}")
         remaining_containers = run_command(
@@ -532,7 +633,9 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
                 self.assertIn(status, {401, 403})
             with self.subTest(method=method, path=path, certificate="trusted"):
                 status, payload = self._request(method, path, "trusted-client")
-                self._assert_reached_backend(status, payload, method, path, management=True)
+                self._assert_reached_backend(
+                    status, payload, method, path, management=True
+                )
 
     def test_untrusted_operator_certificate_fails_before_backend(self) -> None:
         try:
@@ -542,7 +645,9 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         self.assertNotEqual(status, 200)
         self.assertIsNone(payload)
 
-    def test_public_enrollment_reaches_backend_without_operator_certificate(self) -> None:
+    def test_public_enrollment_reaches_backend_without_operator_certificate(
+        self,
+    ) -> None:
         status, payload = self._request("POST", "/agent/v1/enroll")
         self._assert_reached_backend(status, payload, "POST", "/agent/v1/enroll")
 
@@ -570,13 +675,17 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
     def test_websocket_upgrade_is_forwarded_without_operator_certificate(self) -> None:
         proxy_config = PROXY_CONFIG.read_text(encoding="utf-8")
         self.assertIn(
-            "limit_conn_zone $binary_remote_addr zone=agent_ws_connections:10m;", proxy_config
+            "limit_conn_zone $binary_remote_addr zone=agent_ws_connections:10m;",
+            proxy_config,
         )
         self.assertIn(
-            "limit_req_zone $binary_remote_addr zone=agent_ws_requests:10m rate=60r/m;", proxy_config
+            "limit_req_zone $binary_remote_addr zone=agent_ws_requests:10m rate=60r/m;",
+            proxy_config,
         )
         self.assertIn("limit_conn agent_ws_connections 32;", proxy_config)
-        self.assertIn("limit_req zone=agent_ws_requests burst=20 nodelay;", proxy_config)
+        self.assertIn(
+            "limit_req zone=agent_ws_requests burst=20 nodelay;", proxy_config
+        )
         request = (
             "GET /agent/v1/connect HTTP/1.1\r\n"
             "Host: visiox-control.test\r\n"
@@ -586,8 +695,12 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
             "Sec-WebSocket-Version: 13\r\n"
             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
         ).encode("ascii")
-        with socket.create_connection(("127.0.0.1", self.proxy_port), timeout=5) as raw_socket:
-            with self._tls_context().wrap_socket(raw_socket, server_hostname="localhost") as tls_socket:
+        with socket.create_connection(
+            ("127.0.0.1", self.proxy_port), timeout=5
+        ) as raw_socket:
+            with self._tls_context().wrap_socket(
+                raw_socket, server_hostname="localhost"
+            ) as tls_socket:
                 tls_socket.sendall(request)
                 response = tls_socket.recv(4096).decode("iso-8859-1")
 
@@ -599,7 +712,9 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         self.assertIn("x-backend-forwarded-for:", lowered)
         self.assertIn("x-backend-host: visiox-control.test", lowered)
         self.assertIn("x-backend-management-proxy-token: ", lowered)
-        self.assertNotIn("x-backend-management-proxy-token: forged-browser-token", lowered)
+        self.assertNotIn(
+            "x-backend-management-proxy-token: forged-browser-token", lowered
+        )
 
     def test_unknown_management_variants_are_denied(self) -> None:
         for method, path in (

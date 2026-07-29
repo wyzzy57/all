@@ -39,6 +39,35 @@ def test_inventory_snapshot_parses_supported_hosts(load_fixture, fixture, platfo
     assert snapshot.unsupported_reasons == ()
 
 
+def test_inventory_snapshot_normalizes_live_resource_metrics(load_fixture):
+    inventory = load_fixture("x86.json")
+    inventory["cpu"]["utilization_percent"] = 37.5
+    inventory["memory"]["available_kib"] = 123456
+    inventory["disk"] = {
+        "total_bytes": 1000,
+        "available_bytes": 400,
+    }
+    inventory["nvidia"]["gpus"][0].update(
+        {
+            "utilization_percent": 72.0,
+            "memory_used_mib": 4096,
+            "temperature_celsius": 66.0,
+            "power_draw_watts": 210.5,
+        }
+    )
+
+    snapshot = parse_inventory(inventory)
+
+    assert snapshot.cpu_utilization_percent == 37.5
+    assert snapshot.memory_available_kib == 123456
+    assert snapshot.disk_total_bytes == 1000
+    assert snapshot.disk_available_bytes == 400
+    assert snapshot.gpus[0].utilization_percent == 72.0
+    assert snapshot.gpus[0].memory_used_mib == 4096
+    assert snapshot.gpus[0].temperature_celsius == 66.0
+    assert snapshot.gpus[0].power_draw_watts == 210.5
+
+
 @pytest.mark.parametrize(
     ("fixture", "expected"),
     [

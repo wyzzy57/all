@@ -2,6 +2,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import DataPreparationView from "@/views/data-preparation/DataPreparationView.vue";
+import dataPreparationViewSource from "@/views/data-preparation/DataPreparationView.vue?raw";
 
 const apiMock = vi.hoisted(() => ({
   createLabelProject: vi.fn(),
@@ -13,6 +14,7 @@ const apiMock = vi.hoisted(() => ({
   listDatasets: vi.fn(),
   listLabelProjects: vi.fn(),
   listDatasetSamples: vi.fn(),
+  launchLabelProject: vi.fn(),
   processDataset: vi.fn(),
   importLabelProjectAnnotations: vi.fn(),
   getTask: vi.fn(),
@@ -40,6 +42,9 @@ vi.mock("element-plus", () => ({
 function mountView() {
   return mount(DataPreparationView, {
     global: {
+      directives: {
+        loading: () => undefined,
+      },
       stubs: {
         "el-alert": true,
         "el-button": { template: "<button v-bind=\"$attrs\" @click=\"$emit('click')\"><slot /></button>" },
@@ -62,6 +67,11 @@ function mountView() {
 }
 
 describe("DataPreparationView", () => {
+  it("uses the shared resource dialog for dataset visibility", () => {
+    expect(dataPreparationViewSource).toContain("ResourceSharingDialog");
+    expect(dataPreparationViewSource).toContain("openDatasetSharing(dataset)");
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     apiMock.listDatasets.mockResolvedValue({
@@ -82,6 +92,9 @@ describe("DataPreparationView", () => {
       offset: 0,
     });
     apiMock.listLabelProjects.mockResolvedValue({ items: [], total: 0 });
+    apiMock.launchLabelProject.mockResolvedValue({
+      launch_url: "http://127.0.0.1:8080/visiox-auth?launch_token=managed-token",
+    });
     apiMock.deleteDataset.mockResolvedValue({});
     apiMock.assignDatasetSplitRatio.mockResolvedValue({ items: [], total: 0, limit: 0, offset: 0 });
     apiMock.analyzeDataset.mockResolvedValue({
@@ -120,6 +133,18 @@ describe("DataPreparationView", () => {
       annotation_count: 135,
     });
     messageBoxMock.confirm.mockResolvedValue(undefined);
+  });
+
+  it("keeps preparation card metadata in a stable four-row layout", async () => {
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listDatasets).toHaveBeenCalledTimes(1));
+    await flushPromises();
+
+    const layout = wrapper.get(".prepare-card-layout");
+    expect(layout.get(".prepare-card-head").text()).toContain("huajiao");
+    expect(layout.get(".chip-row").text()).toContain("目标检测");
+    expect(layout.get(".dataset-meta").text()).toContain("Label Studio");
+    expect(layout.get(".dataset-stats").text()).toContain("样本 135");
   });
 
   it("shows a more action on dataset cards and deletes after confirmation", async () => {
@@ -192,7 +217,7 @@ describe("DataPreparationView", () => {
     await vi.waitFor(() => expect(apiMock.listDatasets).toHaveBeenCalledTimes(2));
   });
 
-  it("opens dataset processing instead of label studio when clicking a dataset card", async () => {
+  it("opens Label Studio through a managed launch token when clicking a preparation card", async () => {
     apiMock.createLabelProject.mockResolvedValue({
       id: "project-1",
       dataset_id: "dataset-1",
@@ -211,7 +236,12 @@ describe("DataPreparationView", () => {
     await flushPromises();
 
     expect(apiMock.createLabelProject).toHaveBeenCalledWith("dataset-1");
-    expect(openSpy).toHaveBeenCalledWith("http://127.0.0.1:8080/projects/1/data", "_blank", "noopener,noreferrer");
+    expect(apiMock.launchLabelProject).toHaveBeenCalledWith("project-1");
+    expect(openSpy).toHaveBeenCalledWith(
+      "http://127.0.0.1:8080/visiox-auth?launch_token=managed-token",
+      "_blank",
+      "noopener,noreferrer",
+    );
     expect(apiMock.analyzeDataset).not.toHaveBeenCalled();
     openSpy.mockRestore();
   });

@@ -22,6 +22,9 @@ from visiox_db.base import Base, IdMixin, TimestampMixin
 class ResourcePool(IdMixin, TimestampMixin, Base):
     __tablename__ = "resource_pools"
     name: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    organization_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), index=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True)
+    visibility: Mapped[str] = mapped_column(String(24), nullable=False, default="private", index=True)
     kind: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     selector: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     compatibility_policy: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
@@ -31,12 +34,22 @@ class ResourcePool(IdMixin, TimestampMixin, Base):
 class ComputeNode(IdMixin, TimestampMixin, Base):
     __tablename__ = "compute_nodes"
     name: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    organization_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), index=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True)
+    visibility: Mapped[str] = mapped_column(String(24), nullable=False, default="private", index=True)
     resource_pool_id: Mapped[str | None] = mapped_column(ForeignKey("resource_pools.id"), index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="enrolling", index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
     architecture: Mapped[str] = mapped_column(String(32), nullable=False)
     platform_kind: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    labels: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    connection_method: Mapped[str] = mapped_column(String(16), nullable=False, default="ssh")
     capabilities: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     resources: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    inventory_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    resource_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     fingerprint: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     agent_version: Mapped[str] = mapped_column(String(40), nullable=False)
     certificate_serial: Mapped[str | None] = mapped_column(String(80), unique=True)

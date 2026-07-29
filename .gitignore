@@ -14,5 +14,9 @@ __pycache__/
 /dist/
 /.local/visiox-agent/
 .local-secrets/
+.migration/
 agent.db
 *.agent-ca.key
+findings.md
+progress.md
+task_plan.md

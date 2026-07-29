@@ -1,4 +1,19 @@
 services:
+  ownership-backfill:
+    build:
+      context: ../..
+      dockerfile: apps/api-service/Dockerfile
+    env_file:
+      - ../../.env
+    command:
+      - python
+      - -m
+      - visiox_api.maintenance.backfill_resource_ownership
+    depends_on:
+      api-service:
+        condition: service_started
+    profiles: ["maintenance"]
+
   api-service:
     build:
       context: ../..
@@ -20,6 +35,9 @@ services:
         condition: service_started
     environment:
       VISIOX_TRAINING_RUNS_ROOT: /workspace/training-runs
+      VISIOX_AUTH_JWT_SECRET_FILE: /run/secrets/visiox_auth_jwt_secret
+      VISIOX_BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/visiox_bootstrap_admin_password
+      VISIOX_AUTH_COOKIE_SECURE: ${VISIOX_AUTH_COOKIE_SECURE:-false}
       VISIOX_AGENT_GATEWAY_ENABLED: "true"
       VISIOX_AGENT_AUTO_GENERATE_CA: "true"
       VISIOX_AGENT_PUBLIC_WS_URL: ${VISIOX_AGENT_PUBLIC_WS_URL:-ws://host.docker.internal:8000/agent/v1/connect}
@@ -28,6 +46,13 @@ services:
       - training-runs:/workspace/training-runs:ro
       - agent-pki:/var/lib/visiox/pki
       - edge-runtime:/run/visiox-edge
+    secrets:
+      - source: visiox_auth_jwt_secret
+        target: visiox_auth_jwt_secret
+        mode: 0400
+      - source: visiox_bootstrap_admin_password
+        target: visiox_bootstrap_admin_password
+        mode: 0400
 
   edge-executor-worker:
     build:
@@ -112,24 +137,17 @@ services:
     build:
       context: ../..
       dockerfile: infra/observability/Dockerfile
+    env_file:
+      - ../../.env
     command:
-      - mlflow
-      - server
-      - --host
-      - 0.0.0.0
-      - --port
-      - "5000"
-      - --allowed-hosts
-      - mlflow,mlflow:5000,localhost,localhost:5001,127.0.0.1,127.0.0.1:5001
-      - --cors-allowed-origins
-      - http://127.0.0.1:5174,http://localhost:5174
-      - --x-frame-options
-      - NONE
-      - --backend-store-uri
-      - sqlite:////mlflow/mlflow.db
-      - --artifacts-destination
-      - /mlflow/artifacts
-      - --serve-artifacts
+      - /bin/sh
+      - -ec
+      - >-
+        exec mlflow server --host 0.0.0.0 --port 5000
+        --allowed-hosts "$${VISIOX_MLFLOW_ALLOWED_HOSTS:-mlflow,mlflow:5000,localhost,localhost:5001,127.0.0.1,127.0.0.1:5001}"
+        --cors-allowed-origins http://127.0.0.1:5174,http://localhost:5174
+        --x-frame-options NONE --backend-store-uri sqlite:////mlflow/mlflow.db
+        --artifacts-destination /mlflow/artifacts --serve-artifacts
     ports:
       - "5001:5000"
     volumes:
@@ -232,8 +250,10 @@ services:
       LABEL_STUDIO_UPSTREAM: http://label-studio:8080
       LABEL_STUDIO_USERNAME: ${LABEL_STUDIO_USERNAME:-admin@example.com}
       LABEL_STUDIO_PASSWORD: ${LABEL_STUDIO_PASSWORD:-visiox123}
+      VISIOX_API_INTERNAL_URL: http://api-service:8000
     depends_on:
       - label-studio
+      - api-service
     ports:
       - "80:8081"
 
@@ -250,3 +270,7 @@ volumes:
 secrets:
   edge_credential_master_key:
     file: ../../.local-secrets/edge_credential_master_key
+  visiox_auth_jwt_secret:
+    file: ../../.local-secrets/visiox_auth_jwt_secret
+  visiox_bootstrap_admin_password:
+    file: ../../.local-secrets/visiox_bootstrap_admin_password

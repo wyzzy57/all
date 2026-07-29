@@ -12,6 +12,7 @@ _PACKAGED_SCRIPTS = frozenset(
         "probe_inventory.sh",
         "stage_training.sh",
         "stop_deployment.sh",
+        "start_deployment.sh",
         "stop_training.sh",
     }
 )
@@ -20,10 +21,7 @@ _PACKAGED_SCRIPTS = frozenset(
 def load_packaged_script(name: str) -> bytes:
     if name not in _PACKAGED_SCRIPTS:
         raise ValueError("Unknown packaged edge script")
-    packaged = (
-        resources.files("visiox_edge_executor_worker")
-        .joinpath("remote", name)
-    )
+    packaged = resources.files("visiox_edge_executor_worker").joinpath("remote", name)
     if packaged.is_file():
         return packaged.read_bytes()
     source_script = Path(__file__).parents[2] / "remote" / name

@@ -491,26 +491,36 @@
     </template>
 
     <template v-else>
-      <header class="wizard-topbar">
-        <button class="back-link" type="button" @click="backToList">
-          <el-icon><ArrowLeft /></el-icon>
-          返回产线列表
-        </button>
-        <nav class="wizard-steps" aria-label="??????">
-          <button
-            v-for="(step, index) in wizardSteps"
-            :key="step"
-            type="button"
-            :class="{ active: activeStep === index, done: activeStep > index }"
-            @click="activeStep = index"
-          >
-            <span>{{ index + 1 }}</span>
-            <strong>{{ step }}</strong>
-          </button>
-        </nav>
-      </header>
+      <PipelineWizardShell
+        :steps="wizardSteps"
+        :active-step="activeStep"
+        :submitting="submitting"
+        :show-direct-deploy="!isLlmWizard"
+        :show-save-draft="isLlmWizard"
+        :draft-saving="llmDraftSaving"
+        :draft-status="isLlmWizard ? llmDraftStatus : ''"
+        @back="backToList"
+        @step="goToWizardStep"
+        @previous="activeStep -= 1"
+        @next="goNext"
+        @submit="submitTraining"
+        @save-draft="saveLlmDraftFromAction"
+      >
+        <LlmPipelineWizardSteps
+          v-if="isLlmWizard"
+          ref="llmWizardRef"
+          v-model="llmForm"
+          :active-step="activeStep"
+          :datasets="datasets"
+          :resource-pools="resourcePools"
+          :compute-nodes="computeNodes"
+          :resources-loading="edgeResourcesLoading"
+          :resource-error="edgeResourceError"
+          @request-resources="loadEdgeResources"
+          @dataset-uploaded="handleLlmDatasetUploaded"
+        />
 
-      <section class="wizard-panel">
+        <template v-else>
         <div v-if="activeStep === 0" class="step-panel">
           <h2>选择产线</h2>
           <button class="scenario-card selected" type="button">
@@ -819,14 +829,9 @@
             <span>训练位置：{{ trainingEnvironmentLabel }}</span>
           </div>
         </div>
+        </template>
 
-        <footer class="wizard-footer">
-          <el-button v-if="activeStep > 0" plain @click="activeStep -= 1">上一步</el-button>
-          <el-button v-if="activeStep === 0" plain>直接部署</el-button>
-          <el-button v-if="activeStep < 3" type="primary" @click="goNext">下一步</el-button>
-          <el-button v-else type="primary" :loading="submitting" @click="submitTraining">提交训练</el-button>
-        </footer>
-      </section>
+      </PipelineWizardShell>
     </template>
 
     <el-dialog
@@ -1005,30 +1010,14 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="publicDialogVisible" title="公开配置" width="560px" class="public-dialog">
-      <div class="public-switch-row">
-        <div>
-          <strong>是否公开</strong>
-          <p>数据集公开后可被其他用户访问</p>
-        </div>
-        <el-switch v-model="publicForm.is_public" />
-      </div>
-      <div class="public-section-title">* 公开权限设置 <span>已选：{{ selectedScopes.length }}</span></div>
-      <div class="permission-grid">
-        <el-checkbox :model-value="allScopesSelected" @change="toggleAllScopes">全选</el-checkbox>
-        <el-checkbox
-          v-for="scope in scopeOptions"
-          :key="scope"
-          :model-value="selectedScopes.includes(scope)"
-          @change="toggleScope(scope)"
-        >
-          {{ scope }}
-        </el-checkbox>
-      </div>
-      <template #footer>
-        <el-button type="primary" @click="confirmPublicConfig">配置完成</el-button>
-      </template>
-    </el-dialog>
+    <ResourceSharingDialog
+      v-if="sharingPipeline"
+      v-model="publicDialogVisible"
+      resource-type="pipeline"
+      :resource-id="sharingPipeline.id"
+      :resource-name="sharingPipeline.name"
+      @saved="handlePipelineSharingSaved"
+    />
   </section>
 </template>
 
@@ -1057,7 +1046,7 @@ import {
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onMounted, onUnmounted, reactive, ref, watch, type Component } from "vue";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 
 import {
   api,
@@ -1075,12 +1064,24 @@ import {
 } from "@/api/client";
 import type { ExperienceInferenceRequest } from "@/components/ServiceExperiencePanel.vue";
 import ServiceExperiencePanel from "@/components/ServiceExperiencePanel.vue";
+import ResourceSharingDialog from "@/components/sharing/ResourceSharingDialog.vue";
+import PipelineWizardShell from "@/features/pipeline-wizard/PipelineWizardShell.vue";
+import { usePipelineWizardDraft } from "@/features/pipeline-wizard/usePipelineWizardDraft";
+import LlmPipelineWizardSteps from "@/features/pipeline-wizard/llm/LlmPipelineWizardSteps.vue";
+import {
+  createDefaultLlmTrainingForm,
+  toLlamaFactoryConfig,
+  type LlmTrainingForm,
+} from "@/features/pipeline-wizard/llm/llmTrainingForm";
 
 type ActiveTab = "all" | "mine" | "favorite";
 type ViewMode = "list" | "wizard" | "detail";
 type CreateTab = "zero" | "local";
 type ProcessingTab = "train" | "val" | "test" | "classes";
 type DetailTab = "basic" | "logs" | "experience" | "deploy" | "evaluate";
+type LlmWizardExpose = {
+  validateStep: (step: number) => { valid: boolean; message: string };
+};
 
 type DatasetAnalysis = {
   sample_count?: number;
@@ -1142,6 +1143,7 @@ type TrainForm = {
 type TrainingEnvironmentMode = "local" | "remote";
 
 const router = useRouter();
+const route = useRoute();
 
 const tabOptions: Array<{ label: string; value: ActiveTab }> = [
   { label: "全部产线", value: "all" },
@@ -1169,8 +1171,6 @@ const localModelTaskOptions = [
   { label: "旋转框检测", value: "obb" },
   { label: "图像分类", value: "classify" },
 ];
-
-const scopeOptions = ["管理员部门", "1组", "2组", "班级1", "班级2"];
 
 const managedYoloParams = new Set(["task", "mode", "model", "data", "project", "name", "exist_ok", "device", "workers"]);
 const yoloParamDefaults: Record<string, unknown> = {
@@ -1291,6 +1291,8 @@ const currentPage = ref(1);
 const pageSize = ref(20);
 const activeStep = ref(0);
 const wizardSteps = ["选择产线", "数据准备", "参数准备", "提交训练"];
+const wizardStepKeys = ["overview", "data", "params", "submit"] as const;
+const llmWizardRef = ref<LlmWizardExpose | null>(null);
 const detailTab = ref<DetailTab>("basic");
 const deployMode = ref<"online" | "offline">("online");
 const evaluationTab = ref<"pipeline" | "history">("pipeline");
@@ -1300,6 +1302,7 @@ const modelFileInput = ref<HTMLInputElement | null>(null);
 const localModelFile = ref<File | null>(null);
 const renameDialogVisible = ref(false);
 const publicDialogVisible = ref(false);
+const sharingPipeline = ref<TrainingPipelineRecord | null>(null);
 const resultFilesDialogVisible = ref(false);
 const resultFilesLoading = ref(false);
 const resultFiles = ref<TrainingArtifactRecord[]>([]);
@@ -1327,7 +1330,6 @@ const latestJobsByPipeline = ref<Record<string, TrainingJobRecord>>({});
 const baseModels = ref<BaseModelRecord[]>([]);
 const trainedModels = ref<TrainedModelRecord[]>([]);
 const datasets = ref<DatasetRecord[]>([]);
-const selectedScopes = ref<string[]>([]);
 const configParams = ref<Record<string, unknown>>({});
 let refreshTimer: number | undefined;
 const analysisResult = ref<DatasetAnalysis | null>(null);
@@ -1344,10 +1346,6 @@ const createForm = reactive({
   description: "",
   localTask: "detect",
   localScale: "n",
-});
-
-const publicForm = reactive({
-  is_public: false,
 });
 
 const deployForm = reactive({
@@ -1407,6 +1405,8 @@ const form = reactive<TrainForm>({
   device: "cpu",
 });
 
+const llmForm = ref<LlmTrainingForm>(createDefaultLlmTrainingForm());
+
 const trainingEnvironment = reactive({
   mode: "local" as TrainingEnvironmentMode,
   poolId: "",
@@ -1420,6 +1420,22 @@ const typeOptions = computed(() => Array.from(new Set(pipelines.value.map((item)
 const selectedScenario = computed(
   () => scenarios.find((scenario) => scenario.key === createForm.scenarioKey) || scenarios[0],
 );
+const isLlmWizard = computed(() => form.task === "llm");
+const llmDraftController = usePipelineWizardDraft(
+  llmForm,
+  computed(() => viewMode.value === "wizard" && isLlmWizard.value && Boolean(wizardPipelineId.value)),
+  saveLlmDraft,
+);
+const llmDraftSaving = computed(() => llmDraftController.status.value === "saving");
+const llmDraftStatus = computed(() => {
+  if (llmDraftController.status.value === "dirty") return "有未保存更改";
+  if (llmDraftController.status.value === "saving") return "草稿保存中";
+  if (llmDraftController.status.value === "error") return "草稿保存失败，点击重试";
+  const savedAt = llmDraftController.lastSavedAt.value;
+  return savedAt
+    ? `草稿已保存 ${savedAt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`
+    : "草稿已保存";
+});
 
 const filteredPipelines = computed(() => {
   const normalizedKeyword = keyword.value.trim().toLowerCase();
@@ -1639,8 +1655,6 @@ const selectedEvaluationMetricRows = computed(() => {
 
 const trainCount = computed(() => splitSummary.value.train.count);
 const valCount = computed(() => splitSummary.value.val.count);
-const allScopesSelected = computed(() => selectedScopes.value.length === scopeOptions.length);
-
 const splitSummary = computed(() => {
   const distribution = analysisResult.value?.split_distribution ?? {};
   const total = Math.max(analysisResult.value?.sample_count ?? selectedDataset.value?.sample_count ?? 0, 0);
@@ -1717,6 +1731,7 @@ watch(configMode, (enabled) => {
 
 watch(activeStep, (step) => {
   if (step === 3 && resourcePools.value.length === 0 && !edgeResourcesLoading.value) void loadEdgeResources();
+  if (viewMode.value === "wizard" && wizardPipelineId.value) void syncWizardRoute();
 });
 
 watch(
@@ -1730,7 +1745,10 @@ watch(
 );
 
 onMounted(() => {
-  void loadWorkspace();
+  void (async () => {
+    await loadWorkspace();
+    await restoreWizardFromRoute();
+  })();
   refreshTimer = window.setInterval(() => {
     if (pipelines.value.some((pipeline) => pipeline.status === "running")) {
       void loadWorkspace({ silent: true });
@@ -1806,7 +1824,7 @@ async function startWizard() {
     return;
   }
   const task = createTab.value === "local" ? createForm.localTask : selectedScenario.value.task;
-  const scale = createTab.value === "local" ? createForm.localScale : "n";
+  const scale = createTab.value === "local" ? createForm.localScale : task === "llm" ? "llm" : "n";
   form.name = name;
   form.task = task;
   form.scale = scale;
@@ -1817,7 +1835,12 @@ async function startWizard() {
   activeSampleId.value = "";
   processingTab.value = "train";
   configParams.value = {};
-  ensureWizardDefaults();
+  if (task === "llm") {
+    llmForm.value = createDefaultLlmTrainingForm(name);
+    trainingEnvironment.mode = "remote";
+  } else {
+    ensureWizardDefaults();
+  }
   submitting.value = true;
   try {
     let uploadedModel: BaseModelRecord | null = null;
@@ -1829,6 +1852,7 @@ async function startWizard() {
     }
     const pipeline = await api.createPipeline({
       name: form.name,
+      engine: form.task === "llm" ? "llamafactory" : "yolo26",
       task: form.task,
       scale: form.scale,
       ...(uploadedModel ? { base_model_id: uploadedModel.id } : {}),
@@ -1838,6 +1862,7 @@ async function startWizard() {
     activeStep.value = 0;
     createDialogVisible.value = false;
     viewMode.value = "wizard";
+    await syncWizardRoute();
   } catch (error) {
     ElMessage.error(getErrorMessage(error, "创建产线失败"));
   } finally {
@@ -1853,16 +1878,22 @@ async function openExistingPipelineWizard(pipeline: TrainingPipelineRecord) {
   form.scale = pipeline.scale || "n";
   form.base_model_id = pipeline.base_model_id || "";
   form.dataset_id = pipeline.dataset_id || "";
-  applyPipelineParams(pipeline);
-  configParams.value = normalizeConfigParams(pipeline.params_template ?? {});
+  if (pipeline.task === "llm") {
+    llmForm.value = llmFormFromPipeline(pipeline);
+    trainingEnvironment.mode = "remote";
+  } else {
+    applyPipelineParams(pipeline);
+    configParams.value = normalizeConfigParams(pipeline.params_template ?? {});
+  }
   analysisResult.value = null;
   samplesBySplit.value = { train: [], val: [], test: [] };
   activeSampleId.value = "";
   processingTab.value = "train";
-  ensureWizardDefaults();
+  if (pipeline.task !== "llm") ensureWizardDefaults();
   activeStep.value = 0;
   viewMode.value = "wizard";
-  if (form.dataset_id) await loadWizardProcessingData();
+  await syncWizardRoute();
+  if (form.dataset_id && pipeline.task !== "llm") await loadWizardProcessingData();
 }
 
 function openPipelineCard(pipeline: TrainingPipelineRecord) {
@@ -2118,6 +2149,35 @@ function backToList() {
   viewMode.value = "list";
   activeStep.value = 0;
   detailPipelineId.value = "";
+  wizardPipelineId.value = "";
+  void router.replace({ path: "/model-space", query: {} });
+}
+
+function wizardStepFromQuery(value: unknown) {
+  const index = wizardStepKeys.indexOf(String(value) as (typeof wizardStepKeys)[number]);
+  return index >= 0 ? index : 0;
+}
+
+function syncWizardRoute() {
+  if (!wizardPipelineId.value) return Promise.resolve();
+  return router.replace({
+    path: "/model-space",
+    query: {
+      pipeline: wizardPipelineId.value,
+      step: wizardStepKeys[activeStep.value] ?? wizardStepKeys[0],
+    },
+  });
+}
+
+async function restoreWizardFromRoute() {
+  const pipelineId = typeof route.query.pipeline === "string" ? route.query.pipeline : "";
+  if (!pipelineId) return;
+  const requestedStep = wizardStepFromQuery(route.query.step);
+  const pipeline = pipelines.value.find((item) => item.id === pipelineId);
+  if (!pipeline || !isConfiguredPipeline(pipeline)) return;
+  await openExistingPipelineWizard(pipeline);
+  activeStep.value = requestedStep;
+  await syncWizardRoute();
 }
 
 function setTab(tab: ActiveTab) {
@@ -2141,7 +2201,34 @@ function rebalanceSplit() {
   form.test_ratio = 0;
 }
 
+function goToWizardStep(index: number) {
+  if (index === activeStep.value) return;
+  if (!isLlmWizard.value) {
+    activeStep.value = index;
+    return;
+  }
+  if (index < activeStep.value) {
+    activeStep.value = index;
+    return;
+  }
+  if (index === activeStep.value + 1) void goNext();
+}
+
 async function goNext() {
+  if (isLlmWizard.value) {
+    const validation = llmWizardRef.value?.validateStep(activeStep.value) ?? { valid: false, message: "大模型配置尚未就绪" };
+    if (!validation.valid) {
+      ElMessage.warning(validation.message);
+      return;
+    }
+    try {
+      await llmDraftController.saveNow();
+      activeStep.value += 1;
+    } catch (error) {
+      ElMessage.error(getErrorMessage(error, "大模型草稿保存失败"));
+    }
+    return;
+  }
   if (activeStep.value === 0) {
     ensureWizardDefaults();
     activeStep.value += 1;
@@ -2215,6 +2302,10 @@ async function loadWizardProcessingData() {
 }
 
 async function submitTraining() {
+  if (isLlmWizard.value) {
+    await submitLlmTraining();
+    return;
+  }
   if (!form.base_model_id || !form.dataset_id) {
     ElMessage.warning("请先选择模型和数据集");
     return;
@@ -2264,6 +2355,70 @@ async function submitTraining() {
     backToList();
   } catch (error) {
     ElMessage.error(getErrorMessage(error, "提交训练失败"));
+  } finally {
+    submitting.value = false;
+  }
+}
+
+async function saveLlmDraft() {
+  if (!wizardPipelineId.value) return;
+  const defaultEnvironment = {
+    device: "remote",
+    workers: llmForm.value.dataloaderWorkers,
+    ...(llmForm.value.poolId ? { resource_pool_id: llmForm.value.poolId } : {}),
+    ...(llmForm.value.nodeId ? { node_id: llmForm.value.nodeId } : {}),
+  };
+  const updated = await api.updatePipeline(wizardPipelineId.value, {
+    name: llmForm.value.name.trim(),
+    engine: "llamafactory",
+    task: "llm",
+    scale: "llm",
+    dataset_id: llmForm.value.datasetId || null,
+    params_template: llmPipelineParams(),
+    default_environment: defaultEnvironment,
+  });
+  form.name = llmForm.value.name.trim();
+  form.dataset_id = llmForm.value.datasetId;
+  replacePipeline(updated);
+}
+
+async function saveLlmDraftFromAction() {
+  try {
+    await llmDraftController.saveNow();
+    ElMessage.success("草稿已保存");
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, "大模型草稿保存失败"));
+  }
+}
+
+async function submitLlmTraining() {
+  const validation = llmWizardRef.value?.validateStep(3) ?? { valid: false, message: "大模型配置尚未就绪" };
+  if (!validation.valid) {
+    ElMessage.warning(validation.message);
+    return;
+  }
+  submitting.value = true;
+  try {
+    await llmDraftController.saveNow();
+    if (!wizardPipelineId.value) throw new Error("大模型产线尚未创建");
+    await api.createTrainingJob(wizardPipelineId.value, {
+      environment: {
+        device: "remote",
+        workers: llmForm.value.dataloaderWorkers,
+        resource_pool_id: llmForm.value.poolId,
+        node_id: llmForm.value.nodeId,
+      },
+      distributed: {
+        resource_pool_id: llmForm.value.poolId,
+        requested_gpus: 1,
+        node_ids: [llmForm.value.nodeId],
+      },
+    });
+    ElMessage.success("大模型训练已提交");
+    await loadWorkspace();
+    backToList();
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, "大模型训练提交失败"));
   } finally {
     submitting.value = false;
   }
@@ -2504,6 +2659,77 @@ function trainingParams() {
   });
 }
 
+function llmPipelineParams() {
+  const modelId = llmForm.value.modelId.trim();
+  return {
+    model_source: llmForm.value.modelSource,
+    ...(modelId
+      ? {
+          model_id: modelId,
+          model_revision: llmForm.value.requestedRevision.trim() || "main",
+          resolved_revision: llmForm.value.resolvedRevision || undefined,
+        }
+      : {}),
+    ...toLlamaFactoryConfig(llmForm.value),
+  };
+}
+
+function handleLlmDatasetUploaded(dataset: DatasetRecord) {
+  const index = datasets.value.findIndex((item) => item.id === dataset.id);
+  if (index >= 0) datasets.value[index] = dataset;
+  else datasets.value.push(dataset);
+}
+
+function llmFormFromPipeline(pipeline: TrainingPipelineRecord): LlmTrainingForm {
+  const params = pipeline.params_template ?? {};
+  const environment = pipeline.default_environment ?? {};
+  const defaults = createDefaultLlmTrainingForm(pipeline.name);
+  const numberValue = (key: string, fallback: number) => {
+    const value = Number(params[key]);
+    return Number.isFinite(value) ? value : fallback;
+  };
+  return {
+    ...defaults,
+    name: pipeline.name,
+    modelSource: params.model_source === "modelscope" ? "modelscope" : "huggingface",
+    modelId: typeof params.model_id === "string" ? params.model_id : "",
+    requestedRevision: typeof params.model_revision === "string" ? params.model_revision : "main",
+    resolvedRevision: typeof params.resolved_revision === "string" ? params.resolved_revision : "",
+    template: typeof params.template === "string" ? params.template : "auto",
+    trustRemoteCode: Boolean(params.trust_remote_code),
+    datasetId: pipeline.dataset_id || "",
+    method: Number(params.quantization_bit) === 4 ? "qlora" : "lora",
+    learningRate: numberValue("learning_rate", defaults.learningRate),
+    epochs: numberValue("num_train_epochs", defaults.epochs),
+    cutoffLen: numberValue("cutoff_len", defaults.cutoffLen),
+    batchSize: numberValue("per_device_train_batch_size", defaults.batchSize),
+    gradientAccumulationSteps: numberValue("gradient_accumulation_steps", defaults.gradientAccumulationSteps),
+    valSize: numberValue("val_size", defaults.valSize),
+    scheduler: typeof params.lr_scheduler_type === "string" ? params.lr_scheduler_type : defaults.scheduler,
+    warmupRatio: numberValue("warmup_ratio", defaults.warmupRatio),
+    precision: params.bf16 ? "bf16" : params.fp16 ? "fp16" : "auto",
+    loraRank: numberValue("lora_rank", defaults.loraRank),
+    loraAlpha: numberValue("lora_alpha", defaults.loraAlpha),
+    loraDropout: numberValue("lora_dropout", defaults.loraDropout),
+    loraTarget: typeof params.lora_target === "string" ? params.lora_target : defaults.loraTarget,
+    maxGradNorm: numberValue("max_grad_norm", defaults.maxGradNorm),
+    seed: numberValue("seed", defaults.seed),
+    gradientCheckpointing: params.gradient_checkpointing !== false,
+    flashAttention: params.flash_attn === "disabled" ? "disabled" : "auto",
+    ropeScaling: ["linear", "dynamic"].includes(String(params.rope_scaling)) ? params.rope_scaling as "linear" | "dynamic" : "none",
+    loggingSteps: numberValue("logging_steps", defaults.loggingSteps),
+    evalSteps: numberValue("eval_steps", defaults.evalSteps),
+    saveSteps: numberValue("save_steps", defaults.saveSteps),
+    saveTotalLimit: numberValue("save_total_limit", defaults.saveTotalLimit),
+    maxSamples: params.max_samples === undefined ? null : numberValue("max_samples", 0),
+    packing: Boolean(params.packing),
+    preprocessingWorkers: numberValue("preprocessing_num_workers", defaults.preprocessingWorkers),
+    dataloaderWorkers: numberValue("dataloader_num_workers", defaults.dataloaderWorkers),
+    poolId: typeof environment.resource_pool_id === "string" ? environment.resource_pool_id : "",
+    nodeId: typeof environment.node_id === "string" ? environment.node_id : "",
+  };
+}
+
 function applyPipelineParams(pipeline: TrainingPipelineRecord) {
   const params = pipeline.params_template ?? {};
   const environment = pipeline.default_environment ?? {};
@@ -2578,25 +2804,19 @@ async function confirmRename() {
 }
 
 function openPublicDialog(pipeline: TrainingPipelineRecord) {
-  editingPipelineId.value = pipeline.id;
-  publicForm.is_public = Boolean(pipeline.is_public);
-  const scope = pipeline.public_scope as { scopes?: unknown } | undefined;
-  selectedScopes.value = Array.isArray(scope?.scopes) ? scope.scopes.map(String) : [];
+  sharingPipeline.value = pipeline;
   publicDialogVisible.value = true;
 }
 
-async function confirmPublicConfig() {
-  if (!editingPipelineId.value) return;
-  try {
-    const updated = await api.updatePipeline(editingPipelineId.value, {
-      is_public: publicForm.is_public,
-      public_scope: { scopes: selectedScopes.value },
-    });
-    replacePipeline(updated);
-    publicDialogVisible.value = false;
-  } catch (error) {
-    ElMessage.error(getErrorMessage(error, "公开配置保存失败"));
-  }
+function handlePipelineSharingSaved(visibility: string) {
+  if (!sharingPipeline.value) return;
+  const updated = {
+    ...sharingPipeline.value,
+    visibility,
+    is_public: visibility === "organization",
+  };
+  replacePipeline(updated);
+  sharingPipeline.value = updated;
 }
 
 async function deletePipeline(pipeline: TrainingPipelineRecord) {
@@ -2632,16 +2852,6 @@ function toggleSelectedPipeline(id: string) {
   if (next.has(id)) next.delete(id);
   else next.add(id);
   selectedPipelineIds.value = next;
-}
-
-function toggleScope(scope: string) {
-  selectedScopes.value = selectedScopes.value.includes(scope)
-    ? selectedScopes.value.filter((item) => item !== scope)
-    : [...selectedScopes.value, scope];
-}
-
-function toggleAllScopes() {
-  selectedScopes.value = allScopesSelected.value ? [] : [...scopeOptions];
 }
 
 function replacePipeline(updated: TrainingPipelineRecord) {

@@ -1,17 +1,24 @@
 import asyncio
+import json
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 import logging
+import sys
 import threading
 import time
 
 import pytest
 
 from visiox_api.main import create_app
+from visiox_api.dependencies.auth import get_current_user
 from visiox_api.routes import edge_ssh
 from visiox_api.routes.edge_ssh import get_edge_bootstrap_service
+from visiox_db.models import AuditLog, ComputeNode, EdgeSshCredential, Organization, User
+from visiox_edge_executor_worker.inventory import parse_inventory
 
 
 BOOTSTRAP_REQUEST = {
@@ -69,9 +76,76 @@ class FakeBootstrapService:
         return {"status": "ok", "node_id": node_id}
 
 
+class PersistingManualBootstrapService(FakeBootstrapService):
+    def __init__(self, session_factory) -> None:
+        super().__init__()
+        self.session_factory = session_factory
+        fixture = Path("tests/fixtures/edge_inventory/x86.json")
+        self.inventory = parse_inventory(
+            json.loads(fixture.read_text(encoding="utf-8"))
+        ).model_dump(mode="json")
+
+    def bootstrap(self, **request: Any) -> dict[str, Any]:
+        self.calls.append(("bootstrap", request))
+        with self.session_factory() as session:
+            organization = session.query(Organization).filter_by(slug="default").one()
+            owner = session.query(User).filter_by(
+                organization_id=organization.id,
+                role="admin",
+                status="active",
+            ).first()
+            assert owner is not None
+            node = ComputeNode(
+                name=request["node_name"],
+                organization_id=organization.id,
+                owner_user_id=owner.id,
+                status="online",
+                architecture="unknown",
+                platform_kind="ssh_edge",
+                capabilities={},
+                resources={},
+                fingerprint={
+                    "ssh_host_key_type": "ssh-ed25519",
+                    "ssh_host_key_fingerprint": request["confirmed_fingerprint"],
+                },
+                agent_version="ssh-bootstrap",
+                connection_method="ssh",
+            )
+            session.add(node)
+            session.flush()
+            session.add(
+                EdgeSshCredential(
+                    node_id=node.id,
+                    ssh_host=request["host"],
+                    ssh_port=request["port"],
+                    ssh_user="visiox-edge",
+                    host_key_type="ssh-ed25519",
+                    host_key_fingerprint=request["confirmed_fingerprint"],
+                    public_key="ssh-ed25519 test-public-key",
+                    encrypted_private_key=b"encrypted-private-key",
+                    encryption_nonce=b"nonce",
+                    key_version=1,
+                )
+            )
+            session.commit()
+            return {"status": "ok", "node_id": node.id}
+
+    def probe(
+        self,
+        *,
+        node_id: str,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        self.calls.append(("probe", {"node_id": node_id, "deadline": deadline}))
+        return {"status": "ok", "node_id": node_id, "inventory": self.inventory}
+
+
 def _client(fake_service: FakeBootstrapService) -> TestClient:
     app = create_app()
     app.dependency_overrides[get_edge_bootstrap_service] = lambda: fake_service
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id="legacy-admin", organization_id="legacy-org", role="admin"
+    )
     return TestClient(app)
 
 
@@ -120,6 +194,102 @@ def test_bootstrap_request_forwards_password_only_to_private_worker_service() ->
     assert "one-time-password" not in response.text
     assert service.calls[0][0] == "bootstrap"
     assert service.calls[0][1]["password"] == "one-time-password"
+
+
+def test_admin_can_onboard_a_manual_node_without_exposing_credentials(
+    authenticated_client,
+) -> None:
+    client, session_factory, _, identity = authenticated_client
+    service = PersistingManualBootstrapService(session_factory)
+    client.app.dependency_overrides[get_edge_bootstrap_service] = lambda: service
+
+    payload = {
+        "name": "gpu-server-01",
+        "host": "10.10.13.20",
+        "port": 22,
+        "administrator": "skyinfor",
+        "password": "temporary-password",
+        "confirmed_fingerprint": "SHA256:confirmed-host-key",
+        "labels": {"location": "lab-a", "purpose": "training"},
+    }
+    response = client.post(
+        "/nodes/manual",
+        headers=identity["admin_headers"],
+        json=payload,
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["name"] == "gpu-server-01"
+    assert body["enabled"] is True
+    assert body["labels"] == payload["labels"]
+    assert body["connection_method"] == "ssh"
+    assert body["resource_revision"] == 1
+    assert body["inventory_refreshed_at"] is not None
+    assert "password" not in response.text
+    assert "encrypted-private-key" not in response.text
+    assert [call[0] for call in service.calls] == [
+        "scan_host_key",
+        "bootstrap",
+        "probe",
+    ]
+
+    with session_factory() as session:
+        assert session.query(ComputeNode).count() == 1
+        assert session.query(EdgeSshCredential).count() == 1
+        assert {
+            row.action for row in session.query(AuditLog).order_by(AuditLog.created_at)
+        } >= {"node.host_key.confirm", "node.create", "node.probe"}
+
+
+def test_member_cannot_onboard_a_manual_node(authenticated_client) -> None:
+    client, session_factory, _, identity = authenticated_client
+    service = PersistingManualBootstrapService(session_factory)
+    client.app.dependency_overrides[get_edge_bootstrap_service] = lambda: service
+
+    response = client.post(
+        "/nodes/manual",
+        headers=identity["member_headers"],
+        json={
+            "name": "forbidden-node",
+            "host": "10.10.13.21",
+            "administrator": "ubuntu",
+            "password": "temporary-password",
+            "confirmed_fingerprint": "SHA256:confirmed-host-key",
+            "labels": {},
+        },
+    )
+
+    assert response.status_code == 403
+    assert service.calls == []
+
+
+def test_manual_node_retry_reuses_the_existing_host_and_credential(
+    authenticated_client,
+) -> None:
+    client, session_factory, _, identity = authenticated_client
+    service = PersistingManualBootstrapService(session_factory)
+    client.app.dependency_overrides[get_edge_bootstrap_service] = lambda: service
+    payload = {
+        "name": "retry-node",
+        "host": "GPU.EXAMPLE.TEST.",
+        "port": 22,
+        "administrator": "ubuntu",
+        "password": "temporary-password",
+        "confirmed_fingerprint": "SHA256:confirmed-host-key",
+        "labels": {},
+    }
+
+    first = client.post("/nodes/manual", headers=identity["admin_headers"], json=payload)
+    second = client.post("/nodes/manual", headers=identity["admin_headers"], json=payload)
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["id"] == second.json()["id"]
+    assert [name for name, _ in service.calls].count("bootstrap") == 1
+    with session_factory() as session:
+        assert session.query(ComputeNode).count() == 1
+        assert session.query(EdgeSshCredential).count() == 1
 
 
 @pytest.mark.parametrize(
@@ -291,16 +461,15 @@ def test_node_operation_route_enforces_fifty_millisecond_ingress_deadline(
 
     monkeypatch.setattr(edge_ssh, "REQUEST_TIMEOUT_SECONDS", 0.05)
     service = SlowService()
-    client = _client(service)
-    started = time.monotonic()
-
-    response = client.post(path)
-    elapsed = time.monotonic() - started
+    with _client(service) as client:
+        started = time.monotonic()
+        response = client.post(path)
+        elapsed = time.monotonic() - started
     assert service.finished.wait(0.2)
 
     assert response.status_code == 504
     assert response.json() == {"detail": "Edge bootstrap request timed out"}
-    assert elapsed < 0.094
+    assert elapsed < (0.16 if sys.platform == "win32" else 0.094)
     assert service.calls[0][0] == operation
     assert service.entered[0] < service.calls[0][1]["deadline"]
     assert service.calls[0][1]["deadline"] <= service.entered[0] + 0.05

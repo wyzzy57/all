@@ -12,9 +12,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from visiox_api.dependencies.auth import get_current_user
+from visiox_api.dependencies.authorization import require_resource_permission
+from visiox_api.dependencies.database import get_db_session
 from visiox_db.models import BaseModel as BaseModelRecord
 from visiox_db.models import TrainedModel, TrainingPipeline
-from visiox_db.session import get_session
+from visiox_db.models.identity import PERMISSION_USE, User
 from visiox_storage.client import ObjectStorageClient
 
 
@@ -63,8 +66,7 @@ class UltralyticsPipelinePredictor:
         )
 
 
-def get_pipeline_inference_session() -> Generator[Session]:
-    yield from get_session()
+get_pipeline_inference_session = get_db_session
 
 
 def get_pipeline_inference_storage(request: Request) -> ObjectStorageClient:
@@ -87,10 +89,12 @@ async def predict_pipeline_image(
     session: Session = Depends(get_pipeline_inference_session),
     storage: ObjectStorageClient = Depends(get_pipeline_inference_storage),
     predictor: PipelinePredictor = Depends(get_pipeline_predictor),
+    actor: User = Depends(get_current_user),
 ) -> PipelinePredictResponse:
     pipeline = session.get(TrainingPipeline, pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
+    require_resource_permission(session, actor, "pipeline", pipeline_id, PERMISSION_USE)
     if file.content_type and not file.content_type.startswith("image/"):
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Only image files are supported")
 

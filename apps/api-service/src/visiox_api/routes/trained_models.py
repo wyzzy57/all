@@ -7,8 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from visiox_api.dependencies.auth import get_current_user
+from visiox_api.dependencies.authorization import require_resource_permission
+from visiox_api.dependencies.database import get_db_session
+from visiox_api.services.authorization import authorized_resource_predicate
 from visiox_db.models import TrainedModel
-from visiox_db.session import get_session
+from visiox_db.models.identity import PERMISSION_EDIT, PERMISSION_VIEW, User
 
 
 router = APIRouter(prefix="/trained-models", tags=["trained-models"])
@@ -26,6 +30,9 @@ class TrainedModelResponse(BaseModel):
     artifact_uri: str
     metrics: dict[str, Any]
     status: str
+    organization_id: str | None
+    owner_user_id: str | None
+    visibility: str
     created_at: datetime
     updated_at: datetime
 
@@ -48,8 +55,7 @@ class TrainedModelUpdateRequest(BaseModel):
         return value
 
 
-def get_trained_model_session() -> Generator[Session]:
-    yield from get_session()
+get_trained_model_session = get_db_session
 
 
 @router.get("", response_model=TrainedModelListResponse)
@@ -60,8 +66,13 @@ def list_trained_models(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_trained_model_session),
+    actor: User = Depends(get_current_user),
 ) -> TrainedModelListResponse:
-    filters = []
+    filters = [
+        authorized_resource_predicate(
+            session, actor, TrainedModel, "trained_model", PERMISSION_VIEW
+        )
+    ]
     if task is not None:
         filters.append(TrainedModel.task == task)
     if pipeline_id is not None:
@@ -85,10 +96,12 @@ def update_trained_model(
     model_id: str,
     payload: TrainedModelUpdateRequest,
     session: Session = Depends(get_trained_model_session),
+    actor: User = Depends(get_current_user),
 ) -> TrainedModel:
     model = session.get(TrainedModel, model_id)
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trained model not found")
+    require_resource_permission(session, actor, "trained_model", model_id, PERMISSION_EDIT)
     model.metrics = {**(model.metrics or {}), "deployment_name": payload.deployment_name}
     session.add(model)
     session.commit()

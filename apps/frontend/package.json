@@ -16,7 +16,8 @@
     "pinia": "^2.2.6",
     "visiox": "file:../..",
     "vue": "^3.5.13",
-    "vue-router": "^4.4.5"
+    "vue-router": "^4.4.5",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^26.1.0",

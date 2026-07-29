@@ -18,7 +18,14 @@ from visiox_api.services.edge_bootstrap import (
 )
 from visiox_common.settings import Settings
 from visiox_db.base import Base
-from visiox_db.models import ComputeNode, EdgeSshCredential, NodeEvent, Task
+from visiox_db.models import (
+    ComputeNode,
+    EdgeSshCredential,
+    NodeEvent,
+    Organization,
+    Task,
+    User,
+)
 from visiox_edge_executor_worker.bootstrap_server import (
     MAX_FRAME_BYTES,
     BootstrapOperations,
@@ -195,7 +202,29 @@ class FakeSshClient:
 def session_factory() -> sessionmaker[Session]:
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    _seed_platform_identity(factory)
+    return factory
+
+
+def _seed_platform_identity(factory: sessionmaker[Session]) -> None:
+    with factory() as session:
+        organization = Organization(name="Default", slug="default", status="active")
+        session.add(organization)
+        session.flush()
+        session.add(
+            User(
+                organization_id=organization.id,
+                username="admin",
+                display_name="Administrator",
+                email="admin@example.test",
+                password_hash="test-only-hash",
+                role="admin",
+                status="active",
+                must_change_password=False,
+            )
+        )
+        session.commit()
 
 
 def _security(ssh_client: Any) -> EdgeExecutorSecurityContext:
@@ -603,6 +632,9 @@ def test_bootstrap_key_reconnect_failure_rolls_back_node_and_credential(
 def test_bootstrap_commit_failure_rolls_back_node_and_credential() -> None:
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
+
+    seed_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    _seed_platform_identity(seed_factory)
 
     class FailingCommitSession(Session):
         def commit(self) -> None:

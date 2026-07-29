@@ -1018,7 +1018,10 @@ def test_compose_and_startup_files_keep_edge_master_key_worker_only() -> None:
     assert api["environment"]["VISIOX_EDGE_BOOTSTRAP_SOCKET"] == (
         "/run/visiox-edge/edge-bootstrap.sock"
     )
-    assert api.get("secrets", []) == []
+    api_secret_targets = {
+        secret["target"] for secret in api.get("secrets", [])
+    }
+    assert "edge_credential_master_key" not in api_secret_targets
     assert "edge-runtime:/run/visiox-edge" in api["volumes"]
     assert all("edge_credential_master_key" not in volume for volume in api["volumes"])
     assert compose["secrets"]["edge_credential_master_key"]["file"] == (
