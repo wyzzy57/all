@@ -89,10 +89,12 @@ describe("dashboard components", () => {
   });
 
   it("defines a flat statistic strip with stable responsive columns", () => {
-    expect(statisticSummaryStripSource).toMatch(/\.statistic-summary-strip\s*\{[\s\S]*?grid-template-columns:\s*repeat\(5,\s*minmax\(0,\s*1fr\)\)/);
-    expect(statisticSummaryStripSource).toMatch(/\.statistic-summary-strip\s*\{[\s\S]*?background:\s*transparent/);
-    expect(statisticSummaryStripSource).toMatch(/@media \(max-width:\s*720px\)[\s\S]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
-    expect(statisticSummaryStripSource).toMatch(/@media \(max-width:\s*420px\)[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+    expect(statisticSummaryStripSource).toMatch(/\.statistic-summary-strip\s*\{[^}]*container:\s*statistic-summary\s*\/\s*inline-size/);
+    expect(statisticSummaryStripSource).toMatch(/\.statistic-summary-strip\s*\{[^}]*background:\s*transparent/);
+    expect(statisticSummaryStripSource).toMatch(/\.statistic-summary-grid\s*\{[^}]*grid-template-columns:\s*repeat\(5,\s*minmax\(0,\s*1fr\)\)/);
+    expect(statisticSummaryStripSource).toMatch(/@container statistic-summary \(max-width:\s*720px\)[\s\S]*?\.statistic-summary-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+    expect(statisticSummaryStripSource).toMatch(/@container statistic-summary \(max-width:\s*420px\)[\s\S]*?\.statistic-summary-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+    expect(statisticSummaryStripSource).not.toMatch(/@media \(max-width:\s*(?:720|420)px\)/);
     expect(statisticSummaryStripSource).not.toMatch(/font-size:\s*[^;]*(?:vw|clamp\()/);
   });
 
@@ -103,8 +105,9 @@ describe("dashboard components", () => {
       },
     });
     const items = wrapper.findAll("[role='listitem']");
-    const [wideStyles] = statisticSummaryStripSource.split("@media (max-width: 720px)");
+    const [wideStyles] = statisticSummaryStripSource.split("@container statistic-summary (max-width: 720px)");
 
+    expect(wrapper.find(".statistic-summary-grid").exists()).toBe(true);
     expect(items).toHaveLength(7);
     expect(items[5].text()).toContain("指标 6");
     expect(items[6].text()).toContain("指标 7");
@@ -431,12 +434,28 @@ describe("dashboard components", () => {
     expect(wrapper.get(".resource-usage-panel").attributes("style")).toContain("min-height");
 
     const meters = wrapper.findAll("[role='meter']");
+    const tracks = wrapper.findAll(".usage-track");
+    expect(meters).toHaveLength(3);
+    meters.forEach((meter) => {
+      expect(meter.attributes("aria-valuenow")).toBeDefined();
+      expect(meter.attributes("aria-valuemin")).toBe("0");
+      expect(meter.attributes("aria-valuemax")).toBe("100");
+      expect(meter.attributes("aria-hidden")).toBeUndefined();
+    });
+    expect(meters[0].attributes("aria-valuenow")).toBe("0");
     expect(meters[0].attributes("aria-valuetext")).toBe("0%");
-    expect(meters[1].attributes("aria-valuenow")).toBeUndefined();
-    expect(meters[1].attributes("aria-valuetext")).toContain("\u6682\u65e0\u9065\u6d4b\u6570\u636e");
-    expect(meters[3].attributes("aria-valuenow")).toBeUndefined();
-    expect(meters[3].get("i").attributes("style")).toBe("width: 0%;");
-    expect(meters[3].get("i").classes()).toContain("unavailable");
+    expect(meters[1].attributes("aria-valuenow")).toBe("42");
+    expect(meters[1].attributes("aria-valuetext")).toContain("42%");
+    expect(meters[1].attributes("aria-valuetext")).toContain("\u90e8\u5206\u9065\u6d4b\u4e0d\u53ef\u7528");
+    [tracks[1], tracks[3]].forEach((track) => {
+      expect(track.attributes("role")).toBeUndefined();
+      expect(track.attributes("aria-valuenow")).toBeUndefined();
+      expect(track.attributes("aria-valuemin")).toBeUndefined();
+      expect(track.attributes("aria-valuemax")).toBeUndefined();
+      expect(track.attributes("aria-hidden")).toBe("true");
+      expect(track.get("i").attributes("style")).toBe("width: 0%;");
+      expect(track.get("i").classes()).toContain("unavailable");
+    });
     expect(resourceUsagePanelSource).toMatch(/\.usage-track\s*\{[\s\S]*?height:\s*8px/);
     expect(resourceUsagePanelSource).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*?transition:\s*none/);
   });
@@ -457,5 +476,56 @@ describe("dashboard components", () => {
 
     const empty = mount(ServiceHealthPanel, { props: { healthBuckets: [], calls: 0, instances: 0 } });
     expect(empty.find("[data-testid='service-health-empty']").exists()).toBe(true);
+  });
+
+  it("maps service health colors from normalized labels instead of bucket order", () => {
+    const wrapper = mount(ServiceHealthPanel, {
+      props: {
+        healthBuckets: [
+          { label: "healthy", value: 6 },
+          { label: "Unhealthy", value: 2 },
+          { label: "unknown", value: 1 },
+        ],
+        calls: 9,
+        instances: 3,
+      },
+    });
+
+    expect(latestOption().series[0].data.map((item: { itemStyle?: { color: string } }) => item.itemStyle?.color)).toEqual([
+      "#16835b",
+      "#c2413a",
+      "#6b7280",
+    ]);
+    const dots = wrapper.findAll(".health-summary i");
+    expect(dots[0].attributes("style")).toContain("background-color: rgb(22, 131, 91)");
+    expect(dots[1].attributes("style")).toContain("background-color: rgb(194, 65, 58)");
+    expect(dots[2].attributes("style")).toContain("background-color: rgb(107, 114, 128)");
+  });
+
+  it("uses a named container for service health responsive layout", () => {
+    expect(serviceHealthPanelSource).toMatch(/\.service-health-panel\s*\{[^}]*container:\s*service-health\s*\/\s*inline-size/);
+    expect(serviceHealthPanelSource).toMatch(/@container service-health \(max-width:\s*520px\)[\s\S]*?\.health-visual\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+    expect(serviceHealthPanelSource).not.toMatch(/@media \(max-width:\s*520px\)/);
+  });
+
+  it("disables service health animation when reduced motion is preferred", () => {
+    const matchMedia = vi.fn((query: string) => ({
+      matches: true,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    vi.stubGlobal("matchMedia", matchMedia);
+
+    mount(ServiceHealthPanel, {
+      props: { healthBuckets: [{ label: "healthy", value: 1 }], calls: 1, instances: 1 },
+    });
+
+    expect(matchMedia).toHaveBeenCalledWith("(prefers-reduced-motion: reduce)");
+    expect(latestOption()).toEqual(expect.objectContaining({ animation: false, animationDuration: 0 }));
   });
 });

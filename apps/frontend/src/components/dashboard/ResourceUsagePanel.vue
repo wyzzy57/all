@@ -29,6 +29,12 @@ function percentage(item: ResourceUsageValue) {
 function meterValue(item: ResourceUsageValue) {
   return hasUsableValue(item) ? percentage(item) : undefined;
 }
+
+function meterValueText(item: ResourceUsageValue) {
+  if (!hasUsableValue(item)) return undefined;
+  const value = formatValue(item);
+  return item.unavailable ? `${value}，部分遥测不可用` : value;
+}
 </script>
 
 <template>
@@ -38,11 +44,11 @@ function meterValue(item: ResourceUsageValue) {
     <div v-else class="resource-grid">
       <div v-for="item in usage" :key="item.label" class="resource-row">
         <div class="resource-label"><span>{{ item.label }}</span><span class="resource-reading"><strong>{{ formatValue(item) }}</strong><small v-if="item.available && item.unavailable">部分遥测不可用</small></span></div>
-        <div class="usage-track" role="meter" :aria-label="item.label" :aria-valuenow="meterValue(item)" :aria-valuetext="formatValue(item)" aria-valuemin="0" aria-valuemax="100"><i :style="{ width: `${percentage(item)}%` }" :class="{ unavailable: !hasUsableValue(item) }" /></div>
+        <div class="usage-track" :role="hasUsableValue(item) ? 'meter' : undefined" :aria-label="hasUsableValue(item) ? item.label : undefined" :aria-valuenow="meterValue(item)" :aria-valuetext="meterValueText(item)" :aria-valuemin="hasUsableValue(item) ? 0 : undefined" :aria-valuemax="hasUsableValue(item) ? 100 : undefined" :aria-hidden="hasUsableValue(item) ? undefined : 'true'"><i :style="{ width: `${percentage(item)}%` }" :class="{ unavailable: !hasUsableValue(item) }" /></div>
       </div>
       <div v-for="gpu in gpuSeries" :key="gpu.label" class="resource-row gpu-row">
         <div class="resource-label"><span>{{ gpu.label }}</span><span class="resource-reading"><strong>{{ formatValue(gpu) }}</strong><small v-if="gpu.available && gpu.unavailable">部分遥测不可用</small></span></div>
-        <div class="usage-track" role="meter" :aria-label="gpu.label" :aria-valuenow="meterValue(gpu)" :aria-valuetext="formatValue(gpu)" aria-valuemin="0" aria-valuemax="100"><i :style="{ width: `${percentage(gpu)}%` }" :class="{ unavailable: !hasUsableValue(gpu) }" /></div>
+        <div class="usage-track" :role="hasUsableValue(gpu) ? 'meter' : undefined" :aria-label="hasUsableValue(gpu) ? gpu.label : undefined" :aria-valuenow="meterValue(gpu)" :aria-valuetext="meterValueText(gpu)" :aria-valuemin="hasUsableValue(gpu) ? 0 : undefined" :aria-valuemax="hasUsableValue(gpu) ? 100 : undefined" :aria-hidden="hasUsableValue(gpu) ? undefined : 'true'"><i :style="{ width: `${percentage(gpu)}%` }" :class="{ unavailable: !hasUsableValue(gpu) }" /></div>
       </div>
     </div>
   </section>

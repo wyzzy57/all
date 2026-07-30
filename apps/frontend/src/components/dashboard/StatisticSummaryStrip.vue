@@ -17,22 +17,30 @@ function displayValue(value: StatisticSummaryItem["value"]) {
 
 <template>
   <section class="statistic-summary-strip" role="list" aria-label="统计摘要">
-    <p v-if="items.length === 0" data-testid="summary-empty" class="summary-empty">暂无统计数据</p>
-    <div v-for="item in items" :key="item.label" class="summary-item" role="listitem">
-      <span class="summary-label">{{ item.label }}</span>
-      <strong class="summary-value">{{ displayValue(item.value) }}<small v-if="item.unit">{{ item.unit }}</small></strong>
+    <div class="statistic-summary-grid">
+      <p v-if="items.length === 0" data-testid="summary-empty" class="summary-empty">暂无统计数据</p>
+      <div v-for="item in items" :key="item.label" class="summary-item" role="listitem">
+        <span class="summary-label">{{ item.label }}</span>
+        <strong class="summary-value">{{ displayValue(item.value) }}<small v-if="item.unit">{{ item.unit }}</small></strong>
+      </div>
     </div>
   </section>
 </template>
 
 <style scoped>
 .statistic-summary-strip {
+  min-width: 0;
+  min-height: 78px;
+  overflow: hidden;
+  background: transparent;
+  container: statistic-summary / inline-size;
+}
+
+.statistic-summary-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0;
   min-height: 78px;
-  overflow: hidden;
-  background: transparent;
 }
 
 .summary-item {
@@ -51,15 +59,15 @@ function displayValue(value: StatisticSummaryItem["value"]) {
 .summary-value small { margin-left: 4px; color: #4b5563; font-size: 13px; font-weight: 500; }
 .summary-empty { display: grid; grid-column: 1 / -1; min-height: 78px; margin: 0; padding: 16px 20px; place-items: center; color: #4b5563; font-size: 13px; text-align: center; background: rgb(255 255 255 / 34%); border: 0; }
 
-@media (max-width: 720px) {
-  .statistic-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@container statistic-summary (max-width: 720px) {
+  .statistic-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .summary-item + .summary-item { border-left: 0; }
   .summary-item:nth-child(even) { border-left: 1px solid #dfe3e8; }
   .summary-item:nth-child(n + 3) { border-top: 1px solid #dfe3e8; }
 }
 
-@media (max-width: 420px) {
-  .statistic-summary-strip { grid-template-columns: minmax(0, 1fr); }
+@container statistic-summary (max-width: 420px) {
+  .statistic-summary-grid { grid-template-columns: minmax(0, 1fr); }
   .summary-item:nth-child(even) { border-left: 0; }
   .summary-item + .summary-item { border-top: 1px solid #dfe3e8; }
 }
