@@ -97,8 +97,8 @@
         </section>
       </div>
 
-      <p v-if="resourceError" class="resource-error" role="alert">
-        {{ resourceError }}。正在展示最近一次成功获取的资源统计。
+      <p v-if="resourceErrorMessage" class="resource-error" role="alert">
+        {{ resourceErrorMessage }}
       </p>
     </template>
   </section>
@@ -204,6 +204,13 @@ const resourceStale = computed(() => {
   return Boolean(freshness && (freshness.stale > 0 || freshness.unknown > 0));
 });
 
+const resourceErrorMessage = computed(() => {
+  if (!resourceError.value) return "";
+  return resourceStatistics.value
+    ? `${resourceError.value}。正在展示最近一次成功获取的资源统计。`
+    : `${resourceError.value}。资源统计暂时不可用，正在重试。`;
+});
+
 function emptyTrend(): StatisticsTrend {
   return { labels: [], values: [] };
 }
@@ -240,9 +247,9 @@ async function loadOverview() {
 async function refreshResourceStatistics() {
   if (document.hidden || resourceLoading.value) return;
   resourceLoading.value = true;
-  resourceError.value = "";
   try {
     resourceStatistics.value = await api.getResourceStatistics();
+    resourceError.value = "";
   } catch (error) {
     resourceError.value = errorMessage(error, "资源统计刷新失败");
   } finally {
@@ -404,6 +411,20 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
+.trend-panel :deep(.asset-trend-chart),
+.pipeline-status-panel :deep(.status-summary-row),
+.resource-panel :deep(.resource-usage-panel),
+.dataset-panel :deep(.pipeline-status-chart),
+.service-panel :deep(.service-health-panel),
+.activity-panel :deep(.activity-summary-panel) {
+  background: transparent;
+}
+
+.dataset-panel :deep(.pipeline-status-chart > header > h3),
+.service-panel :deep(.service-health-panel > header > h3) {
+  display: none;
+}
+
 .trend-panel {
   min-height: 320px;
   background: var(--workbench-surface-raised);
@@ -431,7 +452,7 @@ onBeforeUnmount(() => {
   overflow-wrap: anywhere;
 }
 
-@container workbench (max-width: 1080px) {
+@container workbench (max-width: 920px) {
   .command-grid {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -475,12 +496,14 @@ onBeforeUnmount(() => {
   }
 }
 
-@container workbench (max-width: 460px) {
+@media (max-width: 460px) {
   .workbench-view {
     gap: 12px;
     font-size: 12px;
   }
+}
 
+@container workbench (max-width: 460px) {
   .workbench-header {
     padding-inline: 0;
   }

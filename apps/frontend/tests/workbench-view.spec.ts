@@ -202,6 +202,27 @@ describe("WorkbenchView", () => {
 
     expect(wrapper.get("[data-testid='resource-panel']").text()).toContain("CPU12.5");
     expect(wrapper.get("[role='alert']").text()).toContain("resource endpoint unavailable");
+    expect(wrapper.get("[role='alert']").text()).toContain("正在展示最近一次成功获取的资源统计");
+  });
+
+  it("reports initial resource unavailability and keeps the alert stable across repeated failures", async () => {
+    apiMock.getResourceStatistics
+      .mockRejectedValueOnce(new Error("resource endpoint unavailable"))
+      .mockRejectedValueOnce(new Error("resource endpoint unavailable"));
+    const wrapper = mountView();
+    await flushPromises();
+
+    const initialAlert = wrapper.get("[role='alert']");
+    expect(initialAlert.text()).toContain("资源统计暂时不可用，正在重试");
+    expect(initialAlert.text()).not.toContain("最近一次成功获取");
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+
+    const repeatedAlert = wrapper.get("[role='alert']");
+    expect(apiMock.getResourceStatistics).toHaveBeenCalledTimes(2);
+    expect(repeatedAlert.element).toBe(initialAlert.element);
+    expect(repeatedAlert.text()).toBe(initialAlert.text());
   });
 
   it("shows an overview loading, error, and empty state without rendering invented data", async () => {
@@ -260,5 +281,16 @@ describe("WorkbenchView", () => {
     expect(workbenchSource).not.toContain("api.listDatasets");
     expect(workbenchSource).not.toContain("api.listPipelines");
     expect(workbenchSource).not.toContain("api.listServices");
+  });
+
+  it("keeps the desktop command grid dense and flattens only the intended child surfaces", () => {
+    expect(workbenchSource).toContain("grid-template-columns: minmax(0, 1.7fr) minmax(280px, .8fr)");
+    expect(workbenchSource).toContain("@container workbench (max-width: 920px)");
+    expect(workbenchSource).not.toContain("@container workbench (max-width: 1080px)");
+    expect(workbenchSource).toContain(".resource-panel :deep(.resource-usage-panel)");
+    expect(workbenchSource).toContain(".dataset-panel :deep(.pipeline-status-chart > header > h3)");
+    expect(workbenchSource).toContain(".service-panel :deep(.service-health-panel > header > h3)");
+    expect(workbenchSource).not.toContain(".resource-panel :deep(.resource-usage-panel > header > h3)");
+    expect(workbenchSource).toMatch(/@media \(max-width: 460px\)\s*\{\s*\.workbench-view\s*\{/);
   });
 });
