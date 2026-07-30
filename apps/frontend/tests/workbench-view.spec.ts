@@ -307,11 +307,17 @@ describe("WorkbenchView", () => {
   });
 
   it("keeps the desktop command grid dense and flattens only the intended child surfaces", () => {
+    const naturalFlowBreakpoint = 1060;
+    const expandedSidebarContentWidth = 1366 - 224 - (22 * 2);
+    const reservedScrollbarGutter = 17;
     const compactBreakpoint = collectCssAtRuleBodies(
       workbenchSource,
-      /@container\s+workbench\s*\(\s*max-width:\s*1100px\s*\)/g,
+      new RegExp(`@container\\s+workbench\\s*\\(\\s*max-width:\\s*${naturalFlowBreakpoint}px\\s*\\)`, "g"),
     ).join("\n");
 
+    expect(expandedSidebarContentWidth).toBe(1098);
+    expect(expandedSidebarContentWidth - reservedScrollbarGutter).toBeGreaterThan(naturalFlowBreakpoint);
+    expect(workbenchSource).not.toContain("@container workbench (max-width: 1100px)");
     expect(workbenchSource).toMatch(
       /\.workbench-view\s*\{[^}]*grid-template-rows:\s*auto\s+58px\s+minmax\(0,\s*310px\)\s+minmax\(0,\s*240px\)\s+auto/s,
     );

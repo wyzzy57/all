@@ -4,7 +4,7 @@
 
 **Goal:** Fit the complete Workbench command center inside a 1366x768 desktop viewport with the sidebar expanded, primarily by reducing the oversized asset trend and vertical spacing without scaling the application.
 
-**Architecture:** Keep all data derivation, polling, routes, and component boundaries unchanged. Add a compact presentation contract to the existing dashboard components and compose a denser two-row desktop grid in `WorkbenchView.vue`; below 1100px, retain the existing responsive vertical flow.
+**Architecture:** Keep all data derivation, polling, routes, and component boundaries unchanged. Add a compact presentation contract to the existing dashboard components and compose a denser two-row desktop grid in `WorkbenchView.vue`; at 1060px and below, retain the existing responsive vertical flow so the approximately 1098px Workbench canvas at 1366px with an expanded sidebar stays compact.
 
 **Tech Stack:** Vue 3 Composition API, TypeScript, scoped CSS, CSS container queries, ECharts 5, Vitest, Vue Test Utils, Playwright browser QA.
 
@@ -26,11 +26,11 @@
 
 - [ ] **Step 1: Add failing source-contract assertions**
 
-Assert the Workbench uses the feasible 310px/240px desktop row budget, keeps the three lower panels in one row, and moves the responsive collapse threshold to 1100px. Assert the asset trend chart remains within the approved 160-180px range rather than requiring an exact value.
+Assert the Workbench uses the feasible 310px/240px desktop row budget, keeps the three lower panels in one row, and uses a 1060px responsive collapse threshold. Assert that the 1098px effective content width at 1366px with the 224px sidebar and 44px main padding remains above that threshold, even with a reserved scrollbar gutter. Assert the asset trend chart remains within the approved 160-180px range rather than requiring an exact value.
 
 ```ts
 expect(workbenchSource).toContain("grid-template-rows: minmax(0, 310px) minmax(0, 240px)");
-expect(workbenchSource).toContain("@container workbench (max-width: 1100px)");
+expect(workbenchSource).toContain("@container workbench (max-width: 1060px)");
 expect(Number.parseFloat(canvas.style.minHeight)).toBeGreaterThanOrEqual(160);
 expect(Number.parseFloat(canvas.style.minHeight)).toBeLessThanOrEqual(180);
 expect(assetTrendChartSource).not.toContain("min-height: 250px");
@@ -110,12 +110,12 @@ Use Workbench-scoped deep selectors so the administrator overview retains its ex
 .activity-panel :deep(.activity-summary-item) { padding-block: 8px; }
 ```
 
-- [ ] **Step 5: Restore natural flow below 1100px**
+- [ ] **Step 5: Restore natural flow at 1060px and below**
 
-At the Workbench container breakpoint, remove bounded grid rows and minimum heights so tablet and phone layouts scroll normally and keep the existing 720px/460px rules.
+At the 1060px Workbench container breakpoint, remove bounded grid rows and minimum heights so narrower layouts scroll normally and keep the existing 720px/460px rules. This boundary remains below the approximately 1081-1098px effective canvas available at the 1366px expanded-sidebar target.
 
 ```css
-@container workbench (max-width: 1100px) {
+@container workbench (max-width: 1060px) {
   .workbench-view { grid-template-rows: none; }
   .command-grid,
   .command-primary,
