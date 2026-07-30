@@ -284,12 +284,19 @@ describe("WorkbenchView", () => {
   });
 
   it("keeps the desktop command grid dense and flattens only the intended child surfaces", () => {
+    const compactBreakpoint = workbenchSource.match(
+      /@container\s+workbench\s*\(\s*max-width:\s*1100px\s*\)\s*\{([\s\S]*?)(?=\s*@(container|media|supports|layer)\b|\s*<\/style>)/,
+    )?.[1] ?? "";
+
     expect(workbenchSource).toMatch(
       /\.workbench-view\s*\{[^}]*grid-template-rows:\s*auto\s+58px\s+minmax\(0,\s*286px\)\s+minmax\(0,\s*214px\)\s+auto/s,
     );
     expect(workbenchSource).toContain("grid-template-columns: minmax(0, 1.7fr) minmax(280px, .8fr)");
     expect(workbenchSource).toMatch(/\.overview-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/s);
-    expect(workbenchSource).toContain("@container workbench (max-width: 1100px)");
+    expect(compactBreakpoint).toMatch(/\.workbench-view\s*\{[^}]*grid-template-rows:\s*none/s);
+    expect(compactBreakpoint).toMatch(
+      /(?=[^{]*\.command-grid)(?=[^{]*\.command-primary)(?=[^{]*\.overview-grid)[^{]*\{[^}]*min-height:\s*0/s,
+    );
     expect(workbenchSource).toContain(".resource-panel :deep(.resource-usage-panel)");
     expect(workbenchSource).toContain(".dataset-panel :deep(.pipeline-status-chart > header > h3)");
     expect(workbenchSource).toContain(".service-panel :deep(.service-health-panel > header > h3)");

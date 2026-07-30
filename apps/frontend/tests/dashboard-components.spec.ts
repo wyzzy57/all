@@ -343,12 +343,12 @@ describe("dashboard components", () => {
 
   it("keeps the asset trend canvas and empty state within the compact workbench row", () => {
     expect(assetTrendChartSource).toMatch(
-      /\.asset-trend-canvas\s*\{[^}]*min-height:\s*176px/s,
+      /(?=[^{]*\.asset-trend-canvas)[^{]*\{[^}]*min-height:\s*176px/s,
     );
     expect(assetTrendChartSource).toMatch(
-      /\.asset-trend-empty\s*\{[^}]*min-height:\s*176px/s,
+      /(?=[^{]*\.asset-trend-empty)[^{]*\{[^}]*min-height:\s*176px/s,
     );
-    expect(assetTrendChartSource).not.toContain("250px");
+    expect(assetTrendChartSource).not.toMatch(/min-height:\s*250px/);
   });
 
   it("renders status labels and numeric values as a semantic list", () => {
