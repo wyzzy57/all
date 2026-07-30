@@ -363,8 +363,8 @@ describe("dashboard components", () => {
       .map((rule) => rule[2]);
 
     expect.soft(canvas.classes()).toContain("asset-trend-canvas");
-    expect.soft(canvas.attributes("style") ?? "").toMatch(/min-height:\s*176px/i);
-    expect.soft(emptyState.attributes("style") ?? "").toMatch(/min-height:\s*176px/i);
+    expect.soft((canvas.element as HTMLElement).style.minHeight).toBe("176px");
+    expect.soft((emptyState.element as HTMLElement).style.minHeight).toBe("176px");
     for (const ruleBody of canvasRuleBodies) {
       expect.soft(ruleBody).not.toMatch(/min-height\s*:/i);
     }
