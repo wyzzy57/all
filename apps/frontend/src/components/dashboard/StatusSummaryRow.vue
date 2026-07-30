@@ -49,8 +49,7 @@ function statusTone(label: string) {
 }
 
 .status-summary-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  display: flex;
   min-width: 0;
 }
 
@@ -59,6 +58,7 @@ function statusTone(label: string) {
   align-items: center;
   justify-content: space-between;
   gap: 14px;
+  flex: 1 1 0;
   min-width: 0;
   min-height: 56px;
   padding: 10px 18px;
@@ -77,6 +77,11 @@ function statusTone(label: string) {
   color: #5f6873;
   font-size: 13px;
   line-height: 20px;
+  overflow-wrap: anywhere;
+}
+
+.status-summary-label > span {
+  min-width: 0;
   overflow-wrap: anywhere;
 }
 
@@ -108,7 +113,7 @@ strong {
   place-items: center;
   margin: 0;
   padding: 18px;
-  color: #78828e;
+  color: #5f6873;
   background: #f5f6f7;
   font-size: 13px;
   line-height: 20px;
@@ -118,7 +123,7 @@ strong {
 
 @media (max-width: 520px) {
   .status-summary-list {
-    grid-template-columns: minmax(0, 1fr);
+    flex-direction: column;
   }
 
   .status-summary-item {

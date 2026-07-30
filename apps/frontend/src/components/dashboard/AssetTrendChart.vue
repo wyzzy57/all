@@ -85,7 +85,7 @@ function option(animation: boolean) {
     legend: {
       top: 0,
       data: ["产线", "数据集"],
-      textStyle: { color: "#5f6b78", fontSize: 12 },
+      textStyle: { color: "#5f6873", fontSize: 12 },
       itemWidth: 12,
       itemHeight: 8,
     },
@@ -98,12 +98,12 @@ function option(animation: boolean) {
       data: labels,
       axisTick: { alignWithLabel: true },
       axisLine: { lineStyle: { color: "#d9dde2" } },
-      axisLabel: { color: "#6f7782", fontSize: 12, hideOverlap: true },
+      axisLabel: { color: "#5f6873", fontSize: 12, hideOverlap: true },
     },
     yAxis: {
       type: "value",
       minInterval: 1,
-      axisLabel: { color: "#6f7782", fontSize: 12 },
+      axisLabel: { color: "#5f6873", fontSize: 12 },
       splitLine: { lineStyle: { color: "#e5e7ea" } },
     },
     series: [
@@ -201,7 +201,7 @@ onBeforeUnmount(disposeChart);
   min-height: 250px;
   place-items: center;
   padding: 20px;
-  color: #78828e;
+  color: #5f6873;
   background: #f5f6f7;
   font-size: 13px;
   line-height: 20px;

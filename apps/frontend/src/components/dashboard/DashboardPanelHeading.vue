@@ -60,7 +60,7 @@ h2 {
 
 p {
   margin: 4px 0 0;
-  color: #727b86;
+  color: #5f6873;
   font-size: 13px;
   line-height: 20px;
   overflow-wrap: anywhere;
@@ -75,7 +75,7 @@ p {
 }
 
 .panel-meta {
-  color: #78818c;
+  color: #5f6873;
   font-size: 12px;
   line-height: 20px;
   overflow-wrap: anywhere;

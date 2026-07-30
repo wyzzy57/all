@@ -54,7 +54,7 @@ const isEmpty = computed(() => props.training === 0 && props.deployments === 0 &
 }
 
 dt {
-  color: #69727d;
+  color: #5f6873;
   font-size: 12px;
   line-height: 18px;
   overflow-wrap: anywhere;
@@ -72,7 +72,7 @@ dd {
 .activity-summary-empty {
   margin: 8px 0 0;
   padding: 10px 12px;
-  color: #78828e;
+  color: #5f6873;
   background: #f5f6f7;
   font-size: 13px;
   line-height: 20px;
