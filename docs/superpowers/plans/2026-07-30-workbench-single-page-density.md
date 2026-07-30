@@ -4,7 +4,7 @@
 
 **Goal:** Fit the complete Workbench command center inside a 1366x768 desktop viewport with the sidebar expanded, primarily by reducing the oversized asset trend and vertical spacing without scaling the application.
 
-**Architecture:** Keep all data derivation, polling, routes, and component boundaries unchanged. Add a compact presentation contract to the existing dashboard components and compose a denser two-row desktop grid in `WorkbenchView.vue`. A 1328px viewport media query restores the root grid's natural rows, while the 1060px Workbench container query controls descendant layouts; this avoids relying on a query container to restyle itself and keeps the 1366px expanded-sidebar target compact.
+**Architecture:** Keep all data derivation, polling, routes, and component boundaries unchanged. Add a compact presentation contract to the existing dashboard components and compose a denser two-row desktop grid in `WorkbenchView.vue`. A 1350px viewport media query restores the root grid's natural rows, while the 1060px Workbench container query controls descendant layouts; this avoids relying on a query container to restyle itself and keeps the 1366px expanded-sidebar target compact.
 
 **Tech Stack:** Vue 3 Composition API, TypeScript, scoped CSS, CSS container queries, ECharts 5, Vitest, Vue Test Utils, Playwright browser QA.
 
@@ -26,11 +26,11 @@
 
 - [ ] **Step 1: Add failing source-contract assertions**
 
-Assert the Workbench uses the feasible 310px/240px desktop row budget and keeps the three lower panels in one row. Assert that a 1328px viewport media query restores natural root rows for 1024px and 375px, while 1366px stays compact. Keep the 1060px container query for descendant layouts only. Assert the asset trend chart remains within the approved 160-180px range rather than requiring an exact value.
+Assert the Workbench uses the feasible 310px/240px desktop row budget and keeps the three lower panels in one row. Assert that a 1350px viewport media query restores natural root rows for 1024px and 375px, while 1366px stays compact. Keep the 1060px container query for descendant layouts only. Assert the asset trend chart remains within the approved 160-180px range rather than requiring an exact value.
 
 ```ts
 expect(workbenchSource).toContain("grid-template-rows: minmax(0, 310px) minmax(0, 240px)");
-expect(workbenchSource).toContain("@media (max-width: 1328px)");
+expect(workbenchSource).toContain("@media (max-width: 1350px)");
 expect(workbenchSource).toContain("@container workbench (max-width: 1060px)");
 expect(Number.parseFloat(canvas.style.minHeight)).toBeGreaterThanOrEqual(160);
 expect(Number.parseFloat(canvas.style.minHeight)).toBeLessThanOrEqual(180);
@@ -113,10 +113,10 @@ Use Workbench-scoped deep selectors so the administrator overview retains its ex
 
 - [ ] **Step 5: Restore root flow below the desktop viewport boundary**
 
-At the 1328px viewport breakpoint, remove bounded root grid rows so narrower layouts scroll normally. Keep the 1060px Workbench container query for descendant grids and retain the existing 720px/460px rules. The root rule must use `@media` because a query container cannot use its own container query to alter itself.
+At the 1350px viewport breakpoint, remove bounded root grid rows so narrower layouts scroll normally. Keep the 1060px Workbench container query for descendant grids and retain the existing 720px/460px rules. The root rule must use `@media` because a query container cannot use its own container query to alter itself.
 
 ```css
-@media (max-width: 1328px) {
+@media (max-width: 1350px) {
   .workbench-view { grid-template-rows: none; }
 }
 
