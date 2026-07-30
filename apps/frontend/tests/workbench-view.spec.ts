@@ -308,15 +308,23 @@ describe("WorkbenchView", () => {
 
   it("keeps the desktop command grid dense and flattens only the intended child surfaces", () => {
     const naturalFlowBreakpoint = 1060;
+    const naturalFlowViewportBreakpoint = 1328;
     const expandedSidebarContentWidth = 1366 - 224 - (22 * 2);
     const reservedScrollbarGutter = 17;
     const compactBreakpoint = collectCssAtRuleBodies(
       workbenchSource,
       new RegExp(`@container\\s+workbench\\s*\\(\\s*max-width:\\s*${naturalFlowBreakpoint}px\\s*\\)`, "g"),
     ).join("\n");
+    const naturalFlowViewport = collectCssAtRuleBodies(
+      workbenchSource,
+      new RegExp(`@media\\s*\\(\\s*max-width:\\s*${naturalFlowViewportBreakpoint}px\\s*\\)`, "g"),
+    ).join("\n");
 
     expect(expandedSidebarContentWidth).toBe(1098);
     expect(expandedSidebarContentWidth - reservedScrollbarGutter).toBeGreaterThan(naturalFlowBreakpoint);
+    expect(1024).toBeLessThanOrEqual(naturalFlowViewportBreakpoint);
+    expect(375).toBeLessThanOrEqual(naturalFlowViewportBreakpoint);
+    expect(1366).toBeGreaterThan(naturalFlowViewportBreakpoint);
     expect(workbenchSource).not.toContain("@container workbench (max-width: 1100px)");
     expect(workbenchSource).toMatch(
       /\.workbench-view\s*\{[^}]*grid-template-rows:\s*auto\s+58px\s+minmax\(0,\s*310px\)\s+minmax\(0,\s*240px\)\s+auto/s,
@@ -330,7 +338,8 @@ describe("WorkbenchView", () => {
     expect(workbenchSource).not.toMatch(/\.command-panel\s*\{[^}]*overflow:\s*hidden/s);
     expect(workbenchSource).toMatch(/\.resource-panel\s*\{[^}]*overflow-y:\s*auto;[^}]*scrollbar-gutter:\s*stable/s);
     expect(workbenchSource).toMatch(/\.resource-panel\s+:deep\(\.resource-grid\)\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
-    expect(compactBreakpoint).toMatch(/\.workbench-view\s*\{[^}]*grid-template-rows:\s*none/s);
+    expect(compactBreakpoint).not.toMatch(/\.workbench-view\s*\{/s);
+    expect(naturalFlowViewport).toMatch(/\.workbench-view\s*\{[^}]*grid-template-rows:\s*none/s);
     expect(compactBreakpoint).toMatch(
       /(?=[^{]*\.command-grid)(?=[^{]*\.command-primary)(?=[^{]*\.overview-grid)[^{]*\{[^}]*min-height:\s*0/s,
     );
@@ -354,6 +363,9 @@ describe("WorkbenchView", () => {
     );
     expect(workbenchSource).toMatch(
       /(?=[^{]*\.statistic-summary-grid)(?=[^{]*\.summary-empty)[^{]*\{[^}]*min-height:\s*56px/s,
+    );
+    expect(workbenchSource).toMatch(
+      /\.workbench-view\s+:deep\(\.summary-item\)\s*\{[^}]*padding:\s*2px\s+14px/s,
     );
     expect(workbenchSource).toMatch(
       /\.service-panel\s+:deep\(\.service-health-panel\)\s*\{[^}]*grid-template-rows:\s*32px\s+minmax\(0,\s*132px\)[^}]*height:\s*168px/s,

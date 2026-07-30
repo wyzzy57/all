@@ -438,7 +438,7 @@ onBeforeUnmount(() => {
 .workbench-view :deep(.summary-item) {
   gap: 2px;
   min-height: 56px;
-  padding: 4px 14px;
+  padding: 2px 14px;
 }
 
 .trend-panel :deep(.asset-trend-canvas),
@@ -577,11 +577,13 @@ onBeforeUnmount(() => {
   overflow-wrap: anywhere;
 }
 
-@container workbench (max-width: 1060px) {
+@media (max-width: 1328px) {
   .workbench-view {
     grid-template-rows: none;
   }
+}
 
+@container workbench (max-width: 1060px) {
   .command-grid,
   .command-primary,
   .overview-grid {
