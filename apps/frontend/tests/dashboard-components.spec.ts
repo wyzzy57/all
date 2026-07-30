@@ -153,7 +153,7 @@ describe("dashboard components", () => {
   });
 
   it("aligns asset trends to a shared insertion-order union time axis", () => {
-    mount(AssetTrendChart, {
+    const wrapper = mount(AssetTrendChart, {
       props: {
         pipelineTrend: { labels: ["2026-05", "2026-07"], values: [3, 7] },
         datasetTrend: { labels: ["2026-06", "2026-07"], values: [5, 9] },
@@ -161,11 +161,19 @@ describe("dashboard components", () => {
     });
 
     const chartOption = latestOption();
+    expect(chartOption.aria).toEqual({ enabled: true });
     expect(chartOption.xAxis.data).toEqual(["2026-05", "2026-07", "2026-06"]);
     expect(chartOption.series).toEqual([
       expect.objectContaining({ name: "\u4ea7\u7ebf", data: [3, 7, 0] }),
       expect.objectContaining({ name: "\u6570\u636e\u96c6", data: [0, 9, 5] }),
     ]);
+
+    const accessibleSummary = wrapper.get("[data-testid='asset-trend-a11y']");
+    expect(accessibleSummary.element.closest("[aria-hidden='true']")).toBeNull();
+    const summaryText = accessibleSummary.text().replace(/\s+/g, " ");
+    expect(summaryText).toMatch(/2026-05.*\u4ea7\u7ebf.*3.*\u6570\u636e\u96c6.*0/);
+    expect(summaryText).toMatch(/2026-07.*\u4ea7\u7ebf.*7.*\u6570\u636e\u96c6.*9/);
+    expect(summaryText).toMatch(/2026-06.*\u4ea7\u7ebf.*0.*\u6570\u636e\u96c6.*5/);
   });
 
   it("animates the asset trend only on its initial render", async () => {
@@ -211,6 +219,7 @@ describe("dashboard components", () => {
     const list = wrapper.get("[role='list']");
     const items = list.findAll("[role='listitem']");
     expect(list.attributes("aria-hidden")).not.toBe("true");
+    expect(list.element.closest("[aria-hidden='true']")).toBeNull();
     expect(items).toHaveLength(2);
     expect(items[0].text()).toContain("\u8fd0\u884c\u4e2d");
     expect(items[1].text()).toContain("\u6210\u529f");
@@ -235,6 +244,7 @@ describe("dashboard components", () => {
     const values = wrapper.get("[role='list']");
     const items = values.findAll("[role='listitem']");
     expect(values.attributes("aria-hidden")).not.toBe("true");
+    expect(values.element.closest("[aria-hidden='true']")).toBeNull();
     expect(items).toHaveLength(3);
     expect(items[0].text()).toContain("\u8bad\u7ec3");
     expect(items[1].text()).toContain("\u90e8\u7f72");
@@ -255,6 +265,7 @@ describe("dashboard components", () => {
     const list = wrapper.get("[role='list']");
     const items = list.findAll("[role='listitem']");
     expect(list.attributes("aria-hidden")).not.toBe("true");
+    expect(list.element.closest("[aria-hidden='true']")).toBeNull();
     expect(items).toHaveLength(3);
     expect(items[0].text()).toContain("\u8bad\u7ec3");
     expect(items[1].text()).toContain("\u90e8\u7f72");
