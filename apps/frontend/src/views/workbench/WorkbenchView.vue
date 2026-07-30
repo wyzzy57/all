@@ -426,14 +426,18 @@ onBeforeUnmount(() => {
   display: none;
 }
 
-.workbench-view :deep(.statistic-summary-strip),
+.workbench-view :deep(.statistic-summary-strip) {
+  min-height: 0;
+}
+
 .workbench-view :deep(.statistic-summary-grid),
 .workbench-view :deep(.summary-empty) {
-  min-height: 58px;
+  min-height: 56px;
 }
 
 .workbench-view :deep(.summary-item) {
   gap: 2px;
+  min-height: 56px;
   padding: 4px 14px;
 }
 
@@ -468,7 +472,36 @@ onBeforeUnmount(() => {
 }
 
 .service-panel :deep(.service-health-panel) {
+  grid-template-rows: 32px minmax(0, 132px);
   gap: 4px;
+  height: 168px;
+  min-height: 0;
+}
+
+.service-panel :deep(.service-health-panel > header) {
+  min-height: 0;
+}
+
+.service-panel :deep(.service-health-panel > header dt) {
+  line-height: 14px;
+}
+
+.service-panel :deep(.service-health-panel > header dd) {
+  margin-top: 0;
+  line-height: 18px;
+}
+
+.service-panel :deep(.health-visual) {
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 8px;
+  height: 132px;
+  min-height: 0;
+}
+
+.service-panel :deep(.health-summary) {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 10px;
+  min-height: 0;
 }
 
 .service-panel :deep(.service-health-panel .dashboard-chart),
@@ -484,7 +517,7 @@ onBeforeUnmount(() => {
 }
 
 .service-panel :deep(.health-summary li) {
-  padding-block: 3px;
+  padding-block: 2px;
 }
 
 .resource-panel :deep(.resource-usage-panel) {
@@ -585,6 +618,20 @@ onBeforeUnmount(() => {
 
   .trend-panel :deep(.asset-trend-canvas) {
     aspect-ratio: 16 / 7 !important;
+  }
+
+  .service-panel :deep(.service-health-panel) {
+    grid-template-rows: none;
+    height: auto;
+  }
+
+  .service-panel :deep(.health-visual) {
+    grid-template-columns: minmax(0, 1fr);
+    height: auto;
+  }
+
+  .service-panel :deep(.health-summary) {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

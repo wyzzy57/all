@@ -342,4 +342,30 @@ describe("WorkbenchView", () => {
     expect(workbenchSource).not.toContain(".resource-panel :deep(.resource-usage-panel > header > h3)");
     expect(workbenchSource).toMatch(/@media \(max-width: 460px\)\s*\{\s*\.workbench-view\s*\{/);
   });
+
+  it("fits KPI and service-health content inside their desktop tracks", () => {
+    const naturalFlowBreakpoint = collectCssAtRuleBodies(
+      workbenchSource,
+      /@container\s+workbench\s*\(\s*max-width:\s*1060px\s*\)/g,
+    ).join("\n");
+
+    expect(workbenchSource).toMatch(
+      /\.workbench-view\s+:deep\(\.statistic-summary-strip\)\s*\{[^}]*min-height:\s*0/s,
+    );
+    expect(workbenchSource).toMatch(
+      /(?=[^{]*\.statistic-summary-grid)(?=[^{]*\.summary-empty)[^{]*\{[^}]*min-height:\s*56px/s,
+    );
+    expect(workbenchSource).toMatch(
+      /\.service-panel\s+:deep\(\.service-health-panel\)\s*\{[^}]*grid-template-rows:\s*32px\s+minmax\(0,\s*132px\)[^}]*height:\s*168px/s,
+    );
+    expect(workbenchSource).toMatch(
+      /\.service-panel\s+:deep\(\.health-visual\)\s*\{[^}]*grid-template-columns:\s*120px\s+minmax\(0,\s*1fr\)[^}]*height:\s*132px/s,
+    );
+    expect(workbenchSource).toMatch(
+      /\.service-panel\s+:deep\(\.health-summary\)\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/s,
+    );
+    expect(naturalFlowBreakpoint).toMatch(
+      /\.service-panel\s+:deep\(\.service-health-panel\)\s*\{[^}]*grid-template-rows:\s*none;[^}]*height:\s*auto/s,
+    );
+  });
 });
