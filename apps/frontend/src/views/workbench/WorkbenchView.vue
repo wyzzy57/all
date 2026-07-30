@@ -326,7 +326,8 @@ onBeforeUnmount(() => {
 
   container: workbench / inline-size;
   display: grid;
-  gap: 14px;
+  grid-template-rows: auto 58px minmax(0, 286px) minmax(0, 214px) auto;
+  gap: 10px;
   width: 100%;
   max-width: 100%;
   min-width: 0;
@@ -380,17 +381,18 @@ onBeforeUnmount(() => {
 
 .command-grid {
   grid-template-columns: minmax(0, 1.7fr) minmax(280px, .8fr);
-  gap: 14px;
+  gap: 10px;
   align-items: stretch;
 }
 
 .command-primary {
-  gap: 14px;
+  grid-template-rows: minmax(0, 214px) minmax(0, 62px);
+  gap: 10px;
 }
 
 .overview-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
+  gap: 10px;
   align-items: stretch;
 }
 
@@ -406,8 +408,8 @@ onBeforeUnmount(() => {
 .command-panel {
   display: grid;
   align-content: start;
-  gap: 12px;
-  padding: 16px;
+  gap: 8px;
+  padding: 12px;
   overflow: hidden;
 }
 
@@ -425,23 +427,69 @@ onBeforeUnmount(() => {
   display: none;
 }
 
+.workbench-view :deep(.statistic-summary-strip),
+.workbench-view :deep(.statistic-summary-grid),
+.workbench-view :deep(.summary-empty) {
+  min-height: 58px;
+}
+
+.workbench-view :deep(.summary-item) {
+  gap: 2px;
+  padding: 4px 14px;
+}
+
+.dataset-panel :deep(.pipeline-status-chart .dashboard-chart),
+.dataset-panel :deep(.pipeline-status-chart .dashboard-empty) {
+  height: 142px;
+  min-height: 142px !important;
+  aspect-ratio: auto !important;
+}
+
+.service-panel :deep(.service-health-panel .dashboard-chart),
+.service-panel :deep(.service-health-panel .dashboard-empty) {
+  height: 138px;
+  min-height: 138px !important;
+  aspect-ratio: auto !important;
+}
+
+.resource-panel :deep(.resource-usage-panel) {
+  align-content: stretch;
+  gap: 8px;
+  height: 100%;
+  min-height: 0 !important;
+}
+
+.resource-panel :deep(.resource-grid) {
+  align-content: space-between;
+  gap: 8px;
+}
+
+.resource-panel :deep(.resource-row) {
+  gap: 5px;
+}
+
+.activity-panel :deep(.activity-summary-item) {
+  padding-block: 8px;
+}
+
 .trend-panel {
-  min-height: 320px;
+  min-height: 0;
   background: var(--workbench-surface-raised);
 }
 
 .pipeline-status-panel {
-  min-height: 102px;
+  min-height: 0;
 }
 
 .resource-panel {
-  min-height: 100%;
+  align-content: stretch;
+  min-height: 0;
 }
 
 .dataset-panel,
 .service-panel,
 .activity-panel {
-  min-height: 310px;
+  min-height: 0;
 }
 
 .resource-error {
@@ -452,7 +500,18 @@ onBeforeUnmount(() => {
   overflow-wrap: anywhere;
 }
 
-@container workbench (max-width: 920px) {
+@container workbench (max-width: 1100px) {
+  .workbench-view {
+    grid-template-rows: none;
+  }
+
+  .command-grid,
+  .command-primary,
+  .overview-grid {
+    grid-template-rows: none;
+    min-height: 0;
+  }
+
   .command-grid {
     grid-template-columns: minmax(0, 1fr);
   }
