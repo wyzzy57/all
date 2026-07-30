@@ -30,17 +30,18 @@ vi.mock("@/components/dashboard/AssetTrendChart.vue", () => ({
   default: { props: ["pipelineTrend", "datasetTrend"], template: '<div data-testid="asset-trend">{{ pipelineTrend.labels.join("|") }}::{{ datasetTrend.labels.join("|") }}</div>' },
 }));
 vi.mock("@/components/dashboard/StatusSummaryRow.vue", () => ({
-  default: { props: ["items"], template: '<div data-testid="status-row">{{ items.map((item) => item.label + item.value).join("|") }}</div>' },
+  default: { props: ["buckets"], template: '<div data-testid="status-row">{{ buckets.map((item) => item.label + item.value).join("|") }}</div>' },
 }));
 vi.mock("@/components/dashboard/DashboardPanelHeading.vue", () => ({
   default: {
-    props: ["title", "metadata", "description", "actionLabel"],
+    name: "DashboardPanelHeading",
+    props: ["title", "meta", "description", "actionLabel"],
     emits: ["action"],
-    template: '<header><h2>{{ title }}</h2><span v-if="metadata">{{ metadata }}</span><p v-if="description">{{ description }}</p><button v-if="actionLabel" type="button" :aria-label="actionLabel" @click="$emit(\'action\')">{{ actionLabel }}</button></header>',
+    template: '<header><h2>{{ title }}</h2><span v-if="meta">{{ meta }}</span><p v-if="description">{{ description }}</p><button v-if="actionLabel" type="button" :aria-label="actionLabel" @click="$emit(\'action\')">{{ actionLabel }}</button></header>',
   },
 }));
 vi.mock("@/components/dashboard/ActivitySummaryPanel.vue", () => ({
-  default: { props: ["training", "deployments", "anomalies"], template: '<div data-testid="activity-panel">{{ training }}|{{ deployments }}|{{ anomalies }}</div>' },
+  default: { props: ["training", "deployments", "anomalies"], template: '<div data-testid="activity-summary">{{ training }}|{{ deployments }}|{{ anomalies }}</div>' },
 }));
 vi.mock("@/components/dashboard/ResourceUsagePanel.vue", () => ({
   default: { props: ["usage", "gpuSeries", "stale"], template: '<div data-testid="resource-panel">{{ usage.map((item) => item.label + item.value).join("|") }}{{ stale ? "stale" : "" }}</div>' },
@@ -51,12 +52,12 @@ vi.mock("@/components/dashboard/ServiceHealthPanel.vue", () => ({
 
 const overview = {
   generated_at: "2026-07-29T08:00:00Z",
-  totals: { pipelines: 3, datasets: 2, training_jobs: 4, services: 2, nodes: 2, users: 0, groups: 0 },
+  totals: { pipelines: 3, datasets: 2, training_jobs: 16, services: 29, nodes: 25, users: 0, groups: 0 },
   status_buckets: {
     pipelines: [{ label: "running", value: 1 }, { label: "success", value: 2 }],
     datasets: [{ label: "validated", value: 2 }],
-    training_jobs: [{ label: "running", value: 1 }],
-    services: [{ label: "running", value: 2 }],
+    training_jobs: [{ label: "Running", value: 1 }, { label: "TRAINING", value: 2 }, { label: "queued", value: 13 }],
+    services: [{ label: "Deploying", value: 3 }, { label: "STARTING", value: 4 }, { label: "running", value: 5 }, { label: "stopped", value: 17 }],
     nodes: [],
   },
   creation_trends: {
@@ -70,8 +71,8 @@ const resources = {
   generated_at: "2026-07-29T08:00:01Z",
   staleness_threshold_seconds: 300,
   nodes: {
-    status_buckets: [{ label: "online", value: 2 }],
-    freshness: { fresh: 2, stale: 0, unknown: 0, oldest_fresh_at: "2026-07-29T08:00:00Z", newest_fresh_at: "2026-07-29T08:00:01Z" },
+    status_buckets: [{ label: "online", value: 25 }],
+    freshness: { fresh: 12, stale: 6, unknown: 7, oldest_fresh_at: "2026-07-29T08:00:00Z", newest_fresh_at: "2026-07-29T08:00:01Z" },
     resource_usage: {
       cpu_utilization_percent: { value: 12.5, available: 2, unavailable: 0 },
       memory_utilization_percent: { value: 25, available: 2, unavailable: 0 },
@@ -79,7 +80,18 @@ const resources = {
     },
   },
   gpus: { series: [{ key: "gpu:anon", refreshed_at: "2026-07-29T08:00:01Z", utilization_percent: { value: 40, available: true }, memory_used_mib: { value: 2048, available: true }, memory_total_mib: { value: 8192, available: true }, memory_utilization_percent: { value: 25, available: true } }] },
-  services: { calls: 18, instances: 2, health_buckets: [{ label: "healthy", value: 2 }], latest_health_checked_at: "2026-07-29T08:00:01Z" },
+  services: {
+    calls: 18,
+    instances: 50,
+    health_buckets: [
+      { label: "healthy", value: 12 },
+      { label: "Unhealthy", value: 8 },
+      { label: "FAILED", value: 9 },
+      { label: "Error", value: 10 },
+      { label: "degraded", value: 11 },
+    ],
+    latest_health_checked_at: "2026-07-29T08:00:01Z",
+  },
   group_allocation_usage: {
     policy_count: 0,
     resource_pool_count: 0,
@@ -130,9 +142,37 @@ describe("WorkbenchView", () => {
     expect(wrapper.get("[data-testid='status-row']").text()).toContain("success2");
     expect(wrapper.get("[data-testid='dataset-status-chart']").text()).toContain("数据集状态|validated2");
     expect(wrapper.get("[data-testid='asset-trend']").text()).toBe("2026-06|2026-07::2026-06|2026-07");
-    expect(wrapper.get("[data-testid='activity-panel']").text()).toBe("1|2|0");
+    expect(wrapper.get("[data-testid='activity-summary']").text()).toBe("3|12|51");
     expect(wrapper.get("[data-testid='resource-panel']").text()).toContain("CPU12.5");
-    expect(wrapper.get("[data-testid='service-panel']").text()).toContain("18|2|healthy2");
+    expect(wrapper.get("[data-testid='service-panel']").text()).toContain("18|50|healthy12|Unhealthy8|FAILED9|Error10|degraded11");
+  });
+
+  it("replaces both legacy trend charts with the combined asset trend", async () => {
+    const wrapper = mountView();
+    await flushPromises();
+
+    expect(wrapper.find("creation-trend-chart-stub").exists()).toBe(false);
+    expect(wrapper.find("dataset-trend-chart-stub").exists()).toBe(false);
+    expect(wrapper.get("[data-testid='asset-trend']").text()).toBe("2026-06|2026-07::2026-06|2026-07");
+  });
+
+  it("composes the approved panel headings and actions", async () => {
+    const wrapper = mountView();
+    await flushPromises();
+
+    const headings = wrapper.findAllComponents({ name: "DashboardPanelHeading" });
+    expect(headings.map((heading) => ({
+      title: heading.props("title"),
+      meta: heading.props("meta"),
+      actionLabel: heading.props("actionLabel"),
+      testId: heading.attributes("data-testid"),
+    }))).toEqual([
+      { title: "资产增长趋势", meta: "近 6 个月", actionLabel: undefined, testId: undefined },
+      { title: "产线运行状态", meta: "共 3 条", actionLabel: undefined, testId: undefined },
+      { title: "数据集状态", meta: undefined, actionLabel: "查看数据资产", testId: "go-data-assets" },
+      { title: "服务健康", meta: undefined, actionLabel: "查看服务", testId: "go-services" },
+      { title: "当前活动", meta: undefined, actionLabel: "查看模型空间", testId: "go-model-space" },
+    ]);
   });
 
   it("polls resource statistics every five seconds, pauses hidden pages, and refreshes when visible", async () => {
@@ -201,12 +241,15 @@ describe("WorkbenchView", () => {
     await flushPromises();
     const quickLinks = wrapper.findAll("[data-testid^='go-']");
     expect(quickLinks).toHaveLength(3);
-    await wrapper.get("[data-testid='go-data-assets'] button").trigger("click");
-    await wrapper.get("[data-testid='go-model-space'] button").trigger("click");
-    await wrapper.get("[data-testid='go-services'] button").trigger("click");
-    expect(pushMock).toHaveBeenNthCalledWith(1, "/data-preparation");
-    expect(pushMock).toHaveBeenNthCalledWith(2, "/model-space");
-    expect(pushMock).toHaveBeenNthCalledWith(3, "/services");
+    wrapper.getComponent("[data-testid='go-data-assets']").vm.$emit("action");
+    wrapper.getComponent("[data-testid='go-model-space']").vm.$emit("action");
+    wrapper.getComponent("[data-testid='go-services']").vm.$emit("action");
+    await flushPromises();
+    expect(pushMock.mock.calls).toEqual([
+      ["/data-preparation"],
+      ["/model-space"],
+      ["/services"],
+    ]);
   });
 
   it("uses stable responsive containers and has no legacy resource list calls", () => {
@@ -217,6 +260,7 @@ describe("WorkbenchView", () => {
     expect(workbenchSource).not.toContain("api.listDatasets");
     expect(workbenchSource).not.toContain("api.listPipelines");
     expect(workbenchSource).not.toContain("api.listServices");
-    expect(workbenchSource).toMatch(/\.quick-link::before\s*\{[^}]*width:\s*44px;[^}]*height:\s*44px/s);
+    expect(workbenchSource).toContain('class="command-grid"');
+    expect(workbenchSource).toContain('class="overview-grid"');
   });
 });
