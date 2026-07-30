@@ -46,20 +46,6 @@ function latestOption() {
   return echartsMocks.setOption.mock.calls[echartsMocks.setOption.mock.calls.length - 1][0];
 }
 
-function collectMinHeightsForSelectors(componentSource: string, selectors: string[]) {
-  const styleSource = componentSource.match(/<style[^>]*>([\s\S]*?)<\/style>/)?.[1] ?? "";
-  const minHeights: number[] = [];
-
-  for (const rule of styleSource.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
-    if (!selectors.some((selector) => rule[1].includes(selector))) continue;
-    for (const declaration of rule[2].matchAll(/min-height\s*:\s*(\d+(?:\.\d+)?)px/g)) {
-      minHeights.push(Number(declaration[1]));
-    }
-  }
-
-  return minHeights;
-}
-
 const statusBuckets = [
   { label: "\u914d\u7f6e\u4e2d", value: 3 },
   { label: "<img src=x onerror=alert(1)>", value: 2 },
@@ -356,30 +342,32 @@ describe("dashboard components", () => {
   });
 
   it("keeps the asset trend canvas and empty state within the compact workbench row", () => {
-    const wrapper = mount(AssetTrendChart, {
+    const populated = mount(AssetTrendChart, {
       props: {
         pipelineTrend: { labels: ["2026-07"], values: [7] },
         datasetTrend: { labels: ["2026-07"], values: [9] },
       },
     });
-    const canvasMinHeights = collectMinHeightsForSelectors(
-      assetTrendChartSource,
-      [".asset-trend-canvas", ".dashboard-chart"],
-    );
-    const emptyMinHeights = collectMinHeightsForSelectors(
-      assetTrendChartSource,
-      [".asset-trend-empty"],
-    );
-    const canvasMinHeight = canvasMinHeights.at(-1);
-    const emptyMinHeight = emptyMinHeights.at(-1);
+    const empty = mount(AssetTrendChart, {
+      props: {
+        pipelineTrend: { labels: [], values: [] },
+        datasetTrend: { labels: [], values: [] },
+      },
+    });
+    const canvas = populated.get(".dashboard-chart");
+    const emptyState = empty.get("[data-testid='asset-trend-empty']");
+    const styleSource = assetTrendChartSource.match(/<style[^>]*>([\s\S]*?)<\/style>/)?.[1] ?? "";
+    const canvasRuleBodies = [...styleSource.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .filter((rule) => [".asset-trend-canvas", ".dashboard-chart"]
+        .some((selector) => rule[1].includes(selector)))
+      .map((rule) => rule[2]);
 
-    expect(wrapper.find(".asset-trend-canvas").exists()).toBe(true);
-    expect(canvasMinHeights.length).toBeGreaterThan(0);
-    expect(canvasMinHeight).toBeGreaterThanOrEqual(160);
-    expect(canvasMinHeight).toBeLessThanOrEqual(180);
-    expect(emptyMinHeights.length).toBeGreaterThan(0);
-    expect(emptyMinHeight).toBeGreaterThanOrEqual(160);
-    expect(emptyMinHeight).toBeLessThanOrEqual(180);
+    expect.soft(canvas.classes()).toContain("asset-trend-canvas");
+    expect.soft(canvas.attributes("style") ?? "").toMatch(/min-height:\s*176px/i);
+    expect.soft(emptyState.attributes("style") ?? "").toMatch(/min-height:\s*176px/i);
+    for (const ruleBody of canvasRuleBodies) {
+      expect.soft(ruleBody).not.toMatch(/min-height\s*:/i);
+    }
   });
 
   it("renders status labels and numeric values as a semantic list", () => {
