@@ -577,7 +577,7 @@ onBeforeUnmount(() => {
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 1328px) {
+@media (max-width: 1350px) {
   .workbench-view {
     grid-template-rows: none;
   }

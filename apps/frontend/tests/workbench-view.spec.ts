@@ -308,7 +308,7 @@ describe("WorkbenchView", () => {
 
   it("keeps the desktop command grid dense and flattens only the intended child surfaces", () => {
     const naturalFlowBreakpoint = 1060;
-    const naturalFlowViewportBreakpoint = 1328;
+    const naturalFlowViewportBreakpoint = 1350;
     const expandedSidebarContentWidth = 1366 - 224 - (22 * 2);
     const reservedScrollbarGutter = 17;
     const compactBreakpoint = collectCssAtRuleBodies(
@@ -324,6 +324,7 @@ describe("WorkbenchView", () => {
     expect(expandedSidebarContentWidth - reservedScrollbarGutter).toBeGreaterThan(naturalFlowBreakpoint);
     expect(1024).toBeLessThanOrEqual(naturalFlowViewportBreakpoint);
     expect(375).toBeLessThanOrEqual(naturalFlowViewportBreakpoint);
+    expect(1350).toBeLessThanOrEqual(naturalFlowViewportBreakpoint);
     expect(1366).toBeGreaterThan(naturalFlowViewportBreakpoint);
     expect(workbenchSource).not.toContain("@container workbench (max-width: 1100px)");
     expect(workbenchSource).toMatch(
