@@ -326,8 +326,8 @@ onBeforeUnmount(() => {
 
   container: workbench / inline-size;
   display: grid;
-  grid-template-rows: auto 58px minmax(0, 310px) minmax(0, 240px) auto;
-  gap: 10px;
+  grid-template-rows: minmax(0, 52px) 58px minmax(0, 310px) minmax(0, 240px) auto;
+  gap: 6px;
   width: 100%;
   max-width: 100%;
   min-width: 0;
@@ -342,7 +342,7 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 16px;
   min-width: 0;
-  padding: 2px 2px 0;
+  padding: 0 2px;
 }
 
 .workbench-header > div {
@@ -353,21 +353,25 @@ onBeforeUnmount(() => {
   margin: 0;
   color: #252a31;
   font-size: 24px;
-  line-height: 32px;
+  line-height: 28px;
   overflow-wrap: anywhere;
 }
 
 .workbench-header p,
 .generated-at {
-  margin: 4px 0 0;
+  margin: 0;
   color: #5f6873;
   font-size: 13px;
-  line-height: 20px;
+  line-height: 18px;
   overflow-wrap: anywhere;
 }
 
+.workbench-header p {
+  margin-top: 2px;
+}
+
 .generated-at {
-  margin-top: 8px;
+  margin-top: 4px;
   text-align: right;
   white-space: nowrap;
 }
@@ -529,7 +533,7 @@ onBeforeUnmount(() => {
 
 .resource-panel :deep(.resource-grid) {
   align-content: space-between;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 
