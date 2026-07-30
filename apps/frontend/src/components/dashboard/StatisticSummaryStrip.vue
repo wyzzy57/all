@@ -44,6 +44,8 @@ function displayValue(value: StatisticSummaryItem["value"]) {
 }
 
 .summary-item + .summary-item { border-left: 1px solid #dfe3e8; }
+.summary-item:nth-child(5n + 1) { border-left: 0; }
+.summary-item:nth-child(n + 6) { border-top: 1px solid #dfe3e8; }
 .summary-label { color: #4b5563; font-size: 13px; line-height: 18px; overflow-wrap: anywhere; }
 .summary-value { display: flex; min-width: 0; flex-wrap: wrap; align-items: baseline; color: #1f2937; font-size: 24px; line-height: 28px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .summary-value small { margin-left: 4px; color: #4b5563; font-size: 13px; font-weight: 500; }

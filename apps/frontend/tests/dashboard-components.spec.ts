@@ -96,6 +96,22 @@ describe("dashboard components", () => {
     expect(statisticSummaryStripSource).not.toMatch(/font-size:\s*[^;]*(?:vw|clamp\()/);
   });
 
+  it("wraps seven admin metrics with coherent wide-row separators", () => {
+    const wrapper = mount(StatisticSummaryStrip, {
+      props: {
+        items: Array.from({ length: 7 }, (_, index) => ({ label: `指标 ${index + 1}`, value: index + 1 })),
+      },
+    });
+    const items = wrapper.findAll("[role='listitem']");
+    const [wideStyles] = statisticSummaryStripSource.split("@media (max-width: 720px)");
+
+    expect(items).toHaveLength(7);
+    expect(items[5].text()).toContain("指标 6");
+    expect(items[6].text()).toContain("指标 7");
+    expect(wideStyles).toMatch(/\.summary-item:nth-child\(5n \+ 1\)\s*\{\s*border-left:\s*0/);
+    expect(wideStyles).toMatch(/\.summary-item:nth-child\(n \+ 6\)\s*\{\s*border-top:\s*1px solid #dfe3e8/);
+  });
+
   it("uses transparent roots and borderless neutral empty states", () => {
     const componentSources = [
       statisticSummaryStripSource,
