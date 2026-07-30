@@ -8,9 +8,13 @@ import CreationTrendChart from "@/components/dashboard/CreationTrendChart.vue";
 import DashboardPanelHeading from "@/components/dashboard/DashboardPanelHeading.vue";
 import DatasetTrendChart from "@/components/dashboard/DatasetTrendChart.vue";
 import PipelineStatusChart from "@/components/dashboard/PipelineStatusChart.vue";
+import pipelineStatusChartSource from "@/components/dashboard/PipelineStatusChart.vue?raw";
 import ResourceUsagePanel from "@/components/dashboard/ResourceUsagePanel.vue";
+import resourceUsagePanelSource from "@/components/dashboard/ResourceUsagePanel.vue?raw";
 import ServiceHealthPanel from "@/components/dashboard/ServiceHealthPanel.vue";
+import serviceHealthPanelSource from "@/components/dashboard/ServiceHealthPanel.vue?raw";
 import StatisticSummaryStrip from "@/components/dashboard/StatisticSummaryStrip.vue";
+import statisticSummaryStripSource from "@/components/dashboard/StatisticSummaryStrip.vue?raw";
 import StatusSummaryRow from "@/components/dashboard/StatusSummaryRow.vue";
 
 const echartsMocks = vi.hoisted(() => ({
@@ -84,6 +88,30 @@ describe("dashboard components", () => {
     expect(empty.get("[data-testid='summary-empty']").text()).toContain("\u6682\u65e0\u7edf\u8ba1\u6570\u636e");
   });
 
+  it("defines a flat statistic strip with stable responsive columns", () => {
+    expect(statisticSummaryStripSource).toMatch(/\.statistic-summary-strip\s*\{[\s\S]*?grid-template-columns:\s*repeat\(5,\s*minmax\(0,\s*1fr\)\)/);
+    expect(statisticSummaryStripSource).toMatch(/\.statistic-summary-strip\s*\{[\s\S]*?background:\s*transparent/);
+    expect(statisticSummaryStripSource).toMatch(/@media \(max-width:\s*720px\)[\s\S]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+    expect(statisticSummaryStripSource).toMatch(/@media \(max-width:\s*420px\)[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+    expect(statisticSummaryStripSource).not.toMatch(/font-size:\s*[^;]*(?:vw|clamp\()/);
+  });
+
+  it("uses transparent roots and borderless neutral empty states", () => {
+    const componentSources = [
+      statisticSummaryStripSource,
+      resourceUsagePanelSource,
+      serviceHealthPanelSource,
+      pipelineStatusChartSource,
+    ];
+
+    componentSources.forEach((source) => {
+      expect(source).toMatch(/background:\s*transparent/);
+      expect(source).not.toMatch(/border:\s*1px dashed/);
+      expect(source).not.toMatch(/#8b98aa/i);
+    });
+    expect(componentSources.filter((source) => /background:\s*rgb\(255 255 255 \/ 34%\)/.test(source))).toHaveLength(4);
+  });
+
   it("renders pipeline status legend, safe tooltip, hover emphasis, and first-mount animation only", async () => {
     const wrapper = mount(PipelineStatusChart, { props: { buckets: statusBuckets } });
     const firstOption = latestOption();
@@ -91,8 +119,10 @@ describe("dashboard components", () => {
 
     expect(firstOption.animation).toBe(true);
     expect(firstOption.aria).toEqual({ enabled: true });
+    expect(firstOption.color).toEqual(["#2563eb", "#16835b", "#b26a00", "#c2413a", "#6b7280"]);
     expect(firstOption.legend.data).toEqual(statusBuckets.map((item) => item.label));
     expect(pie.emphasis).toEqual(expect.objectContaining({ scale: true }));
+    expect(pie.selectedMode).toBe(false);
     expect(pie.selectedOffset).toBeUndefined();
     expect(pie.radius).toEqual(expect.any(Array));
     expect(wrapper.get(".dashboard-chart").attributes("style")).toContain("aspect-ratio");
@@ -105,6 +135,25 @@ describe("dashboard components", () => {
     expect(latestOption().animation).toBe(false);
     wrapper.unmount();
     expect(echartsMocks.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables pipeline status animation when reduced motion is preferred", () => {
+    const matchMedia = vi.fn((query: string) => ({
+      matches: true,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    vi.stubGlobal("matchMedia", matchMedia);
+
+    mount(PipelineStatusChart, { props: { buckets: [{ label: "运行成功", value: 2 }] } });
+
+    expect(matchMedia).toHaveBeenCalledWith("(prefers-reduced-motion: reduce)");
+    expect(latestOption()).toEqual(expect.objectContaining({ animation: false, animationDuration: 0 }));
   });
 
   it("renders no-data placeholders instead of initializing empty status and trend charts", () => {
@@ -350,6 +399,8 @@ describe("dashboard components", () => {
         usage: [
           { label: "CPU", value: 0, unit: "%", available: true, unavailable: false },
           { label: "\u5185\u5b58", value: null, unit: "%", available: false, unavailable: true },
+          { label: "\u78c1\u76d8", value: 42, unit: "%", available: true, unavailable: true },
+          { label: "\u5f02\u5e38\u9065\u6d4b", value: Number.NaN, unit: "%", available: true, unavailable: false },
         ],
         gpuSeries: [{ id: "gpu-0", label: "GPU 0", value: 64, unit: "%", available: true, unavailable: false }],
         stale: true,
@@ -359,8 +410,19 @@ describe("dashboard components", () => {
     expect(wrapper.text()).toContain("0%");
     expect(wrapper.text()).toContain("\u6682\u65e0\u9065\u6d4b\u6570\u636e");
     expect(wrapper.text()).toContain("GPU 0");
+    expect(wrapper.text()).toContain("\u90e8\u5206\u9065\u6d4b\u4e0d\u53ef\u7528");
     expect(wrapper.get("[data-testid='resource-stale']").text()).toContain("\u9010\u6e10\u53d8\u65e7");
     expect(wrapper.get(".resource-usage-panel").attributes("style")).toContain("min-height");
+
+    const meters = wrapper.findAll("[role='meter']");
+    expect(meters[0].attributes("aria-valuetext")).toBe("0%");
+    expect(meters[1].attributes("aria-valuenow")).toBeUndefined();
+    expect(meters[1].attributes("aria-valuetext")).toContain("\u6682\u65e0\u9065\u6d4b\u6570\u636e");
+    expect(meters[3].attributes("aria-valuenow")).toBeUndefined();
+    expect(meters[3].get("i").attributes("style")).toBe("width: 0%;");
+    expect(meters[3].get("i").classes()).toContain("unavailable");
+    expect(resourceUsagePanelSource).toMatch(/\.usage-track\s*\{[\s\S]*?height:\s*8px/);
+    expect(resourceUsagePanelSource).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*?transition:\s*none/);
   });
 
   it("renders service health buckets, calls, and instances with a no-data state", () => {
@@ -375,6 +437,7 @@ describe("dashboard components", () => {
     expect(wrapper.text()).toContain("38");
     expect(wrapper.text()).toContain("7");
     expect(latestOption().series[0]).toEqual(expect.objectContaining({ type: "pie" }));
+    expect(wrapper.findAll(".health-summary [role='listitem']").map((item) => item.text())).toEqual(["\u5065\u5eb76", "\u5f02\u5e381"]);
 
     const empty = mount(ServiceHealthPanel, { props: { healthBuckets: [], calls: 0, instances: 0 } });
     expect(empty.find("[data-testid='service-health-empty']").exists()).toBe(true);

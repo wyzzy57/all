@@ -25,16 +25,19 @@ function escapeHtml(value: string) {
 }
 
 function option(animation: boolean) {
+  const prefersReducedMotion = typeof window !== "undefined"
+    && typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   return {
-    animation,
-    animationDuration: 360,
+    animation: animation && !prefersReducedMotion,
+    animationDuration: prefersReducedMotion ? 0 : 360,
     aria: { enabled: true },
-    color: ["#2f73f7", "#5c92f6", "#a8c5fb", "#f5b638", "#ef7b7b", "#7b8aa4"],
+    color: ["#2563eb", "#16835b", "#b26a00", "#c2413a", "#6b7280"],
     tooltip: {
       trigger: "item",
       formatter: (params: { name: string; value: number; marker?: string }) => `${params.marker ?? ""}${escapeHtml(params.name)}: ${Number(params.value).toLocaleString("zh-CN")}`,
     },
-    legend: { type: "scroll", bottom: 0, data: props.buckets.map((bucket) => bucket.label), textStyle: { color: "#5c6b80", fontSize: 12 } },
+    legend: { type: "scroll", bottom: 0, data: props.buckets.map((bucket) => bucket.label), textStyle: { color: "#4b5563", fontSize: 12 } },
     series: [{
       type: "pie",
       radius: ["45%", "70%"],
@@ -88,9 +91,9 @@ onBeforeUnmount(disposeChart);
 </template>
 
 <style scoped>
-.dashboard-panel { min-width: 0; background: #fff; }
-h3 { margin: 0; color: #18263b; font-size: 15px; line-height: 22px; }
+.dashboard-panel { min-width: 0; background: transparent; }
+h3 { margin: 0; color: #1f2937; font-size: 15px; line-height: 22px; }
 .dashboard-chart { width: 100%; }
-.dashboard-empty { display: grid; min-height: 240px; place-items: center; color: #8b98aa; font-size: 13px; border: 1px dashed #dbe4f1; border-radius: 6px; }
+.dashboard-empty { display: grid; min-height: 240px; padding: 16px; place-items: center; color: #4b5563; font-size: 13px; text-align: center; background: rgb(255 255 255 / 34%); border: 0; border-radius: 6px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 </style>
