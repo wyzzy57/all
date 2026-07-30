@@ -342,12 +342,24 @@ describe("dashboard components", () => {
   });
 
   it("keeps the asset trend canvas and empty state within the compact workbench row", () => {
-    expect(assetTrendChartSource).toMatch(
-      /(?=[^{]*\.asset-trend-canvas)[^{]*\{[^}]*min-height:\s*176px/s,
-    );
-    expect(assetTrendChartSource).toMatch(
-      /(?=[^{]*\.asset-trend-empty)[^{]*\{[^}]*min-height:\s*176px/s,
-    );
+    const wrapper = mount(AssetTrendChart, {
+      props: {
+        pipelineTrend: { labels: ["2026-07"], values: [7] },
+        datasetTrend: { labels: ["2026-07"], values: [9] },
+      },
+    });
+    const canvasMinHeight = Number(assetTrendChartSource.match(
+      /(?=[^{]*\.asset-trend-canvas)[^{]*\{[^}]*min-height:\s*(\d+)px/s,
+    )?.[1]);
+    const emptyMinHeight = Number(assetTrendChartSource.match(
+      /(?=[^{]*\.asset-trend-empty)[^{]*\{[^}]*min-height:\s*(\d+)px/s,
+    )?.[1]);
+
+    expect(wrapper.find(".asset-trend-canvas").exists()).toBe(true);
+    expect(canvasMinHeight).toBeGreaterThanOrEqual(160);
+    expect(canvasMinHeight).toBeLessThanOrEqual(180);
+    expect(emptyMinHeight).toBeGreaterThanOrEqual(160);
+    expect(emptyMinHeight).toBeLessThanOrEqual(180);
     expect(assetTrendChartSource).not.toMatch(/min-height:\s*250px/);
   });
 

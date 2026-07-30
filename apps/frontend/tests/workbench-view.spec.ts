@@ -5,6 +5,29 @@ import AsyncState from "@/components/common/AsyncState.vue";
 import WorkbenchView from "@/views/workbench/WorkbenchView.vue";
 import workbenchSource from "@/views/workbench/WorkbenchView.vue?raw";
 
+function collectCssAtRuleBodies(source: string, atRulePattern: RegExp) {
+  const bodies: string[] = [];
+
+  for (const match of source.matchAll(atRulePattern)) {
+    if (match.index === undefined) continue;
+    const openingBrace = source.indexOf("{", match.index + match[0].length);
+    if (openingBrace < 0) continue;
+
+    let depth = 0;
+    for (let index = openingBrace; index < source.length; index += 1) {
+      if (source[index] === "{") depth += 1;
+      if (source[index] !== "}") continue;
+      depth -= 1;
+      if (depth === 0) {
+        bodies.push(source.slice(openingBrace + 1, index));
+        break;
+      }
+    }
+  }
+
+  return bodies;
+}
+
 const pushMock = vi.hoisted(() => vi.fn());
 const apiMock = vi.hoisted(() => ({
   getWorkbenchStatistics: vi.fn(),
@@ -284,9 +307,10 @@ describe("WorkbenchView", () => {
   });
 
   it("keeps the desktop command grid dense and flattens only the intended child surfaces", () => {
-    const compactBreakpoint = workbenchSource.match(
-      /@container\s+workbench\s*\(\s*max-width:\s*1100px\s*\)\s*\{([\s\S]*?)(?=\s*@(container|media|supports|layer)\b|\s*<\/style>)/,
-    )?.[1] ?? "";
+    const compactBreakpoint = collectCssAtRuleBodies(
+      workbenchSource,
+      /@container\s+workbench\s*\(\s*max-width:\s*1100px\s*\)/g,
+    ).join("\n");
 
     expect(workbenchSource).toMatch(
       /\.workbench-view\s*\{[^}]*grid-template-rows:\s*auto\s+58px\s+minmax\(0,\s*286px\)\s+minmax\(0,\s*214px\)\s+auto/s,
