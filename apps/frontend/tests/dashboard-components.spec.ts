@@ -1,12 +1,16 @@
 import { mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import ActivitySummaryPanel from "@/components/dashboard/ActivitySummaryPanel.vue";
+import AssetTrendChart from "@/components/dashboard/AssetTrendChart.vue";
 import CreationTrendChart from "@/components/dashboard/CreationTrendChart.vue";
+import DashboardPanelHeading from "@/components/dashboard/DashboardPanelHeading.vue";
 import DatasetTrendChart from "@/components/dashboard/DatasetTrendChart.vue";
 import PipelineStatusChart from "@/components/dashboard/PipelineStatusChart.vue";
 import ResourceUsagePanel from "@/components/dashboard/ResourceUsagePanel.vue";
 import ServiceHealthPanel from "@/components/dashboard/ServiceHealthPanel.vue";
 import StatisticSummaryStrip from "@/components/dashboard/StatisticSummaryStrip.vue";
+import StatusSummaryRow from "@/components/dashboard/StatusSummaryRow.vue";
 
 const echartsMocks = vi.hoisted(() => ({
   dispose: vi.fn(),
@@ -146,6 +150,128 @@ describe("dashboard components", () => {
     expect(resizeObserverObserve).toHaveBeenCalledWith(wrapper.get(".dashboard-chart").element);
     resizeObserverCallback([], {} as ResizeObserver);
     expect(echartsMocks.resize).toHaveBeenCalledTimes(1);
+  });
+
+  it("aligns asset trends to a shared union time axis", () => {
+    mount(AssetTrendChart, {
+      props: {
+        pipelineTrend: { labels: ["2026-05", "2026-07"], values: [3, 7] },
+        datasetTrend: { labels: ["2026-06", "2026-07"], values: [5, 9] },
+      },
+    });
+
+    const chartOption = latestOption();
+    expect(chartOption.xAxis.data).toEqual(["2026-05", "2026-06", "2026-07"]);
+    expect(chartOption.series).toEqual([
+      expect.objectContaining({ name: "\u4ea7\u7ebf", data: [3, 0, 7] }),
+      expect.objectContaining({ name: "\u6570\u636e\u96c6", data: [0, 5, 9] }),
+    ]);
+  });
+
+  it("animates the asset trend only on its initial render", async () => {
+    const wrapper = mount(AssetTrendChart, {
+      props: {
+        pipelineTrend: { labels: ["2026-07"], values: [7] },
+        datasetTrend: { labels: ["2026-07"], values: [9] },
+      },
+    });
+
+    expect(latestOption()).toEqual(expect.objectContaining({ animation: true, aria: { enabled: true } }));
+
+    await wrapper.setProps({
+      pipelineTrend: { labels: ["2026-08"], values: [8] },
+      datasetTrend: { labels: ["2026-08"], values: [10] },
+    });
+
+    expect(latestOption()).toEqual(expect.objectContaining({ animation: false }));
+  });
+
+  it("renders an explicit empty asset trend without initializing ECharts", () => {
+    const wrapper = mount(AssetTrendChart, {
+      props: {
+        pipelineTrend: { labels: [], values: [] },
+        datasetTrend: { labels: [], values: [] },
+      },
+    });
+
+    expect(wrapper.get("[data-testid='asset-trend-empty']").text()).toContain("\u6682\u65e0\u8d44\u4ea7\u8d8b\u52bf\u6570\u636e");
+    expect(echartsMocks.init).not.toHaveBeenCalled();
+  });
+
+  it("renders status labels and numeric values as a semantic list", () => {
+    const wrapper = mount(StatusSummaryRow, {
+      props: {
+        items: [
+          { label: "\u8fd0\u884c\u4e2d", value: 3 },
+          { label: "\u6210\u529f", value: 12 },
+        ],
+      },
+    });
+
+    const list = wrapper.get("[role='list']");
+    expect(list.text()).toContain("\u8fd0\u884c\u4e2d");
+    expect(list.text()).toContain("3");
+    expect(list.text()).toContain("\u6210\u529f");
+    expect(list.text()).toContain("12");
+  });
+
+  it("renders an explicit empty status summary", () => {
+    const wrapper = mount(StatusSummaryRow, { props: { items: [] } });
+
+    expect(wrapper.get("[data-testid='status-summary-empty']").text()).toContain("\u6682\u65e0\u72b6\u6001\u6570\u636e");
+  });
+
+  it("renders training, deployment, and anomaly activity values", () => {
+    const wrapper = mount(ActivitySummaryPanel, {
+      props: { training: 4, deployments: 2, anomalies: 1 },
+    });
+
+    const values = wrapper.get("[role='list']");
+    expect(values.text()).toContain("\u8bad\u7ec3");
+    expect(values.text()).toContain("4");
+    expect(values.text()).toContain("\u90e8\u7f72");
+    expect(values.text()).toContain("2");
+    expect(values.text()).toContain("\u5f02\u5e38");
+    expect(values.text()).toContain("1");
+  });
+
+  it("keeps zero activity values accessible alongside an explicit empty message", () => {
+    const wrapper = mount(ActivitySummaryPanel, {
+      props: { training: 0, deployments: 0, anomalies: 0 },
+    });
+
+    expect(wrapper.get("[data-testid='activity-summary-empty']").text()).toContain("\u6682\u65e0\u6d3b\u8dc3\u4efb\u52a1");
+    const values = wrapper.get("[role='list']").text();
+    expect(values).toContain("\u8bad\u7ec3");
+    expect(values).toContain("\u90e8\u7f72");
+    expect(values).toContain("\u5f02\u5e38");
+    expect(values.match(/0/g)).toHaveLength(3);
+  });
+
+  it("renders a panel heading with optional metadata and description", () => {
+    const wrapper = mount(DashboardPanelHeading, {
+      props: {
+        title: "\u8d44\u4ea7\u8d8b\u52bf",
+        metadata: "\u8fd1 30 \u5929",
+        description: "\u4ea7\u7ebf\u4e0e\u6570\u636e\u96c6\u521b\u5efa\u91cf",
+      },
+    });
+
+    expect(wrapper.get("h2").text()).toBe("\u8d44\u4ea7\u8d8b\u52bf");
+    expect(wrapper.text()).toContain("\u8fd1 30 \u5929");
+    expect(wrapper.text()).toContain("\u4ea7\u7ebf\u4e0e\u6570\u636e\u96c6\u521b\u5efa\u91cf");
+    expect(wrapper.find("button").exists()).toBe(false);
+  });
+
+  it("labels the optional panel action and emits it when clicked", async () => {
+    const wrapper = mount(DashboardPanelHeading, {
+      props: { title: "\u670d\u52a1\u72b6\u6001", actionLabel: "\u67e5\u770b\u670d\u52a1" },
+    });
+
+    const action = wrapper.get("button");
+    expect(action.attributes("aria-label")).toBe("\u67e5\u770b\u670d\u52a1");
+    await action.trigger("click");
+    expect(wrapper.emitted("action")).toHaveLength(1);
   });
 
   it("renders available resource usage, unavailable telemetry, stale state, and GPU series", () => {

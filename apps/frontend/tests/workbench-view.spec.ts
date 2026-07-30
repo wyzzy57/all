@@ -24,13 +24,23 @@ vi.mock("@/components/dashboard/StatisticSummaryStrip.vue", () => ({
   default: { props: ["items"], template: '<div data-testid="summary-strip">{{ items.map((item) => item.label + item.value).join("|") }}</div>' },
 }));
 vi.mock("@/components/dashboard/PipelineStatusChart.vue", () => ({
-  default: { props: ["buckets"], template: '<div data-testid="pipeline-chart">{{ buckets.map((item) => item.label + item.value).join("|") }}</div>' },
+  default: { props: ["buckets", "title"], template: '<div data-testid="dataset-status-chart">{{ title }}|{{ buckets.map((item) => item.label + item.value).join("|") }}</div>' },
 }));
-vi.mock("@/components/dashboard/CreationTrendChart.vue", () => ({
-  default: { props: ["trend"], template: '<div data-testid="creation-chart">{{ trend.labels.join("|") }}</div>' },
+vi.mock("@/components/dashboard/AssetTrendChart.vue", () => ({
+  default: { props: ["pipelineTrend", "datasetTrend"], template: '<div data-testid="asset-trend">{{ pipelineTrend.labels.join("|") }}::{{ datasetTrend.labels.join("|") }}</div>' },
 }));
-vi.mock("@/components/dashboard/DatasetTrendChart.vue", () => ({
-  default: { props: ["trend"], template: '<div data-testid="dataset-chart">{{ trend.labels.join("|") }}</div>' },
+vi.mock("@/components/dashboard/StatusSummaryRow.vue", () => ({
+  default: { props: ["items"], template: '<div data-testid="status-row">{{ items.map((item) => item.label + item.value).join("|") }}</div>' },
+}));
+vi.mock("@/components/dashboard/DashboardPanelHeading.vue", () => ({
+  default: {
+    props: ["title", "metadata", "description", "actionLabel"],
+    emits: ["action"],
+    template: '<header><h2>{{ title }}</h2><span v-if="metadata">{{ metadata }}</span><p v-if="description">{{ description }}</p><button v-if="actionLabel" type="button" :aria-label="actionLabel" @click="$emit(\'action\')">{{ actionLabel }}</button></header>',
+  },
+}));
+vi.mock("@/components/dashboard/ActivitySummaryPanel.vue", () => ({
+  default: { props: ["training", "deployments", "anomalies"], template: '<div data-testid="activity-panel">{{ training }}|{{ deployments }}|{{ anomalies }}</div>' },
 }));
 vi.mock("@/components/dashboard/ResourceUsagePanel.vue", () => ({
   default: { props: ["usage", "gpuSeries", "stale"], template: '<div data-testid="resource-panel">{{ usage.map((item) => item.label + item.value).join("|") }}{{ stale ? "stale" : "" }}</div>' },
@@ -41,10 +51,13 @@ vi.mock("@/components/dashboard/ServiceHealthPanel.vue", () => ({
 
 const overview = {
   generated_at: "2026-07-29T08:00:00Z",
-  totals: { pipelines: 3, datasets: 2, training_jobs: 4, services: 1, nodes: 2, users: 0, groups: 0 },
+  totals: { pipelines: 3, datasets: 2, training_jobs: 4, services: 2, nodes: 2, users: 0, groups: 0 },
   status_buckets: {
     pipelines: [{ label: "running", value: 1 }, { label: "success", value: 2 }],
-    datasets: [], training_jobs: [], services: [], nodes: [],
+    datasets: [{ label: "validated", value: 2 }],
+    training_jobs: [{ label: "running", value: 1 }],
+    services: [{ label: "running", value: 2 }],
+    nodes: [],
   },
   creation_trends: {
     pipelines: { labels: ["2026-06", "2026-07"], values: [1, 2] },
@@ -81,7 +94,11 @@ describe("WorkbenchView", () => {
   const wrappers: Array<ReturnType<typeof mount>> = [];
 
   function mountView() {
-    const wrapper = mount(WorkbenchView);
+    const wrapper = mount(WorkbenchView, {
+      global: {
+        stubs: ["CreationTrendChart", "DatasetTrendChart"],
+      },
+    });
     wrappers.push(wrapper);
     return wrapper;
   }
@@ -110,7 +127,10 @@ describe("WorkbenchView", () => {
     expect(apiMock.listPipelines).not.toHaveBeenCalled();
     expect(apiMock.listServices).not.toHaveBeenCalled();
     expect(wrapper.get("[data-testid='summary-strip']").text()).toContain("产线数量3");
-    expect(wrapper.get("[data-testid='pipeline-chart']").text()).toContain("success2");
+    expect(wrapper.get("[data-testid='status-row']").text()).toContain("success2");
+    expect(wrapper.get("[data-testid='dataset-status-chart']").text()).toContain("数据集状态|validated2");
+    expect(wrapper.get("[data-testid='asset-trend']").text()).toBe("2026-06|2026-07::2026-06|2026-07");
+    expect(wrapper.get("[data-testid='activity-panel']").text()).toBe("1|2|0");
     expect(wrapper.get("[data-testid='resource-panel']").text()).toContain("CPU12.5");
     expect(wrapper.get("[data-testid='service-panel']").text()).toContain("18|2|healthy2");
   });
@@ -179,13 +199,13 @@ describe("WorkbenchView", () => {
   it("keeps the three approved quick navigation targets", async () => {
     const wrapper = mountView();
     await flushPromises();
-    const quickLinks = wrapper.findAll(".quick-link");
+    const quickLinks = wrapper.findAll("[data-testid^='go-']");
     expect(quickLinks).toHaveLength(3);
-    await quickLinks[0].trigger("click");
-    await quickLinks[1].trigger("click");
-    await quickLinks[2].trigger("click");
+    await wrapper.get("[data-testid='go-data-assets'] button").trigger("click");
+    await wrapper.get("[data-testid='go-model-space'] button").trigger("click");
+    await wrapper.get("[data-testid='go-services'] button").trigger("click");
     expect(pushMock).toHaveBeenNthCalledWith(1, "/data-preparation");
-    expect(pushMock).toHaveBeenNthCalledWith(2, "/data-preparation");
+    expect(pushMock).toHaveBeenNthCalledWith(2, "/model-space");
     expect(pushMock).toHaveBeenNthCalledWith(3, "/services");
   });
 
