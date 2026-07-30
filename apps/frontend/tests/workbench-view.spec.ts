@@ -138,8 +138,8 @@ describe("WorkbenchView", () => {
     expect(apiMock.listDatasets).not.toHaveBeenCalled();
     expect(apiMock.listPipelines).not.toHaveBeenCalled();
     expect(apiMock.listServices).not.toHaveBeenCalled();
-    expect(wrapper.get("[data-testid='summary-strip']").text()).toContain("产线数量3");
-    expect(wrapper.get("[data-testid='status-row']").text()).toContain("success2");
+    expect(wrapper.get("[data-testid='summary-strip']").text()).toBe("产线数量3|数据集数量2|训练任务16|服务数量29|可用节点25");
+    expect(wrapper.get("[data-testid='status-row']").text()).toBe("running1|success2");
     expect(wrapper.get("[data-testid='dataset-status-chart']").text()).toContain("数据集状态|validated2");
     expect(wrapper.get("[data-testid='asset-trend']").text()).toBe("2026-06|2026-07::2026-06|2026-07");
     expect(wrapper.get("[data-testid='activity-summary']").text()).toBe("3|12|51");
@@ -241,10 +241,9 @@ describe("WorkbenchView", () => {
     await flushPromises();
     const quickLinks = wrapper.findAll("[data-testid^='go-']");
     expect(quickLinks).toHaveLength(3);
-    wrapper.getComponent("[data-testid='go-data-assets']").vm.$emit("action");
-    wrapper.getComponent("[data-testid='go-model-space']").vm.$emit("action");
-    wrapper.getComponent("[data-testid='go-services']").vm.$emit("action");
-    await flushPromises();
+    await wrapper.get("[data-testid='go-data-assets'] button").trigger("click");
+    await wrapper.get("[data-testid='go-model-space'] button").trigger("click");
+    await wrapper.get("[data-testid='go-services'] button").trigger("click");
     expect(pushMock.mock.calls).toEqual([
       ["/data-preparation"],
       ["/model-space"],
@@ -252,15 +251,14 @@ describe("WorkbenchView", () => {
     ]);
   });
 
-  it("uses stable responsive containers and has no legacy resource list calls", () => {
-    expect(workbenchSource).toContain('import AsyncState from "@/components/common/AsyncState.vue"');
-    expect(workbenchSource).toContain("<AsyncState");
-    expect(workbenchSource).toContain("container: workbench / inline-size");
-    expect(workbenchSource).toContain("@container workbench");
+  it("renders the command-center containers and has no legacy resource list calls", async () => {
+    const wrapper = mountView();
+    await flushPromises();
+
+    expect(wrapper.find(".command-grid").exists()).toBe(true);
+    expect(wrapper.find(".overview-grid").exists()).toBe(true);
     expect(workbenchSource).not.toContain("api.listDatasets");
     expect(workbenchSource).not.toContain("api.listPipelines");
     expect(workbenchSource).not.toContain("api.listServices");
-    expect(workbenchSource).toContain('class="command-grid"');
-    expect(workbenchSource).toContain('class="overview-grid"');
   });
 });

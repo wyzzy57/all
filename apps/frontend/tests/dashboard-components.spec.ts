@@ -210,14 +210,14 @@ describe("dashboard components", () => {
 
     const list = wrapper.get("[role='list']");
     const items = list.findAll("[role='listitem']");
+    expect(list.attributes("aria-hidden")).not.toBe("true");
     expect(items).toHaveLength(2);
     expect(items[0].text()).toContain("\u8fd0\u884c\u4e2d");
-    expect(items[0].text()).toContain("3");
     expect(items[1].text()).toContain("\u6210\u529f");
-    expect(items[1].text()).toContain("12");
-    items.forEach((item, index) => {
+    expect(items.map((item) => item.get("strong").text())).toEqual(["3", "12"]);
+    items.forEach((item) => {
       expect(item.attributes("aria-hidden")).not.toBe("true");
-      expect(item.findAll("[aria-hidden='true']").some((hidden) => hidden.text().includes(String([3, 12][index])))).toBe(false);
+      expect(item.get("strong").attributes("aria-hidden")).not.toBe("true");
     });
   });
 
@@ -234,16 +234,15 @@ describe("dashboard components", () => {
 
     const values = wrapper.get("[role='list']");
     const items = values.findAll("[role='listitem']");
+    expect(values.attributes("aria-hidden")).not.toBe("true");
     expect(items).toHaveLength(3);
     expect(items[0].text()).toContain("\u8bad\u7ec3");
-    expect(items[0].text()).toContain("4");
     expect(items[1].text()).toContain("\u90e8\u7f72");
-    expect(items[1].text()).toContain("2");
     expect(items[2].text()).toContain("\u5f02\u5e38");
-    expect(items[2].text()).toContain("1");
-    items.forEach((item, index) => {
+    expect(items.map((item) => item.get("dd").text())).toEqual(["4", "2", "1"]);
+    items.forEach((item) => {
       expect(item.attributes("aria-hidden")).not.toBe("true");
-      expect(item.findAll("[aria-hidden='true']").some((hidden) => hidden.text().includes(String([4, 2, 1][index])))).toBe(false);
+      expect(item.get("dd").attributes("aria-hidden")).not.toBe("true");
     });
   });
 
@@ -253,15 +252,17 @@ describe("dashboard components", () => {
     });
 
     expect(wrapper.get("[data-testid='activity-summary-empty']").text()).toContain("\u6682\u65e0\u6d3b\u52a8\u6570\u636e");
-    const items = wrapper.get("[role='list']").findAll("[role='listitem']");
+    const list = wrapper.get("[role='list']");
+    const items = list.findAll("[role='listitem']");
+    expect(list.attributes("aria-hidden")).not.toBe("true");
     expect(items).toHaveLength(3);
     expect(items[0].text()).toContain("\u8bad\u7ec3");
     expect(items[1].text()).toContain("\u90e8\u7f72");
     expect(items[2].text()).toContain("\u5f02\u5e38");
     items.forEach((item) => {
-      expect(item.text()).toContain("0");
+      expect(item.get("dd").text()).toBe("0");
       expect(item.attributes("aria-hidden")).not.toBe("true");
-      expect(item.findAll("[aria-hidden='true']").some((hidden) => hidden.text().includes("0"))).toBe(false);
+      expect(item.get("dd").attributes("aria-hidden")).not.toBe("true");
     });
   });
 
