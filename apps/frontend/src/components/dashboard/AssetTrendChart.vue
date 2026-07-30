@@ -38,6 +38,7 @@ const alignedRows = computed(() => {
 let chart: ReturnType<typeof init> | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let hasAnimated = false;
+const reducedMotionQuery = "(prefers-reduced-motion: reduce)";
 
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, (character) => ({
@@ -72,9 +73,12 @@ function formatTooltip(params: {
 
 function option(animation: boolean) {
   const labels = axisLabels.value;
+  const prefersReducedMotion = typeof window !== "undefined"
+    && typeof window.matchMedia === "function"
+    && window.matchMedia(reducedMotionQuery).matches;
   return {
-    animation,
-    animationDuration: 360,
+    animation: animation && !prefersReducedMotion,
+    animationDuration: prefersReducedMotion ? 0 : 360,
     aria: { enabled: true },
     color: ["#4f78a8", "#6e9983"],
     grid: { top: 46, left: 12, right: 12, bottom: 28, containLabel: true },
@@ -160,7 +164,14 @@ onBeforeUnmount(disposeChart);
     <div v-if="!hasData" data-testid="asset-trend-empty" class="asset-trend-empty">
       暂无资产趋势数据
     </div>
-    <div v-else ref="chartElement" class="dashboard-chart" />
+    <div
+      v-else
+      ref="chartElement"
+      class="dashboard-chart"
+      tabindex="0"
+      role="img"
+      aria-label="资产趋势图，按时间展示产线与数据集数量"
+    />
     <ul v-if="hasData" data-testid="asset-trend-a11y" class="sr-only" aria-label="资产趋势数据">
       <li v-for="row in alignedRows" :key="row.label">
         {{ row.label }}，产线：{{ row.pipeline }}，数据集：{{ row.dataset }}
@@ -178,6 +189,11 @@ onBeforeUnmount(disposeChart);
   width: 100%;
   min-height: 250px;
   aspect-ratio: 16 / 7;
+}
+
+.dashboard-chart:focus-visible {
+  outline: 2px solid #3568a8;
+  outline-offset: 2px;
 }
 
 .asset-trend-empty {

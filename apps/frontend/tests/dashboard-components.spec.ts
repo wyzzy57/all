@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import ActivitySummaryPanel from "@/components/dashboard/ActivitySummaryPanel.vue";
 import AssetTrendChart from "@/components/dashboard/AssetTrendChart.vue";
+import assetTrendChartSource from "@/components/dashboard/AssetTrendChart.vue?raw";
 import CreationTrendChart from "@/components/dashboard/CreationTrendChart.vue";
 import DashboardPanelHeading from "@/components/dashboard/DashboardPanelHeading.vue";
 import DatasetTrendChart from "@/components/dashboard/DatasetTrendChart.vue";
@@ -192,6 +193,46 @@ describe("dashboard components", () => {
     });
 
     expect(latestOption()).toEqual(expect.objectContaining({ animation: false }));
+  });
+
+  it("disables asset trend animation when reduced motion is preferred", () => {
+    const matchMedia = vi.fn((query: string) => ({
+      matches: true,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    vi.stubGlobal("matchMedia", matchMedia);
+
+    mount(AssetTrendChart, {
+      props: {
+        pipelineTrend: { labels: ["2026-07"], values: [7] },
+        datasetTrend: { labels: ["2026-07"], values: [9] },
+      },
+    });
+
+    expect(matchMedia).toHaveBeenCalledWith("(prefers-reduced-motion: reduce)");
+    expect(latestOption()).toEqual(expect.objectContaining({ animation: false, animationDuration: 0 }));
+  });
+
+  it("makes the non-empty asset trend keyboard focusable with a visible focus indicator", () => {
+    const wrapper = mount(AssetTrendChart, {
+      props: {
+        pipelineTrend: { labels: ["2026-07"], values: [7] },
+        datasetTrend: { labels: ["2026-07"], values: [9] },
+      },
+    });
+
+    const chart = wrapper.get(".dashboard-chart");
+    expect(chart.attributes("tabindex")).toBe("0");
+    expect(chart.attributes("role")).toBe("img");
+    expect(chart.attributes("aria-label")).toContain("\u8d44\u4ea7\u8d8b\u52bf");
+    expect(chart.element.closest("[aria-hidden='true']")).toBeNull();
+    expect(assetTrendChartSource).toMatch(/\.dashboard-chart:focus-visible\s*\{[\s\S]*?outline:/);
   });
 
   it("renders an explicit empty asset trend without initializing ECharts", () => {
