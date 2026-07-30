@@ -361,10 +361,14 @@ describe("dashboard components", () => {
       .filter((rule) => [".asset-trend-canvas", ".dashboard-chart"]
         .some((selector) => rule[1].includes(selector)))
       .map((rule) => rule[2]);
+    const canvasMinHeight = Number.parseFloat((canvas.element as HTMLElement).style.minHeight);
+    const emptyMinHeight = Number.parseFloat((emptyState.element as HTMLElement).style.minHeight);
 
     expect.soft(canvas.classes()).toContain("asset-trend-canvas");
-    expect.soft((canvas.element as HTMLElement).style.minHeight).toBe("176px");
-    expect.soft((emptyState.element as HTMLElement).style.minHeight).toBe("176px");
+    expect.soft(canvasMinHeight).toBeGreaterThanOrEqual(160);
+    expect.soft(canvasMinHeight).toBeLessThanOrEqual(180);
+    expect.soft(emptyMinHeight).toBeGreaterThanOrEqual(160);
+    expect.soft(emptyMinHeight).toBeLessThanOrEqual(180);
     for (const ruleBody of canvasRuleBodies) {
       expect.soft(ruleBody).not.toMatch(/min-height\s*:/i);
     }

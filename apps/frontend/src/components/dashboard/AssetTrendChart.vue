@@ -165,7 +165,7 @@ onBeforeUnmount(disposeChart);
       v-if="!hasData"
       data-testid="asset-trend-empty"
       class="asset-trend-empty"
-      :style="{ minHeight: '176px' }"
+      :style="{ minHeight: '168px' }"
     >
       暂无资产趋势数据
     </div>
@@ -173,7 +173,7 @@ onBeforeUnmount(disposeChart);
       v-else
       ref="chartElement"
       class="dashboard-chart asset-trend-canvas"
-      :style="{ minHeight: '176px' }"
+      :style="{ minHeight: '168px' }"
       tabindex="0"
       role="img"
       aria-label="资产趋势图，按时间展示产线与数据集数量"

@@ -326,7 +326,7 @@ onBeforeUnmount(() => {
 
   container: workbench / inline-size;
   display: grid;
-  grid-template-rows: auto 58px minmax(0, 286px) minmax(0, 214px) auto;
+  grid-template-rows: auto 58px minmax(0, 310px) minmax(0, 240px) auto;
   gap: 10px;
   width: 100%;
   max-width: 100%;
@@ -386,8 +386,8 @@ onBeforeUnmount(() => {
 }
 
 .command-primary {
-  grid-template-rows: minmax(0, 214px) minmax(0, 62px);
-  gap: 10px;
+  grid-template-rows: minmax(0, 208px) minmax(0, 94px);
+  gap: 8px;
 }
 
 .overview-grid {
@@ -410,7 +410,6 @@ onBeforeUnmount(() => {
   align-content: start;
   gap: 8px;
   padding: 12px;
-  overflow: hidden;
 }
 
 .trend-panel :deep(.asset-trend-chart),
@@ -438,18 +437,54 @@ onBeforeUnmount(() => {
   padding: 4px 14px;
 }
 
+.trend-panel :deep(.asset-trend-canvas),
+.trend-panel :deep(.asset-trend-empty) {
+  box-sizing: border-box;
+  height: 168px;
+  aspect-ratio: auto !important;
+}
+
+.trend-panel :deep(.asset-trend-canvas) {
+  overflow: hidden;
+}
+
+.pipeline-status-panel :deep(.status-summary-item),
+.pipeline-status-panel :deep(.status-summary-empty) {
+  box-sizing: border-box;
+  min-height: 52px;
+  padding: 6px 12px;
+}
+
 .dataset-panel :deep(.pipeline-status-chart .dashboard-chart),
 .dataset-panel :deep(.pipeline-status-chart .dashboard-empty) {
-  height: 142px;
-  min-height: 142px !important;
+  box-sizing: border-box;
+  height: 168px;
+  min-height: 168px !important;
   aspect-ratio: auto !important;
+}
+
+.dataset-panel :deep(.pipeline-status-chart .dashboard-chart) {
+  overflow: hidden;
+}
+
+.service-panel :deep(.service-health-panel) {
+  gap: 4px;
 }
 
 .service-panel :deep(.service-health-panel .dashboard-chart),
 .service-panel :deep(.service-health-panel .dashboard-empty) {
-  height: 138px;
-  min-height: 138px !important;
+  box-sizing: border-box;
+  height: 128px;
+  min-height: 128px !important;
   aspect-ratio: auto !important;
+}
+
+.service-panel :deep(.service-health-panel .dashboard-chart) {
+  overflow: hidden;
+}
+
+.service-panel :deep(.health-summary li) {
+  padding-block: 3px;
 }
 
 .resource-panel :deep(.resource-usage-panel) {
@@ -461,6 +496,7 @@ onBeforeUnmount(() => {
 
 .resource-panel :deep(.resource-grid) {
   align-content: space-between;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -473,23 +509,31 @@ onBeforeUnmount(() => {
 }
 
 .trend-panel {
+  gap: 4px;
   min-height: 0;
+  padding: 10px;
   background: var(--workbench-surface-raised);
 }
 
 .pipeline-status-panel {
+  gap: 4px;
   min-height: 0;
+  padding: 8px;
 }
 
 .resource-panel {
   align-content: stretch;
   min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .dataset-panel,
 .service-panel,
 .activity-panel {
+  gap: 6px;
   min-height: 0;
+  padding: 10px;
 }
 
 .resource-error {
@@ -527,6 +571,20 @@ onBeforeUnmount(() => {
 
   .resource-panel {
     min-height: 0;
+    overflow-y: auto;
+  }
+
+  .resource-panel :deep(.resource-grid) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-panel :deep(.asset-trend-canvas),
+  .trend-panel :deep(.asset-trend-empty) {
+    height: auto;
+  }
+
+  .trend-panel :deep(.asset-trend-canvas) {
+    aspect-ratio: 16 / 7 !important;
   }
 }
 

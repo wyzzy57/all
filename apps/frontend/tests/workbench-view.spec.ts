@@ -313,14 +313,23 @@ describe("WorkbenchView", () => {
     ).join("\n");
 
     expect(workbenchSource).toMatch(
-      /\.workbench-view\s*\{[^}]*grid-template-rows:\s*auto\s+58px\s+minmax\(0,\s*286px\)\s+minmax\(0,\s*214px\)\s+auto/s,
+      /\.workbench-view\s*\{[^}]*grid-template-rows:\s*auto\s+58px\s+minmax\(0,\s*310px\)\s+minmax\(0,\s*240px\)\s+auto/s,
+    );
+    expect(workbenchSource).toMatch(
+      /\.command-primary\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*208px\)\s+minmax\(0,\s*94px\)[^}]*gap:\s*8px/s,
     );
     expect(workbenchSource).toContain("grid-template-columns: minmax(0, 1.7fr) minmax(280px, .8fr)");
     expect(workbenchSource).toMatch(/\.overview-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/s);
+    expect(workbenchSource).toMatch(/\.asset-trend-canvas\)[^{]*\{[^}]*height:\s*168px;[^}]*aspect-ratio:\s*auto/s);
+    expect(workbenchSource).not.toMatch(/\.command-panel\s*\{[^}]*overflow:\s*hidden/s);
+    expect(workbenchSource).toMatch(/\.resource-panel\s*\{[^}]*overflow-y:\s*auto;[^}]*scrollbar-gutter:\s*stable/s);
+    expect(workbenchSource).toMatch(/\.resource-panel\s+:deep\(\.resource-grid\)\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
     expect(compactBreakpoint).toMatch(/\.workbench-view\s*\{[^}]*grid-template-rows:\s*none/s);
     expect(compactBreakpoint).toMatch(
       /(?=[^{]*\.command-grid)(?=[^{]*\.command-primary)(?=[^{]*\.overview-grid)[^{]*\{[^}]*min-height:\s*0/s,
     );
+    expect(compactBreakpoint).toMatch(/\.resource-panel\s*\{[^}]*overflow-y:\s*auto/s);
+    expect(compactBreakpoint).toMatch(/\.resource-panel\s+:deep\(\.resource-grid\)\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s);
     expect(workbenchSource).toContain(".resource-panel :deep(.resource-usage-panel)");
     expect(workbenchSource).toContain(".dataset-panel :deep(.pipeline-status-chart > header > h3)");
     expect(workbenchSource).toContain(".service-panel :deep(.service-health-panel > header > h3)");

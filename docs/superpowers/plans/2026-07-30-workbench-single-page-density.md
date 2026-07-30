@@ -14,11 +14,7 @@
 
 - Modify `apps/frontend/src/views/workbench/WorkbenchView.vue`: compact page rhythm, desktop grid rows, and single-screen panel sizing.
 - Modify `apps/frontend/src/components/dashboard/AssetTrendChart.vue`: reduce the main chart and empty-state heights to the approved 160-180px range.
-- Modify `apps/frontend/src/components/dashboard/StatisticSummaryStrip.vue`: reduce the Workbench KPI strip height while preserving wrapping behavior.
-- Modify `apps/frontend/src/components/dashboard/PipelineStatusChart.vue`: support a compact chart height from its containing panel without changing the admin default.
-- Modify `apps/frontend/src/components/dashboard/ServiceHealthPanel.vue`: support the compact lower-row presentation.
-- Modify `apps/frontend/src/components/dashboard/ResourceUsagePanel.vue`: reduce desktop telemetry gaps without reducing readable text.
-- Modify `apps/frontend/src/components/dashboard/ActivitySummaryPanel.vue`: reduce vertical padding in the lower summary.
+- Keep shared dashboard component defaults unchanged; apply KPI, status, lower-chart, resource, and activity compaction with scoped deep selectors in `WorkbenchView.vue` so administrator views do not regress.
 - Modify `apps/frontend/tests/workbench-view.spec.ts`: lock the dense layout and breakpoint contract.
 - Modify `apps/frontend/tests/dashboard-components.spec.ts`: lock compact chart and summary dimensions.
 
@@ -30,13 +26,13 @@
 
 - [ ] **Step 1: Add failing source-contract assertions**
 
-Assert the Workbench uses a compact desktop row budget, keeps the three lower panels in one row, and moves the responsive collapse threshold to 1100px. Assert the asset trend chart uses a 176px minimum height rather than 250px.
+Assert the Workbench uses the feasible 310px/240px desktop row budget, keeps the three lower panels in one row, and moves the responsive collapse threshold to 1100px. Assert the asset trend chart remains within the approved 160-180px range rather than requiring an exact value.
 
 ```ts
-expect(workbenchSource).toContain("grid-template-rows: minmax(0, 286px) minmax(0, 214px)");
+expect(workbenchSource).toContain("grid-template-rows: minmax(0, 310px) minmax(0, 240px)");
 expect(workbenchSource).toContain("@container workbench (max-width: 1100px)");
-expect(workbenchSource).toContain("min-height: 176px");
-expect(assetTrendChartSource).toMatch(/\.asset-trend-canvas\s*\{[^}]*min-height:\s*176px/s);
+expect(Number.parseFloat(canvas.style.minHeight)).toBeGreaterThanOrEqual(160);
+expect(Number.parseFloat(canvas.style.minHeight)).toBeLessThanOrEqual(180);
 expect(assetTrendChartSource).not.toContain("min-height: 250px");
 ```
 
@@ -62,43 +58,43 @@ git commit -m "test: define single-page workbench density"
 **Files:**
 - Modify: `apps/frontend/src/views/workbench/WorkbenchView.vue`
 - Modify: `apps/frontend/src/components/dashboard/AssetTrendChart.vue`
-- Modify: `apps/frontend/src/components/dashboard/StatisticSummaryStrip.vue`
-- Modify: `apps/frontend/src/components/dashboard/PipelineStatusChart.vue`
-- Modify: `apps/frontend/src/components/dashboard/ServiceHealthPanel.vue`
-- Modify: `apps/frontend/src/components/dashboard/ResourceUsagePanel.vue`
-- Modify: `apps/frontend/src/components/dashboard/ActivitySummaryPanel.vue`
 
 - [ ] **Step 1: Reduce page and KPI vertical rhythm**
 
-Use a 10px page gap, a 58px KPI strip, 10px panel gaps, and 12px panel padding. Preserve 12px or larger body text and existing 44px action hit areas.
+Use a 10px page gap and a 58px KPI strip. The trend panel uses 10px padding/4px gap, the pipeline summary uses 8px padding/4px gap, and lower-row panels use 10px padding/6px gap. Preserve 12px or larger body text and existing 44px action hit areas.
 
 ```css
 .workbench-view { gap: 10px; }
 .statistic-summary-strip,
 .statistic-summary-grid { min-height: 58px; }
 .summary-item { gap: 2px; padding: 8px 16px; }
-.command-panel { gap: 8px; padding: 12px; }
+.trend-panel { gap: 4px; padding: 10px; }
+.pipeline-status-panel { gap: 4px; padding: 8px; }
+.dataset-panel, .service-panel, .activity-panel { gap: 6px; padding: 10px; }
 ```
 
 - [ ] **Step 2: Reduce the asset trend to a compact chart**
 
-Set both the chart canvas and empty state to 176px. Keep the existing ECharts legend, tooltip, resize observer, ARIA description, and first-render animation behavior unchanged.
+Set both the chart canvas and empty state to 168px. Keep the existing ECharts legend, tooltip, resize observer, ARIA description, and first-render animation behavior unchanged. Remove the desktop aspect-ratio expansion so the declared height is the rendered height.
 
 ```css
 .asset-trend-canvas,
-.asset-trend-empty { min-height: 176px; }
+.asset-trend-empty { min-height: 168px; }
+.asset-trend-canvas { height: 168px; aspect-ratio: auto; }
 .asset-trend-empty { padding: 12px; }
 ```
 
 - [ ] **Step 3: Fit the desktop page into two bounded content rows**
 
-Keep the existing left-wide/right-narrow main area, but bound it to 286px and the lower overview row to 214px. The pipeline status remains directly under the compact trend inside the left column; the resource panel spans the main row height.
+Keep the existing left-wide/right-narrow main area, but use a feasible 310px main row and 240px lower overview row. The pipeline status remains directly under the compact trend inside the left column; the resource panel spans the main row height and scrolls vertically only when additional GPU telemetry exceeds its budget.
 
 ```css
-.workbench-view { grid-template-rows: auto 58px minmax(0, 286px) minmax(0, 214px) auto; }
+.workbench-view { grid-template-rows: auto 58px minmax(0, 310px) minmax(0, 240px) auto; }
 .command-grid { min-height: 0; }
-.command-primary { grid-template-rows: minmax(0, 214px) minmax(0, 62px); }
+.command-primary { grid-template-rows: minmax(0, 208px) minmax(0, 94px); gap: 8px; }
 .overview-grid { min-height: 0; }
+.resource-panel { overflow-y: auto; scrollbar-gutter: stable; }
+.resource-panel .resource-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 ```
 
 - [ ] **Step 4: Compact lower charts and summaries only inside Workbench panels**
@@ -107,9 +103,9 @@ Use Workbench-scoped deep selectors so the administrator overview retains its ex
 
 ```css
 .dataset-panel :deep(.dashboard-chart),
-.dataset-panel :deep(.dashboard-empty) { min-height: 142px !important; }
+.dataset-panel :deep(.dashboard-empty) { min-height: 168px !important; }
 .service-panel :deep(.dashboard-chart),
-.service-panel :deep(.dashboard-empty) { min-height: 138px !important; }
+.service-panel :deep(.dashboard-empty) { min-height: 128px !important; }
 .resource-panel :deep(.resource-usage-panel) { gap: 8px; }
 .activity-panel :deep(.activity-summary-item) { padding-block: 8px; }
 ```
@@ -124,6 +120,7 @@ At the Workbench container breakpoint, remove bounded grid rows and minimum heig
   .command-grid,
   .command-primary,
   .overview-grid { min-height: 0; }
+  .resource-panel .resource-grid { grid-template-columns: minmax(0, 1fr); }
 }
 ```
 
