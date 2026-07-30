@@ -341,6 +341,16 @@ describe("dashboard components", () => {
     expect(echartsMocks.init).not.toHaveBeenCalled();
   });
 
+  it("keeps the asset trend canvas and empty state within the compact workbench row", () => {
+    expect(assetTrendChartSource).toMatch(
+      /\.asset-trend-canvas\s*\{[^}]*min-height:\s*176px/s,
+    );
+    expect(assetTrendChartSource).toMatch(
+      /\.asset-trend-empty\s*\{[^}]*min-height:\s*176px/s,
+    );
+    expect(assetTrendChartSource).not.toContain("250px");
+  });
+
   it("renders status labels and numeric values as a semantic list", () => {
     const wrapper = mount(StatusSummaryRow, {
       props: {

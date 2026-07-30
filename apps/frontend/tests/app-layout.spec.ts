@@ -120,7 +120,8 @@ describe("global application header", () => {
     expect(appSource).toContain('class="app-content-shell"');
     expect(stylesSource).toMatch(/\.app-content-shell\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden/s);
     expect(stylesSource).toMatch(/\.app-main\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*auto/s);
-    expect(workbenchSource).toContain("@container workbench (max-width: 920px)");
+    expect(workbenchSource).toContain("@container workbench (max-width: 1100px)");
+    expect(workbenchSource).not.toMatch(/transform:\s*scale\(/);
     expect(adminOverviewSource).toContain("@container admin-overview (max-width: 1120px)");
     expect(adminOverviewSource).toContain(".failure-table-wrap { overflow-x: auto;");
     expect(auditLogSource).toContain(".audit-table-wrap { overflow-x: auto;");
