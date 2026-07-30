@@ -28,6 +28,38 @@ function collectCssAtRuleBodies(source: string, atRulePattern: RegExp) {
   return bodies;
 }
 
+function collectTopLevelCssRuleBodies(source: string, selector: string) {
+  const bodies: string[] = [];
+  let depth = 0;
+  let preludeStart = 0;
+  let selectedBodyStart = -1;
+
+  for (let index = 0; index < source.length; index += 1) {
+    if (source[index] === "{" && depth === 0) {
+      const prelude = source.slice(preludeStart, index).replace(/\/\*[\s\S]*?\*\//g, "").trim();
+      if (prelude === selector) selectedBodyStart = index + 1;
+      depth += 1;
+      continue;
+    }
+    if (source[index] === "{") {
+      depth += 1;
+      continue;
+    }
+    if (source[index] !== "}") {
+      if (source[index] === ";" && depth === 0) preludeStart = index + 1;
+      continue;
+    }
+
+    depth -= 1;
+    if (depth !== 0) continue;
+    if (selectedBodyStart >= 0) bodies.push(source.slice(selectedBodyStart, index));
+    selectedBodyStart = -1;
+    preludeStart = index + 1;
+  }
+
+  return bodies;
+}
+
 const pushMock = vi.hoisted(() => vi.fn());
 const apiMock = vi.hoisted(() => ({
   getWorkbenchStatistics: vi.fn(),
@@ -311,17 +343,19 @@ describe("WorkbenchView", () => {
     const naturalFlowViewportBreakpoint = 1350;
     const expandedSidebarContentWidth = 1366 - 224 - (22 * 2);
     const reservedScrollbarGutter = 17;
-    const naturalFlowViewportStart = workbenchSource.search(
-      new RegExp(`@media\\s*\\(\\s*max-width:\\s*${naturalFlowViewportBreakpoint}px\\s*\\)`),
-    );
-    const desktopStyles = workbenchSource.slice(0, naturalFlowViewportStart);
+    const stylesheet = workbenchSource.match(/<style(?:\s[^>]*)?>([\s\S]*?)<\/style>/)?.[1] ?? "";
+    const desktopWorkbenchRule = collectTopLevelCssRuleBodies(stylesheet, ".workbench-view").join("\n");
+    const desktopResourceGridRule = collectTopLevelCssRuleBodies(
+      stylesheet,
+      ".resource-panel :deep(.resource-grid)",
+    ).join("\n");
     const compactBreakpoint = collectCssAtRuleBodies(
-      workbenchSource,
+      stylesheet,
       new RegExp(`@container\\s+workbench\\s*\\(\\s*max-width:\\s*${naturalFlowBreakpoint}px\\s*\\)`, "g"),
     ).join("\n");
     const naturalFlowViewport = collectCssAtRuleBodies(
-      workbenchSource,
-      new RegExp(`@media\\s*\\(\\s*max-width:\\s*${naturalFlowViewportBreakpoint}px\\s*\\)`, "g"),
+      stylesheet,
+      new RegExp(`@media\\s*\\(\\s*max-width:\\s*${naturalFlowViewportBreakpoint}px\\s*\\)(?=\\s*\\{)`, "g"),
     ).join("\n");
 
     expect(expandedSidebarContentWidth).toBe(1098);
@@ -330,13 +364,15 @@ describe("WorkbenchView", () => {
     expect(375).toBeLessThanOrEqual(naturalFlowViewportBreakpoint);
     expect(1350).toBeLessThanOrEqual(naturalFlowViewportBreakpoint);
     expect(1366).toBeGreaterThan(naturalFlowViewportBreakpoint);
-    expect(naturalFlowViewportStart).toBeGreaterThan(-1);
+    expect(stylesheet).not.toBe("");
+    expect(desktopWorkbenchRule).not.toBe("");
+    expect(desktopResourceGridRule).not.toBe("");
     expect(workbenchSource).not.toContain("@container workbench (max-width: 1100px)");
-    expect.soft(desktopStyles).toMatch(
-      /\.workbench-view\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*52px\)\s+58px\s+minmax\(0,\s*310px\)\s+minmax\(0,\s*240px\)(?:\s|;)/s,
+    expect.soft(desktopWorkbenchRule).toMatch(
+      /grid-template-rows:\s*minmax\(0,\s*52px\)\s+58px\s+minmax\(0,\s*310px\)\s+minmax\(0,\s*240px\)(?:\s|;)/s,
     );
-    expect.soft(desktopStyles).toMatch(
-      /\.workbench-view\s*\{[^}]*gap:\s*6px\s*;/s,
+    expect.soft(desktopWorkbenchRule).toMatch(
+      /gap:\s*6px\s*;/s,
     );
     expect(workbenchSource).toMatch(
       /\.command-primary\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*208px\)\s+minmax\(0,\s*94px\)[^}]*gap:\s*8px/s,
@@ -346,8 +382,8 @@ describe("WorkbenchView", () => {
     expect(workbenchSource).toMatch(/\.asset-trend-canvas\)[^{]*\{[^}]*height:\s*168px;[^}]*aspect-ratio:\s*auto/s);
     expect(workbenchSource).not.toMatch(/\.command-panel\s*\{[^}]*overflow:\s*hidden/s);
     expect(workbenchSource).toMatch(/\.resource-panel\s*\{[^}]*overflow-y:\s*auto;[^}]*scrollbar-gutter:\s*stable/s);
-    expect.soft(desktopStyles).toMatch(
-      /\.resource-panel\s+:deep\(\.resource-grid\)\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s*;/s,
+    expect.soft(desktopResourceGridRule).toMatch(
+      /grid-template-columns:\s*minmax\(0,\s*1fr\)\s*;/s,
     );
     expect(compactBreakpoint).not.toMatch(/\.workbench-view\s*\{/s);
     expect(naturalFlowViewport).toMatch(/\.workbench-view\s*\{[^}]*grid-template-rows:\s*none/s);
