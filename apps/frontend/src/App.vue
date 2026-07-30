@@ -2,66 +2,78 @@
   <div v-if="isLoginRoute" class="auth-route">
     <router-view />
   </div>
-  <el-container v-else class="app-shell" direction="vertical">
-    <el-header class="app-header">
-      <a class="brand" href="/workbench" aria-label="VisioX 首页" @click.prevent="$router.push('/workbench')">
-        <span class="brand-word">Visio</span><span class="brand-x">X</span>
-      </a>
-      <div class="header-actions">
-        <span class="environment-status"><i></i>平台服务正常</span>
-        <el-tag type="success" effect="plain" round>内网部署</el-tag>
+  <el-container v-else class="app-shell">
+    <el-aside
+      :width="sidebarWidth"
+      class="app-sidebar"
+      :class="{ collapsed: effectiveCollapsed, 'mobile-expanded': isMobile && !effectiveCollapsed }"
+    >
+      <div class="sidebar-brand">
+        <a class="brand" href="/workbench" aria-label="VisioX 首页" @click.prevent="$router.push('/workbench')">
+          <span class="brand-word">Visio</span><span class="brand-x">X</span>
+        </a>
       </div>
-    </el-header>
 
-    <el-container class="app-body">
-      <el-aside
-        :width="sidebarWidth"
-        class="app-sidebar"
-        :class="{ collapsed: effectiveCollapsed, 'mobile-expanded': isMobile && !effectiveCollapsed }"
-      >
-        <nav class="sidebar-nav" aria-label="主导航">
-          <div v-for="(group, groupIndex) in navGroups" :key="groupIndex" class="nav-group">
-            <el-menu
-              :default-active="$route.path"
-              :collapse="effectiveCollapsed"
-              router
-              class="nav-menu"
+      <nav class="sidebar-nav" aria-label="主导航">
+        <div v-for="(group, groupIndex) in navGroups" :key="groupIndex" class="nav-group">
+          <el-menu
+            :default-active="$route.path"
+            :collapse="effectiveCollapsed"
+            router
+            class="nav-menu"
+            @select="handleNavSelect"
+          >
+            <el-menu-item
+              v-for="item in group"
+              :key="item.path"
+              :index="item.path"
+              :aria-label="item.label"
+              :title="item.label"
             >
-              <el-menu-item
-                v-for="item in group"
-                :key="item.path"
-                :index="item.path"
-                :aria-label="item.label"
-                :title="item.label"
-              >
-                <el-icon><component :is="item.icon" /></el-icon>
-                <span>{{ item.label }}</span>
-              </el-menu-item>
-            </el-menu>
-          </div>
-        </nav>
-
-        <div class="sidebar-account">
-          <UserAccountMenu :collapsed="effectiveCollapsed" />
+              <el-icon><component :is="item.icon" /></el-icon>
+              <span>{{ item.label }}</span>
+            </el-menu-item>
+          </el-menu>
         </div>
+      </nav>
 
-        <button
-          class="sidebar-toggle"
-          type="button"
-          :aria-label="effectiveCollapsed ? '展开侧边栏' : '收起侧边栏'"
-          :title="effectiveCollapsed ? '展开侧边栏' : '收起侧边栏'"
-          @click="toggleSidebar"
-        >
-          <el-icon><ArrowRight v-if="effectiveCollapsed" /><ArrowLeft v-else /></el-icon>
-        </button>
-      </el-aside>
+      <div class="sidebar-account">
+        <UserAccountMenu
+          :collapsed="effectiveCollapsed"
+          @open-management="openManagement"
+        />
+      </div>
 
-      <el-container class="app-content-shell">
-        <el-main class="app-main">
-          <router-view />
-        </el-main>
-      </el-container>
+      <button
+        class="sidebar-toggle"
+        type="button"
+        :aria-label="effectiveCollapsed ? '展开侧边栏' : '收起侧边栏'"
+        :title="effectiveCollapsed ? '展开侧边栏' : '收起侧边栏'"
+        @click="toggleSidebar"
+      >
+        <el-icon><ArrowRight v-if="effectiveCollapsed" /><ArrowLeft v-else /></el-icon>
+      </button>
+    </el-aside>
+
+    <button
+      v-if="isMobile && mobileExpanded"
+      type="button"
+      class="sidebar-scrim"
+      aria-label="关闭侧边栏"
+      @click="mobileExpanded = false"
+    />
+
+    <el-container class="app-content-shell">
+      <el-main class="app-main">
+        <router-view />
+      </el-main>
     </el-container>
+
+    <ManagementCenterDialog
+      v-if="managementOpen"
+      v-model="managementOpen"
+      :initial-section="managementSection"
+    />
   </el-container>
 </template>
 
@@ -76,10 +88,15 @@ import {
   Tickets,
   TrendCharts,
 } from "@element-plus/icons-vue";
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 
+import type { ManagementSection } from "@/components/account/ManagementCenterDialog.vue";
 import UserAccountMenu from "@/components/account/UserAccountMenu.vue";
+
+const ManagementCenterDialog = defineAsyncComponent(
+  () => import("@/components/account/ManagementCenterDialog.vue"),
+);
 
 const route = useRoute();
 const isLoginRoute = computed(() => route.name === "login" || route.path.replace(/\/+$/, "") === "/login");
@@ -89,7 +106,9 @@ const isMobile = ref(mobileMedia?.matches ?? false);
 const userCollapsed = ref(window.localStorage.getItem("visiox.sidebar.collapsed") === "true");
 const mobileExpanded = ref(false);
 const effectiveCollapsed = computed(() => isMobile.value ? !mobileExpanded.value : userCollapsed.value);
-const sidebarWidth = computed(() => (effectiveCollapsed.value ? "64px" : "184px"));
+const sidebarWidth = computed(() => (effectiveCollapsed.value ? "64px" : "224px"));
+const managementOpen = ref(false);
+const managementSection = ref<ManagementSection>("account");
 
 function handleMobileChange(event: MediaQueryListEvent) {
   isMobile.value = event.matches;
@@ -106,6 +125,15 @@ function toggleSidebar() {
   }
   userCollapsed.value = !userCollapsed.value;
   window.localStorage.setItem("visiox.sidebar.collapsed", String(userCollapsed.value));
+}
+
+function handleNavSelect() {
+  if (isMobile.value) mobileExpanded.value = false;
+}
+
+function openManagement(section: ManagementSection) {
+  managementSection.value = section;
+  managementOpen.value = true;
 }
 
 const navGroups = [

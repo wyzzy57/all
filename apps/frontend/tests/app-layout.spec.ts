@@ -28,12 +28,11 @@ describe("global application header", () => {
     expect(appSource).toContain(':collapsed="effectiveCollapsed"');
   });
 
-  it("keeps the header shell and deployment status without repeated page copy", () => {
-    expect(appSource).toContain('class="app-header"');
-    expect(appSource).toContain("内网部署");
+  it("moves the brand into the sidebar and removes the standalone header", () => {
+    expect(appSource).not.toContain('class="app-header"');
+    expect(appSource).toContain('class="sidebar-brand"');
     expect(appSource).not.toContain('class="page-title"');
     expect(appSource).not.toContain('class="page-subtitle"');
-    expect(appSource).not.toContain("私有化视觉模型平台");
   });
 
   it("uses a viewport-owned shell and collapses navigation before content becomes cramped", () => {
@@ -51,20 +50,22 @@ describe("global application header", () => {
     );
   });
 
-  it("uses one continuous branded header above the sidebar and content", () => {
+  it("keeps the VisiOX wordmark inside the navigation rail", () => {
     expect(appSource).toContain('class="brand-word">Visio');
     expect(appSource).toContain('class="brand-x">X');
-    expect(appSource.indexOf('class="app-header"')).toBeLessThan(
-      appSource.indexOf('class="app-body"'),
-    );
-    expect(appSource.indexOf('class="app-header"')).toBeLessThan(
+    expect(appSource.indexOf('class="sidebar-brand"')).toBeGreaterThan(
       appSource.indexOf('class="app-sidebar"'),
+    );
+    expect(appSource.indexOf('class="sidebar-brand"')).toBeLessThan(
+      appSource.indexOf('class="sidebar-nav"'),
     );
   });
 
-  it("keeps the page canvas white and reveals the sidebar handle on interaction", () => {
-    expect(stylesSource).toContain("--visiox-canvas: #ffffff");
-    expect(stylesSource).toContain("background: #f5f6f8");
+  it("uses a neutral ChatGPT-style canvas and neutral selected navigation", () => {
+    expect(stylesSource).toContain("--visiox-canvas: #f7f7f8");
+    expect(stylesSource).toContain("--visiox-sidebar: #f3f3f3");
+    expect(stylesSource).toMatch(/\.nav-menu \.el-menu-item\.is-active\s*\{[^}]*background:\s*#e7e7e7;[^}]*color:\s*#171717/s);
+    expect(stylesSource).not.toMatch(/\.nav-menu \.el-menu-item\.is-active::before/);
     expect(stylesSource).toContain(".nav-group");
     expect(stylesSource).toContain(".app-sidebar:hover .sidebar-toggle");
     expect(stylesSource).toContain(".app-sidebar:focus-within .sidebar-toggle");
@@ -115,7 +116,7 @@ describe("global application header", () => {
   });
 
   it("defines shell containment and page overflow contracts for browser QA", () => {
-    expect(appSource.indexOf('class="app-header"')).toBeLessThan(appSource.indexOf('class="app-body"'));
+    expect(appSource).not.toContain('class="app-header"');
     expect(appSource).toContain('class="app-content-shell"');
     expect(stylesSource).toMatch(/\.app-content-shell\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden/s);
     expect(stylesSource).toMatch(/\.app-main\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*auto/s);

@@ -80,6 +80,15 @@ describe("UserAccountMenu", () => {
     expect(wrapper.find("[data-testid='admin-authorization-entry']").exists()).toBe(true);
   });
 
+  it("opens account tools in the management center without replacing the current page", async () => {
+    const { router, wrapper } = await mountMenu("admin");
+
+    await wrapper.get("[data-testid='admin-user-entry']").trigger("click");
+
+    expect(wrapper.emitted("open-management")).toEqual([["users"]]);
+    expect(router.currentRoute.value.path).toBe("/");
+  });
+
   it("logs out and returns to login", async () => {
     const { auth, router, wrapper } = await mountMenu("member");
     vi.spyOn(auth, "logout").mockResolvedValue();

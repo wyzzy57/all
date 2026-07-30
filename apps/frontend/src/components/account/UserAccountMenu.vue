@@ -4,10 +4,13 @@
     placement="top-start"
     trigger="click"
     :teleported="false"
+    popper-class="account-menu-popper"
     @command="handleCommand"
+    @visible-change="menuOpen = $event"
   >
     <button
       class="account-trigger"
+      :class="{ 'is-open': menuOpen }"
       type="button"
       data-testid="account-trigger"
       :aria-label="`账户菜单：${auth.user?.display_name || auth.user?.username || '用户'}`"
@@ -22,6 +25,13 @@
 
     <template #dropdown>
       <el-dropdown-menu class="account-dropdown">
+        <div class="account-dropdown-profile">
+          <el-avatar :size="34">{{ initials }}</el-avatar>
+          <span>
+            <strong>{{ auth.user?.display_name || auth.user?.username }}</strong>
+            <small>{{ roleLabel }}</small>
+          </span>
+        </div>
         <el-dropdown-item command="account" data-testid="profile-entry">
           <el-icon><User /></el-icon>账户设置
         </el-dropdown-item>
@@ -59,15 +69,20 @@
 
 <script setup lang="ts">
 import { ArrowUp, Avatar, DataAnalysis, DocumentChecked, Key, Monitor, SwitchButton, User, UserFilled } from "@element-plus/icons-vue";
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { useRouter } from "vue-router";
 
+import type { ManagementSection } from "@/components/account/ManagementCenterDialog.vue";
 import { useAuthStore } from "@/stores/auth";
 
 defineProps<{ collapsed: boolean }>();
+const emit = defineEmits<{
+  "open-management": [section: ManagementSection];
+}>();
 
 const auth = useAuthStore();
 const router = useRouter();
+const menuOpen = ref(false);
 const initials = computed(() => {
   const value = auth.user?.display_name || auth.user?.username || "U";
   return value.trim().slice(0, 1).toUpperCase();
@@ -75,14 +90,14 @@ const initials = computed(() => {
 const roleLabel = computed(() => (auth.isAdmin ? "管理员" : "普通用户"));
 
 async function handleCommand(command: string) {
-  const routes: Record<string, string> = {
-    account: "/account",
-    "admin-overview": "/admin/overview",
-    "admin-users": "/admin/users",
-    "admin-groups": "/admin/groups",
-    "admin-authorization": "/admin/authorization",
-    "admin-audit": "/admin/audit-logs",
-    "admin-resources": "/admin/resources",
+  const sections: Record<string, ManagementSection> = {
+    account: "account",
+    "admin-overview": "overview",
+    "admin-users": "users",
+    "admin-groups": "groups",
+    "admin-authorization": "authorization",
+    "admin-audit": "audit",
+    "admin-resources": "resources",
   };
   if (command === "logout") {
     try {
@@ -93,7 +108,7 @@ async function handleCommand(command: string) {
     await router.replace("/login");
     return;
   }
-  const path = routes[command];
-  if (path) await router.push(path);
+  const section = sections[command];
+  if (section) emit("open-management", section);
 }
 </script>
