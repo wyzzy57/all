@@ -3,7 +3,7 @@
     <header class="workbench-header">
       <div>
         <h1>工作台</h1>
-        <p>当前账号可访问资源的实时概览</p>
+        <p>训练、数据与服务运行概览</p>
       </div>
       <time v-if="overview" class="generated-at">统计生成于 {{ formatTimestamp(overview.generated_at) }}</time>
     </header>
@@ -33,53 +33,69 @@
     <template v-else-if="overview">
       <StatisticSummaryStrip :items="summaryItems" />
 
-      <section class="dashboard-section preparation-section">
-        <div class="section-heading">
-          <h2>数据准备分析</h2>
-          <button type="button" class="quick-link" @click="goDataPreparation">快速访问</button>
+      <div class="command-grid">
+        <div class="command-primary">
+          <section class="command-panel trend-panel">
+            <DashboardPanelHeading title="资产增长趋势" meta="近 6 个月" />
+            <AssetTrendChart
+              :pipeline-trend="pipelineTrend"
+              :dataset-trend="datasetTrend"
+            />
+          </section>
+
+          <section class="command-panel pipeline-status-panel">
+            <DashboardPanelHeading
+              title="产线运行状态"
+              :meta="`共 ${overview.totals.pipelines} 条`"
+            />
+            <StatusSummaryRow :buckets="pipelineStatusBuckets" />
+          </section>
         </div>
-        <div class="dashboard-grid dashboard-grid-three">
-          <DatasetTrendChart :trend="datasetTrend" title="数据集创建趋势" />
+
+        <section class="command-panel resource-panel">
           <ResourceUsagePanel
             :usage="resourceUsage"
             :gpu-series="gpuUsage"
             :stale="resourceStale"
           />
-          <section class="dataset-summary" aria-label="数据集状态">
-            <h3>数据集状态</h3>
-            <dl>
-              <div v-for="bucket in datasetStatusBuckets" :key="bucket.label">
-                <dt>{{ statusLabel(bucket.label) }}</dt>
-                <dd>{{ bucket.value }}</dd>
-              </div>
-              <div v-if="datasetStatusBuckets.length === 0" class="no-buckets">暂无数据集状态</div>
-            </dl>
-          </section>
-        </div>
-      </section>
+        </section>
+      </div>
 
-      <section class="dashboard-section model-section">
-        <div class="section-heading">
-          <h2>模型空间分析</h2>
-          <button type="button" class="quick-link" @click="goDataPreparation">快速访问</button>
-        </div>
-        <div class="dashboard-grid dashboard-grid-two">
-          <PipelineStatusChart :buckets="pipelineStatusBuckets" />
-          <CreationTrendChart :trend="pipelineTrend" />
-        </div>
-      </section>
+      <div class="overview-grid">
+        <section class="command-panel dataset-panel">
+          <DashboardPanelHeading
+            title="数据集状态"
+            action-label="查看数据资产"
+            data-testid="go-data-assets"
+            @action="goDataPreparation"
+          />
+          <PipelineStatusChart :buckets="datasetStatusBuckets" title="数据集状态" />
+        </section>
 
-      <section class="dashboard-section service-section">
-        <div class="section-heading">
-          <h2>服务列表分析</h2>
-          <button type="button" class="quick-link" @click="goServices">快速访问</button>
-        </div>
-        <ServiceHealthPanel
-          :health-buckets="resourceStatistics?.services.health_buckets ?? []"
-          :calls="resourceStatistics?.services.calls ?? 0"
-          :instances="resourceStatistics?.services.instances ?? 0"
-        />
-      </section>
+        <section class="command-panel service-panel">
+          <DashboardPanelHeading
+            title="服务健康"
+            action-label="查看服务"
+            data-testid="go-services"
+            @action="goServices"
+          />
+          <ServiceHealthPanel
+            :health-buckets="serviceHealthBuckets"
+            :calls="serviceCalls"
+            :instances="serviceInstances"
+          />
+        </section>
+
+        <section class="command-panel activity-panel">
+          <DashboardPanelHeading
+            title="当前活动"
+            action-label="查看模型空间"
+            data-testid="go-model-space"
+            @action="goModelSpace"
+          />
+          <ActivitySummaryPanel v-bind="activity" />
+        </section>
+      </div>
 
       <p v-if="resourceError" class="resource-error" role="alert">
         {{ resourceError }}。正在展示最近一次成功获取的资源统计。
@@ -100,12 +116,14 @@ import {
   type WorkbenchStatistics,
 } from "@/api/client";
 import AsyncState from "@/components/common/AsyncState.vue";
-import CreationTrendChart from "@/components/dashboard/CreationTrendChart.vue";
-import DatasetTrendChart from "@/components/dashboard/DatasetTrendChart.vue";
+import ActivitySummaryPanel from "@/components/dashboard/ActivitySummaryPanel.vue";
+import AssetTrendChart from "@/components/dashboard/AssetTrendChart.vue";
+import DashboardPanelHeading from "@/components/dashboard/DashboardPanelHeading.vue";
 import PipelineStatusChart from "@/components/dashboard/PipelineStatusChart.vue";
 import ResourceUsagePanel, { type ResourceUsageValue } from "@/components/dashboard/ResourceUsagePanel.vue";
 import ServiceHealthPanel from "@/components/dashboard/ServiceHealthPanel.vue";
 import StatisticSummaryStrip, { type StatisticSummaryItem } from "@/components/dashboard/StatisticSummaryStrip.vue";
+import StatusSummaryRow from "@/components/dashboard/StatusSummaryRow.vue";
 
 const RESOURCE_POLL_INTERVAL_MS = 5_000;
 
@@ -141,6 +159,26 @@ const pipelineStatusBuckets = computed(() => overview.value?.status_buckets.pipe
 const datasetStatusBuckets = computed(() => overview.value?.status_buckets.datasets ?? []);
 const pipelineTrend = computed<StatisticsTrend>(() => overview.value?.creation_trends.pipelines ?? emptyTrend());
 const datasetTrend = computed<StatisticsTrend>(() => overview.value?.creation_trends.datasets ?? emptyTrend());
+const serviceHealthBuckets = computed(() => resourceStatistics.value?.services.health_buckets ?? []);
+const serviceCalls = computed(() => resourceStatistics.value?.services.calls ?? 0);
+const serviceInstances = computed(() => resourceStatistics.value?.services.instances ?? 0);
+
+const activity = computed(() => ({
+  training: sumBuckets(
+    overview.value?.status_buckets.training_jobs ?? [],
+    new Set(["running", "training"]),
+  ),
+  deployments: sumBuckets(
+    overview.value?.status_buckets.services ?? [],
+    new Set(["deploying", "starting", "running"]),
+  ),
+  anomalies: (resourceStatistics.value?.nodes.freshness.stale ?? 0)
+    + (resourceStatistics.value?.nodes.freshness.unknown ?? 0)
+    + sumBuckets(
+      resourceStatistics.value?.services.health_buckets ?? [],
+      new Set(["unhealthy", "failed", "error", "degraded"]),
+    ),
+}));
 
 const resourceUsage = computed<ResourceUsageValue[]>(() => {
   const usage = resourceStatistics.value?.nodes.resource_usage;
@@ -168,6 +206,12 @@ const resourceStale = computed(() => {
 
 function emptyTrend(): StatisticsTrend {
   return { labels: [], values: [] };
+}
+
+function sumBuckets(buckets: StatisticsBucket[], labels: Set<string>) {
+  return buckets.reduce((sum, bucket) => (
+    labels.has(bucket.label.trim().toLowerCase()) ? sum + bucket.value : sum
+  ), 0);
 }
 
 function resourceValue(label: string, metric?: { value: number | null; available: number; unavailable: number }): ResourceUsageValue {
@@ -237,20 +281,6 @@ function errorStatus(error: unknown): number | undefined {
   return typeof error.status === "number" ? error.status : undefined;
 }
 
-function statusLabel(status: string) {
-  const labels: Record<string, string> = {
-    created: "已创建",
-    validated: "已校验",
-    processing: "处理中",
-    failed: "失败",
-    running: "运行中",
-    success: "成功",
-    stopped: "已停止",
-    draft: "配置中",
-  };
-  return labels[status] ?? status;
-}
-
 function formatTimestamp(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
@@ -262,6 +292,10 @@ function goDataPreparation() {
 
 function goServices() {
   void router.push("/services");
+}
+
+function goModelSpace() {
+  void router.push("/model-space");
 }
 
 onMounted(() => {
@@ -279,97 +313,186 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .workbench-view {
+  --workbench-surface: #f3f4f6;
+  --workbench-surface-raised: #f6f7f8;
+  --workbench-border: #e0e2e6;
+
   container: workbench / inline-size;
   display: grid;
-  gap: 18px;
+  gap: 14px;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
   min-height: 100%;
-  color: #18263b;
+  color: #252a31;
+  overflow-x: clip;
 }
 
-.workbench-header,
-.section-heading {
+.workbench-header {
   display: flex;
   align-items: start;
   justify-content: space-between;
   gap: 16px;
-}
-
-.workbench-header h1,
-.section-heading h2 {
-  margin: 0;
-  color: #172033;
-}
-
-.workbench-header h1 { font-size: 24px; line-height: 32px; }
-.workbench-header p,
-.generated-at { margin: 4px 0 0; color: #718096; font-size: 13px; line-height: 20px; }
-.generated-at { margin-top: 8px; white-space: nowrap; }
-
-.quick-link {
-  position: relative;
-  min-width: 44px;
-  min-height: 24px;
-  padding: 0 4px;
-  border: 0;
-  background: transparent;
-  color: #1763ff;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 20px;
-}
-
-.quick-link::before {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 44px;
-  height: 44px;
-  content: "";
-  transform: translate(-50%, -50%);
-}
-
-.dashboard-section {
-  display: grid;
-  gap: 12px;
   min-width: 0;
-  padding: 18px;
-  border: 1px solid #e7edf6;
-  border-radius: 6px;
-  background: #fff;
+  padding: 2px 2px 0;
 }
 
-.section-heading h2 { font-size: 17px; line-height: 24px; }
-.dashboard-grid { display: grid; gap: 18px; min-width: 0; }
-.dashboard-grid-three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.dashboard-grid-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.workbench-header > div {
+  min-width: 0;
+}
 
-.dataset-summary { min-width: 0; }
-.dataset-summary h3 { margin: 0; color: #18263b; font-size: 15px; line-height: 22px; }
-.dataset-summary dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 16px 0 0; }
-.dataset-summary dl > div { min-width: 0; padding: 12px; border: 1px solid #edf1f7; border-radius: 4px; background: #fafcff; }
-.dataset-summary dt { overflow: hidden; color: #718096; font-size: 12px; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; }
-.dataset-summary dd { margin: 5px 0 0; color: #26364e; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.dataset-summary .no-buckets { grid-column: 1 / -1; color: #8b98aa; text-align: center; }
+.workbench-header h1 {
+  margin: 0;
+  color: #252a31;
+  font-size: 24px;
+  line-height: 32px;
+  overflow-wrap: anywhere;
+}
 
-.resource-error { margin: -4px 0 0; color: #a66c00; font-size: 12px; line-height: 18px; }
+.workbench-header p,
+.generated-at {
+  margin: 4px 0 0;
+  color: #5f6873;
+  font-size: 13px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+
+.generated-at {
+  margin-top: 8px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.command-grid,
+.overview-grid,
+.command-primary {
+  display: grid;
+  min-width: 0;
+}
+
+.command-grid {
+  grid-template-columns: minmax(0, 1.7fr) minmax(280px, .8fr);
+  gap: 14px;
+  align-items: stretch;
+}
+
+.command-primary {
+  gap: 14px;
+}
+
+.overview-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  align-items: stretch;
+}
+
+.command-panel,
+.statistic-summary-strip {
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid var(--workbench-border);
+  border-radius: 8px;
+  background: var(--workbench-surface);
+}
+
+.command-panel {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  padding: 16px;
+  overflow: hidden;
+}
+
+.trend-panel {
+  min-height: 320px;
+  background: var(--workbench-surface-raised);
+}
+
+.pipeline-status-panel {
+  min-height: 102px;
+}
+
+.resource-panel {
+  min-height: 100%;
+}
+
+.dataset-panel,
+.service-panel,
+.activity-panel {
+  min-height: 310px;
+}
+
+.resource-error {
+  margin: -2px 2px 0;
+  color: #8a641f;
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
 
 @container workbench (max-width: 1080px) {
-  .dashboard-grid-three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .dashboard-grid-three > :last-child { grid-column: 1 / -1; }
+  .command-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .activity-panel {
+    grid-column: 1 / -1;
+    min-height: 0;
+  }
+
+  .resource-panel {
+    min-height: 0;
+  }
 }
 
 @container workbench (max-width: 720px) {
-  .workbench-header { align-items: start; flex-direction: column; gap: 0; }
-  .generated-at { margin-top: 2px; white-space: normal; }
-  .dashboard-grid-three,
-  .dashboard-grid-two { grid-template-columns: minmax(0, 1fr); }
-  .dashboard-grid-three > :last-child { grid-column: auto; }
+  .workbench-header {
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .generated-at {
+    margin-top: 2px;
+    text-align: left;
+    white-space: normal;
+  }
+
+  .overview-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .activity-panel {
+    grid-column: auto;
+  }
+
+  .command-panel {
+    min-height: 0;
+  }
 }
 
 @container workbench (max-width: 460px) {
-  .dashboard-section { padding: 14px; }
-  .dataset-summary dl { grid-template-columns: minmax(0, 1fr); }
+  .workbench-view {
+    gap: 12px;
+    font-size: 12px;
+  }
+
+  .workbench-header {
+    padding-inline: 0;
+  }
+
+  .command-grid,
+  .command-primary,
+  .overview-grid {
+    gap: 12px;
+  }
+
+  .command-panel {
+    padding: 12px;
+  }
 }
 </style>
