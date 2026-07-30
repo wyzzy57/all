@@ -5,11 +5,16 @@ import { AriaComponent, LegendComponent, TooltipComponent } from "echarts/compon
 import { init, use } from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
 import type { DashboardBucket } from "./PipelineStatusChart.vue";
+import { dashboardStatusLabel } from "./statusLabels";
 
 const props = withDefaults(defineProps<{ healthBuckets: DashboardBucket[]; calls: number; instances: number; title?: string }>(), { title: "服务分析" });
 use([CanvasRenderer, PieChart, LegendComponent, TooltipComponent, AriaComponent]);
 const chartElement = ref<HTMLElement | null>(null);
 const hasData = computed(() => props.healthBuckets.some((bucket) => bucket.value > 0));
+const displayBuckets = computed(() => props.healthBuckets.map((bucket) => ({
+  ...bucket,
+  displayLabel: dashboardStatusLabel(bucket.label, "service"),
+})));
 const statusColors: Record<string, string> = {
   healthy: "#16835b",
   success: "#16835b",
@@ -37,7 +42,7 @@ function option(animation: boolean) {
   const prefersReducedMotion = typeof window !== "undefined"
     && typeof window.matchMedia === "function"
     && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  return { animation: animation && !prefersReducedMotion, animationDuration: prefersReducedMotion ? 0 : 360, aria: { enabled: true }, tooltip: { trigger: "item", formatter: (params: { name: string; value: number; marker?: string }) => `${params.marker ?? ""}${escapeHtml(params.name)}: ${Number(params.value).toLocaleString("zh-CN")}` }, legend: { type: "scroll", bottom: 0, data: props.healthBuckets.map((item) => item.label), textStyle: { color: "#4b5563", fontSize: 12 } }, series: [{ type: "pie", radius: ["42%", "66%"], center: ["50%", "45%"], selectedMode: false, data: props.healthBuckets.map((item) => ({ name: item.label, value: item.value, itemStyle: { color: healthColor(item.label) } })), label: { show: false }, emphasis: { scale: true, scaleSize: 8, label: { show: false } } }] };
+  return { animation: animation && !prefersReducedMotion, animationDuration: prefersReducedMotion ? 0 : 360, aria: { enabled: true }, tooltip: { trigger: "item", formatter: (params: { name: string; value: number; marker?: string }) => `${params.marker ?? ""}${escapeHtml(params.name)}: ${Number(params.value).toLocaleString("zh-CN")}` }, legend: { type: "scroll", bottom: 0, data: displayBuckets.value.map((item) => item.displayLabel), textStyle: { color: "#4b5563", fontSize: 12 } }, series: [{ type: "pie", radius: ["42%", "66%"], center: ["50%", "45%"], selectedMode: false, data: displayBuckets.value.map((item) => ({ name: item.displayLabel, value: item.value, itemStyle: { color: healthColor(item.label) } })), label: { show: false }, emphasis: { scale: true, scaleSize: 8, label: { show: false } } }] };
 }
 function disposeChart() { resizeObserver?.disconnect(); resizeObserver = null; chart?.dispose(); chart = null; }
 function renderChart() { if (!hasData.value) { disposeChart(); return; } if (!chart && chartElement.value) { chart = init(chartElement.value); chart.setOption(option(!hasAnimated), true); hasAnimated = true; if (typeof ResizeObserver !== "undefined") { resizeObserver = new ResizeObserver(() => chart?.resize()); resizeObserver.observe(chartElement.value); } return; } chart?.setOption(option(false), true); }
@@ -50,9 +55,9 @@ watch(() => props.healthBuckets, renderChart, { deep: true, flush: "post" }); on
     <div v-if="!hasData" data-testid="service-health-empty" class="dashboard-empty">暂无服务健康数据</div>
     <div v-else class="health-visual">
       <div ref="chartElement" class="dashboard-chart" :style="{ aspectRatio: '16 / 10', minHeight: '190px' }" />
-      <ul class="health-summary" role="list" aria-label="服务健康状态明细"><li v-for="bucket in healthBuckets" :key="bucket.label" role="listitem"><span><i :style="{ backgroundColor: healthColor(bucket.label) }" aria-hidden="true" />{{ bucket.label }}</span><strong>{{ bucket.value.toLocaleString("zh-CN") }}</strong></li></ul>
+      <ul class="health-summary" role="list" aria-label="服务健康状态明细"><li v-for="bucket in displayBuckets" :key="bucket.label" role="listitem"><span><i :style="{ backgroundColor: healthColor(bucket.label) }" aria-hidden="true" />{{ bucket.displayLabel }}</span><strong>{{ bucket.value.toLocaleString("zh-CN") }}</strong></li></ul>
     </div>
-    <ul v-if="!hasData && healthBuckets.length" class="sr-only"><li v-for="bucket in healthBuckets" :key="bucket.label">{{ bucket.label }}：{{ bucket.value }}</li></ul>
+    <ul v-if="!hasData && displayBuckets.length" class="sr-only"><li v-for="bucket in displayBuckets" :key="bucket.label">{{ bucket.displayLabel }}：{{ bucket.value }}</li></ul>
   </section>
 </template>
 

@@ -114,6 +114,7 @@ describe("AdminOverviewView", () => {
     expect(adminOverviewSource).toContain('import AsyncState from "@/components/common/AsyncState.vue"');
     expect(adminOverviewSource).toContain("<AsyncState");
     expect(adminOverviewSource).toMatch(/\.section-heading button::before,\s*\.failures-section button::before\s*\{[^}]*width:\s*44px;[^}]*height:\s*44px/s);
+    expect(adminOverviewSource).toMatch(/\.admin-summary-surface\s*\{[^}]*background:\s*#fff;[^}]*border:\s*1px solid #e7edf6/s);
   });
 
   it("routes each management section and failure row to its actionable target", async () => {

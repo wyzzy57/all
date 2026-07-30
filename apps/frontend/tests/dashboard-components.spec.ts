@@ -156,6 +156,32 @@ describe("dashboard components", () => {
     expect(echartsMocks.dispose).toHaveBeenCalledTimes(1);
   });
 
+  it("translates backend status values into Chinese business labels", () => {
+    const summary = mount(StatusSummaryRow, {
+      props: { buckets: [{ label: "running", value: 2 }, { label: "success", value: 1 }] },
+    });
+    expect(summary.text()).toContain("运行中");
+    expect(summary.text()).toContain("运行成功");
+    expect(summary.text()).not.toContain("running");
+
+    const pipeline = mount(PipelineStatusChart, {
+      props: { buckets: [{ label: "draft", value: 2 }, { label: "success", value: 1 }] },
+    });
+    expect(latestOption().legend.data).toEqual(["配置中", "运行成功"]);
+    expect(pipeline.get(".sr-only").text()).toContain("配置中");
+
+    const service = mount(ServiceHealthPanel, {
+      props: {
+        healthBuckets: [{ label: "healthy", value: 3 }, { label: "unhealthy", value: 1 }],
+        calls: 4,
+        instances: 2,
+      },
+    });
+    expect(latestOption().legend.data).toEqual(["健康", "异常"]);
+    expect(service.get(".health-summary").text()).toContain("健康");
+    expect(service.get(".health-summary").text()).toContain("异常");
+  });
+
   it("disables pipeline status animation when reduced motion is preferred", () => {
     const matchMedia = vi.fn((query: string) => ({
       matches: true,

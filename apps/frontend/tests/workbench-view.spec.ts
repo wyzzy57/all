@@ -138,11 +138,11 @@ describe("WorkbenchView", () => {
     expect(apiMock.listDatasets).not.toHaveBeenCalled();
     expect(apiMock.listPipelines).not.toHaveBeenCalled();
     expect(apiMock.listServices).not.toHaveBeenCalled();
-    expect(wrapper.get("[data-testid='summary-strip']").text()).toBe("产线数量3|数据集数量2|训练任务16|服务数量29|可用节点25");
+    expect(wrapper.get("[data-testid='summary-strip']").text()).toBe("产线数量3|数据集数量2|训练任务16|服务数量29|可用节点12");
     expect(wrapper.get("[data-testid='status-row']").text()).toBe("running1|success2");
     expect(wrapper.get("[data-testid='dataset-status-chart']").text()).toContain("数据集状态|validated2");
     expect(wrapper.get("[data-testid='asset-trend']").text()).toBe("2026-06|2026-07::2026-06|2026-07");
-    expect(wrapper.get("[data-testid='activity-summary']").text()).toBe("3|12|51");
+    expect(wrapper.get("[data-testid='activity-summary']").text()).toBe("3|7|51");
     expect(wrapper.get("[data-testid='resource-panel']").text()).toContain("CPU12.5");
     expect(wrapper.get("[data-testid='service-panel']").text()).toContain("18|50|healthy12|Unhealthy8|FAILED9|Error10|degraded11");
   });

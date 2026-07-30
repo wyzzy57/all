@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { dashboardStatusLabel } from "./statusLabels";
+
 export type StatusSummaryBucket = {
   label: string;
   value: number;
@@ -35,7 +37,7 @@ function statusTone(label: string) {
       <div v-for="bucket in buckets" :key="bucket.label" class="status-summary-item" role="listitem">
         <span class="status-summary-label">
           <i class="status-dot" :class="statusTone(bucket.label)" aria-hidden="true" />
-          <span>{{ bucket.label }}</span>
+          <span>{{ dashboardStatusLabel(bucket.label, "pipeline") }}</span>
         </span>
         <strong>{{ bucket.value.toLocaleString("zh-CN") }}</strong>
       </div>

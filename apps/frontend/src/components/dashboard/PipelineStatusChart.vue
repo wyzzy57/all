@@ -4,18 +4,24 @@ import { PieChart } from "echarts/charts";
 import { AriaComponent, LegendComponent, TooltipComponent } from "echarts/components";
 import { init, use } from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
+import { dashboardStatusLabel, type DashboardStatusContext } from "./statusLabels";
 
 export type DashboardBucket = { label: string; value: number };
 
 const props = withDefaults(defineProps<{
   buckets: DashboardBucket[];
   title?: string;
-}>(), { title: "产线状态" });
+  statusContext?: DashboardStatusContext;
+}>(), { title: "产线状态", statusContext: "pipeline" });
 
 use([CanvasRenderer, PieChart, LegendComponent, TooltipComponent, AriaComponent]);
 
 const chartElement = ref<HTMLElement | null>(null);
 const hasData = computed(() => props.buckets.some((bucket) => bucket.value > 0));
+const displayBuckets = computed(() => props.buckets.map((bucket) => ({
+  ...bucket,
+  label: dashboardStatusLabel(bucket.label, props.statusContext),
+})));
 let chart: ReturnType<typeof init> | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let hasAnimated = false;
@@ -37,14 +43,14 @@ function option(animation: boolean) {
       trigger: "item",
       formatter: (params: { name: string; value: number; marker?: string }) => `${params.marker ?? ""}${escapeHtml(params.name)}: ${Number(params.value).toLocaleString("zh-CN")}`,
     },
-    legend: { type: "scroll", bottom: 0, data: props.buckets.map((bucket) => bucket.label), textStyle: { color: "#4b5563", fontSize: 12 } },
+    legend: { type: "scroll", bottom: 0, data: displayBuckets.value.map((bucket) => bucket.label), textStyle: { color: "#4b5563", fontSize: 12 } },
     series: [{
       type: "pie",
       radius: ["45%", "70%"],
       center: ["50%", "44%"],
       avoidLabelOverlap: true,
       selectedMode: false,
-      data: props.buckets.map((bucket) => ({ name: bucket.label, value: bucket.value })),
+      data: displayBuckets.value.map((bucket) => ({ name: bucket.label, value: bucket.value })),
       label: { show: false },
       emphasis: { scale: true, scaleSize: 8, label: { show: false } },
     }],
@@ -86,7 +92,7 @@ onBeforeUnmount(disposeChart);
     <header><h3>{{ title }}</h3></header>
     <div v-if="!hasData" data-testid="pipeline-status-empty" class="dashboard-empty">暂无产线状态数据</div>
     <div v-else ref="chartElement" class="dashboard-chart" :style="{ aspectRatio: '16 / 10', minHeight: '240px' }" />
-    <ul class="sr-only"><li v-for="bucket in buckets" :key="bucket.label">{{ bucket.label }}：{{ bucket.value }}</li></ul>
+    <ul class="sr-only"><li v-for="bucket in displayBuckets" :key="bucket.label">{{ bucket.label }}：{{ bucket.value }}</li></ul>
   </section>
 </template>
 

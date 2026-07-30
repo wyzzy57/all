@@ -26,7 +26,9 @@
     />
 
     <template v-else-if="overview">
-      <StatisticSummaryStrip :items="summaryItems" />
+      <section class="admin-summary-surface">
+        <StatisticSummaryStrip :items="summaryItems" />
+      </section>
 
       <div class="chart-grid">
         <section class="overview-section">
@@ -180,6 +182,7 @@ onBeforeUnmount(() => { stopPolling(); document.removeEventListener("visibilityc
 
 <style scoped>
 .admin-overview { container: admin-overview / inline-size; display: grid; gap: 16px; min-width: 0; color: #172033; }
+.admin-summary-surface { min-width: 0; overflow: hidden; background: #fff; border: 1px solid #e7edf6; border-radius: 6px; }
 .page-heading,.section-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
 .page-heading h1,.section-heading h2 { margin: 0; }.page-heading h1 { font-size: 24px; line-height: 32px; }
 .page-heading p,.page-heading time { margin: 4px 0 0; color: #718096; font-size: 13px; }.page-heading time { margin-top: 8px; }

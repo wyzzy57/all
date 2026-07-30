@@ -69,7 +69,7 @@
             data-testid="go-data-assets"
             @action="goDataPreparation"
           />
-          <PipelineStatusChart :buckets="datasetStatusBuckets" title="数据集状态" />
+          <PipelineStatusChart :buckets="datasetStatusBuckets" title="数据集状态" status-context="dataset" />
         </section>
 
         <section class="command-panel service-panel">
@@ -151,7 +151,7 @@ const summaryItems = computed<StatisticSummaryItem[]>(() => {
     { label: "数据集数量", value: totals.datasets, unit: "个" },
     { label: "训练任务", value: totals.training_jobs, unit: "个" },
     { label: "服务数量", value: totals.services, unit: "个" },
-    { label: "可用节点", value: totals.nodes, unit: "个" },
+    { label: "可用节点", value: resourceStatistics.value?.nodes.freshness.fresh ?? null, unit: "个" },
   ];
 });
 
@@ -170,7 +170,7 @@ const activity = computed(() => ({
   ),
   deployments: sumBuckets(
     overview.value?.status_buckets.services ?? [],
-    new Set(["deploying", "starting", "running"]),
+    new Set(["deploying", "starting"]),
   ),
   anomalies: (resourceStatistics.value?.nodes.freshness.stale ?? 0)
     + (resourceStatistics.value?.nodes.freshness.unknown ?? 0)
