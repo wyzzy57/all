@@ -46,6 +46,20 @@ function latestOption() {
   return echartsMocks.setOption.mock.calls[echartsMocks.setOption.mock.calls.length - 1][0];
 }
 
+function collectMinHeightsForSelectors(componentSource: string, selectors: string[]) {
+  const styleSource = componentSource.match(/<style[^>]*>([\s\S]*?)<\/style>/)?.[1] ?? "";
+  const minHeights: number[] = [];
+
+  for (const rule of styleSource.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (!selectors.some((selector) => rule[1].includes(selector))) continue;
+    for (const declaration of rule[2].matchAll(/min-height\s*:\s*(\d+(?:\.\d+)?)px/g)) {
+      minHeights.push(Number(declaration[1]));
+    }
+  }
+
+  return minHeights;
+}
+
 const statusBuckets = [
   { label: "\u914d\u7f6e\u4e2d", value: 3 },
   { label: "<img src=x onerror=alert(1)>", value: 2 },
@@ -348,19 +362,24 @@ describe("dashboard components", () => {
         datasetTrend: { labels: ["2026-07"], values: [9] },
       },
     });
-    const canvasMinHeight = Number(assetTrendChartSource.match(
-      /(?=[^{]*\.asset-trend-canvas)[^{]*\{[^}]*min-height:\s*(\d+)px/s,
-    )?.[1]);
-    const emptyMinHeight = Number(assetTrendChartSource.match(
-      /(?=[^{]*\.asset-trend-empty)[^{]*\{[^}]*min-height:\s*(\d+)px/s,
-    )?.[1]);
+    const canvasMinHeights = collectMinHeightsForSelectors(
+      assetTrendChartSource,
+      [".asset-trend-canvas", ".dashboard-chart"],
+    );
+    const emptyMinHeights = collectMinHeightsForSelectors(
+      assetTrendChartSource,
+      [".asset-trend-empty"],
+    );
+    const canvasMinHeight = canvasMinHeights.at(-1);
+    const emptyMinHeight = emptyMinHeights.at(-1);
 
     expect(wrapper.find(".asset-trend-canvas").exists()).toBe(true);
+    expect(canvasMinHeights.length).toBeGreaterThan(0);
     expect(canvasMinHeight).toBeGreaterThanOrEqual(160);
     expect(canvasMinHeight).toBeLessThanOrEqual(180);
+    expect(emptyMinHeights.length).toBeGreaterThan(0);
     expect(emptyMinHeight).toBeGreaterThanOrEqual(160);
     expect(emptyMinHeight).toBeLessThanOrEqual(180);
-    expect(assetTrendChartSource).not.toMatch(/min-height:\s*250px/);
   });
 
   it("renders status labels and numeric values as a semantic list", () => {

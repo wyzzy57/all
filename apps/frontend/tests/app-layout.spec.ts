@@ -117,15 +117,16 @@ describe("global application header", () => {
 
   it("defines shell containment and page overflow contracts for browser QA", () => {
     const workbenchRootRules = [...workbenchSource.matchAll(/\.workbench-view\s*\{([^{}]*)\}/g)]
-      .map((match) => match[1])
-      .join("\n");
+      .map((match) => match[1]);
 
     expect(appSource).not.toContain('class="app-header"');
     expect(appSource).toContain('class="app-content-shell"');
     expect(stylesSource).toMatch(/\.app-content-shell\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden/s);
     expect(stylesSource).toMatch(/\.app-main\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*auto/s);
     expect(workbenchSource).toContain("@container workbench (max-width: 1100px)");
-    expect(workbenchRootRules).not.toMatch(/transform:\s*scale\(/);
+    for (const ruleBody of workbenchRootRules) {
+      expect(ruleBody).not.toMatch(/transform\s*:[^;{}]*scale\s*\(/);
+    }
     expect(adminOverviewSource).toContain("@container admin-overview (max-width: 1120px)");
     expect(adminOverviewSource).toContain(".failure-table-wrap { overflow-x: auto;");
     expect(auditLogSource).toContain(".audit-table-wrap { overflow-x: auto;");
