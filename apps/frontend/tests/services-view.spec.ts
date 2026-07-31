@@ -68,6 +68,18 @@ describe("ServicesView", () => {
     expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
   });
 
+  it("wraps narrow service footer actions without compressing their text", () => {
+    const narrowContainer = servicesViewSource.match(
+      /@container services \(max-width: 520px\) \{([\s\S]*?)\n\}/,
+    )?.[1];
+
+    expect(narrowContainer).toMatch(/\.service-card footer\s*\{[^}]*flex-wrap:\s*wrap/);
+    expect(narrowContainer).toMatch(
+      /\.service-status,\s*\.service-card footer button\s*\{[^}]*(?:flex:\s*none[^}]*white-space:\s*nowrap|white-space:\s*nowrap[^}]*flex:\s*none)/,
+    );
+    expect(narrowContainer).toMatch(/\.service-card footer i\s*\{[^}]*display:\s*none/);
+  });
+
   it("uses the shared resource dialog for service access", () => {
     expect(servicesViewSource).toContain("ResourceSharingDialog");
     expect(servicesViewSource).toContain("openServiceSharing(selectedService)");

@@ -611,6 +611,9 @@ button { font: inherit; }
   .services-tools, .detail-header, .detail-actions { align-items: stretch; flex-direction: column; }
   .sort-select, .search-input { width: 100%; }
   .service-grid, .metric-grid { grid-template-columns: 1fr; }
+  .service-card footer { flex-wrap: wrap; }
+  .service-status, .service-card footer button { flex: none; white-space: nowrap; }
+  .service-card footer i { display: none; }
   .detail-tabs { gap: 20px; overflow-x: auto; }
 }
 </style>
