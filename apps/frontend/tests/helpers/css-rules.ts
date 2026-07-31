@@ -7,6 +7,14 @@ export type CssSourceKind = "css" | "sfc";
 const MAX_SHADOW_OFFSET_PX = 2;
 const MAX_SHADOW_BLUR_PX = 6;
 const MAX_SHADOW_SPREAD_PX = 1;
+const NON_TRANSLATING_TRANSFORMS = new Set([
+  "perspective",
+  "rotate", "rotate3d", "rotatex", "rotatey", "rotatez",
+  "scale", "scale3d", "scalex", "scaley", "scalez",
+  "skew", "skewx", "skewy",
+]);
+
+type LiftStatus = "safe" | "lift" | "unknown";
 
 export function topLevelRuleDeclarations(
   source: string,
@@ -37,8 +45,8 @@ export function topLevelRuleDeclarations(
 export function hasForbiddenHoverElevation(declarations: CssDeclarations | undefined): boolean {
   if (!declarations) return false;
 
-  const hasLift = (declarations.get("transform") ?? []).some(transformHasNegativeY)
-    || (declarations.get("translate") ?? []).some(translatePropertyHasNegativeY);
+  const hasLift = (declarations.get("transform") ?? []).some(transformIsForbidden)
+    || (declarations.get("translate") ?? []).some(translatePropertyIsForbidden);
   const hasLargeShadow = (declarations.get("box-shadow") ?? []).some((value) => {
     if (value.trim().toLowerCase() === "none") return false;
     return splitTopLevel(value, ",").some((shadow) => !isSmallShadow(shadow));
@@ -54,17 +62,48 @@ function styleBlocks(source: string) {
   return descriptor.styles.map((style) => style.content);
 }
 
-function transformHasNegativeY(value: string) {
-  return functionCalls(value).some(({ name, arguments: args }) => {
-    const values = functionArguments(args);
-    if (name === "translatey") return isNegativeLength(values[0]);
-    if (name === "translate" || name === "translate3d") return isNegativeLength(values[1]);
-    return false;
-  });
+function transformIsForbidden(value: string) {
+  if (value.trim().toLowerCase() === "none") return false;
+  const calls = topLevelFunctionCalls(value);
+  if (!calls) return true;
+  return calls.some((call) => transformCallLiftStatus(call) !== "safe");
 }
 
-function translatePropertyHasNegativeY(value: string) {
-  return isNegativeLength(splitTopLevelWhitespace(value)[1]);
+function translatePropertyIsForbidden(value: string) {
+  if (value.trim().toLowerCase() === "none") return false;
+  const values = splitTopLevelWhitespace(value);
+  if (values.length < 1 || values.length > 3) return true;
+  const statuses = values.map(lengthLiftStatus);
+  if (statuses.includes("unknown")) return true;
+  return statuses[1] === "lift";
+}
+
+function transformCallLiftStatus(call: { name: string; arguments: string }): LiftStatus {
+  if (NON_TRANSLATING_TRANSFORMS.has(call.name)) return "safe";
+
+  const values = functionArguments(call.arguments);
+  if (call.name === "translatey") return fixedArityLiftStatus(values, 1, 0, lengthLiftStatus);
+  if (call.name === "translate") {
+    if (values.length < 1 || values.length > 2) return "unknown";
+    if (values.some((value) => lengthLiftStatus(value) === "unknown")) return "unknown";
+    return values[1] ? lengthLiftStatus(values[1]) : "safe";
+  }
+  if (call.name === "translate3d") return fixedArityLiftStatus(values, 3, 1, lengthLiftStatus);
+  if (call.name === "matrix") return fixedArityLiftStatus(values, 6, 5, numberLiftStatus);
+  if (call.name === "matrix3d") return fixedArityLiftStatus(values, 16, 13, numberLiftStatus);
+  return "unknown";
+}
+
+function fixedArityLiftStatus(
+  values: string[],
+  arity: number,
+  yIndex: number,
+  classify: (value: string | undefined) => LiftStatus,
+): LiftStatus {
+  if (values.length !== arity) return "unknown";
+  const statuses = values.map(classify);
+  if (statuses.includes("unknown")) return "unknown";
+  return statuses[yIndex] ?? "unknown";
 }
 
 function isSmallShadow(value: string) {
@@ -90,10 +129,22 @@ function parseLength(token: string): number | null | undefined {
   return null;
 }
 
-function isNegativeLength(value: string | undefined) {
-  if (!value) return false;
-  const match = value.trim().match(/^(-?(?:\d+(?:\.\d+)?|\.\d+))(?:[a-z%]+)?$/i);
-  return match ? Number(match[1]) < 0 : false;
+function lengthLiftStatus(value: string | undefined): LiftStatus {
+  if (!value) return "unknown";
+  const normalized = value.trim();
+  const calcMatch = normalized.match(/^calc\(\s*([^()]+)\s*\)$/i);
+  return numericLiftStatus(calcMatch?.[1] ?? normalized, true);
+}
+
+function numberLiftStatus(value: string | undefined): LiftStatus {
+  return value ? numericLiftStatus(value.trim(), false) : "unknown";
+}
+
+function numericLiftStatus(value: string, allowUnit: boolean): LiftStatus {
+  const unit = allowUnit ? "(?:[a-z%]+)?" : "";
+  const match = value.match(new RegExp(`^(-?(?:\\d+(?:\\.\\d+)?|\\.\\d+))${unit}$`, "i"));
+  if (!match) return "unknown";
+  return Number(match[1]) < 0 ? "lift" : "safe";
 }
 
 function functionArguments(value: string) {
@@ -101,11 +152,15 @@ function functionArguments(value: string) {
   return commaSeparated.length > 1 ? commaSeparated : splitTopLevelWhitespace(value);
 }
 
-function functionCalls(value: string) {
+function topLevelFunctionCalls(value: string) {
   const calls: Array<{ name: string; arguments: string }> = [];
-  const pattern = /([a-z][a-z0-9-]*)\s*\(/gi;
-  for (const match of value.matchAll(pattern)) {
-    const start = match.index! + match[0].length;
+  let index = 0;
+  while (index < value.length) {
+    while (/\s/.test(value[index] ?? "")) index += 1;
+    if (index >= value.length) break;
+    const match = value.slice(index).match(/^([a-z][a-z0-9-]*)\s*\(/i);
+    if (!match) return undefined;
+    const start = index + match[0].length;
     let depth = 1;
     let end = start;
     while (end < value.length && depth > 0) {
@@ -113,11 +168,11 @@ function functionCalls(value: string) {
       if (value[end] === ")") depth -= 1;
       end += 1;
     }
-    if (depth === 0) {
-      calls.push({ name: match[1]!.toLowerCase(), arguments: value.slice(start, end - 1) });
-    }
+    if (depth !== 0) return undefined;
+    calls.push({ name: match[1]!.toLowerCase(), arguments: value.slice(start, end - 1) });
+    index = end;
   }
-  return calls;
+  return calls.length > 0 ? calls : undefined;
 }
 
 function splitTopLevel(value: string, separator: string) {

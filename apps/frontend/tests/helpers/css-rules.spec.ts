@@ -37,14 +37,31 @@ describe("CSS rule helpers", () => {
     "transform: translate(0, -1px);",
     "transform: translateY(-1px);",
     "transform: translate3d(0, -1px, 0);",
+    "transform: matrix(1, 0, 0, 1, 0, -1);",
+    "transform: translateY(calc(-1px));",
     "translate: 0 -1px;",
+    "translate: 0 calc(-1px);",
   ])("rejects negative Y lift from %s", (css) => {
     expect(hasForbiddenHoverElevation(declarations(css))).toBe(true);
   });
 
-  it("allows horizontal and non-negative translation", () => {
+  it.each([
+    "transform: var(--hover-transform);",
+    "transform: translateY(var(--hover-lift));",
+    "translate: var(--hover-translate);",
+    "translate: 0 var(--hover-lift);",
+  ])("conservatively rejects indeterminate movement from %s", (css) => {
+    expect(hasForbiddenHoverElevation(declarations(css))).toBe(true);
+  });
+
+  it("allows explicit none, zero, horizontal, and non-negative translation", () => {
+    expect(hasForbiddenHoverElevation(declarations("transform: none;"))).toBe(false);
+    expect(hasForbiddenHoverElevation(declarations("translate: none;"))).toBe(false);
+    expect(hasForbiddenHoverElevation(declarations("translate: 0;"))).toBe(false);
     expect(hasForbiddenHoverElevation(declarations("transform: translate(-1px, 0);"))).toBe(false);
     expect(hasForbiddenHoverElevation(declarations("transform: translateY(1px);"))).toBe(false);
+    expect(hasForbiddenHoverElevation(declarations("transform: translateY(calc(0px));"))).toBe(false);
+    expect(hasForbiddenHoverElevation(declarations("transform: matrix(1, 0, 0, 1, 0, 0);"))).toBe(false);
     expect(hasForbiddenHoverElevation(declarations("translate: -1px 0;"))).toBe(false);
   });
 });
