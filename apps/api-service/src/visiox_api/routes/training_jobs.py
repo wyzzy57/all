@@ -179,6 +179,13 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _lock_pipeline_to_first_job(pipeline: TrainingPipeline, job_id: str) -> None:
+    if pipeline.first_submitted_job_id is None:
+        pipeline.first_submitted_job_id = job_id
+    if pipeline.framework_locked_at is None:
+        pipeline.framework_locked_at = _utc_now()
+
+
 def _job_response(
     job: TrainingJob,
     environment: dict[str, Any] | None = None,
@@ -323,6 +330,7 @@ async def create_training_job(
         "environment": environment,
     }
     pipeline.status = "running"
+    _lock_pipeline_to_first_job(pipeline, job.id)
     session.add(pipeline)
     session.commit()
     session.refresh(job)
@@ -381,7 +389,9 @@ async def _create_llm_training_job(
         )
     try:
         dataset = validate_llm_dataset(session, str(pipeline.dataset_id))
-        dataset_version = resolve_llm_dataset_version(session, dataset.id, request.dataset_version_id)
+        dataset_version = resolve_llm_dataset_version(
+            session, dataset.id, request.dataset_version_id
+        )
         params = validate_llamafactory_config(
             {**(pipeline.params_template or {}), **request.params}
         )
@@ -474,7 +484,9 @@ async def _create_distributed_training_job(
         pipeline_id=pipeline.id,
         status="queued",
         params=params,
-        metrics={"dataset_snapshot": context_payload} if context_payload.get("dataset_version_id") else {},
+        metrics={"dataset_snapshot": context_payload}
+        if context_payload.get("dataset_version_id")
+        else {},
         organization_id=actor.organization_id,
         owner_user_id=actor.id,
         visibility="private",
@@ -526,6 +538,9 @@ async def _create_distributed_training_job(
     session.add(task)
     session.flush()
     session.add_all([job, pipeline])
+    session.flush()
+    _lock_pipeline_to_first_job(pipeline, job_id)
+    session.add(pipeline)
     session.flush()
     session.add(run)
     session.flush()

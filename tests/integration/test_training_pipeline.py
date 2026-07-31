@@ -553,7 +553,6 @@ def test_create_legacy_pipeline_returns_explicit_identity(client: TestClient) ->
             "name": "legacy-yolo-identity",
             "engine": "yolo26",
             "task": "detect",
-            "scale": "n",
         },
     )
     llama = client.post(
@@ -581,7 +580,15 @@ def test_create_legacy_pipeline_returns_explicit_identity(client: TestClient) ->
         "framework": "ultralytics",
         "adapter_key": "ultralytics.object_detection.v1",
         "adapter_version": "1.0.0",
-        "model_family": "YOLO26",
+        "model_family": "yolo26",
+    }
+    assert yolo.json()["scale"] == "n"
+    assert yolo.json()["recipe"]["model"] == {
+        "key": "yolo26n",
+        "label": "YOLO26-N",
+        "runtime_id": "yolo26n.pt",
+        "family": "YOLO26",
+        "variant": "N",
     }
     assert llama.status_code == 201, llama.text
     assert llama.json()["task_kind"] == "llm_sft"
@@ -626,15 +633,13 @@ def test_update_unlocked_pipeline_switches_framework_after_revalidation(
 @pytest.mark.parametrize(
     "identity_change",
     [
-        {
-            "task_kind": "object_detection",
-            "framework": "paddlex",
-            "adapter_key": "paddlex.object_detection.v1",
-            "adapter_version": "1.0.0",
-            "model_family": "PP-YOLOE",
-            "recipe": {"model": "PP-YOLOE-S"},
-        },
-        {"engine": "paddlex", "task": "detect", "scale": "s"},
+        {"task_kind": "llm_sft"},
+        {"framework": "paddlex"},
+        {"adapter_key": "paddlex.object_detection.v1"},
+        {"adapter_version": "2.0.0"},
+        {"model_family": "PP-YOLOE"},
+        {"engine": "paddlex"},
+        {"task": "segment"},
         {"scale": "s"},
     ],
 )
@@ -643,36 +648,68 @@ def test_update_locked_pipeline_rejects_explicit_and_legacy_identity_changes(
     session_factory,
     identity_change: dict,
 ) -> None:
-    created = client.post(
-        "/pipelines",
-        json={
-            "name": f"locked-{len(identity_change)}-{sorted(identity_change)[0]}",
-            "engine": "yolo26",
-            "task": "detect",
-            "scale": "n",
-        },
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    created = create_pipeline(
+        client,
+        base_model_id,
+        dataset_id,
+        name=f"locked-{sorted(identity_change)[0]}",
     )
+    submitted = client.post(f"/pipelines/{created.json()['id']}/jobs", json={})
+
+    assert submitted.status_code == 201, submitted.text
     with session_factory() as session:
-        pipeline = session.get(TrainingPipeline, created.json()["id"])
-        assert pipeline is not None
-        pipeline.framework_locked_at = datetime.now(UTC)
-        session.add(pipeline)
-        session.commit()
+        locked = session.get(TrainingPipeline, created.json()["id"])
+        assert locked is not None
+        assert locked.framework_locked_at is not None
+        assert locked.first_submitted_job_id == submitted.json()["id"]
 
     rejected = client.patch(
         f"/pipelines/{created.json()['id']}",
         json=identity_change,
-    )
-    renamed = client.patch(
-        f"/pipelines/{created.json()['id']}",
-        json={"name": f"{created.json()['name']}-renamed"},
     )
 
     assert rejected.status_code == 409, rejected.text
     assert rejected.json()["detail"] == (
         "Pipeline framework identity is locked; clone the pipeline to change it"
     )
-    assert renamed.status_code == 200, renamed.text
+
+
+@pytest.mark.parametrize(
+    "equal_identity",
+    [
+        {"task_kind": "object_detection"},
+        {"framework": "ultralytics"},
+        {"adapter_key": "ultralytics.object_detection.v1"},
+        {"adapter_version": "1.0"},
+        {"model_family": "YOLO26"},
+        {"engine": "yolo26"},
+        {"task": "detect"},
+        {"scale": "N"},
+    ],
+)
+def test_update_locked_pipeline_allows_equivalent_partial_identity_fields(
+    client: TestClient,
+    session_factory,
+    equal_identity: dict,
+) -> None:
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    created = create_pipeline(
+        client,
+        base_model_id,
+        dataset_id,
+        name=f"locked-equal-{sorted(equal_identity)[0]}",
+    )
+    submitted = client.post(f"/pipelines/{created.json()['id']}/jobs", json={})
+
+    assert submitted.status_code == 201, submitted.text
+    updated = client.patch(
+        f"/pipelines/{created.json()['id']}",
+        json=equal_identity,
+    )
+
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["status"] == "running"
 
 
 def test_pipeline_identity_payload_rejects_conflicts_and_unknown_fields(
@@ -1221,7 +1258,10 @@ def test_create_training_job_creates_task_and_enqueues_command(
     assert list_response.json()["total"] == 1
     assert detail_response.json()["task_id"] == body["task_id"]
     with session_factory() as session:
-        assert session.get(TrainingPipeline, pipeline_id).status == "running"
+        pipeline = session.get(TrainingPipeline, pipeline_id)
+        assert pipeline.status == "running"
+        assert pipeline.framework_locked_at is not None
+        assert pipeline.first_submitted_job_id == body["id"]
 
 
 def test_create_distributed_training_job_persists_plan_and_enqueues_id_only_edge_command(
@@ -1266,8 +1306,11 @@ def test_create_distributed_training_job_persists_plan_and_enqueues_id_only_edge
         task = session.get(Task, body["task_id"])
         run = session.get(DistributedTrainingRun, body["distributed_run_id"])
         execution = session.get(RemoteExecution, body["remote_execution_id"])
+        pipeline = session.get(TrainingPipeline, pipeline_id)
 
     assert job.task_id == task.id
+    assert pipeline.framework_locked_at is not None
+    assert pipeline.first_submitted_job_id == body["id"]
     assert task.task_type == TaskType.EDGE_TRAIN.value
     assert task.payload["distributed_training_run_id"] == run.id
     assert run.training_job_id == job.id
@@ -1376,7 +1419,10 @@ def test_create_llm_training_job_uses_platform_image_and_model_reference(
     with session_factory() as session:
         task = session.get(Task, body["task_id"])
         run = session.get(DistributedTrainingRun, body["distributed_run_id"])
+        pipeline = session.get(TrainingPipeline, pipeline_id)
     assert task.payload["engine"] == "llamafactory"
+    assert pipeline.framework_locked_at is not None
+    assert pipeline.first_submitted_job_id == body["id"]
     assert task.payload["dataset_manifest_checksum"] == "c" * 64
     assert task.payload["dataset_version_id"] == dataset_version.id
     assert task.payload["model_reference"] == {

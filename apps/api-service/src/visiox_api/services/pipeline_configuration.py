@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
 from sqlalchemy.orm import Session
 
 from visiox_api.services.framework_adapters import FrameworkAdapterCatalog
@@ -62,16 +63,19 @@ class ResolvedPipelineConfiguration:
     @property
     def identity(self) -> tuple[str, ...]:
         model = self.recipe.get("model") or {}
-        return (
-            self.task_kind,
-            self.framework,
-            self.adapter_key,
-            self.adapter_version,
-            self.model_family,
-            str(model.get("key", "")),
-            self.engine,
-            self.task,
-            self.scale,
+        return tuple(
+            value.casefold()
+            for value in (
+                self.task_kind,
+                self.framework,
+                self.adapter_key,
+                self.adapter_version,
+                self.model_family,
+                str(model.get("key", "")),
+                self.engine,
+                self.task,
+                self.scale,
+            )
         )
 
 
@@ -95,6 +99,7 @@ class PipelineConfigurationService:
         fields_set: set[str],
     ) -> ResolvedPipelineConfiguration:
         current = self.from_pipeline(pipeline)
+        self._reject_locked_identity_changes(pipeline, changes, fields_set)
         values = {
             "engine": pipeline.engine,
             "task": pipeline.task,
@@ -120,6 +125,60 @@ class PipelineConfigurationService:
         ) and (resolved.identity != current.identity):
             raise PipelineConfigurationError(IDENTITY_LOCK_DETAIL, status_code=409)
         return resolved
+
+    @staticmethod
+    def has_effective_change(
+        current: ResolvedPipelineConfiguration,
+        resolved: ResolvedPipelineConfiguration,
+    ) -> bool:
+        return current.identity != resolved.identity or any(
+            getattr(current, field) != getattr(resolved, field)
+            for field in (
+                "recipe",
+                "base_model_id",
+                "dataset_id",
+                "params_template",
+                "default_environment",
+            )
+        )
+
+    @staticmethod
+    def _reject_locked_identity_changes(
+        pipeline: TrainingPipeline,
+        changes: dict[str, Any],
+        fields_set: set[str],
+    ) -> None:
+        if (
+            pipeline.framework_locked_at is None
+            and pipeline.first_submitted_job_id is None
+        ):
+            return
+        current_values = {
+            "task_kind": pipeline.task_kind,
+            "framework": pipeline.framework,
+            "adapter_key": pipeline.adapter_key,
+            "adapter_version": pipeline.adapter_version,
+            "model_family": pipeline.model_family,
+            "engine": pipeline.engine,
+            "task": pipeline.task,
+            "scale": pipeline.scale,
+        }
+        for field, current_value in current_values.items():
+            if field not in fields_set:
+                continue
+            requested_value = changes.get(field)
+            if field == "adapter_version":
+                try:
+                    equivalent = Version(str(requested_value)) == Version(current_value)
+                except InvalidVersion:
+                    equivalent = False
+            else:
+                equivalent = (
+                    requested_value is not None
+                    and str(requested_value).casefold() == current_value.casefold()
+                )
+            if not equivalent:
+                raise PipelineConfigurationError(IDENTITY_LOCK_DETAIL, status_code=409)
 
     def from_pipeline(
         self, pipeline: TrainingPipeline
@@ -207,11 +266,14 @@ class PipelineConfigurationService:
             task for task in adapter.capabilities.tasks if task.task_type == task_kind
         )
         model = self._resolve_model(task_capability, values, fields_set, current)
-        family = (
-            model.family
-            if model is not None and model.family
-            else values.get("model_family")
-        )
+        if values.get("engine") == "yolo26" and "model_family" not in fields_set:
+            family = "yolo26"
+        else:
+            family = (
+                model.family
+                if model is not None and model.family
+                else values.get("model_family")
+            )
         if not family:
             family = "legacy-unspecified"
         if "model_family" in fields_set and model is not None:
@@ -369,6 +431,8 @@ class PipelineConfigurationService:
             and task.task_type == "object_detection"
         ):
             identifiers.append(str(values["scale"]).casefold())
+        if not identifiers and values.get("engine") == "yolo26":
+            identifiers.append("n")
         if not identifiers and current is not None:
             current_model = current.recipe.get("model") or {}
             if current_model.get("key"):

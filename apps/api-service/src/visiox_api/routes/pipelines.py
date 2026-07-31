@@ -382,17 +382,11 @@ def update_pipeline(
         "default_environment",
     }
     touches_training_config = bool(request.model_fields_set & configuration_fields)
-    if touches_training_config and pipeline.status == "running":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Running pipeline cannot be edited",
-        )
-
-    if request.name is not None:
-        pipeline.name = request.name.strip()
     if touches_training_config:
+        service = PipelineConfigurationService(catalog)
+        current_configuration = service.from_pipeline(pipeline)
         try:
-            configuration = PipelineConfigurationService(catalog).resolve_update(
+            configuration = service.resolve_update(
                 session,
                 pipeline,
                 request.model_dump(),
@@ -400,7 +394,18 @@ def update_pipeline(
             )
         except PipelineConfigurationError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-        PipelineConfigurationService(catalog).apply(pipeline, configuration)
+        effective_change = service.has_effective_change(
+            current_configuration, configuration
+        )
+        if effective_change and pipeline.status == "running":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Running pipeline cannot be edited",
+            )
+        if effective_change:
+            service.apply(pipeline, configuration)
+    if request.name is not None:
+        pipeline.name = request.name.strip()
     if request.is_public is not None:
         pipeline.is_public = request.is_public
     if request.public_scope is not None:
