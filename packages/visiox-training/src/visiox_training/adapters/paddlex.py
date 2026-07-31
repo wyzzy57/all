@@ -78,6 +78,7 @@ class PaddleXAdapter(FrameworkAdapter):
                             family="PP-YOLOE",
                             variant="S",
                             source="paddlex",
+                            revision="paddlex-model-zoo/3.0.3/PP-YOLOE_plus-S",
                         ),
                         ModelCapability(
                             model_key="rt-detr-l",
@@ -86,6 +87,7 @@ class PaddleXAdapter(FrameworkAdapter):
                             family="RT-DETR",
                             variant="L",
                             source="paddlex",
+                            revision="paddlex-model-zoo/3.0.3/RT-DETR-L",
                         ),
                     ),
                     accepted_dataset_formats=("coco",),

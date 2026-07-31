@@ -282,6 +282,7 @@ class TrainingJobAttempt(IdMixin, TimestampMixin, Base):
     launch_spec: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False, default=dict
     )
+    launch_spec_checksum: Mapped[str] = mapped_column(String(128), nullable=False)
     log_uri: Mapped[str | None] = mapped_column(Text)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     artifact_manifest: Mapped[dict[str, Any]] = mapped_column(

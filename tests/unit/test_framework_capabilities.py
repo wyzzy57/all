@@ -90,11 +90,26 @@ def test_catalog_publishes_exact_product_model_choices_and_versions() -> None:
             model.family,
             model.variant,
             model.source,
+            model.revision,
         )
         for model in paddlex.tasks[0].models
     ] == [
-        ("PP-YOLOE-S", "PP-YOLOE_plus-S", "PP-YOLOE", "S", "paddlex"),
-        ("RT-DETR-L", "RT-DETR-L", "RT-DETR", "L", "paddlex"),
+        (
+            "PP-YOLOE-S",
+            "PP-YOLOE_plus-S",
+            "PP-YOLOE",
+            "S",
+            "paddlex",
+            "paddlex-model-zoo/3.0.3/PP-YOLOE_plus-S",
+        ),
+        (
+            "RT-DETR-L",
+            "RT-DETR-L",
+            "RT-DETR",
+            "L",
+            "paddlex",
+            "paddlex-model-zoo/3.0.3/RT-DETR-L",
+        ),
     ]
 
     llama = adapters["llamafactory"].capabilities

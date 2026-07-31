@@ -12,7 +12,13 @@ from sqlalchemy.orm import Session
 from visiox_api.services.framework_adapters import FrameworkAdapterCatalog
 from visiox_common.settings import Settings
 from visiox_db.models import BaseModel as StoredBaseModel
-from visiox_db.models import Dataset, DatasetVersion, TrainingJob, TrainingPipeline
+from visiox_db.models import (
+    Dataset,
+    DatasetVersion,
+    DistributedTrainingRun,
+    TrainingJob,
+    TrainingPipeline,
+)
 from visiox_edge_executor_worker.deployment import validate_image_digest
 from visiox_training.contracts import LaunchSpec
 
@@ -208,14 +214,23 @@ class TrainingSubmissionService:
         *,
         job: TrainingJob,
         attempt_number: int,
-        checkpoint_uri: str,
-        checkpoint_checksum: str,
+        checkpoint_run: DistributedTrainingRun,
         checkpoint_framework: str | None = None,
         checkpoint_model_family: str | None = None,
     ) -> ResolvedTrainingSubmission:
         snapshot = ResolvedTrainingSnapshot.model_validate(
             copy.deepcopy(job.resolved_snapshot)
         )
+        if checkpoint_run.training_job_id != job.id:
+            raise TrainingSubmissionError(
+                "Checkpoint is not bound to the frozen training job"
+            )
+        checkpoint_uri = checkpoint_run.checkpoint_uri
+        checkpoint_checksum = checkpoint_run.checkpoint_checksum
+        if not checkpoint_uri or not checkpoint_checksum:
+            raise TrainingSubmissionError(
+                "Executor-managed checkpoint URI and checksum are required"
+            )
         if (
             checkpoint_framework
             and checkpoint_framework.casefold() != snapshot.framework.casefold()
@@ -294,7 +309,7 @@ class TrainingSubmissionService:
                 id=model.model_key,
                 family=str(model.family),
                 runtime_id=runtime_id,
-                revision=adapter.capabilities.framework_version,
+                revision=model.revision,
             )
         if pipeline.framework != "ultralytics":
             raise TrainingSubmissionError(

@@ -853,6 +853,12 @@ def test_multi_framework_training_migration_preserves_and_backfills_legacy_rows(
 
     inspector = inspect(engine)
     assert "training_job_attempts" in inspector.get_table_names()
+    attempt_columns = {
+        column["name"]: column
+        for column in inspector.get_columns("training_job_attempts")
+    }
+    assert "launch_spec_checksum" in attempt_columns
+    assert attempt_columns["launch_spec_checksum"]["nullable"] is False
     pipeline_columns = {
         column["name"]: column for column in inspector.get_columns("training_pipelines")
     }
@@ -1092,9 +1098,9 @@ def test_multi_framework_training_migration_preserves_and_backfills_legacy_rows(
         connection.execute(
             text(
                 "INSERT INTO training_job_attempts "
-                "(id, training_job_id, attempt_number, status, launch_spec, metrics, "
+                "(id, training_job_id, attempt_number, status, launch_spec, launch_spec_checksum, metrics, "
                 "artifact_manifest, container_ids, created_at, updated_at) VALUES "
-                "('attempt-yolo-1', 'job-yolo', 1, 'completed', '{}', '{}', '{}', "
+                "('attempt-yolo-1', 'job-yolo', 1, 'completed', '{}', 'legacy-test-checksum', '{}', '{}', "
                 "'[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
         )
@@ -1295,9 +1301,9 @@ def test_multi_framework_downgrade_preflight_is_atomic(tmp_path):
         connection.execute(
             text(
                 "INSERT INTO training_job_attempts "
-                "(id, training_job_id, attempt_number, status, launch_spec, metrics, "
+                "(id, training_job_id, attempt_number, status, launch_spec, launch_spec_checksum, metrics, "
                 "artifact_manifest, container_ids, created_at, updated_at) VALUES "
-                "('attempt-downgrade', 'job-downgrade', 1, 'completed', '{}', '{}', '{}', "
+                "('attempt-downgrade', 'job-downgrade', 1, 'completed', '{}', 'legacy-test-checksum', '{}', '{}', "
                 "'[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
         )

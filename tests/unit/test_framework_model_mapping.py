@@ -294,6 +294,7 @@ def test_framework_model_tables_expose_persisted_identity_columns() -> None:
         "ix_training_pipelines_first_submitted_job_id",
     } <= {index.name for index in TrainingPipeline.__table__.indexes}
     assert TrainingJobAttempt.__table__.name == "training_job_attempts"
+    assert "launch_spec_checksum" in inspect(TrainingJobAttempt).columns.keys()
     assert {
         "ix_training_job_attempts_started_at",
         "ix_training_job_attempts_status",

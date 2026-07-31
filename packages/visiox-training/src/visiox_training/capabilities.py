@@ -45,6 +45,7 @@ class ModelCapability(ImmutableCapability):
     family: str | None = None
     variant: str | None = None
     source: str | None = None
+    revision: str | None = None
     sources: Sequence[str] = ()
 
     @field_validator("sources")

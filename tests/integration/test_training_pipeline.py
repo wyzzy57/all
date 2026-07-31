@@ -51,6 +51,7 @@ from visiox_edge_executor_worker.inventory import (
     parse_inventory,
 )
 from visiox_storage.client import InMemoryObjectStorageClient
+from visiox_training.contracts import LaunchSpec
 from tests.integration.ownership_test_support import install_legacy_ownership
 import visiox_training_worker.main as training_worker_main
 from visiox_training_worker.main import CommandResult, run_training_job
@@ -1323,6 +1324,13 @@ def test_create_training_job_creates_task_and_enqueues_command(
         assert attempt.attempt_number == 1
         assert attempt.launch_spec["adapter_key"] == "ultralytics.object_detection.v1"
         assert job.launch_spec_checksum
+        assert attempt.launch_spec_checksum == job.launch_spec_checksum
+        assert (
+            attempt.launch_spec_checksum
+            == LaunchSpec.model_validate(
+                attempt.launch_spec
+            ).canonical_checksum_sha256()
+        )
         assert job.resolved_snapshot == {
             "schema_version": "1.0",
             "task_kind": "object_detection",
@@ -1439,7 +1447,9 @@ def test_create_paddlex_training_job_freezes_official_model_snapshot(
     assert job.resolved_snapshot["framework"] == "paddlex"
     assert job.resolved_snapshot["runtime_image_digest"].endswith("c" * 64)
     assert job.resolved_snapshot["runtime_model_id"] == "PP-YOLOE_plus-S"
-    assert job.resolved_snapshot["model"]["revision"] == "3.0.3"
+    assert job.resolved_snapshot["model"]["revision"] == (
+        "paddlex-model-zoo/3.0.3/PP-YOLOE_plus-S"
+    )
     assert job.resolved_snapshot["dataset"]["manifest_checksum"] == "b" * 64
     assert job.resolved_snapshot["parameters"]["epochs"] == 2
     assert job.resolved_snapshot["parameters"]["batch_size"] == 4
@@ -1931,6 +1941,13 @@ def test_resume_distributed_training_uses_checkpoint_and_increments_attempt(
     assert attempts[0].launch_spec != attempts[1].launch_spec
     assert attempts[0].launch_spec["env"]["VISIOX_TRAINING_ATTEMPT"] == "1"
     assert attempts[1].launch_spec["env"]["VISIOX_TRAINING_ATTEMPT"] == "2"
+    for attempt_record in attempts:
+        assert (
+            attempt_record.launch_spec_checksum
+            == LaunchSpec.model_validate(
+                attempt_record.launch_spec
+            ).canonical_checksum_sha256()
+        )
 
 
 def test_resume_distributed_training_rejects_incompatible_checkpoint_identity(
@@ -1979,6 +1996,97 @@ def test_resume_distributed_training_rejects_incompatible_checkpoint_identity(
             )
         )
     assert len(attempts) == 1
+
+
+def test_resume_distributed_training_rejects_unbound_checkpoint_override_without_identity(
+    client: TestClient,
+    session_factory,
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+    created = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 2,
+                "node_ids": node_ids,
+                "training_image_digest": f"registry.example/visiox/training@sha256:{'d' * 64}",
+            }
+        },
+    ).json()
+    with session_factory() as session:
+        run = session.get(DistributedTrainingRun, created["distributed_run_id"])
+        job = session.get(TrainingJob, created["id"])
+        run.status = "failed"
+        run.checkpoint_uri = f"minio://training/checkpoints/{created['id']}/last.pt"
+        run.checkpoint_checksum = "e" * 64
+        job.status = "failed"
+        session.commit()
+
+    response = client.post(
+        f"/training-jobs/{created['id']}/resume",
+        json={
+            "checkpoint_uri": "minio://attacker/foreign.pt",
+            "checkpoint_checksum": "f" * 64,
+        },
+    )
+
+    assert response.status_code == 409
+    assert "checkpoint" in response.json()["detail"].lower()
+    with session_factory() as session:
+        attempts = list(
+            session.scalars(
+                select(TrainingJobAttempt).where(
+                    TrainingJobAttempt.training_job_id == created["id"]
+                )
+            )
+        )
+    assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("failure_point", ["flush", "commit"])
+def test_training_submission_database_failure_rolls_back_all_state(
+    client: TestClient,
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    rollback_calls = 0
+    original_rollback = Session.rollback
+
+    def failing_operation(self, *args, **kwargs):
+        del self, args, kwargs
+        raise RuntimeError(f"injected {failure_point} failure")
+
+    def recording_rollback(self, *args, **kwargs):
+        nonlocal rollback_calls
+        rollback_calls += 1
+        return original_rollback(self, *args, **kwargs)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Session, failure_point, failing_operation)
+        patcher.setattr(Session, "rollback", recording_rollback)
+        with pytest.raises(RuntimeError, match=f"injected {failure_point} failure"):
+            client.post(f"/pipelines/{pipeline_id}/jobs", json={})
+
+    assert rollback_calls >= 1
+    with session_factory() as session:
+        pipeline = session.get(TrainingPipeline, pipeline_id)
+        jobs = list(
+            session.scalars(
+                select(TrainingJob).where(TrainingJob.pipeline_id == pipeline_id)
+            )
+        )
+        attempts = list(session.scalars(select(TrainingJobAttempt)))
+    assert jobs == []
+    assert attempts == []
+    assert pipeline.status == "ready"
+    assert pipeline.framework_locked_at is None
+    assert pipeline.first_submitted_job_id is None
 
 
 def test_resume_distributed_training_rejects_pool_change(

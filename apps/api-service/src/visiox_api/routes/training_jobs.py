@@ -390,23 +390,28 @@ async def create_training_job(
         attempt_number=1,
         status="queued",
         launch_spec=submission.launch_spec.model_dump(mode="json"),
+        launch_spec_checksum=submission.launch_spec_checksum,
     )
-    session.add_all([job, task, attempt])
-    session.flush()
-    task.resource_id = job.id
-    job.task_id = task.id
-    task.payload = {
-        "pipeline_id": pipeline.id,
-        "training_job_id": job.id,
-        "dataset_id": resources.dataset.id,
-        "base_model_id": resources.base_model.id,
-        "params": params,
-        "environment": environment,
-    }
-    pipeline.status = "running"
-    lock_pipeline_to_first_job(pipeline, job.id)
-    session.add(pipeline)
-    session.commit()
+    try:
+        session.add_all([job, task, attempt])
+        session.flush()
+        task.resource_id = job.id
+        job.task_id = task.id
+        task.payload = {
+            "pipeline_id": pipeline.id,
+            "training_job_id": job.id,
+            "dataset_id": resources.dataset.id,
+            "base_model_id": resources.base_model.id,
+            "params": params,
+            "environment": environment,
+        }
+        pipeline.status = "running"
+        lock_pipeline_to_first_job(pipeline, job.id)
+        session.add(pipeline)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     session.refresh(job)
     session.refresh(task)
     response.status_code = status.HTTP_201_CREATED
@@ -634,19 +639,24 @@ async def _create_distributed_training_job(
         attempt_number=1,
         status="queued",
         launch_spec=submission.launch_spec.model_dump(mode="json"),
+        launch_spec_checksum=submission.launch_spec_checksum,
     )
-    pipeline.status = "running"
-    session.add(task)
-    session.flush()
-    session.add_all([job, pipeline, attempt_record])
-    session.flush()
-    lock_pipeline_to_first_job(pipeline, job_id)
-    session.add(pipeline)
-    session.flush()
-    session.add(run)
-    session.flush()
-    session.add(execution)
-    session.commit()
+    try:
+        pipeline.status = "running"
+        session.add(task)
+        session.flush()
+        session.add_all([job, pipeline, attempt_record])
+        session.flush()
+        lock_pipeline_to_first_job(pipeline, job_id)
+        session.add(pipeline)
+        session.flush()
+        session.add(run)
+        session.flush()
+        session.add(execution)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     response.status_code = status.HTTP_201_CREATED
     try:
         await _enqueue_edge_execution(
@@ -799,9 +809,22 @@ async def resume_distributed_training_job(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Distributed training cannot be resumed from status: {previous.status}",
         )
-    checkpoint_uri = request.checkpoint_uri or previous.checkpoint_uri
-    checkpoint_checksum = request.checkpoint_checksum or previous.checkpoint_checksum
+    checkpoint_uri = previous.checkpoint_uri
+    checkpoint_checksum = previous.checkpoint_checksum
     _validate_checkpoint(checkpoint_uri, checkpoint_checksum)
+    if request.checkpoint_uri is not None and request.checkpoint_uri != checkpoint_uri:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Checkpoint URI does not match the executor-managed checkpoint",
+        )
+    if (
+        request.checkpoint_checksum is not None
+        and request.checkpoint_checksum.casefold() != checkpoint_checksum.casefold()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Checkpoint checksum does not match the executor-managed checkpoint",
+        )
     if previous.training_image_digest is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -842,8 +865,7 @@ async def resume_distributed_training_job(
         submission = TrainingSubmissionService(session, settings).resolve_retry(
             job=job,
             attempt_number=attempt,
-            checkpoint_uri=checkpoint_uri,
-            checkpoint_checksum=checkpoint_checksum,
+            checkpoint_run=previous,
             checkpoint_framework=request.checkpoint_framework,
             checkpoint_model_family=request.checkpoint_model_family,
         )
@@ -895,20 +917,25 @@ async def resume_distributed_training_job(
         attempt_number=attempt,
         status="queued",
         launch_spec=submission.launch_spec.model_dump(mode="json"),
+        launch_spec_checksum=submission.launch_spec_checksum,
     )
-    session.add_all([task, attempt_record])
-    session.flush()
-    job.task_id = task_id
-    job.status = "queued"
-    job.finished_at = None
-    if pipeline is not None:
-        pipeline.status = "running"
-    session.add_all([job, run])
-    if pipeline is not None:
-        session.add(pipeline)
-    session.flush()
-    session.add(execution)
-    session.commit()
+    try:
+        session.add_all([task, attempt_record])
+        session.flush()
+        job.task_id = task_id
+        job.status = "queued"
+        job.finished_at = None
+        if pipeline is not None:
+            pipeline.status = "running"
+        session.add_all([job, run])
+        if pipeline is not None:
+            session.add(pipeline)
+        session.flush()
+        session.add(execution)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     try:
         await _enqueue_edge_execution(
             producer,
