@@ -140,6 +140,15 @@ describe("ModelSpaceView", () => {
     expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
   });
 
+  it("keeps the narrowest pipeline and scenario grids shrinkable", () => {
+    const narrowContainer = modelSpaceViewSource.match(
+      /@container model-space \(max-width: 480px\) \{([\s\S]*?)\n\}/,
+    )?.[1];
+
+    expect(narrowContainer).toMatch(/\.pipeline-grid,\s*\.scenario-grid/);
+    expect(narrowContainer).toContain("grid-template-columns: minmax(0, 1fr)");
+  });
+
   it("uses the real shared resource dialog instead of hard-coded public scopes", () => {
     expect(modelSpaceViewSource).toContain("ResourceSharingDialog");
     expect(modelSpaceViewSource).not.toContain('const scopeOptions = [');

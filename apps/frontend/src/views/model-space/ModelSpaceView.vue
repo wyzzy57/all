@@ -5267,7 +5267,7 @@ function getErrorMessage(error: unknown, fallback: string) {
 @container model-space (max-width: 480px) {
   .pipeline-grid,
   .scenario-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .header-actions,
