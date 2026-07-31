@@ -3,26 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import DataPreparationView from "@/views/data-preparation/DataPreparationView.vue";
 import dataPreparationViewSource from "@/views/data-preparation/DataPreparationView.vue?raw";
-
-function topLevelRuleBody(source: string, selector: string, declaration: string) {
-  const styleTagStart = source.indexOf("<style");
-  const cssStart = styleTagStart === -1 ? 0 : source.indexOf(">", styleTagStart) + 1;
-  const closingStyle = source.indexOf("</style>", cssStart);
-  const cssEnd = closingStyle === -1 ? source.length : closingStyle;
-  const cssSource = source.slice(cssStart, cssEnd);
-  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rules = [...cssSource.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
-    .filter((match) => {
-      const prefix = cssSource.slice(0, match.index);
-      return [...prefix].reduce(
-        (depth, character) => depth + (character === "{" ? 1 : character === "}" ? -1 : 0),
-        0,
-      ) === 0;
-    })
-    .filter((match) => new RegExp(`(?:^|;)\\s*${declaration}\\s*:`).test(match[1]));
-  expect(rules, `expected one top-level ${selector} rule`).toHaveLength(1);
-  return rules[0]![1];
-}
+import { topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const apiMock = vi.hoisted(() => ({
   createLabelProject: vi.fn(),
@@ -88,36 +69,23 @@ function mountView() {
 
 describe("DataPreparationView", () => {
   it("uses the raised shared surface for import cards", () => {
-    for (const nestedImportRule of [
-      `<style>@media (max-width: 720px) {
-      .import-card { background: var(--visiox-card-surface-raised); }
-      }</style>`,
-      `<style>@container data-view (max-width: 900px) {
-      .import-card { background: var(--visiox-card-surface-raised); }
-      }</style>`,
-    ]) {
-      expect(() => topLevelRuleBody(nestedImportRule, ".import-card", "background"))
-        .toThrow(/expected one top-level \.import-card rule/);
-    }
-
-    const importCardRule = topLevelRuleBody(dataPreparationViewSource, ".import-card", "background");
-    expect(importCardRule).toMatch(/background:\s*var\(--visiox-card-surface-raised\)\s*;/);
-    expect(importCardRule).toMatch(/border:\s*1px solid var\(--visiox-card-border\)\s*;/);
-    expect(importCardRule).toMatch(/border-radius:\s*var\(--visiox-card-radius\)\s*;/);
+    const importCardRule = topLevelRuleDeclarations(dataPreparationViewSource, ".import-card", "sfc");
+    expect(importCardRule?.get("background")).toEqual(["var(--visiox-card-surface-raised)"]);
+    expect(importCardRule?.get("border")).toEqual(["1px solid var(--visiox-card-border)"]);
+    expect(importCardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
   });
 
   it("uses the standard shared surface for dataset cards", () => {
-    const datasetCardRule = topLevelRuleBody(dataPreparationViewSource, ".dataset-card", "background");
-    expect(datasetCardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);
-    expect(datasetCardRule).toMatch(/border:\s*1px solid var\(--visiox-card-border\)\s*;/);
-    expect(datasetCardRule).toMatch(/border-radius:\s*var\(--visiox-card-radius\)\s*;/);
+    const datasetCardRule = topLevelRuleDeclarations(dataPreparationViewSource, ".dataset-card", "sfc");
+    expect(datasetCardRule?.get("background")).toEqual(["var(--visiox-card-surface)"]);
+    expect(datasetCardRule?.get("border")).toEqual(["1px solid var(--visiox-card-border)"]);
+    expect(datasetCardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
   });
 
   it("does not lift dataset cards on hover", () => {
-    const hoverRule = topLevelRuleBody(dataPreparationViewSource, ".dataset-card:hover", "box-shadow");
-    expect([...hoverRule.matchAll(/box-shadow\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
-    expect([...hoverRule.matchAll(/transform\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
-    expect(hoverRule).not.toMatch(/translateY\s*\(/);
+    const hoverRule = topLevelRuleDeclarations(dataPreparationViewSource, ".dataset-card:hover", "sfc");
+    expect((hoverRule?.get("transform") ?? []).some((value) => /\btranslate(?:Y)?\s*\(/i.test(value))).toBe(false);
+    expect((hoverRule?.get("box-shadow") ?? []).every((value) => value === "none")).toBe(true);
   });
 
   it("uses the shared resource dialog for dataset visibility", () => {

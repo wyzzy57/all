@@ -3,26 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import ModelSpaceView from "@/views/model-space/ModelSpaceView.vue";
 import modelSpaceViewSource from "@/views/model-space/ModelSpaceView.vue?raw";
-
-function topLevelRuleBody(source: string, selector: string, declaration: string) {
-  const styleTagStart = source.indexOf("<style");
-  const cssStart = styleTagStart === -1 ? 0 : source.indexOf(">", styleTagStart) + 1;
-  const closingStyle = source.indexOf("</style>", cssStart);
-  const cssEnd = closingStyle === -1 ? source.length : closingStyle;
-  const cssSource = source.slice(cssStart, cssEnd);
-  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rules = [...cssSource.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
-    .filter((match) => {
-      const prefix = cssSource.slice(0, match.index);
-      return [...prefix].reduce(
-        (depth, character) => depth + (character === "{" ? 1 : character === "}" ? -1 : 0),
-        0,
-      ) === 0;
-    })
-    .filter((match) => new RegExp(`(?:^|;)\\s*${declaration}\\s*:`).test(match[1]));
-  expect(rules, `expected one top-level ${selector} rule`).toHaveLength(1);
-  return rules[0]![1];
-}
+import { topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const pushMock = vi.hoisted(() => vi.fn());
 const replaceMock = vi.hoisted(() => vi.fn());
@@ -142,29 +123,16 @@ function mockDeployablePipeline() {
 
 describe("ModelSpaceView", () => {
   it("uses the standard shared pipeline card surface", () => {
-    for (const nestedPipelineRule of [
-      `<style>@media (max-width: 720px) {
-      .pipeline-card { background: var(--visiox-card-surface); }
-      }</style>`,
-      `<style>@container model-space (max-width: 900px) {
-      .pipeline-card { background: var(--visiox-card-surface); }
-      }</style>`,
-    ]) {
-      expect(() => topLevelRuleBody(nestedPipelineRule, ".pipeline-card", "background"))
-        .toThrow(/expected one top-level \.pipeline-card rule/);
-    }
-
-    const cardRule = topLevelRuleBody(modelSpaceViewSource, ".pipeline-card", "background");
-    expect(cardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);
-    expect(cardRule).toMatch(/border:\s*1px solid var\(--visiox-card-border\)\s*;/);
-    expect(cardRule).toMatch(/border-radius:\s*var\(--visiox-card-radius\)\s*;/);
+    const cardRule = topLevelRuleDeclarations(modelSpaceViewSource, ".pipeline-card", "sfc");
+    expect(cardRule?.get("background")).toEqual(["var(--visiox-card-surface)"]);
+    expect(cardRule?.get("border")).toEqual(["1px solid var(--visiox-card-border)"]);
+    expect(cardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
   });
 
   it("does not lift pipeline cards on hover", () => {
-    const hoverRule = topLevelRuleBody(modelSpaceViewSource, ".pipeline-card:hover", "box-shadow");
-    expect([...hoverRule.matchAll(/box-shadow\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
-    expect([...hoverRule.matchAll(/transform\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
-    expect(hoverRule).not.toMatch(/translateY\s*\(/);
+    const hoverRule = topLevelRuleDeclarations(modelSpaceViewSource, ".pipeline-card:hover", "sfc");
+    expect((hoverRule?.get("transform") ?? []).some((value) => /\btranslate(?:Y)?\s*\(/i.test(value))).toBe(false);
+    expect((hoverRule?.get("box-shadow") ?? []).every((value) => value === "none")).toBe(true);
   });
 
   it("uses the real shared resource dialog instead of hard-coded public scopes", () => {

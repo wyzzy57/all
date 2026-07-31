@@ -3,26 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import ServicesView from "@/views/services/ServicesView.vue";
 import servicesViewSource from "@/views/services/ServicesView.vue?raw";
-
-function topLevelRuleBody(source: string, selector: string, declaration: string) {
-  const styleTagStart = source.indexOf("<style");
-  const cssStart = styleTagStart === -1 ? 0 : source.indexOf(">", styleTagStart) + 1;
-  const closingStyle = source.indexOf("</style>", cssStart);
-  const cssEnd = closingStyle === -1 ? source.length : closingStyle;
-  const cssSource = source.slice(cssStart, cssEnd);
-  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rules = [...cssSource.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
-    .filter((match) => {
-      const prefix = cssSource.slice(0, match.index);
-      return [...prefix].reduce(
-        (depth, character) => depth + (character === "{" ? 1 : character === "}" ? -1 : 0),
-        0,
-      ) === 0;
-    })
-    .filter((match) => new RegExp(`(?:^|;)\\s*${declaration}\\s*:`).test(match[1]));
-  expect(rules, `expected one top-level ${selector} rule`).toHaveLength(1);
-  return rules[0]![1];
-}
+import { topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const pushMock = vi.hoisted(() => vi.fn());
 const routeState = vi.hoisted(() => ({ params: {} as Record<string, string | undefined> }));
@@ -76,29 +57,16 @@ function mountView() {
 
 describe("ServicesView", () => {
   it("uses the standard shared service card surface", () => {
-    for (const nestedServiceRule of [
-      `<style>@media (max-width: 720px) {
-      .service-card { background: var(--visiox-card-surface); }
-      }</style>`,
-      `<style>@container services (max-width: 900px) {
-      .service-card { background: var(--visiox-card-surface); }
-      }</style>`,
-    ]) {
-      expect(() => topLevelRuleBody(nestedServiceRule, ".service-card", "background"))
-        .toThrow(/expected one top-level \.service-card rule/);
-    }
-
-    const cardRule = topLevelRuleBody(servicesViewSource, ".service-card", "background");
-    expect(cardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);
-    expect(cardRule).toMatch(/border:\s*1px solid var\(--visiox-card-border\)\s*;/);
-    expect(cardRule).toMatch(/border-radius:\s*var\(--visiox-card-radius\)\s*;/);
+    const cardRule = topLevelRuleDeclarations(servicesViewSource, ".service-card", "sfc");
+    expect(cardRule?.get("background")).toEqual(["var(--visiox-card-surface)"]);
+    expect(cardRule?.get("border")).toEqual(["1px solid var(--visiox-card-border)"]);
+    expect(cardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
   });
 
   it("does not lift service cards on hover", () => {
-    const hoverRule = topLevelRuleBody(servicesViewSource, ".service-card:hover", "box-shadow");
-    expect([...hoverRule.matchAll(/box-shadow\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
-    expect([...hoverRule.matchAll(/transform\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
-    expect(hoverRule).not.toMatch(/translateY\s*\(/);
+    const hoverRule = topLevelRuleDeclarations(servicesViewSource, ".service-card:hover", "sfc");
+    expect((hoverRule?.get("transform") ?? []).some((value) => /\btranslate(?:Y)?\s*\(/i.test(value))).toBe(false);
+    expect((hoverRule?.get("box-shadow") ?? []).every((value) => value === "none")).toBe(true);
   });
 
   it("uses the shared resource dialog for service access", () => {

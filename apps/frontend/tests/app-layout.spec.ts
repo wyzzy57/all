@@ -13,23 +13,9 @@ import stylesRawSource from "@/styles.css?raw";
 import adminOverviewSource from "@/views/admin/AdminOverviewView.vue?raw";
 import auditLogSource from "@/views/admin/AuditLogView.vue?raw";
 import workbenchSource from "@/views/workbench/WorkbenchView.vue?raw";
+import { topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const stylesSource = stylesRawSource || readFileSync("src/styles.css", "utf8");
-
-function topLevelRuleBody(source: string, selector: string) {
-  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rules = [...source.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
-    .filter((match) => {
-      const prefix = source.slice(0, match.index);
-      const depth = [...prefix].reduce(
-        (current, character) => current + (character === "{" ? 1 : character === "}" ? -1 : 0),
-        0,
-      );
-      return depth === 0;
-    });
-  expect(rules, `expected one top-level ${selector} rule`).toHaveLength(1);
-  return rules[0]![1];
-}
 
 describe("global application header", () => {
   afterEach(() => {
@@ -96,14 +82,23 @@ describe("global application header", () => {
       :root { --visiox-card-surface: #f3f4f6; }
       }`,
     ]) {
-      expect(() => topLevelRuleBody(nestedRootRule, ":root")).toThrow(/expected one top-level :root rule/);
+      expect(topLevelRuleDeclarations(nestedRootRule, ":root")).toBeUndefined();
     }
 
-    const rootRule = topLevelRuleBody(stylesSource, ":root");
-    expect(rootRule).toMatch(/--visiox-card-surface:\s*#f3f4f6\s*;/);
-    expect(rootRule).toMatch(/--visiox-card-surface-raised:\s*#f6f7f8\s*;/);
-    expect(rootRule).toMatch(/--visiox-card-border:\s*#e0e2e6\s*;/);
-    expect(rootRule).toMatch(/--visiox-card-radius:\s*8px\s*;/);
+    const commentedDeclarations = topLevelRuleDeclarations(`
+      /* :root { --visiox-card-surface: #f3f4f6; } */
+      :root {
+        /* --visiox-card-surface: #f3f4f6; */
+        --sentinel: 1;
+      }
+    `, ":root");
+    expect(commentedDeclarations?.has("--visiox-card-surface")).toBe(false);
+
+    const rootRule = topLevelRuleDeclarations(stylesSource, ":root");
+    expect(rootRule?.get("--visiox-card-surface")).toEqual(["#f3f4f6"]);
+    expect(rootRule?.get("--visiox-card-surface-raised")).toEqual(["#f6f7f8"]);
+    expect(rootRule?.get("--visiox-card-border")).toEqual(["#e0e2e6"]);
+    expect(rootRule?.get("--visiox-card-radius")).toEqual(["8px"]);
   });
 
   it("visually collapses the sidebar on narrow screens and keeps an explicit account focus ring", () => {
