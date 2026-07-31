@@ -34,6 +34,7 @@ from visiox_db.models.model_space import (
     PipelineEvaluation,
     TrainedModel,
     TrainingJob,
+    TrainingJobAttempt,
     TrainingPipeline,
 )
 from visiox_db.models.observability import (
@@ -74,6 +75,7 @@ __all__ = [
     "Task",
     "TrainedModel",
     "TrainingJob",
+    "TrainingJobAttempt",
     "TrainingPipeline",
     "User",
     "UserGroup",

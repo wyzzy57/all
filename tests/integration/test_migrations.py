@@ -33,6 +33,7 @@ EXPECTED_TABLES |= {
     "remote_executions",
     "deployment_instances",
     "distributed_training_runs",
+    "training_job_attempts",
 }
 
 EXPECTED_TABLES |= {
@@ -397,15 +398,22 @@ def test_resource_ownership_nullable_migration_adds_compatible_columns(tmp_path)
 
     inspector = inspect(create_engine(database_url))
     for table in (
-        "datasets", "training_pipelines", "training_jobs", "trained_models",
-        "deployment_services", "resource_pools", "compute_nodes",
+        "datasets",
+        "training_pipelines",
+        "training_jobs",
+        "trained_models",
+        "deployment_services",
+        "resource_pools",
+        "compute_nodes",
     ):
         columns = {column["name"]: column for column in inspector.get_columns(table)}
         assert columns["organization_id"]["nullable"] is True
         assert columns["owner_user_id"]["nullable"] is True
         assert columns["visibility"]["nullable"] is False
         assert {"organization_id", "owner_user_id", "visibility"} <= {
-            column for index in inspector.get_indexes(table) for column in index["column_names"]
+            column
+            for index in inspector.get_indexes(table)
+            for column in index["column_names"]
         }
 
 
@@ -459,8 +467,13 @@ def test_resource_ownership_constraints_require_backfill_and_reject_nulls(tmp_pa
 
     inspector = inspect(engine)
     for table in (
-        "datasets", "training_pipelines", "training_jobs", "trained_models",
-        "deployment_services", "resource_pools", "compute_nodes",
+        "datasets",
+        "training_pipelines",
+        "training_jobs",
+        "trained_models",
+        "deployment_services",
+        "resource_pools",
+        "compute_nodes",
     ):
         columns = {column["name"]: column for column in inspector.get_columns(table)}
         assert columns["organization_id"]["nullable"] is False
@@ -483,7 +496,9 @@ def test_resource_ownership_constraints_require_backfill_and_reject_nulls(tmp_pa
             raise AssertionError("database accepted a dataset without ownership")
 
 
-def test_durable_logs_and_service_revision_migration_backfills_existing_services(tmp_path):
+def test_durable_logs_and_service_revision_migration_backfills_existing_services(
+    tmp_path,
+):
     database_url = f"sqlite:///{tmp_path / 'durable-logs.db'}"
     config = _alembic_config(database_url)
     command.upgrade(config, "20260727_0004")
@@ -608,7 +623,9 @@ def test_durable_logs_and_service_revision_migration_backfills_existing_services
         )
         revisions = dict(
             connection.execute(
-                text("SELECT deployment_service_id, deployment_revision FROM deployment_instances")
+                text(
+                    "SELECT deployment_service_id, deployment_revision FROM deployment_instances"
+                )
             ).all()
         )
         active_revisions = dict(
@@ -625,7 +642,9 @@ def test_durable_logs_and_service_revision_migration_backfills_existing_services
     assert set(active_revisions.values()) == {1}
 
 
-def test_dataset_version_migration_backfills_validated_assets_and_event_constraints(tmp_path):
+def test_dataset_version_migration_backfills_validated_assets_and_event_constraints(
+    tmp_path,
+):
     database_url = f"sqlite:///{tmp_path / 'dataset-versions.db'}"
     config = _alembic_config(database_url)
     command.upgrade(config, "20260727_0005")
@@ -674,8 +693,12 @@ def test_dataset_version_migration_backfills_validated_assets_and_event_constrai
     command.upgrade(config, "20260727_0006")
 
     inspector = inspect(engine)
-    assert {"dataset_versions", "label_sync_events"}.issubset(inspector.get_table_names())
-    dataset_columns = {column["name"]: column for column in inspector.get_columns("datasets")}
+    assert {"dataset_versions", "label_sync_events"}.issubset(
+        inspector.get_table_names()
+    )
+    dataset_columns = {
+        column["name"]: column for column in inspector.get_columns("datasets")
+    }
     assert dataset_columns["asset_role"]["nullable"] is False
     assert ("dataset_id", "version") in {
         tuple(constraint["column_names"])
@@ -687,7 +710,9 @@ def test_dataset_version_migration_backfills_validated_assets_and_event_constrai
     }
 
     with engine.connect() as connection:
-        roles = dict(connection.execute(text("SELECT id, asset_role FROM datasets")).all())
+        roles = dict(
+            connection.execute(text("SELECT id, asset_role FROM datasets")).all()
+        )
         version = connection.execute(
             text(
                 "SELECT dataset_id, version, manifest_checksum, object_uri, total_count, valid_count "
@@ -702,6 +727,724 @@ def test_dataset_version_migration_backfills_validated_assets_and_event_constrai
         "minio://datasets/dataset-published/train.jsonl",
         8,
         6,
+    )
+
+
+def test_multi_framework_training_migration_preserves_and_backfills_legacy_rows(
+    tmp_path,
+):
+    database_url = f"sqlite:///{tmp_path / 'multi-framework-training.db'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "20260727_0006")
+    engine = create_engine(database_url)
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO organizations (id, name, slug, status) VALUES "
+                "('org-training', 'Training', 'training', 'active')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users "
+                "(id, organization_id, username, display_name, email, password_hash, "
+                "role, status, must_change_password) VALUES "
+                "('user-training', 'org-training', 'trainer', 'Trainer', "
+                "'trainer@example.test', 'hash', 'admin', 'active', false)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO base_models "
+                "(id, family, task, scale, filename, source_path, local_uri, checksum, "
+                "size_bytes, status, created_at, updated_at) VALUES "
+                "('base-yolo', 'yolo26', 'detect', 'n', 'yolo26n.pt', "
+                "'models/yolo26n.pt', 'minio://models/base/yolo26n.pt', NULL, NULL, "
+                "'ready', '2026-07-01 01:00:00', '2026-07-01 01:00:00')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO training_pipelines "
+                "(id, name, organization_id, owner_user_id, visibility, engine, task, scale, "
+                "base_model_id, dataset_id, params_template, default_environment, status, is_public, "
+                "public_scope, is_favorite, created_at, updated_at) VALUES "
+                "('pipeline-yolo', 'legacy-yolo', 'org-training', 'user-training', "
+                "'private', 'yolo26', 'detect', 'n', 'base-yolo', 'dataset-current-yolo', "
+                '\'{"epochs": 12, "imgsz": 640}\', \'{"device": "0"}\', '
+                "'ready', false, '{}', true, '2026-07-01 02:00:00', "
+                "'2026-07-01 02:00:00'), "
+                "('pipeline-llama', 'legacy-llama', 'org-training', 'user-training', "
+                "'private', 'llamafactory', 'sft', '7b', NULL, 'dataset-current-llama', "
+                '\'{"model_family": "Qwen2.5", "finetuning_type": "lora"}\', '
+                "'{\"device\": \"0,1\"}', 'ready', false, '{}', false, "
+                "'2026-07-02 02:00:00', '2026-07-02 02:00:00'), "
+                "('pipeline-draft', 'legacy-draft', 'org-training', 'user-training', "
+                "'private', 'yolo26', 'detect', 's', NULL, NULL, '{\"epochs\": 3}', '{}', "
+                "'draft', false, '{}', false, '2026-07-03 02:00:00', "
+                "'2026-07-03 02:00:00')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO tasks "
+                "(id, task_type, status, progress, resource_type, resource_id, payload, "
+                "retryable, created_at, updated_at) VALUES "
+                "('task-yolo', 'TRAIN_MODEL', 'COMPLETED', 100, 'training_job', "
+                "'job-yolo', '{\"base_model_id\": \"base-submitted-yolo\"}', false, "
+                "'2026-07-04 02:00:00', '2026-07-04 04:00:00'), "
+                "('task-llama', 'EDGE_TRAIN', 'COMPLETED', 100, 'training_job', "
+                '\'job-llama\', \'{"dataset_id": "dataset-submitted-llama", '
+                '"model_reference": {"model_id": "Qwen/Qwen2.5-7B"}}\', false, '
+                "'2026-07-05 02:00:00', '2026-07-05 05:00:00')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO training_jobs "
+                "(id, pipeline_id, organization_id, owner_user_id, visibility, task_id, status, params, "
+                "metrics, log_uri, started_at, finished_at, created_at, updated_at) VALUES "
+                "('job-yolo', 'pipeline-yolo', 'org-training', 'user-training', 'private', 'task-yolo', "
+                "'completed', '{\"batch\": 8}', '{\"map50\": 0.81}', "
+                "'minio://logs/job-yolo.log', '2026-07-04 03:00:00', "
+                "'2026-07-04 04:00:00', '2026-07-04 02:00:00', "
+                "'2026-07-04 04:00:00'), "
+                "('job-llama', 'pipeline-llama', 'org-training', 'user-training', 'private', 'task-llama', "
+                "'completed', '{\"learning_rate\": 0.0001}', '{\"loss\": 0.42}', "
+                "'minio://logs/job-llama.log', '2026-07-05 03:00:00', "
+                "'2026-07-05 05:00:00', '2026-07-05 02:00:00', "
+                "'2026-07-05 05:00:00')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO trained_models "
+                "(id, pipeline_id, organization_id, owner_user_id, visibility, training_job_id, "
+                "name, version, task, artifact_uri, metrics, status, created_at, updated_at) VALUES "
+                "('model-yolo', 'pipeline-yolo', 'org-training', 'user-training', 'private', "
+                "'job-yolo', 'pepper-detector', '1', 'detect', "
+                "'minio://models/job-yolo/best.pt', '{\"map50\": 0.81}', 'ready', "
+                "'2026-07-04 04:00:00', '2026-07-04 04:00:00'), "
+                "('model-llama', 'pipeline-llama', 'org-training', 'user-training', 'private', "
+                "'job-llama', 'support-assistant', '1', 'sft', "
+                "'minio://models/job-llama/adapter_model.safetensors', "
+                "'{\"loss\": 0.42}', 'ready', '2026-07-05 05:00:00', "
+                "'2026-07-05 05:00:00')"
+            )
+        )
+
+    legacy_rows = {}
+    with engine.connect() as connection:
+        for table in (
+            "base_models",
+            "tasks",
+            "training_pipelines",
+            "training_jobs",
+            "trained_models",
+        ):
+            legacy_rows[table] = (
+                connection.execute(text(f"SELECT * FROM {table} ORDER BY id"))
+                .mappings()
+                .all()
+            )
+
+    command.upgrade(config, "20260731_0001")
+
+    inspector = inspect(engine)
+    assert "training_job_attempts" in inspector.get_table_names()
+    pipeline_columns = {
+        column["name"]: column for column in inspector.get_columns("training_pipelines")
+    }
+    trained_model_columns = {
+        column["name"]: column for column in inspector.get_columns("trained_models")
+    }
+    assert {
+        "task_kind",
+        "framework",
+        "adapter_key",
+        "adapter_version",
+        "model_family",
+        "recipe",
+        "framework_locked_at",
+        "first_submitted_job_id",
+        "cloned_from_pipeline_id",
+    } <= pipeline_columns.keys()
+    assert all(
+        not pipeline_columns[column]["nullable"]
+        for column in (
+            "task_kind",
+            "framework",
+            "adapter_key",
+            "adapter_version",
+            "model_family",
+            "recipe",
+        )
+    )
+    assert all(
+        trained_model_columns[column]["nullable"]
+        for column in (
+            "framework",
+            "adapter_key",
+            "model_family",
+            "model_format",
+        )
+    )
+    assert trained_model_columns["artifact_role"]["nullable"] is False
+    assert {
+        "ix_training_pipelines_cloned_from_pipeline_id",
+        "ix_training_pipelines_first_submitted_job_id",
+    } <= {index["name"] for index in inspector.get_indexes("training_pipelines")}
+
+    with engine.connect() as connection:
+        pipelines = {
+            row["id"]: row
+            for row in connection.execute(
+                text(
+                    "SELECT id, engine, task, scale, task_kind, framework, adapter_key, "
+                    "adapter_version, model_family, recipe, framework_locked_at, "
+                    "first_submitted_job_id, cloned_from_pipeline_id FROM training_pipelines"
+                )
+            ).mappings()
+        }
+        jobs = {
+            row["id"]: row
+            for row in connection.execute(
+                text(
+                    "SELECT id, params, metrics, resolved_snapshot, launch_spec_checksum "
+                    "FROM training_jobs"
+                )
+            ).mappings()
+        }
+        models = {
+            row["id"]: row
+            for row in connection.execute(
+                text(
+                    "SELECT id, name, artifact_uri, metrics, status, framework, adapter_key, "
+                    "model_family, model_format, artifact_role, checksum, size_bytes, "
+                    "evaluation_report_uri, deployment_compatibility, artifact_manifest, "
+                    "display_name, training_job_attempt_id FROM trained_models"
+                )
+            ).mappings()
+        }
+        base_model = (
+            connection.execute(
+                text(
+                    "SELECT family, task, scale, filename, checksum, framework, model_family, "
+                    "variant, artifact_format, artifact_metadata FROM base_models "
+                    "WHERE id='base-yolo'"
+                )
+            )
+            .mappings()
+            .one()
+        )
+        attempt_count = connection.execute(
+            text("SELECT COUNT(*) FROM training_job_attempts")
+        ).scalar_one()
+
+    assert pipelines["pipeline-yolo"] == {
+        "id": "pipeline-yolo",
+        "engine": "yolo26",
+        "task": "detect",
+        "scale": "n",
+        "task_kind": "object_detection",
+        "framework": "ultralytics",
+        "adapter_key": "ultralytics.object_detection.v1",
+        "adapter_version": "1.0.0",
+        "model_family": "yolo26",
+        "recipe": '{"epochs": 12, "imgsz": 640}',
+        "framework_locked_at": "2026-07-04 02:00:00",
+        "first_submitted_job_id": "job-yolo",
+        "cloned_from_pipeline_id": None,
+    }
+    assert pipelines["pipeline-llama"]["task_kind"] == "llm_sft"
+    assert pipelines["pipeline-llama"]["framework"] == "llamafactory"
+    assert pipelines["pipeline-llama"]["adapter_key"] == "llamafactory.llm_sft.v1"
+    assert pipelines["pipeline-llama"]["adapter_version"] == "1.0.0"
+    assert pipelines["pipeline-llama"]["model_family"] == "Qwen2.5"
+    assert pipelines["pipeline-draft"]["model_family"] == "yolo26"
+    assert pipelines["pipeline-draft"]["framework_locked_at"] is None
+    assert pipelines["pipeline-draft"]["first_submitted_job_id"] is None
+    assert json.loads(jobs["job-yolo"]["params"]) == {"batch": 8}
+    assert json.loads(jobs["job-yolo"]["metrics"]) == {"map50": 0.81}
+    assert jobs["job-yolo"]["launch_spec_checksum"] is None
+    assert json.loads(jobs["job-yolo"]["resolved_snapshot"]) == {
+        "adapter_key": "ultralytics.object_detection.v1",
+        "adapter_version": "1.0.0",
+        "base_model_id": "base-submitted-yolo",
+        "framework": "ultralytics",
+        "legacy_engine": "yolo26",
+        "legacy_scale": "n",
+        "legacy_task": "detect",
+        "model_family": "yolo26",
+        "params": {"batch": 8},
+        "pipeline_id": "pipeline-yolo",
+        "task_kind": "object_detection",
+    }
+    llama_snapshot = json.loads(jobs["job-llama"]["resolved_snapshot"])
+    assert llama_snapshot["dataset_id"] == "dataset-submitted-llama"
+    assert "base_model_id" not in llama_snapshot
+    assert "dataset_id" not in json.loads(jobs["job-yolo"]["resolved_snapshot"])
+    assert models["model-yolo"]["name"] == "pepper-detector"
+    assert models["model-yolo"]["artifact_uri"] == "minio://models/job-yolo/best.pt"
+    assert json.loads(models["model-yolo"]["metrics"]) == {"map50": 0.81}
+    assert models["model-yolo"]["status"] == "ready"
+    assert models["model-yolo"]["model_format"] == "pt"
+    assert models["model-llama"]["model_format"] == "safetensors"
+    for model in models.values():
+        assert model["artifact_role"] == "legacy_primary"
+        assert model["checksum"] is None
+        assert model["size_bytes"] is None
+        assert model["evaluation_report_uri"] is None
+        assert json.loads(model["deployment_compatibility"]) == {}
+        assert json.loads(model["artifact_manifest"]) == {}
+        assert model["display_name"] == model["name"]
+        assert model["training_job_attempt_id"] is None
+    assert base_model == {
+        "family": "yolo26",
+        "task": "detect",
+        "scale": "n",
+        "filename": "yolo26n.pt",
+        "checksum": None,
+        "framework": "ultralytics",
+        "model_family": "yolo26",
+        "variant": "n",
+        "artifact_format": "pt",
+        "artifact_metadata": "{}",
+    }
+    assert attempt_count == 0
+    assert len(pipelines) == 3
+    assert len(jobs) == 2
+    assert len(models) == 2
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO trained_models "
+                "(id, pipeline_id, organization_id, owner_user_id, visibility, training_job_id, "
+                "name, version, task, artifact_uri, metrics, status, artifact_role, "
+                "deployment_compatibility, artifact_manifest, display_name, created_at, updated_at) "
+                "VALUES ('model-yolo-unassigned', 'pipeline-yolo', 'org-training', "
+                "'user-training', 'private', 'job-yolo', 'pending-role', '1', 'detect', "
+                "'minio://models/job-yolo/pending', '{}', 'ready', 'unassigned', '{}', '{}', "
+                "'pending-role', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        try:
+            connection.execute(
+                text(
+                    "INSERT INTO trained_models "
+                    "(id, pipeline_id, organization_id, owner_user_id, visibility, training_job_id, "
+                    "name, version, task, artifact_uri, metrics, status, artifact_role, "
+                    "deployment_compatibility, artifact_manifest, display_name, created_at, updated_at) "
+                    "VALUES ('model-yolo-unassigned-duplicate', 'pipeline-yolo', 'org-training', "
+                    "'user-training', 'private', 'job-yolo', 'duplicate-role', '1', 'detect', "
+                    "'minio://models/job-yolo/pending-duplicate', '{}', 'ready', 'unassigned', "
+                    "'{}', '{}', 'duplicate-role', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                )
+            )
+        except Exception as error:
+            assert "UNIQUE" in str(error).upper()
+        else:
+            raise AssertionError(
+                "database accepted a duplicate unassigned artifact role"
+            )
+        connection.execute(
+            text(
+                "INSERT INTO trained_models "
+                "(id, pipeline_id, organization_id, owner_user_id, visibility, training_job_id, "
+                "name, version, task, artifact_uri, metrics, status, framework, adapter_key, "
+                "model_family, model_format, artifact_role, deployment_compatibility, "
+                "artifact_manifest, display_name, created_at, updated_at) VALUES "
+                "('model-yolo-report', 'pipeline-yolo', 'org-training', 'user-training', "
+                "'private', 'job-yolo', 'pepper-report', '1', 'detect', "
+                "'minio://models/job-yolo/report.json', '{}', 'ready', 'ultralytics', "
+                "'ultralytics.object_detection.v1', 'yolo26', 'json', "
+                "'evaluation_report', '{}', '{}', 'pepper-report', CURRENT_TIMESTAMP, "
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+        try:
+            connection.execute(
+                text(
+                    "INSERT INTO trained_models "
+                    "(id, pipeline_id, organization_id, owner_user_id, visibility, training_job_id, "
+                    "name, version, task, artifact_uri, metrics, status, framework, adapter_key, "
+                    "model_family, model_format, artifact_role, deployment_compatibility, "
+                    "artifact_manifest, display_name, created_at, updated_at) VALUES "
+                    "('model-yolo-duplicate', 'pipeline-yolo', 'org-training', 'user-training', "
+                    "'private', 'job-yolo', 'duplicate', '1', 'detect', "
+                    "'minio://models/job-yolo/duplicate.pt', '{}', 'ready', 'ultralytics', "
+                    "'ultralytics.object_detection.v1', 'yolo26', 'pt', 'legacy_primary', "
+                    "'{}', '{}', 'duplicate', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                )
+            )
+        except Exception as error:
+            assert "UNIQUE" in str(error).upper()
+        else:
+            raise AssertionError("database accepted a duplicate legacy artifact role")
+        connection.execute(
+            text(
+                "DELETE FROM trained_models WHERE id IN "
+                "('model-yolo-report', 'model-yolo-unassigned')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO training_job_attempts "
+                "(id, training_job_id, attempt_number, status, launch_spec, metrics, "
+                "artifact_manifest, container_ids, created_at, updated_at) VALUES "
+                "('attempt-yolo-1', 'job-yolo', 1, 'completed', '{}', '{}', '{}', "
+                "'[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        for model_id, role in (
+            ("attempt-checkpoint", "checkpoint"),
+            ("attempt-report", "evaluation_report"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO trained_models "
+                    "(id, pipeline_id, organization_id, owner_user_id, visibility, "
+                    "training_job_id, training_job_attempt_id, name, version, task, "
+                    "artifact_uri, metrics, status, framework, adapter_key, model_family, "
+                    "model_format, artifact_role, deployment_compatibility, "
+                    "artifact_manifest, display_name, created_at, updated_at) VALUES "
+                    "(:id, 'pipeline-yolo', 'org-training', 'user-training', 'private', "
+                    "'job-yolo', 'attempt-yolo-1', :id, '1', 'detect', "
+                    "'minio://models/job-yolo/attempt-artifact', '{}', 'ready', "
+                    "'ultralytics', 'ultralytics.object_detection.v1', 'yolo26', "
+                    "'unknown', :role, '{}', '{}', :id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {"id": model_id, "role": role},
+            )
+        try:
+            connection.execute(
+                text(
+                    "INSERT INTO trained_models "
+                    "(id, pipeline_id, organization_id, owner_user_id, visibility, "
+                    "training_job_id, training_job_attempt_id, name, version, task, "
+                    "artifact_uri, metrics, status, framework, adapter_key, model_family, "
+                    "model_format, artifact_role, deployment_compatibility, "
+                    "artifact_manifest, display_name, created_at, updated_at) VALUES "
+                    "('attempt-checkpoint-duplicate', 'pipeline-yolo', 'org-training', "
+                    "'user-training', 'private', 'job-yolo', 'attempt-yolo-1', "
+                    "'duplicate', '1', 'detect', 'minio://models/job-yolo/duplicate', "
+                    "'{}', 'ready', 'ultralytics', 'ultralytics.object_detection.v1', "
+                    "'yolo26', 'unknown', 'checkpoint', '{}', '{}', 'duplicate', "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                )
+            )
+        except Exception as error:
+            assert "UNIQUE" in str(error).upper()
+        else:
+            raise AssertionError("database accepted a duplicate attempt artifact role")
+        connection.execute(
+            text(
+                "DELETE FROM trained_models WHERE training_job_attempt_id='attempt-yolo-1'"
+            )
+        )
+        connection.execute(
+            text("DELETE FROM training_job_attempts WHERE id='attempt-yolo-1'")
+        )
+
+    command.downgrade(config, "20260727_0006")
+
+    inspector = inspect(engine)
+    assert "training_job_attempts" not in inspector.get_table_names()
+    assert "framework" not in {
+        column["name"] for column in inspector.get_columns("base_models")
+    }
+    assert "task_kind" not in {
+        column["name"] for column in inspector.get_columns("training_pipelines")
+    }
+    assert "resolved_snapshot" not in {
+        column["name"] for column in inspector.get_columns("training_jobs")
+    }
+    assert "artifact_role" not in {
+        column["name"] for column in inspector.get_columns("trained_models")
+    }
+    assert {
+        index["name"]: tuple(index["column_names"])
+        for index in inspector.get_indexes("trained_models")
+        if index["unique"]
+    }["uq_trained_models_training_job"] == ("training_job_id",)
+    assert {
+        tuple(constraint["column_names"])
+        for constraint in inspector.get_unique_constraints("base_models")
+    } >= {("family", "task", "scale"), ("filename",)}
+
+    with engine.connect() as connection:
+        for table, rows in legacy_rows.items():
+            restored = (
+                connection.execute(
+                    text(
+                        f"SELECT * FROM {table} WHERE id != 'model-yolo-report' ORDER BY id"
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            assert [dict(row) for row in restored] == [dict(row) for row in rows]
+
+
+def test_multi_framework_downgrade_preflight_is_atomic(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'multi-framework-downgrade.db'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "20260731_0001")
+    engine = create_engine(database_url)
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO organizations (id, name, slug, status) VALUES "
+                "('org-downgrade', 'Downgrade', 'downgrade', 'active')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users "
+                "(id, organization_id, username, display_name, email, password_hash, role, "
+                "status, must_change_password) VALUES ('user-downgrade', 'org-downgrade', "
+                "'owner', 'Owner', 'owner@example.test', 'hash', 'admin', 'active', false)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO training_pipelines "
+                "(id, name, organization_id, owner_user_id, visibility, engine, task, scale, "
+                "task_kind, framework, adapter_key, adapter_version, model_family, recipe, "
+                "params_template, default_environment, status, is_public, public_scope, "
+                "is_favorite, created_at, updated_at) VALUES ('pipeline-downgrade', "
+                "'pipeline-downgrade', 'org-downgrade', 'user-downgrade', 'private', "
+                "'yolo26', 'detect', 'n', 'object_detection', 'ultralytics', "
+                "'ultralytics.object_detection.v1', '1.0.0', 'yolo26', '{}', '{}', '{}', "
+                "'ready', false, '{}', false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO training_jobs "
+                "(id, pipeline_id, organization_id, owner_user_id, visibility, status, params, "
+                "metrics, resolved_snapshot, created_at, updated_at) VALUES ('job-downgrade', "
+                "'pipeline-downgrade', 'org-downgrade', 'user-downgrade', 'private', "
+                "'completed', '{}', '{}', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        for model_id, role in (
+            ("model-downgrade-primary", "legacy_primary"),
+            ("model-downgrade-report", "evaluation_report"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO trained_models "
+                    "(id, pipeline_id, organization_id, owner_user_id, visibility, "
+                    "training_job_id, name, version, task, artifact_uri, metrics, status, "
+                    "artifact_role, deployment_compatibility, artifact_manifest, display_name, "
+                    "created_at, updated_at) VALUES (:id, 'pipeline-downgrade', "
+                    "'org-downgrade', 'user-downgrade', 'private', 'job-downgrade', :id, "
+                    "'1', 'detect', :uri, '{}', 'ready', :role, '{}', '{}', :id, "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "id": model_id,
+                    "role": role,
+                    "uri": f"minio://models/{model_id}",
+                },
+            )
+
+    def schema_snapshot():
+        inspector = inspect(engine)
+        with engine.connect() as connection:
+            return {
+                "tables": set(inspector.get_table_names()),
+                "trained_columns": tuple(
+                    column["name"] for column in inspector.get_columns("trained_models")
+                ),
+                "trained_indexes": tuple(
+                    sorted(
+                        index["name"]
+                        for index in inspector.get_indexes("trained_models")
+                    )
+                ),
+                "attempt_count": connection.execute(
+                    text("SELECT COUNT(*) FROM training_job_attempts")
+                ).scalar_one(),
+                "model_count": connection.execute(
+                    text("SELECT COUNT(*) FROM trained_models")
+                ).scalar_one(),
+                "revision": connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one(),
+            }
+
+    before = schema_snapshot()
+    try:
+        command.downgrade(config, "20260727_0006")
+    except RuntimeError as error:
+        assert "multiple trained models" in str(error)
+        assert "reconcile artifacts" in str(error)
+    else:
+        raise AssertionError("downgrade accepted multiple models for one training job")
+    assert schema_snapshot() == before
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("DELETE FROM trained_models WHERE id='model-downgrade-report'")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO training_job_attempts "
+                "(id, training_job_id, attempt_number, status, launch_spec, metrics, "
+                "artifact_manifest, container_ids, created_at, updated_at) VALUES "
+                "('attempt-downgrade', 'job-downgrade', 1, 'completed', '{}', '{}', '{}', "
+                "'[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    before = schema_snapshot()
+    try:
+        command.downgrade(config, "20260727_0006")
+    except RuntimeError as error:
+        assert "training job attempts" in str(error)
+        assert "remove attempts" in str(error)
+    else:
+        raise AssertionError("downgrade accepted persisted training attempts")
+    assert schema_snapshot() == before
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("DELETE FROM training_job_attempts WHERE id='attempt-downgrade'")
+        )
+    command.downgrade(config, "20260727_0006")
+    inspector = inspect(engine)
+    assert "training_job_attempts" not in inspector.get_table_names()
+    assert "artifact_role" not in {
+        column["name"] for column in inspector.get_columns("trained_models")
+    }
+
+
+def test_multi_framework_downgrade_rejects_base_model_tuple_collisions_atomically(
+    tmp_path,
+):
+    database_url = f"sqlite:///{tmp_path / 'base-model-downgrade.db'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "20260731_0001")
+    engine = create_engine(database_url)
+
+    with engine.begin() as connection:
+        for model_id, framework, filename, artifact_format in (
+            ("base-ultralytics", "ultralytics", "shared.pt", "pt"),
+            ("base-paddlex", "paddlex", "shared.pdparams", "pdparams"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO base_models "
+                    "(id, family, task, scale, filename, source_path, status, framework, "
+                    "model_family, variant, artifact_format, artifact_metadata, created_at, "
+                    "updated_at) VALUES (:id, 'shared-family', 'detect', 'n', :filename, "
+                    ":filename, 'ready', :framework, 'shared-family', 'n', "
+                    ":artifact_format, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "id": model_id,
+                    "framework": framework,
+                    "filename": filename,
+                    "artifact_format": artifact_format,
+                },
+            )
+
+    def schema_and_data_snapshot():
+        inspector = inspect(engine)
+        with engine.connect() as connection:
+            return {
+                "tables": tuple(sorted(inspector.get_table_names())),
+                "trained_columns": tuple(
+                    column["name"] for column in inspector.get_columns("trained_models")
+                ),
+                "base_columns": tuple(
+                    column["name"] for column in inspector.get_columns("base_models")
+                ),
+                "base_unique_constraints": tuple(
+                    sorted(
+                        (
+                            constraint["name"],
+                            tuple(constraint["column_names"]),
+                        )
+                        for constraint in inspector.get_unique_constraints(
+                            "base_models"
+                        )
+                    )
+                ),
+                "base_rows": tuple(
+                    connection.execute(
+                        text(
+                            "SELECT id, family, task, scale, filename, framework "
+                            "FROM base_models ORDER BY id"
+                        )
+                    ).all()
+                ),
+                "revision": connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one(),
+            }
+
+    before = schema_and_data_snapshot()
+    try:
+        command.downgrade(config, "20260727_0006")
+    except RuntimeError as error:
+        assert "legacy base model tuple collisions" in str(error)
+        assert "reconcile base models" in str(error)
+    else:
+        raise AssertionError(
+            "downgrade accepted colliding legacy base model identities"
+        )
+    assert schema_and_data_snapshot() == before
+
+
+def test_multi_framework_training_migration_identifiers_fit_postgresql():
+    migration_path = Path(
+        "infra/migrations/versions/20260731_0001_multi_framework_training.py"
+    )
+    tree = ast.parse(migration_path.read_text(encoding="utf-8"))
+    identifiers: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {
+            "create_index",
+            "drop_index",
+            "create_foreign_key",
+            "drop_constraint",
+            "create_unique_constraint",
+        }:
+            if node.args and isinstance(node.args[0], ast.Constant):
+                identifiers.append(node.args[0].value)
+        for keyword in node.keywords:
+            if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
+                identifiers.append(keyword.value.value)
+
+    dialect = postgresql.dialect()
+    assert identifiers
+    for identifier in identifiers:
+        dialect.validate_identifier(identifier)
+
+
+def test_multi_framework_training_migration_uses_bounded_backfill_reads():
+    migration_path = Path(
+        "infra/migrations/versions/20260731_0001_multi_framework_training.py"
+    )
+    tree = ast.parse(migration_path.read_text(encoding="utf-8"))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+
+    assert not any(
+        isinstance(call.func, ast.Attribute) and call.func.attr == "all"
+        for call in calls
+    )
+    assert any(
+        isinstance(call.func, ast.Attribute) and call.func.attr == "fetchmany"
+        for call in calls
     )
 
 
