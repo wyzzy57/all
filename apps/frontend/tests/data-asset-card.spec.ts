@@ -27,6 +27,22 @@ describe("DataAssetCard", () => {
     expect(cardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
   });
 
+  it("owns the root card layout and mode dimensions", () => {
+    const cardRule = topLevelRuleDeclarations(dataAssetCardSource, ".data-asset-card", "sfc");
+    expect(cardRule?.get("box-sizing")).toEqual(["border-box"]);
+    expect(cardRule?.get("cursor")).toEqual(["pointer"]);
+    expect(cardRule?.get("min-height")).toEqual(["138px"]);
+    expect(cardRule?.get("padding")).toEqual(["18px 18px 16px"]);
+    expect(cardRule?.get("position")).toEqual(["relative"]);
+    expect(cardRule?.get("text-align")).toEqual(["left"]);
+
+    const prepareRule = topLevelRuleDeclarations(dataAssetCardSource, ".prepare-card", "sfc");
+    const libraryRule = topLevelRuleDeclarations(dataAssetCardSource, ".library-card", "sfc");
+    expect(prepareRule?.get("height")).toEqual(["220px"]);
+    expect(libraryRule?.get("min-height")).toEqual(["122px"]);
+    expect(libraryRule?.get("padding")).toEqual(["16px 16px 14px"]);
+  });
+
   it("does not lift the shared card on hover", () => {
     const hoverRule = topLevelRuleDeclarations(dataAssetCardSource, ".data-asset-card:hover", "sfc");
     expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);

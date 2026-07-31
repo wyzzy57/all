@@ -197,7 +197,7 @@ function count(value?: number) {
 }
 
 .library-card {
-  min-height: 170px;
+  min-height: 122px;
   padding: 16px 16px 14px;
 }
 

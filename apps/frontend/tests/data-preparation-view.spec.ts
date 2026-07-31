@@ -75,13 +75,10 @@ describe("DataPreparationView", () => {
     expect(importCardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
   });
 
-  it("leaves dataset card shell styling to DataAssetCard", () => {
-    const datasetCardRule = topLevelRuleDeclarations(dataPreparationViewSource, ".dataset-card", "sfc");
-    expect(datasetCardRule).toBeDefined();
-    for (const property of ["background", "border", "border-radius", "box-shadow", "transform", "transition"]) {
-      expect(datasetCardRule?.has(property)).toBe(false);
+  it("leaves all dataset card root ownership to DataAssetCard", () => {
+    for (const selector of [".dataset-card", ".prepare-card", ".library-card"]) {
+      expect(topLevelRuleDeclarations(dataPreparationViewSource, selector, "sfc")).toBeUndefined();
     }
-    expect(topLevelRuleDeclarations(dataPreparationViewSource, ".dataset-card:hover", "sfc")).toBeUndefined();
     expect(dataPreparationViewSource).not.toContain(".dataset-card:hover");
     expect(dataPreparationViewSource).not.toContain(".dataset-card:focus-within");
   });
