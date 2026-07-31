@@ -174,22 +174,22 @@ function count(value?: number) {
 
 <style scoped>
 .data-asset-card {
-  background: #ffffff;
-  border: 1px solid #dce3ee;
-  border-radius: 4px;
+  background: var(--visiox-card-surface);
+  border: 1px solid var(--visiox-card-border);
+  border-radius: var(--visiox-card-radius);
   box-sizing: border-box;
   cursor: pointer;
   min-height: 138px;
   padding: 18px 18px 16px;
   position: relative;
   text-align: left;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  transition: border-color 0.15s ease;
 }
 
 .data-asset-card:hover {
-  border-color: #93c5fd;
-  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.08);
-  transform: translateY(-1px);
+  border-color: #aeb7c3;
+  box-shadow: none;
+  transform: none;
 }
 
 .prepare-card {

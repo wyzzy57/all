@@ -1273,10 +1273,10 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 .import-card {
-  background: #ffffff;
-  border: 1px solid #dbe3ef;
-  border-radius: 4px;
-  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.045);
+  background: var(--visiox-card-surface-raised);
+  border: 1px solid var(--visiox-card-border);
+  border-radius: var(--visiox-card-radius);
+  box-shadow: none;
   display: flex;
   flex-direction: column;
   min-height: 178px;
@@ -1482,22 +1482,22 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 .dataset-card {
-  background: #ffffff;
-  border: 1px solid #dce3ee;
-  border-radius: 4px;
+  background: var(--visiox-card-surface);
+  border: 1px solid var(--visiox-card-border);
+  border-radius: var(--visiox-card-radius);
   box-sizing: border-box;
   cursor: pointer;
   min-height: 138px;
   padding: 18px 18px 16px;
   position: relative;
   text-align: left;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  transition: border-color 0.15s ease;
 }
 
 .dataset-card:hover {
-  border-color: #93c5fd;
-  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.08);
-  transform: translateY(-1px);
+  border-color: #aeb7c3;
+  box-shadow: none;
+  transform: none;
 }
 
 .dataset-card:hover .dataset-more-button,

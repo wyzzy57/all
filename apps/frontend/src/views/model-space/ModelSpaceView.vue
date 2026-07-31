@@ -3227,10 +3227,17 @@ function getErrorMessage(error: unknown, fallback: string) {
   position: relative;
   min-height: 138px;
   padding: 22px 20px 16px;
-  border: 1px solid #dfe5ef;
-  border-radius: 4px;
-  background: #fff;
-  box-shadow: 0 2px 6px rgb(17 24 39 / 3%);
+  border: 1px solid var(--visiox-card-border);
+  border-radius: var(--visiox-card-radius);
+  background: var(--visiox-card-surface);
+  box-shadow: none;
+  transition: border-color 0.15s ease;
+}
+
+.pipeline-card:hover {
+  border-color: #aeb7c3;
+  box-shadow: none;
+  transform: none;
 }
 
 .pipeline-card.selected {
