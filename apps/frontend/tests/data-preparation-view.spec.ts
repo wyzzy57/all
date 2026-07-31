@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import DataPreparationView from "@/views/data-preparation/DataPreparationView.vue";
 import dataPreparationViewSource from "@/views/data-preparation/DataPreparationView.vue?raw";
-import { hasForbiddenHoverElevation, topLevelRuleDeclarations } from "./helpers/css-rules";
+import { topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const apiMock = vi.hoisted(() => ({
   createLabelProject: vi.fn(),
@@ -75,16 +75,15 @@ describe("DataPreparationView", () => {
     expect(importCardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
   });
 
-  it("uses the standard shared surface for dataset cards", () => {
+  it("leaves dataset card shell styling to DataAssetCard", () => {
     const datasetCardRule = topLevelRuleDeclarations(dataPreparationViewSource, ".dataset-card", "sfc");
-    expect(datasetCardRule?.get("background")).toEqual(["var(--visiox-card-surface)"]);
-    expect(datasetCardRule?.get("border")).toEqual(["1px solid var(--visiox-card-border)"]);
-    expect(datasetCardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
-  });
-
-  it("does not lift dataset cards on hover", () => {
-    const hoverRule = topLevelRuleDeclarations(dataPreparationViewSource, ".dataset-card:hover", "sfc");
-    expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
+    expect(datasetCardRule).toBeDefined();
+    for (const property of ["background", "border", "border-radius", "box-shadow", "transform", "transition"]) {
+      expect(datasetCardRule?.has(property)).toBe(false);
+    }
+    expect(topLevelRuleDeclarations(dataPreparationViewSource, ".dataset-card:hover", "sfc")).toBeUndefined();
+    expect(dataPreparationViewSource).not.toContain(".dataset-card:hover");
+    expect(dataPreparationViewSource).not.toContain(".dataset-card:focus-within");
   });
 
   it("uses the shared resource dialog for dataset visibility", () => {

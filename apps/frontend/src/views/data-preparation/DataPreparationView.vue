@@ -1482,28 +1482,12 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 .dataset-card {
-  background: var(--visiox-card-surface);
-  border: 1px solid var(--visiox-card-border);
-  border-radius: var(--visiox-card-radius);
   box-sizing: border-box;
   cursor: pointer;
   min-height: 138px;
   padding: 18px 18px 16px;
   position: relative;
   text-align: left;
-  transition: border-color 0.15s ease;
-}
-
-.dataset-card:hover {
-  border-color: #aeb7c3;
-  box-shadow: none;
-  transform: none;
-}
-
-.dataset-card:hover .dataset-more-button,
-.dataset-card:focus-within .dataset-more-button {
-  opacity: 1;
-  pointer-events: auto;
 }
 
 .library-card {

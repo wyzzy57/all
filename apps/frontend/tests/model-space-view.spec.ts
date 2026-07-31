@@ -129,8 +129,14 @@ describe("ModelSpaceView", () => {
     expect(cardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
   });
 
-  it("does not lift pipeline cards on hover", () => {
-    const hoverRule = topLevelRuleDeclarations(modelSpaceViewSource, ".pipeline-card:hover", "sfc");
+  it("limits restrained hover feedback to non-skeleton pipeline cards", () => {
+    expect(topLevelRuleDeclarations(modelSpaceViewSource, ".pipeline-card:hover", "sfc")).toBeUndefined();
+    const hoverRule = topLevelRuleDeclarations(
+      modelSpaceViewSource,
+      ".pipeline-card:not(.skeleton-card):hover",
+      "sfc",
+    );
+    expect(hoverRule?.get("border-color")).toEqual(["#aeb7c3"]);
     expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
   });
 

@@ -3234,7 +3234,7 @@ function getErrorMessage(error: unknown, fallback: string) {
   transition: border-color 0.15s ease;
 }
 
-.pipeline-card:hover {
+.pipeline-card:not(.skeleton-card):hover {
   border-color: #aeb7c3;
   box-shadow: none;
   transform: none;

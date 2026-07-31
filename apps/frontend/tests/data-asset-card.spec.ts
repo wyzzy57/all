@@ -72,7 +72,7 @@ describe("DataAssetCard", () => {
       },
     });
 
-    expect(wrapper.classes()).toContain("dataset-card");
+    expect(wrapper.classes()).toEqual(expect.arrayContaining(["dataset-card", "data-asset-card"]));
     await wrapper.get("[data-testid='validate-dataset-dataset-1']").trigger("click");
     await wrapper.get("[data-testid='process-dataset-dataset-1']").trigger("click");
     expect(wrapper.emitted("validate")).toHaveLength(1);
