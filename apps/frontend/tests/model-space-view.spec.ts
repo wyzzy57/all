@@ -4,11 +4,23 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import ModelSpaceView from "@/views/model-space/ModelSpaceView.vue";
 import modelSpaceViewSource from "@/views/model-space/ModelSpaceView.vue?raw";
 
-function ruleBody(source: string, selector: string, declaration: string) {
+function topLevelRuleBody(source: string, selector: string, declaration: string) {
+  const styleTagStart = source.indexOf("<style");
+  const cssStart = styleTagStart === -1 ? 0 : source.indexOf(">", styleTagStart) + 1;
+  const closingStyle = source.indexOf("</style>", cssStart);
+  const cssEnd = closingStyle === -1 ? source.length : closingStyle;
+  const cssSource = source.slice(cssStart, cssEnd);
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rules = [...source.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
+  const rules = [...cssSource.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
+    .filter((match) => {
+      const prefix = cssSource.slice(0, match.index);
+      return [...prefix].reduce(
+        (depth, character) => depth + (character === "{" ? 1 : character === "}" ? -1 : 0),
+        0,
+      ) === 0;
+    })
     .filter((match) => new RegExp(`(?:^|;)\\s*${declaration}\\s*:`).test(match[1]));
-  expect(rules, `expected one exact ${selector} rule`).toHaveLength(1);
+  expect(rules, `expected one top-level ${selector} rule`).toHaveLength(1);
   return rules[0]![1];
 }
 
@@ -130,14 +142,21 @@ function mockDeployablePipeline() {
 
 describe("ModelSpaceView", () => {
   it("uses the standard shared pipeline card surface", () => {
-    const cardRule = ruleBody(modelSpaceViewSource, ".pipeline-card", "background");
+    expect(() => topLevelRuleBody(`
+      <style>
+      @media (max-width: 720px) { .pipeline-card { background: var(--visiox-card-surface); } }
+      @container model-space (max-width: 900px) { .pipeline-card { background: var(--visiox-card-surface); } }
+      </style>
+    `, ".pipeline-card", "background")).toThrow(/expected one top-level \.pipeline-card rule/);
+
+    const cardRule = topLevelRuleBody(modelSpaceViewSource, ".pipeline-card", "background");
     expect(cardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);
     expect(cardRule).toMatch(/border:\s*1px solid var\(--visiox-card-border\)\s*;/);
     expect(cardRule).toMatch(/border-radius:\s*var\(--visiox-card-radius\)\s*;/);
   });
 
   it("does not lift pipeline cards on hover", () => {
-    const hoverRule = ruleBody(modelSpaceViewSource, ".pipeline-card:hover", "box-shadow");
+    const hoverRule = topLevelRuleBody(modelSpaceViewSource, ".pipeline-card:hover", "box-shadow");
     expect([...hoverRule.matchAll(/box-shadow\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
     expect([...hoverRule.matchAll(/transform\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
     expect(hoverRule).not.toMatch(/translateY\s*\(/);

@@ -4,11 +4,23 @@ import { describe, expect, it } from "vitest";
 import DataAssetCard from "@/components/data/DataAssetCard.vue";
 import dataAssetCardSource from "@/components/data/DataAssetCard.vue?raw";
 
-function ruleBody(source: string, selector: string, declaration: string) {
+function topLevelRuleBody(source: string, selector: string, declaration: string) {
+  const styleTagStart = source.indexOf("<style");
+  const cssStart = styleTagStart === -1 ? 0 : source.indexOf(">", styleTagStart) + 1;
+  const closingStyle = source.indexOf("</style>", cssStart);
+  const cssEnd = closingStyle === -1 ? source.length : closingStyle;
+  const cssSource = source.slice(cssStart, cssEnd);
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rules = [...source.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
+  const rules = [...cssSource.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
+    .filter((match) => {
+      const prefix = cssSource.slice(0, match.index);
+      return [...prefix].reduce(
+        (depth, character) => depth + (character === "{" ? 1 : character === "}" ? -1 : 0),
+        0,
+      ) === 0;
+    })
     .filter((match) => new RegExp(`(?:^|;)\\s*${declaration}\\s*:`).test(match[1]));
-  expect(rules, `expected one exact ${selector} rule`).toHaveLength(1);
+  expect(rules, `expected one top-level ${selector} rule`).toHaveLength(1);
   return rules[0]![1];
 }
 
@@ -28,14 +40,21 @@ const asset = {
 
 describe("DataAssetCard", () => {
   it("uses the standard shared card surface", () => {
-    const cardRule = ruleBody(dataAssetCardSource, ".data-asset-card", "background");
+    expect(() => topLevelRuleBody(`
+      <style>
+      @media (max-width: 720px) { .data-asset-card { background: var(--visiox-card-surface); } }
+      @container data-card (max-width: 900px) { .data-asset-card { background: var(--visiox-card-surface); } }
+      </style>
+    `, ".data-asset-card", "background")).toThrow(/expected one top-level \.data-asset-card rule/);
+
+    const cardRule = topLevelRuleBody(dataAssetCardSource, ".data-asset-card", "background");
     expect(cardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);
     expect(cardRule).toMatch(/border:\s*1px solid var\(--visiox-card-border\)\s*;/);
     expect(cardRule).toMatch(/border-radius:\s*var\(--visiox-card-radius\)\s*;/);
   });
 
   it("does not lift the shared card on hover", () => {
-    const hoverRule = ruleBody(dataAssetCardSource, ".data-asset-card:hover", "box-shadow");
+    const hoverRule = topLevelRuleBody(dataAssetCardSource, ".data-asset-card:hover", "box-shadow");
     expect([...hoverRule.matchAll(/box-shadow\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
     expect([...hoverRule.matchAll(/transform\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
     expect(hoverRule).not.toMatch(/translateY\s*\(/);

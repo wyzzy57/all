@@ -16,6 +16,21 @@ import workbenchSource from "@/views/workbench/WorkbenchView.vue?raw";
 
 const stylesSource = stylesRawSource || readFileSync("src/styles.css", "utf8");
 
+function topLevelRuleBody(source: string, selector: string) {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rules = [...source.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
+    .filter((match) => {
+      const prefix = source.slice(0, match.index);
+      const depth = [...prefix].reduce(
+        (current, character) => current + (character === "{" ? 1 : character === "}" ? -1 : 0),
+        0,
+      );
+      return depth === 0;
+    });
+  expect(rules, `expected one top-level ${selector} rule`).toHaveLength(1);
+  return rules[0]![1];
+}
+
 describe("global application header", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -73,10 +88,12 @@ describe("global application header", () => {
   });
 
   it("defines the shared business card surface tokens on the root", () => {
-    const rootRules = [...stylesSource.matchAll(/^\s*:root\s*\{([^{}]*)\}/gm)];
-    expect(rootRules).toHaveLength(1);
+    expect(() => topLevelRuleBody(`
+      @media (max-width: 720px) { :root { --visiox-card-surface: #f3f4f6; } }
+      @container shell (max-width: 900px) { :root { --visiox-card-surface: #f3f4f6; } }
+    `, ":root")).toThrow(/expected one top-level :root rule/);
 
-    const rootRule = rootRules[0]![1];
+    const rootRule = topLevelRuleBody(stylesSource, ":root");
     expect(rootRule).toMatch(/--visiox-card-surface:\s*#f3f4f6\s*;/);
     expect(rootRule).toMatch(/--visiox-card-surface-raised:\s*#f6f7f8\s*;/);
     expect(rootRule).toMatch(/--visiox-card-border:\s*#e0e2e6\s*;/);

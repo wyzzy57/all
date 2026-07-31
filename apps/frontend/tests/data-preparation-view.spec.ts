@@ -4,11 +4,23 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import DataPreparationView from "@/views/data-preparation/DataPreparationView.vue";
 import dataPreparationViewSource from "@/views/data-preparation/DataPreparationView.vue?raw";
 
-function ruleBody(source: string, selector: string, declaration: string) {
+function topLevelRuleBody(source: string, selector: string, declaration: string) {
+  const styleTagStart = source.indexOf("<style");
+  const cssStart = styleTagStart === -1 ? 0 : source.indexOf(">", styleTagStart) + 1;
+  const closingStyle = source.indexOf("</style>", cssStart);
+  const cssEnd = closingStyle === -1 ? source.length : closingStyle;
+  const cssSource = source.slice(cssStart, cssEnd);
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const rules = [...source.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
+  const rules = [...cssSource.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
+    .filter((match) => {
+      const prefix = cssSource.slice(0, match.index);
+      return [...prefix].reduce(
+        (depth, character) => depth + (character === "{" ? 1 : character === "}" ? -1 : 0),
+        0,
+      ) === 0;
+    })
     .filter((match) => new RegExp(`(?:^|;)\\s*${declaration}\\s*:`).test(match[1]));
-  expect(rules, `expected one exact ${selector} rule`).toHaveLength(1);
+  expect(rules, `expected one top-level ${selector} rule`).toHaveLength(1);
   return rules[0]![1];
 }
 
@@ -76,21 +88,28 @@ function mountView() {
 
 describe("DataPreparationView", () => {
   it("uses the raised shared surface for import cards", () => {
-    const importCardRule = ruleBody(dataPreparationViewSource, ".import-card", "background");
+    expect(() => topLevelRuleBody(`
+      <style>
+      @media (max-width: 720px) { .import-card { background: var(--visiox-card-surface-raised); } }
+      @container data-view (max-width: 900px) { .import-card { background: var(--visiox-card-surface-raised); } }
+      </style>
+    `, ".import-card", "background")).toThrow(/expected one top-level \.import-card rule/);
+
+    const importCardRule = topLevelRuleBody(dataPreparationViewSource, ".import-card", "background");
     expect(importCardRule).toMatch(/background:\s*var\(--visiox-card-surface-raised\)\s*;/);
     expect(importCardRule).toMatch(/border:\s*1px solid var\(--visiox-card-border\)\s*;/);
     expect(importCardRule).toMatch(/border-radius:\s*var\(--visiox-card-radius\)\s*;/);
   });
 
   it("uses the standard shared surface for dataset cards", () => {
-    const datasetCardRule = ruleBody(dataPreparationViewSource, ".dataset-card", "background");
+    const datasetCardRule = topLevelRuleBody(dataPreparationViewSource, ".dataset-card", "background");
     expect(datasetCardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);
     expect(datasetCardRule).toMatch(/border:\s*1px solid var\(--visiox-card-border\)\s*;/);
     expect(datasetCardRule).toMatch(/border-radius:\s*var\(--visiox-card-radius\)\s*;/);
   });
 
   it("does not lift dataset cards on hover", () => {
-    const hoverRule = ruleBody(dataPreparationViewSource, ".dataset-card:hover", "box-shadow");
+    const hoverRule = topLevelRuleBody(dataPreparationViewSource, ".dataset-card:hover", "box-shadow");
     expect([...hoverRule.matchAll(/box-shadow\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
     expect([...hoverRule.matchAll(/transform\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
     expect(hoverRule).not.toMatch(/translateY\s*\(/);
