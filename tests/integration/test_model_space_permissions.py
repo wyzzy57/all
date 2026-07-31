@@ -1,8 +1,16 @@
-from visiox_db.models import Annotation, BaseModel, Dataset, DatasetSample, TrainingPipeline
+from visiox_db.models import (
+    Annotation,
+    BaseModel,
+    Dataset,
+    DatasetSample,
+    TrainingPipeline,
+)
 from visiox_db.models.identity import ResourceGrant
 
 
-def test_pipeline_ownership_listing_and_action_permissions(authenticated_client) -> None:
+def test_pipeline_ownership_listing_and_action_permissions(
+    authenticated_client,
+) -> None:
     client, session_factory, _, identity = authenticated_client
     headers = identity["member_headers"]
     created_response = client.post(
@@ -63,15 +71,20 @@ def test_pipeline_ownership_listing_and_action_permissions(authenticated_client)
         "shared-pipeline",
     }
     assert client.get(f"/pipelines/{shared_id}", headers=headers).status_code == 200
-    assert client.patch(
-        f"/pipelines/{shared_id}", headers=headers, json={"name": "forbidden"}
-    ).status_code == 403
+    assert (
+        client.patch(
+            f"/pipelines/{shared_id}", headers=headers, json={"name": "forbidden"}
+        ).status_code
+        == 403
+    )
     assert client.delete(f"/pipelines/{shared_id}", headers=headers).status_code == 403
     assert client.get(f"/pipelines/{private_id}", headers=headers).status_code == 403
     assert client.get(f"/pipelines/{foreign_id}", headers=headers).status_code == 404
 
 
-def test_pipeline_creation_requires_dataset_use_permission(authenticated_client) -> None:
+def test_pipeline_creation_requires_dataset_use_permission(
+    authenticated_client,
+) -> None:
     client, session_factory, _, identity = authenticated_client
     headers = identity["member_headers"]
     with session_factory() as session:
@@ -140,3 +153,63 @@ def test_pipeline_creation_requires_dataset_use_permission(authenticated_client)
     allowed = client.post("/pipelines", headers=headers, json=payload)
     assert allowed.status_code == 201, allowed.text
     assert allowed.json()["owner_user_id"] == identity["member_id"]
+
+
+def test_pipeline_clone_requires_use_and_does_not_republish_shared_source(
+    authenticated_client,
+) -> None:
+    client, session_factory, _, identity = authenticated_client
+    headers = identity["member_headers"]
+    with session_factory() as session:
+        source = TrainingPipeline(
+            name="shared-clone-source",
+            task="detect",
+            scale="n",
+            organization_id=identity["organization_id"],
+            owner_user_id=identity["admin_id"],
+            visibility="organization",
+            is_public=True,
+            public_scope={"groups": ["admins"]},
+        )
+        session.add(source)
+        session.flush()
+        grant = ResourceGrant(
+            organization_id=identity["organization_id"],
+            resource_type="pipeline",
+            resource_id=source.id,
+            principal_type="user",
+            principal_id=identity["member_id"],
+            permissions=["view"],
+            created_by=identity["admin_id"],
+        )
+        session.add(grant)
+        session.commit()
+        source_id = source.id
+        grant_id = grant.id
+
+    denied = client.post(
+        f"/pipelines/{source_id}/clone",
+        headers=headers,
+        json={"name": "member-clone-denied"},
+    )
+    assert denied.status_code == 403
+
+    with session_factory() as session:
+        grant = session.get(ResourceGrant, grant_id)
+        assert grant is not None
+        grant.permissions = ["view", "use"]
+        session.add(grant)
+        session.commit()
+
+    allowed = client.post(
+        f"/pipelines/{source_id}/clone",
+        headers=headers,
+        json={"name": "member-clone-allowed"},
+    )
+
+    assert allowed.status_code == 201, allowed.text
+    assert allowed.json()["owner_user_id"] == identity["member_id"]
+    assert allowed.json()["organization_id"] == identity["organization_id"]
+    assert allowed.json()["visibility"] == "private"
+    assert allowed.json()["is_public"] is False
+    assert allowed.json()["public_scope"] == {}

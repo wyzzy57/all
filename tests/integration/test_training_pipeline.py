@@ -44,15 +44,24 @@ from visiox_db.models import (
     Organization,
     User,
 )
-from visiox_edge_executor_worker.inventory import compatibility_key, compatibility_policy, parse_inventory
+from visiox_edge_executor_worker.inventory import (
+    compatibility_key,
+    compatibility_policy,
+    parse_inventory,
+)
 from visiox_storage.client import InMemoryObjectStorageClient
 from tests.integration.ownership_test_support import install_legacy_ownership
 import visiox_training_worker.main as training_worker_main
 from visiox_training_worker.main import CommandResult, run_training_job
-from visiox_training_worker.runner import SubprocessTrainingRunner, run_pending_training_tasks
+from visiox_training_worker.runner import (
+    SubprocessTrainingRunner,
+    run_pending_training_tasks,
+)
 
 
-LEGACY_TEST_ACTOR = SimpleNamespace(id="legacy-admin", organization_id="legacy-org", role="admin")
+LEGACY_TEST_ACTOR = SimpleNamespace(
+    id="legacy-admin", organization_id="legacy-org", role="admin"
+)
 
 
 class FakeStreamProducer:
@@ -139,7 +148,13 @@ class InspectingRunner:
 
 
 class FailingLogStorage(InMemoryObjectStorageClient):
-    def put_file(self, bucket: str, object_name: str, file_path: Path, content_type: str | None = None) -> str:
+    def put_file(
+        self,
+        bucket: str,
+        object_name: str,
+        file_path: Path,
+        content_type: str | None = None,
+    ) -> str:
         if bucket == "training":
             raise RuntimeError("log upload failed")
         return super().put_file(bucket, object_name, file_path, content_type)
@@ -162,9 +177,7 @@ def session_factory(tmp_path):
         cursor.close()
 
     with Session(engine) as session:
-        session.add(
-            Organization(id="legacy-org", name="Legacy", slug="legacy")
-        )
+        session.add(Organization(id="legacy-org", name="Legacy", slug="legacy"))
         session.add(
             User(
                 id="legacy-admin",
@@ -191,7 +204,9 @@ def stream_producer() -> FakeStreamProducer:
 
 
 @pytest.fixture()
-def client(session_factory, stream_producer: FakeStreamProducer) -> Generator[TestClient]:
+def client(
+    session_factory, stream_producer: FakeStreamProducer
+) -> Generator[TestClient]:
     app = create_app()
     app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
@@ -303,9 +318,13 @@ def seed_training_ready_rows(
     return base_model_id, dataset_id, sample_id
 
 
-def seed_distributed_pool(session_factory, *, name: str = "training-pool", node_count: int = 2) -> tuple[str, list[str]]:
+def seed_distributed_pool(
+    session_factory, *, name: str = "training-pool", node_count: int = 2
+) -> tuple[str, list[str]]:
     snapshot = parse_inventory(
-        json.loads(Path("tests/fixtures/edge_inventory/x86.json").read_text(encoding="utf-8"))
+        json.loads(
+            Path("tests/fixtures/edge_inventory/x86.json").read_text(encoding="utf-8")
+        )
     )
     key = compatibility_key(snapshot)
     with session_factory() as session:
@@ -323,7 +342,9 @@ def seed_distributed_pool(session_factory, *, name: str = "training-pool", node_
             node_snapshot = snapshot.model_copy(
                 update={
                     "gpus": tuple(
-                        gpu.model_copy(update={"uuid": f"GPU-{name}-{index}-{gpu_index}"})
+                        gpu.model_copy(
+                            update={"uuid": f"GPU-{name}-{index}-{gpu_index}"}
+                        )
                         for gpu_index, gpu in enumerate(snapshot.gpus)
                     )
                 }
@@ -362,7 +383,9 @@ def seed_distributed_pool(session_factory, *, name: str = "training-pool", node_
         return pool.id, [node.id for node in nodes]
 
 
-def create_pipeline(client: TestClient, base_model_id: str, dataset_id: str, **overrides):
+def create_pipeline(
+    client: TestClient, base_model_id: str, dataset_id: str, **overrides
+):
     payload = {
         "name": "detect-training",
         "task": "detect",
@@ -376,7 +399,9 @@ def create_pipeline(client: TestClient, base_model_id: str, dataset_id: str, **o
     return client.post("/pipelines", json=payload)
 
 
-def test_create_pipeline_validates_base_model_dataset_and_lists_filters(client: TestClient, session_factory):
+def test_create_pipeline_validates_base_model_dataset_and_lists_filters(
+    client: TestClient, session_factory
+):
     base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
 
     response = create_pipeline(client, base_model_id, dataset_id)
@@ -405,7 +430,12 @@ def test_create_pipeline_without_training_resources_persists_draft(client: TestC
     )
     partial = client.post(
         "/pipelines",
-        json={"name": "invalid-draft", "task": "detect", "scale": "n", "base_model_id": "base-only"},
+        json={
+            "name": "invalid-draft",
+            "task": "detect",
+            "scale": "n",
+            "base_model_id": "base-only",
+        },
     )
     duplicate = client.post(
         "/pipelines",
@@ -424,7 +454,431 @@ def test_create_pipeline_without_training_resources_persists_draft(client: TestC
     assert duplicate.json()["detail"] == "产线名称已存在，请使用其他名称"
 
 
-def test_create_and_update_llamafactory_pipeline_without_yolo_base_model(client: TestClient, session_factory):
+@pytest.mark.parametrize(
+    ("name", "explicit", "legacy", "expected_family", "expected_model"),
+    [
+        (
+            "explicit-ultralytics",
+            {
+                "task_kind": "object_detection",
+                "framework": "ultralytics",
+                "adapter_key": "ultralytics.object_detection.v1",
+                "adapter_version": "1.0.0",
+                "model_family": "yolo26",
+                "recipe": {"model": "YOLO26-N"},
+            },
+            {"engine": "yolo26", "task": "detect", "scale": "n"},
+            "YOLO26",
+            ("YOLO26-N", "yolo26n.pt", "N"),
+        ),
+        (
+            "explicit-paddlex-ppyoloe",
+            {
+                "task_kind": "object_detection",
+                "framework": "paddlex",
+                "adapter_key": "paddlex.object_detection.v1",
+                "adapter_version": "1.0.0",
+                "model_family": "PP-YOLOE",
+                "recipe": {"model": "PP-YOLOE-S"},
+            },
+            {"engine": "paddlex", "task": "detect", "scale": "s"},
+            "PP-YOLOE",
+            ("PP-YOLOE-S", "PP-YOLOE_plus-S", "S"),
+        ),
+        (
+            "explicit-paddlex-rtdetr",
+            {
+                "task_kind": "object_detection",
+                "framework": "paddlex",
+                "adapter_key": "paddlex.object_detection.v1",
+                "adapter_version": "1.0.0",
+                "model_family": "RT-DETR",
+                "recipe": {"model": "RT-DETR-L"},
+            },
+            {"engine": "paddlex", "task": "detect", "scale": "l"},
+            "RT-DETR",
+            ("RT-DETR-L", "RT-DETR-L", "L"),
+        ),
+        (
+            "explicit-llamafactory",
+            {
+                "task_kind": "llm_sft",
+                "framework": "llamafactory",
+                "adapter_key": "llamafactory.llm_sft.v1",
+                "adapter_version": "1.0.0",
+                "model_family": "Qwen3",
+                "recipe": {"model": "Qwen/Qwen3-0.6B"},
+            },
+            {"engine": "llamafactory", "task": "llm", "scale": "0.6B"},
+            "Qwen3",
+            ("Qwen3 0.6B", "Qwen/Qwen3-0.6B", "0.6B"),
+        ),
+    ],
+)
+def test_create_explicit_adapter_drafts_resolves_catalog_models(
+    client: TestClient,
+    name: str,
+    explicit: dict,
+    legacy: dict,
+    expected_family: str,
+    expected_model: tuple[str, str, str],
+) -> None:
+    response = client.post("/pipelines", json={"name": name, **legacy, **explicit})
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert {key: body[key] for key in explicit if key != "recipe"} == {
+        **{
+            key: explicit[key]
+            for key in explicit
+            if key not in {"recipe", "model_family"}
+        },
+        "model_family": expected_family,
+    }
+    assert {key: body[key] for key in legacy} == legacy
+    assert body["recipe"]["model"] == {
+        "key": body["recipe"]["model"]["key"],
+        "label": expected_model[0],
+        "runtime_id": expected_model[1],
+        "family": expected_family,
+        "variant": expected_model[2],
+    }
+    assert body["status"] == "draft"
+
+
+def test_create_legacy_pipeline_returns_explicit_identity(client: TestClient) -> None:
+    yolo = client.post(
+        "/pipelines",
+        json={
+            "name": "legacy-yolo-identity",
+            "engine": "yolo26",
+            "task": "detect",
+            "scale": "n",
+        },
+    )
+    llama = client.post(
+        "/pipelines",
+        json={
+            "name": "legacy-llama-identity",
+            "engine": "llamafactory",
+            "task": "llm",
+            "scale": "llm",
+        },
+    )
+
+    assert yolo.status_code == 201, yolo.text
+    assert {
+        key: yolo.json()[key]
+        for key in (
+            "task_kind",
+            "framework",
+            "adapter_key",
+            "adapter_version",
+            "model_family",
+        )
+    } == {
+        "task_kind": "object_detection",
+        "framework": "ultralytics",
+        "adapter_key": "ultralytics.object_detection.v1",
+        "adapter_version": "1.0.0",
+        "model_family": "YOLO26",
+    }
+    assert llama.status_code == 201, llama.text
+    assert llama.json()["task_kind"] == "llm_sft"
+    assert llama.json()["framework"] == "llamafactory"
+    assert llama.json()["adapter_key"] == "llamafactory.llm_sft.v1"
+
+
+def test_update_unlocked_pipeline_switches_framework_after_revalidation(
+    client: TestClient,
+) -> None:
+    created = client.post(
+        "/pipelines",
+        json={
+            "name": "switchable-draft",
+            "engine": "yolo26",
+            "task": "detect",
+            "scale": "n",
+        },
+    )
+
+    updated = client.patch(
+        f"/pipelines/{created.json()['id']}",
+        json={
+            "engine": "paddlex",
+            "task": "detect",
+            "scale": "s",
+            "task_kind": "object_detection",
+            "framework": "paddlex",
+            "adapter_key": "paddlex.object_detection.v1",
+            "adapter_version": "1.0.0",
+            "model_family": "PP-YOLOE",
+            "recipe": {"model": "PP-YOLOE-S"},
+        },
+    )
+
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["framework"] == "paddlex"
+    assert updated.json()["recipe"]["model"]["runtime_id"] == "PP-YOLOE_plus-S"
+    assert updated.json()["status"] == "draft"
+
+
+@pytest.mark.parametrize(
+    "identity_change",
+    [
+        {
+            "task_kind": "object_detection",
+            "framework": "paddlex",
+            "adapter_key": "paddlex.object_detection.v1",
+            "adapter_version": "1.0.0",
+            "model_family": "PP-YOLOE",
+            "recipe": {"model": "PP-YOLOE-S"},
+        },
+        {"engine": "paddlex", "task": "detect", "scale": "s"},
+        {"scale": "s"},
+    ],
+)
+def test_update_locked_pipeline_rejects_explicit_and_legacy_identity_changes(
+    client: TestClient,
+    session_factory,
+    identity_change: dict,
+) -> None:
+    created = client.post(
+        "/pipelines",
+        json={
+            "name": f"locked-{len(identity_change)}-{sorted(identity_change)[0]}",
+            "engine": "yolo26",
+            "task": "detect",
+            "scale": "n",
+        },
+    )
+    with session_factory() as session:
+        pipeline = session.get(TrainingPipeline, created.json()["id"])
+        assert pipeline is not None
+        pipeline.framework_locked_at = datetime.now(UTC)
+        session.add(pipeline)
+        session.commit()
+
+    rejected = client.patch(
+        f"/pipelines/{created.json()['id']}",
+        json=identity_change,
+    )
+    renamed = client.patch(
+        f"/pipelines/{created.json()['id']}",
+        json={"name": f"{created.json()['name']}-renamed"},
+    )
+
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"] == (
+        "Pipeline framework identity is locked; clone the pipeline to change it"
+    )
+    assert renamed.status_code == 200, renamed.text
+
+
+def test_pipeline_identity_payload_rejects_conflicts_and_unknown_fields(
+    client: TestClient,
+) -> None:
+    conflicting = client.post(
+        "/pipelines",
+        json={
+            "name": "conflicting-identity",
+            "engine": "yolo26",
+            "task": "detect",
+            "scale": "n",
+            "task_kind": "object_detection",
+            "framework": "paddlex",
+            "adapter_key": "paddlex.object_detection.v1",
+            "adapter_version": "1.0.0",
+            "model_family": "PP-YOLOE",
+            "recipe": {"model": "PP-YOLOE-S"},
+        },
+    )
+    unknown = client.post(
+        "/pipelines",
+        json={
+            "name": "unknown-identity-field",
+            "task": "detect",
+            "scale": "n",
+            "adapter_claim": "untrusted",
+        },
+    )
+
+    assert conflicting.status_code == 422
+    assert conflicting.json()["detail"] == "framework conflicts with legacy engine"
+    assert unknown.status_code == 422
+
+
+def test_explicit_pipeline_rejects_adapter_model_and_dataset_mismatches(
+    client: TestClient,
+    session_factory,
+) -> None:
+    with session_factory() as session:
+        dataset = Dataset(
+            name="paddlex-wrong-task",
+            task="llm",
+            status="validated",
+            sample_count=1,
+            annotation_count=1,
+        )
+        session.add(dataset)
+        session.commit()
+        dataset_id = dataset.id
+
+    base = {
+        "task_kind": "object_detection",
+        "framework": "paddlex",
+        "adapter_key": "paddlex.object_detection.v1",
+        "adapter_version": "1.0.0",
+        "model_family": "PP-YOLOE",
+        "recipe": {"model": "PP-YOLOE-S"},
+    }
+    wrong_adapter = client.post(
+        "/pipelines",
+        json={
+            "name": "wrong-adapter",
+            **base,
+            "adapter_key": "ultralytics.object_detection.v1",
+        },
+    )
+    forged_model = client.post(
+        "/pipelines",
+        json={
+            "name": "forged-model-runtime",
+            **base,
+            "recipe": {
+                "model": {
+                    "label": "PP-YOLOE-S",
+                    "runtime_id": "arbitrary-runtime-id",
+                }
+            },
+        },
+    )
+    wrong_dataset = client.post(
+        "/pipelines",
+        json={"name": "wrong-paddlex-dataset", **base, "dataset_id": dataset_id},
+    )
+
+    assert wrong_adapter.status_code == 422
+    assert wrong_adapter.json()["detail"] == (
+        "Framework 'paddlex' does not support task 'object_detection'"
+    )
+    assert forged_model.status_code == 422
+    assert forged_model.json()["detail"] == (
+        "recipe model runtime_id does not match the adapter catalog"
+    )
+    assert wrong_dataset.status_code == 422
+    assert wrong_dataset.json()["detail"] == "PaddleX dataset task must be detect"
+
+
+def test_clone_locked_pipeline_copies_configuration_without_jobs(
+    client: TestClient,
+    session_factory,
+) -> None:
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    source = create_pipeline(
+        client,
+        base_model_id,
+        dataset_id,
+        name="clone-source",
+    )
+    with session_factory() as session:
+        pipeline = session.get(TrainingPipeline, source.json()["id"])
+        assert pipeline is not None
+        pipeline.is_public = True
+        pipeline.public_scope = {"groups": ["quality"]}
+        job = TrainingJob(
+            pipeline_id=pipeline.id,
+            status="succeeded",
+            params={},
+            metrics={},
+            resolved_snapshot={},
+            organization_id=pipeline.organization_id,
+            owner_user_id=pipeline.owner_user_id,
+            visibility="private",
+        )
+        session.add(job)
+        session.flush()
+        pipeline.framework_locked_at = datetime.now(UTC)
+        pipeline.first_submitted_job_id = job.id
+        session.add(pipeline)
+        session.commit()
+
+    cloned = client.post(
+        f"/pipelines/{source.json()['id']}/clone",
+        json={"name": "clone-copy"},
+    )
+
+    assert cloned.status_code == 201, cloned.text
+    body = cloned.json()
+    assert body["cloned_from_pipeline_id"] == source.json()["id"]
+    assert body["framework_locked_at"] is None
+    assert body["first_submitted_job_id"] is None
+    assert body["status"] == "draft"
+    assert body["dataset_id"] == dataset_id
+    assert body["base_model_id"] == base_model_id
+    assert body["params_template"] == source.json()["params_template"]
+    assert body["default_environment"] == source.json()["default_environment"]
+    assert body["is_public"] is True
+    assert body["public_scope"] == {"groups": ["quality"]}
+    with session_factory() as session:
+        assert (
+            session.scalars(
+                select(TrainingJob).where(TrainingJob.pipeline_id == body["id"])
+            ).all()
+            == []
+        )
+        assert (
+            session.scalars(
+                select(TrainedModel).where(TrainedModel.pipeline_id == body["id"])
+            ).all()
+            == []
+        )
+
+
+def test_clone_pipeline_revalidates_framework_override_and_name_collision(
+    client: TestClient,
+) -> None:
+    source = client.post(
+        "/pipelines",
+        json={
+            "name": "clone-override-source",
+            "engine": "yolo26",
+            "task": "detect",
+            "scale": "n",
+        },
+    )
+    overridden = client.post(
+        f"/pipelines/{source.json()['id']}/clone",
+        json={
+            "name": "clone-override-target",
+            "engine": "paddlex",
+            "task": "detect",
+            "scale": "l",
+            "task_kind": "object_detection",
+            "framework": "paddlex",
+            "adapter_key": "paddlex.object_detection.v1",
+            "adapter_version": "1.0.0",
+            "model_family": "RT-DETR",
+            "recipe": {"model": "RT-DETR-L"},
+            "base_model_id": None,
+        },
+    )
+    collision = client.post(
+        f"/pipelines/{source.json()['id']}/clone",
+        json={"name": "clone-override-target"},
+    )
+
+    assert overridden.status_code == 201, overridden.text
+    assert overridden.json()["framework"] == "paddlex"
+    assert overridden.json()["model_family"] == "RT-DETR"
+    assert overridden.json()["recipe"]["model"]["runtime_id"] == "RT-DETR-L"
+    assert collision.status_code == 409
+    assert collision.json()["detail"] == "Pipeline name already exists"
+
+
+def test_create_and_update_llamafactory_pipeline_without_yolo_base_model(
+    client: TestClient, session_factory
+):
     created = client.post(
         "/pipelines",
         json={
@@ -486,7 +940,9 @@ def test_create_and_update_llamafactory_pipeline_without_yolo_base_model(client:
     assert body["params_template"]["model_id"] == "Qwen/Qwen3-0.6B"
 
 
-def test_llamafactory_pipeline_rejects_managed_fields_and_non_llm_dataset(client: TestClient, session_factory):
+def test_llamafactory_pipeline_rejects_managed_fields_and_non_llm_dataset(
+    client: TestClient, session_factory
+):
     with session_factory() as session:
         dataset = Dataset(
             name="image-dataset",
@@ -525,7 +981,9 @@ def test_llamafactory_pipeline_rejects_managed_fields_and_non_llm_dataset(client
     assert wrong_dataset.json()["detail"] == "dataset task must be llm"
 
 
-def test_create_pipeline_with_uploaded_base_model_persists_draft(client: TestClient, session_factory):
+def test_create_pipeline_with_uploaded_base_model_persists_draft(
+    client: TestClient, session_factory
+):
     with session_factory() as session:
         model = BaseModel(
             family="custom-model",
@@ -544,7 +1002,12 @@ def test_create_pipeline_with_uploaded_base_model_persists_draft(client: TestCli
 
     response = client.post(
         "/pipelines",
-        json={"name": "local-model-draft", "task": "detect", "scale": "n", "base_model_id": model_id},
+        json={
+            "name": "local-model-draft",
+            "task": "detect",
+            "scale": "n",
+            "base_model_id": model_id,
+        },
     )
 
     assert response.status_code == 201
@@ -552,7 +1015,9 @@ def test_create_pipeline_with_uploaded_base_model_persists_draft(client: TestCli
     assert response.json()["base_model_id"] == model_id
 
 
-def test_update_and_delete_pipeline_visibility_settings(client: TestClient, session_factory):
+def test_update_and_delete_pipeline_visibility_settings(
+    client: TestClient, session_factory
+):
     base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
     created = create_pipeline(client, base_model_id, dataset_id)
     pipeline_id = created.json()["id"]
@@ -573,13 +1038,20 @@ def test_update_and_delete_pipeline_visibility_settings(client: TestClient, sess
     assert updated.json()["name"] == "renamed-detect"
     assert updated.json()["is_public"] is True
     assert updated.json()["is_favorite"] is True
-    assert updated.json()["public_scope"] == {"departments": ["管理员部门"], "groups": ["1组"]}
+    assert updated.json()["public_scope"] == {
+        "departments": ["管理员部门"],
+        "groups": ["1组"],
+    }
     assert deleted.status_code == 204
     assert missing.status_code == 404
 
 
-def test_update_pipeline_revalidates_and_syncs_base_model_task_scale(client: TestClient, session_factory):
-    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory, scale="l")
+def test_update_pipeline_revalidates_and_syncs_base_model_task_scale(
+    client: TestClient, session_factory
+):
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(
+        session_factory, scale="l"
+    )
     created = create_pipeline(client, base_model_id, dataset_id, scale="l")
     pipeline_id = created.json()["id"]
     with session_factory() as session:
@@ -596,7 +1068,9 @@ def test_update_pipeline_revalidates_and_syncs_base_model_task_scale(client: Tes
         session.commit()
         next_base_model_id = base_model.id
 
-    updated = client.patch(f"/pipelines/{pipeline_id}", json={"base_model_id": next_base_model_id})
+    updated = client.patch(
+        f"/pipelines/{pipeline_id}", json={"base_model_id": next_base_model_id}
+    )
 
     assert updated.status_code == 200
     body = updated.json()
@@ -605,7 +1079,9 @@ def test_update_pipeline_revalidates_and_syncs_base_model_task_scale(client: Tes
     assert body["scale"] == "n"
 
 
-def test_create_pipeline_accepts_ultralytics_yolo26_training_params(client: TestClient, session_factory):
+def test_create_pipeline_accepts_ultralytics_yolo26_training_params(
+    client: TestClient, session_factory
+):
     base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
 
     response = create_pipeline(
@@ -653,7 +1129,9 @@ def test_create_pipeline_accepts_ultralytics_yolo26_training_params(client: Test
     assert params["embed"] == [10, 12]
 
 
-def test_create_pipeline_maps_legacy_warmup_steps_to_ultralytics_warmup_epochs(client: TestClient, session_factory):
+def test_create_pipeline_maps_legacy_warmup_steps_to_ultralytics_warmup_epochs(
+    client: TestClient, session_factory
+):
     base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
 
     response = create_pipeline(
@@ -691,7 +1169,9 @@ def test_create_pipeline_rejects_invalid_prechecks_and_params(
     payload_overrides,
     expected_status: int,
 ):
-    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory, **seed_kwargs)
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(
+        session_factory, **seed_kwargs
+    )
 
     response = create_pipeline(client, base_model_id, dataset_id, **payload_overrides)
 
@@ -734,7 +1214,9 @@ def test_create_training_job_creates_task_and_enqueues_command(
         "environment": body["environment"],
     }
 
-    list_response = client.get(f"/training-jobs?pipeline_id={pipeline_id}&status=queued")
+    list_response = client.get(
+        f"/training-jobs?pipeline_id={pipeline_id}&status=queued"
+    )
     detail_response = client.get(f"/training-jobs/{body['id']}")
     assert list_response.json()["total"] == 1
     assert detail_response.json()["task_id"] == body["task_id"]
@@ -793,7 +1275,10 @@ def test_create_distributed_training_job_persists_plan_and_enqueues_id_only_edge
     assert run.node_ids == sorted(node_ids)
     assert run.world_size == 2
     assert run.master_port == 29600
-    assert run.training_image_digest == f"registry.example/visiox/training@sha256:{'a' * 64}"
+    assert (
+        run.training_image_digest
+        == f"registry.example/visiox/training@sha256:{'a' * 64}"
+    )
     assert [rank["node_rank"] for rank in run.ranks] == [0, 1]
     assert execution.node_id == run.node_ids[0]
     assert execution.operation == "train"
@@ -899,7 +1384,10 @@ def test_create_llm_training_job_uses_platform_image_and_model_reference(
         "model_id": "Qwen/Qwen3-0.6B",
         "revision": "d" * 40,
     }
-    assert run.training_image_digest == f"registry.example/visiox/llm-training@sha256:{'b' * 64}"
+    assert (
+        run.training_image_digest
+        == f"registry.example/visiox/llm-training@sha256:{'b' * 64}"
+    )
 
 
 def test_delete_pipeline_removes_distributed_training_dependencies(
@@ -928,7 +1416,9 @@ def test_delete_pipeline_removes_distributed_training_dependencies(
         assert session.get(TrainingPipeline, pipeline_id) is None
         assert session.get(TrainingJob, created["id"]) is None
         assert session.get(Task, created["task_id"]) is None
-        assert session.get(DistributedTrainingRun, created["distributed_run_id"]) is None
+        assert (
+            session.get(DistributedTrainingRun, created["distributed_run_id"]) is None
+        )
     assert session.get(RemoteExecution, created["remote_execution_id"]) is None
 
 
@@ -974,14 +1464,18 @@ def test_delete_training_record_preserves_trained_model_and_removes_task_depende
     with session_factory() as session:
         assert session.get(TrainingJob, created["id"]) is None
         assert session.get(Task, created["task_id"]) is None
-        assert session.get(DistributedTrainingRun, created["distributed_run_id"]) is None
+        assert (
+            session.get(DistributedTrainingRun, created["distributed_run_id"]) is None
+        )
         assert session.get(RemoteExecution, created["remote_execution_id"]) is None
         preserved = session.get(TrainedModel, model_id)
         assert preserved is not None
         assert preserved.training_job_id is None
 
 
-def test_delete_training_record_rejects_active_job(client: TestClient, session_factory) -> None:
+def test_delete_training_record_rejects_active_job(
+    client: TestClient, session_factory
+) -> None:
     base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
     pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
     created = client.post(f"/pipelines/{pipeline_id}/jobs", json={}).json()
@@ -1174,7 +1668,9 @@ def test_resume_distributed_training_rejects_pool_change(
     base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
     pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
     pool_id, node_ids = seed_distributed_pool(session_factory, name="original-pool")
-    other_pool_id, other_node_ids = seed_distributed_pool(session_factory, name="other-pool")
+    other_pool_id, other_node_ids = seed_distributed_pool(
+        session_factory, name="other-pool"
+    )
     created = client.post(
         f"/pipelines/{pipeline_id}/jobs",
         json={
@@ -1230,7 +1726,9 @@ def test_cancel_training_task_marks_job_and_pipeline_canceled(
     assert saved_task.error_code == "TRAINING_CANCELED"
 
 
-def test_create_training_job_revalidates_pipeline_resources(client: TestClient, session_factory):
+def test_create_training_job_revalidates_pipeline_resources(
+    client: TestClient, session_factory
+):
     base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
     pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
     with session_factory() as session:
@@ -1247,7 +1745,9 @@ def test_create_training_job_revalidates_pipeline_resources(client: TestClient, 
     assert jobs == []
 
 
-def test_create_training_job_marks_job_and_task_failed_when_enqueue_fails(session_factory):
+def test_create_training_job_marks_job_and_task_failed_when_enqueue_fails(
+    session_factory,
+):
     app = create_app()
     app.dependency_overrides[get_current_user] = lambda: LEGACY_TEST_ACTOR
 
@@ -1257,9 +1757,13 @@ def test_create_training_job_marks_job_and_task_failed_when_enqueue_fails(sessio
 
     app.dependency_overrides[get_pipeline_session] = override_session
     app.dependency_overrides[get_training_job_session] = override_session
-    app.dependency_overrides[get_training_stream_producer] = lambda: FailingStreamProducer()
+    app.dependency_overrides[get_training_stream_producer] = lambda: (
+        FailingStreamProducer()
+    )
     with TestClient(app) as client:
-        base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+        base_model_id, dataset_id, _sample_id = seed_training_ready_rows(
+            session_factory
+        )
         pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
         response = client.post(f"/pipelines/{pipeline_id}/jobs", json={})
 
@@ -1278,8 +1782,12 @@ def test_create_training_job_marks_job_and_task_failed_when_enqueue_fails(sessio
     assert task.error_code == "ENQUEUE_FAILED"
 
 
-def _create_job_for_worker(session_factory, tmp_path, storage: InMemoryObjectStorageClient) -> tuple[str, str]:
-    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory, storage, tmp_path)
+def _create_job_for_worker(
+    session_factory, tmp_path, storage: InMemoryObjectStorageClient
+) -> tuple[str, str]:
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(
+        session_factory, storage, tmp_path
+    )
     with session_factory() as session:
         pipeline = TrainingPipeline(
             name="worker-pipeline",
@@ -1328,13 +1836,17 @@ def _create_job_for_worker(session_factory, tmp_path, storage: InMemoryObjectSto
         return task.id, job.id
 
 
-def test_worker_runs_training_exports_dataset_and_registers_model(session_factory, tmp_path):
+def test_worker_runs_training_exports_dataset_and_registers_model(
+    session_factory, tmp_path
+):
     storage = InMemoryObjectStorageClient()
     task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
     runner = FakeRunner()
 
     with session_factory() as session:
-        result = run_training_job(session, storage, runner, task_id, job_id, tmp_path / "work")
+        result = run_training_job(
+            session, storage, runner, task_id, job_id, tmp_path / "work"
+        )
 
     assert result.training_job_id == job_id
     assert result.trained_model_id
@@ -1345,16 +1857,23 @@ def test_worker_runs_training_exports_dataset_and_registers_model(session_factor
     assert "classes=[0,1]" in runner.commands[0]
     assert "device=cpu" in runner.commands[0]
     assert not isinstance(runner.commands[0], str)
-    data_arg = next(argument for argument in runner.commands[0] if argument.startswith("data="))
+    data_arg = next(
+        argument for argument in runner.commands[0] if argument.startswith("data=")
+    )
     data_yaml_path = Path(data_arg.split("=", 1)[1])
-    assert f"path: {data_yaml_path.parent.resolve().as_posix()}" in data_yaml_path.read_text(encoding="utf-8")
+    assert (
+        f"path: {data_yaml_path.parent.resolve().as_posix()}"
+        in data_yaml_path.read_text(encoding="utf-8")
+    )
 
     with session_factory() as session:
         job = session.get(TrainingJob, job_id)
         task = session.get(Task, task_id)
         trained_model = session.get(TrainedModel, result.trained_model_id)
         pipeline = session.get(TrainingPipeline, job.pipeline_id)
-        trained_models = session.scalars(select(TrainedModel).where(TrainedModel.pipeline_id == pipeline.id)).all()
+        trained_models = session.scalars(
+            select(TrainedModel).where(TrainedModel.pipeline_id == pipeline.id)
+        ).all()
         log_stream = session.scalar(
             select(LogStream).where(
                 LogStream.resource_type == "training_job",
@@ -1378,9 +1897,7 @@ def test_worker_runs_training_exports_dataset_and_registers_model(session_factor
     assert task.status == TaskStatus.SUCCESS.value
     assert task.progress == 100
     assert {model.name for model in trained_models} == {"best.pt", "last.pt"}
-    assert {
-        model.name: model.metrics["checksum"] for model in trained_models
-    } == {
+    assert {model.name: model.metrics["checksum"] for model in trained_models} == {
         "best.pt": sha256(b"best model").hexdigest(),
         "last.pt": sha256(b"last model").hexdigest(),
     }
@@ -1399,10 +1916,14 @@ def test_training_job_artifacts_can_be_listed_and_downloaded(session_factory, tm
     best_path.write_bytes(b"best model")
     result_path.write_bytes(b"training chart")
     best_uri = storage.put_file("models", "trained/model-1/best.pt", best_path)
-    result_uri = storage.put_file("training", "jobs/job-1/visualizations/results.png", result_path)
+    result_uri = storage.put_file(
+        "training", "jobs/job-1/visualizations/results.png", result_path
+    )
 
     with session_factory() as session:
-        pipeline = TrainingPipeline(name="artifact-pipeline", task="detect", scale="n", status="success")
+        pipeline = TrainingPipeline(
+            name="artifact-pipeline", task="detect", scale="n", status="success"
+        )
         session.add(pipeline)
         session.flush()
         job = TrainingJob(
@@ -1452,17 +1973,23 @@ def test_training_job_artifacts_can_be_listed_and_downloaded(session_factory, tm
     assert download.headers["content-disposition"].endswith('filename="best.pt"')
 
 
-def test_training_job_artifacts_use_stored_filename_for_legacy_model_rows(session_factory, tmp_path):
+def test_training_job_artifacts_use_stored_filename_for_legacy_model_rows(
+    session_factory, tmp_path
+):
     storage = InMemoryObjectStorageClient()
     weight_path = tmp_path / "best.pt"
     weight_path.write_bytes(b"legacy best model")
     weight_uri = storage.put_file("models", "trained/model-legacy/best.pt", weight_path)
 
     with session_factory() as session:
-        pipeline = TrainingPipeline(name="legacy-artifact-pipeline", task="detect", scale="n", status="success")
+        pipeline = TrainingPipeline(
+            name="legacy-artifact-pipeline", task="detect", scale="n", status="success"
+        )
         session.add(pipeline)
         session.flush()
-        job = TrainingJob(id="job-legacy", pipeline_id=pipeline.id, status="success", metrics={})
+        job = TrainingJob(
+            id="job-legacy", pipeline_id=pipeline.id, status="success", metrics={}
+        )
         session.add(job)
         session.flush()
         model = TrainedModel(
@@ -1522,16 +2049,26 @@ run = Path(project) / name
     )
 
     assert result.exit_code == 0
-    assert result.artifact_path == tmp_path / "runs" / "job-test" / "weights" / "best.pt"
+    assert (
+        result.artifact_path == tmp_path / "runs" / "job-test" / "weights" / "best.pt"
+    )
     assert result.weight_paths == {
         "best.pt": tmp_path / "runs" / "job-test" / "weights" / "best.pt",
         "last.pt": tmp_path / "runs" / "job-test" / "weights" / "last.pt",
     }
-    assert result.metrics == {"epoch": 1, "metrics/mAP50(B)": 0.91, "metrics/precision(B)": 0.88}
-    assert result.visualization_paths == {"results.png": tmp_path / "runs" / "job-test" / "results.png"}
+    assert result.metrics == {
+        "epoch": 1,
+        "metrics/mAP50(B)": 0.91,
+        "metrics/precision(B)": 0.88,
+    }
+    assert result.visualization_paths == {
+        "results.png": tmp_path / "runs" / "job-test" / "results.png"
+    }
 
 
-def test_worker_falls_back_to_cpu_when_cuda_device_requested_without_cuda(session_factory, tmp_path, monkeypatch):
+def test_worker_falls_back_to_cpu_when_cuda_device_requested_without_cuda(
+    session_factory, tmp_path, monkeypatch
+):
     storage = InMemoryObjectStorageClient()
     task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
     monkeypatch.setattr(training_worker_main, "_cuda_is_available", lambda: False)
@@ -1541,7 +2078,11 @@ def test_worker_falls_back_to_cpu_when_cuda_device_requested_without_cuda(sessio
         job = session.get(TrainingJob, job_id)
         task = session.get(Task, task_id)
         job.params = {**job.params, "device": "0"}
-        task.payload = {**task.payload, "params": job.params, "environment": {"device": "0"}}
+        task.payload = {
+            **task.payload,
+            "params": job.params,
+            "environment": {"device": "0"},
+        }
         session.add_all([job, task])
         session.commit()
 
@@ -1558,7 +2099,9 @@ def test_worker_marks_task_and_job_failed_when_runner_fails(session_factory, tmp
 
     with session_factory() as session:
         with pytest.raises(RuntimeError, match="cuda out of memory"):
-            run_training_job(session, storage, FailingRunner(), task_id, job_id, tmp_path / "work")
+            run_training_job(
+                session, storage, FailingRunner(), task_id, job_id, tmp_path / "work"
+            )
 
     with session_factory() as session:
         job = session.get(TrainingJob, job_id)
@@ -1574,16 +2117,28 @@ def test_worker_marks_task_and_job_failed_when_runner_fails(session_factory, tmp
     assert "cuda out of memory" in task.error_message
     assert task.retryable is True
     assert trained_models == []
-    assert not any(bucket == "models" and object_name.startswith("trained/") for bucket, object_name in storage.objects)
+    assert not any(
+        bucket == "models" and object_name.startswith("trained/")
+        for bucket, object_name in storage.objects
+    )
 
 
-def test_worker_marks_pipeline_canceled_when_training_is_canceled(session_factory, tmp_path):
+def test_worker_marks_pipeline_canceled_when_training_is_canceled(
+    session_factory, tmp_path
+):
     storage = InMemoryObjectStorageClient()
     task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
 
     with session_factory() as session:
         with pytest.raises(RuntimeError, match="training canceled"):
-            run_training_job(session, storage, CancelingRunner(session_factory, task_id), task_id, job_id, tmp_path / "work")
+            run_training_job(
+                session,
+                storage,
+                CancelingRunner(session_factory, task_id),
+                task_id,
+                job_id,
+                tmp_path / "work",
+            )
 
     with session_factory() as session:
         job = session.get(TrainingJob, job_id)
@@ -1597,12 +2152,16 @@ def test_worker_marks_pipeline_canceled_when_training_is_canceled(session_factor
     assert task.retryable is False
 
 
-def test_run_pending_training_tasks_keeps_worker_alive_when_task_fails(session_factory, tmp_path):
+def test_run_pending_training_tasks_keeps_worker_alive_when_task_fails(
+    session_factory, tmp_path
+):
     storage = InMemoryObjectStorageClient()
     task_id, _job_id = _create_job_for_worker(session_factory, tmp_path, storage)
 
     with session_factory() as session:
-        processed = run_pending_training_tasks(session, storage, FailingRunner(), tmp_path / "work")
+        processed = run_pending_training_tasks(
+            session, storage, FailingRunner(), tmp_path / "work"
+        )
 
     assert [task.id for task in processed] == [task_id]
     assert processed[0].status == TaskStatus.FAILED.value
@@ -1621,7 +2180,9 @@ def test_worker_rejects_payload_mismatch_and_marks_failed(session_factory, tmp_p
 
     with session_factory() as session:
         with pytest.raises(RuntimeError, match="dataset_id"):
-            run_training_job(session, storage, runner, task_id, job_id, tmp_path / "work")
+            run_training_job(
+                session, storage, runner, task_id, job_id, tmp_path / "work"
+            )
 
     with session_factory() as session:
         job = session.get(TrainingJob, job_id)
@@ -1645,7 +2206,9 @@ def test_worker_does_not_run_when_task_is_already_claimed(session_factory, tmp_p
 
     with session_factory() as session:
         with pytest.raises(RuntimeError, match="already claimed"):
-            run_training_job(session, storage, runner, task_id, job_id, tmp_path / "work")
+            run_training_job(
+                session, storage, runner, task_id, job_id, tmp_path / "work"
+            )
 
     assert runner.commands == []
 
@@ -1671,7 +2234,11 @@ def test_worker_uses_safe_base_model_download_filename(session_factory, tmp_path
         )
         session.add(pipeline)
         session.flush()
-        job = TrainingJob(pipeline_id=pipeline.id, status="queued", params={"epochs": 2, "batch": 4, "imgsz": 640})
+        job = TrainingJob(
+            pipeline_id=pipeline.id,
+            status="queued",
+            params={"epochs": 2, "batch": 4, "imgsz": 640},
+        )
         task = Task(
             task_type=TaskType.TRAIN_MODEL.value,
             status=TaskStatus.QUEUED.value,
@@ -1695,16 +2262,22 @@ def test_worker_uses_safe_base_model_download_filename(session_factory, tmp_path
         job_id = job.id
 
     with session_factory() as session:
-        run_training_job(session, storage, FakeRunner(), task_id, job_id, tmp_path / "work")
+        run_training_job(
+            session, storage, FakeRunner(), task_id, job_id, tmp_path / "work"
+        )
 
     assert (tmp_path / "work" / "base-model" / "base.pt").exists()
     assert not (tmp_path / "work" / "escape.pt").exists()
 
 
-def test_worker_replaces_placeholder_base_model_with_real_ultralytics_asset(session_factory, tmp_path, monkeypatch):
+def test_worker_replaces_placeholder_base_model_with_real_ultralytics_asset(
+    session_factory, tmp_path, monkeypatch
+):
     storage = InMemoryObjectStorageClient()
     task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
-    storage.objects[("models", "base/detect-n.pt")] = b"visiox prepared yolo26 base model placeholder: yolo26-detect-n\n"
+    storage.objects[("models", "base/detect-n.pt")] = (
+        b"visiox prepared yolo26 base model placeholder: yolo26-detect-n\n"
+    )
     downloaded = tmp_path / "downloaded.pt"
     downloaded.write_bytes(b"real ultralytics weights")
 
@@ -1713,25 +2286,36 @@ def test_worker_replaces_placeholder_base_model_with_real_ultralytics_asset(sess
         assert target_dir.name == "base-model"
         return downloaded
 
-    monkeypatch.setattr(training_worker_main, "_download_base_model_asset", fake_download)
+    monkeypatch.setattr(
+        training_worker_main, "_download_base_model_asset", fake_download
+    )
     runner = InspectingRunner()
 
     with session_factory() as session:
         run_training_job(session, storage, runner, task_id, job_id, tmp_path / "work")
 
     assert runner.base_model_bytes == b"real ultralytics weights"
-    assert storage.objects[("models", "base/detect-n.pt")] == b"real ultralytics weights"
+    assert (
+        storage.objects[("models", "base/detect-n.pt")] == b"real ultralytics weights"
+    )
 
 
-def test_worker_cleans_uploaded_artifacts_when_later_persist_fails(session_factory, tmp_path):
+def test_worker_cleans_uploaded_artifacts_when_later_persist_fails(
+    session_factory, tmp_path
+):
     storage = FailingLogStorage()
     task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
 
     with session_factory() as session:
         with pytest.raises(RuntimeError, match="log upload failed"):
-            run_training_job(session, storage, FakeRunner(), task_id, job_id, tmp_path / "work")
+            run_training_job(
+                session, storage, FakeRunner(), task_id, job_id, tmp_path / "work"
+            )
 
-    assert not any(bucket == "models" and object_name.startswith("trained/") for bucket, object_name in storage.objects)
+    assert not any(
+        bucket == "models" and object_name.startswith("trained/")
+        for bucket, object_name in storage.objects
+    )
     with session_factory() as session:
         job = session.get(TrainingJob, job_id)
         task = session.get(Task, task_id)
@@ -1748,9 +2332,13 @@ def test_worker_is_idempotent_for_successful_training_job(session_factory, tmp_p
     runner = FakeRunner()
 
     with session_factory() as session:
-        first = run_training_job(session, storage, runner, task_id, job_id, tmp_path / "work")
+        first = run_training_job(
+            session, storage, runner, task_id, job_id, tmp_path / "work"
+        )
     with session_factory() as session:
-        second = run_training_job(session, storage, runner, task_id, job_id, tmp_path / "work-again")
+        second = run_training_job(
+            session, storage, runner, task_id, job_id, tmp_path / "work-again"
+        )
 
     assert second.trained_model_id == first.trained_model_id
     assert len(runner.commands) == 1
