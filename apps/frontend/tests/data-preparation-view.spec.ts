@@ -88,12 +88,17 @@ function mountView() {
 
 describe("DataPreparationView", () => {
   it("uses the raised shared surface for import cards", () => {
-    expect(() => topLevelRuleBody(`
-      <style>
-      @media (max-width: 720px) { .import-card { background: var(--visiox-card-surface-raised); } }
-      @container data-view (max-width: 900px) { .import-card { background: var(--visiox-card-surface-raised); } }
-      </style>
-    `, ".import-card", "background")).toThrow(/expected one top-level \.import-card rule/);
+    for (const nestedImportRule of [
+      `<style>@media (max-width: 720px) {
+      .import-card { background: var(--visiox-card-surface-raised); }
+      }</style>`,
+      `<style>@container data-view (max-width: 900px) {
+      .import-card { background: var(--visiox-card-surface-raised); }
+      }</style>`,
+    ]) {
+      expect(() => topLevelRuleBody(nestedImportRule, ".import-card", "background"))
+        .toThrow(/expected one top-level \.import-card rule/);
+    }
 
     const importCardRule = topLevelRuleBody(dataPreparationViewSource, ".import-card", "background");
     expect(importCardRule).toMatch(/background:\s*var\(--visiox-card-surface-raised\)\s*;/);

@@ -76,12 +76,17 @@ function mountView() {
 
 describe("ServicesView", () => {
   it("uses the standard shared service card surface", () => {
-    expect(() => topLevelRuleBody(`
-      <style>
-      @media (max-width: 720px) { .service-card { background: var(--visiox-card-surface); } }
-      @container services (max-width: 900px) { .service-card { background: var(--visiox-card-surface); } }
-      </style>
-    `, ".service-card", "background")).toThrow(/expected one top-level \.service-card rule/);
+    for (const nestedServiceRule of [
+      `<style>@media (max-width: 720px) {
+      .service-card { background: var(--visiox-card-surface); }
+      }</style>`,
+      `<style>@container services (max-width: 900px) {
+      .service-card { background: var(--visiox-card-surface); }
+      }</style>`,
+    ]) {
+      expect(() => topLevelRuleBody(nestedServiceRule, ".service-card", "background"))
+        .toThrow(/expected one top-level \.service-card rule/);
+    }
 
     const cardRule = topLevelRuleBody(servicesViewSource, ".service-card", "background");
     expect(cardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);

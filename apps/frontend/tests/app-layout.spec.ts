@@ -88,10 +88,16 @@ describe("global application header", () => {
   });
 
   it("defines the shared business card surface tokens on the root", () => {
-    expect(() => topLevelRuleBody(`
-      @media (max-width: 720px) { :root { --visiox-card-surface: #f3f4f6; } }
-      @container shell (max-width: 900px) { :root { --visiox-card-surface: #f3f4f6; } }
-    `, ":root")).toThrow(/expected one top-level :root rule/);
+    for (const nestedRootRule of [
+      `@media (max-width: 720px) {
+      :root { --visiox-card-surface: #f3f4f6; }
+      }`,
+      `@container shell (max-width: 900px) {
+      :root { --visiox-card-surface: #f3f4f6; }
+      }`,
+    ]) {
+      expect(() => topLevelRuleBody(nestedRootRule, ":root")).toThrow(/expected one top-level :root rule/);
+    }
 
     const rootRule = topLevelRuleBody(stylesSource, ":root");
     expect(rootRule).toMatch(/--visiox-card-surface:\s*#f3f4f6\s*;/);

@@ -40,12 +40,17 @@ const asset = {
 
 describe("DataAssetCard", () => {
   it("uses the standard shared card surface", () => {
-    expect(() => topLevelRuleBody(`
-      <style>
-      @media (max-width: 720px) { .data-asset-card { background: var(--visiox-card-surface); } }
-      @container data-card (max-width: 900px) { .data-asset-card { background: var(--visiox-card-surface); } }
-      </style>
-    `, ".data-asset-card", "background")).toThrow(/expected one top-level \.data-asset-card rule/);
+    for (const nestedCardRule of [
+      `<style>@media (max-width: 720px) {
+      .data-asset-card { background: var(--visiox-card-surface); }
+      }</style>`,
+      `<style>@container data-card (max-width: 900px) {
+      .data-asset-card { background: var(--visiox-card-surface); }
+      }</style>`,
+    ]) {
+      expect(() => topLevelRuleBody(nestedCardRule, ".data-asset-card", "background"))
+        .toThrow(/expected one top-level \.data-asset-card rule/);
+    }
 
     const cardRule = topLevelRuleBody(dataAssetCardSource, ".data-asset-card", "background");
     expect(cardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);

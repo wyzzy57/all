@@ -142,12 +142,17 @@ function mockDeployablePipeline() {
 
 describe("ModelSpaceView", () => {
   it("uses the standard shared pipeline card surface", () => {
-    expect(() => topLevelRuleBody(`
-      <style>
-      @media (max-width: 720px) { .pipeline-card { background: var(--visiox-card-surface); } }
-      @container model-space (max-width: 900px) { .pipeline-card { background: var(--visiox-card-surface); } }
-      </style>
-    `, ".pipeline-card", "background")).toThrow(/expected one top-level \.pipeline-card rule/);
+    for (const nestedPipelineRule of [
+      `<style>@media (max-width: 720px) {
+      .pipeline-card { background: var(--visiox-card-surface); }
+      }</style>`,
+      `<style>@container model-space (max-width: 900px) {
+      .pipeline-card { background: var(--visiox-card-surface); }
+      }</style>`,
+    ]) {
+      expect(() => topLevelRuleBody(nestedPipelineRule, ".pipeline-card", "background"))
+        .toThrow(/expected one top-level \.pipeline-card rule/);
+    }
 
     const cardRule = topLevelRuleBody(modelSpaceViewSource, ".pipeline-card", "background");
     expect(cardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);
