@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import DataAssetCard from "@/components/data/DataAssetCard.vue";
 import dataAssetCardSource from "@/components/data/DataAssetCard.vue?raw";
-import { topLevelRuleDeclarations } from "./helpers/css-rules";
+import { hasForbiddenHoverElevation, topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const asset = {
   id: "dataset-1",
@@ -29,8 +29,7 @@ describe("DataAssetCard", () => {
 
   it("does not lift the shared card on hover", () => {
     const hoverRule = topLevelRuleDeclarations(dataAssetCardSource, ".data-asset-card:hover", "sfc");
-    expect((hoverRule?.get("transform") ?? []).some((value) => /\btranslate(?:Y)?\s*\(/i.test(value))).toBe(false);
-    expect((hoverRule?.get("box-shadow") ?? []).every((value) => value === "none")).toBe(true);
+    expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
   });
 
   it("renders preparation metadata in stable rows and emits workflow actions", async () => {

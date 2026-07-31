@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import ModelSpaceView from "@/views/model-space/ModelSpaceView.vue";
 import modelSpaceViewSource from "@/views/model-space/ModelSpaceView.vue?raw";
-import { topLevelRuleDeclarations } from "./helpers/css-rules";
+import { hasForbiddenHoverElevation, topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const pushMock = vi.hoisted(() => vi.fn());
 const replaceMock = vi.hoisted(() => vi.fn());
@@ -131,8 +131,7 @@ describe("ModelSpaceView", () => {
 
   it("does not lift pipeline cards on hover", () => {
     const hoverRule = topLevelRuleDeclarations(modelSpaceViewSource, ".pipeline-card:hover", "sfc");
-    expect((hoverRule?.get("transform") ?? []).some((value) => /\btranslate(?:Y)?\s*\(/i.test(value))).toBe(false);
-    expect((hoverRule?.get("box-shadow") ?? []).every((value) => value === "none")).toBe(true);
+    expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
   });
 
   it("uses the real shared resource dialog instead of hard-coded public scopes", () => {

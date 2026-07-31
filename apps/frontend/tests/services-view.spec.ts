@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import ServicesView from "@/views/services/ServicesView.vue";
 import servicesViewSource from "@/views/services/ServicesView.vue?raw";
-import { topLevelRuleDeclarations } from "./helpers/css-rules";
+import { hasForbiddenHoverElevation, topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const pushMock = vi.hoisted(() => vi.fn());
 const routeState = vi.hoisted(() => ({ params: {} as Record<string, string | undefined> }));
@@ -65,8 +65,7 @@ describe("ServicesView", () => {
 
   it("does not lift service cards on hover", () => {
     const hoverRule = topLevelRuleDeclarations(servicesViewSource, ".service-card:hover", "sfc");
-    expect((hoverRule?.get("transform") ?? []).some((value) => /\btranslate(?:Y)?\s*\(/i.test(value))).toBe(false);
-    expect((hoverRule?.get("box-shadow") ?? []).every((value) => value === "none")).toBe(true);
+    expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
   });
 
   it("uses the shared resource dialog for service access", () => {

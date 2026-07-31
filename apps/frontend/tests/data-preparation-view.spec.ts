@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import DataPreparationView from "@/views/data-preparation/DataPreparationView.vue";
 import dataPreparationViewSource from "@/views/data-preparation/DataPreparationView.vue?raw";
-import { topLevelRuleDeclarations } from "./helpers/css-rules";
+import { hasForbiddenHoverElevation, topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const apiMock = vi.hoisted(() => ({
   createLabelProject: vi.fn(),
@@ -84,8 +84,7 @@ describe("DataPreparationView", () => {
 
   it("does not lift dataset cards on hover", () => {
     const hoverRule = topLevelRuleDeclarations(dataPreparationViewSource, ".dataset-card:hover", "sfc");
-    expect((hoverRule?.get("transform") ?? []).some((value) => /\btranslate(?:Y)?\s*\(/i.test(value))).toBe(false);
-    expect((hoverRule?.get("box-shadow") ?? []).every((value) => value === "none")).toBe(true);
+    expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
   });
 
   it("uses the shared resource dialog for dataset visibility", () => {
