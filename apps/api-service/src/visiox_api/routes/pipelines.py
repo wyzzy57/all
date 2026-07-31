@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict
 from pydantic import Field
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -26,6 +26,7 @@ from visiox_api.services.pipeline_configuration import (
     PipelineConfigurationError,
     PipelineConfigurationService,
 )
+from visiox_api.services.pipeline_locking import get_pipeline_for_update
 from visiox_db.models import (
     DeploymentService,
     DistributedTrainingRun,
@@ -358,7 +359,7 @@ def update_pipeline(
         require_resource_permission(
             session, actor, "dataset", request.dataset_id, PERMISSION_USE
         )
-    pipeline = session.get(TrainingPipeline, pipeline_id)
+    pipeline = get_pipeline_for_update(session, pipeline_id)
     if pipeline is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found"
@@ -432,7 +433,7 @@ def delete_pipeline(
     session: Session = Depends(get_pipeline_session),
     actor: User = Depends(get_current_user),
 ) -> None:
-    pipeline = session.get(TrainingPipeline, pipeline_id)
+    pipeline = get_pipeline_for_update(session, pipeline_id)
     if pipeline is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found"
@@ -450,6 +451,16 @@ def delete_pipeline(
             status_code=status.HTTP_409_CONFLICT,
             detail="Delete pipeline services before deleting the pipeline",
         )
+
+    pipeline.first_submitted_job_id = None
+    session.add(pipeline)
+    session.flush()
+    session.execute(
+        update(TrainingPipeline)
+        .where(TrainingPipeline.cloned_from_pipeline_id == pipeline_id)
+        .values(cloned_from_pipeline_id=None)
+    )
+    session.flush()
 
     job_ids = list(
         session.scalars(

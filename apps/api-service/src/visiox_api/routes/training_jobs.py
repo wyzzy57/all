@@ -20,6 +20,10 @@ from visiox_api.dependencies.auth import get_current_user
 from visiox_api.dependencies.authorization import require_resource_permission
 from visiox_api.dependencies.database import get_db_session
 from visiox_api.services.authorization import authorized_resource_predicate
+from visiox_api.services.pipeline_locking import (
+    get_pipeline_for_update,
+    lock_pipeline_to_first_job,
+)
 from visiox_common.settings import Settings, get_settings
 from visiox_db.base import new_id
 from visiox_db.models import (
@@ -179,13 +183,6 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _lock_pipeline_to_first_job(pipeline: TrainingPipeline, job_id: str) -> None:
-    if pipeline.first_submitted_job_id is None:
-        pipeline.first_submitted_job_id = job_id
-    if pipeline.framework_locked_at is None:
-        pipeline.framework_locked_at = _utc_now()
-
-
 def _job_response(
     job: TrainingJob,
     environment: dict[str, Any] | None = None,
@@ -235,7 +232,7 @@ async def create_training_job(
     settings: Settings = Depends(get_settings),
     actor: User = Depends(get_current_user),
 ) -> TrainingJobResponse:
-    pipeline = session.get(TrainingPipeline, pipeline_id)
+    pipeline = get_pipeline_for_update(session, pipeline_id)
     if pipeline is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found"
@@ -330,7 +327,7 @@ async def create_training_job(
         "environment": environment,
     }
     pipeline.status = "running"
-    _lock_pipeline_to_first_job(pipeline, job.id)
+    lock_pipeline_to_first_job(pipeline, job.id)
     session.add(pipeline)
     session.commit()
     session.refresh(job)
@@ -539,7 +536,7 @@ async def _create_distributed_training_job(
     session.flush()
     session.add_all([job, pipeline])
     session.flush()
-    _lock_pipeline_to_first_job(pipeline, job_id)
+    lock_pipeline_to_first_job(pipeline, job_id)
     session.add(pipeline)
     session.flush()
     session.add(run)

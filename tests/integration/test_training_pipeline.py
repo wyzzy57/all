@@ -872,6 +872,33 @@ def test_clone_locked_pipeline_copies_configuration_without_jobs(
         )
 
 
+def test_delete_clone_source_preserves_clone_and_clears_source_reference(
+    client: TestClient,
+    session_factory,
+) -> None:
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    source = create_pipeline(
+        client,
+        base_model_id,
+        dataset_id,
+        name="clone-delete-source",
+    )
+    cloned = client.post(
+        f"/pipelines/{source.json()['id']}/clone",
+        json={"name": "clone-delete-child"},
+    )
+    assert cloned.status_code == 201, cloned.text
+
+    deleted = client.delete(f"/pipelines/{source.json()['id']}")
+
+    assert deleted.status_code == 204, deleted.text
+    with session_factory() as session:
+        assert session.get(TrainingPipeline, source.json()["id"]) is None
+        child = session.get(TrainingPipeline, cloned.json()["id"])
+        assert child is not None
+        assert child.cloned_from_pipeline_id is None
+
+
 def test_clone_pipeline_revalidates_framework_override_and_name_collision(
     client: TestClient,
 ) -> None:
