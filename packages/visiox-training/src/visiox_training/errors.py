@@ -24,3 +24,7 @@ class UnknownAdapterVersionError(FrameworkAdapterError):
 
 class UnsupportedTaskFrameworkError(FrameworkAdapterError):
     """Raised when a framework does not support a requested task type."""
+
+
+class UnsupportedAdapterOperationError(FrameworkAdapterError):
+    """Raised when a catalog operation is not wired for execution yet."""

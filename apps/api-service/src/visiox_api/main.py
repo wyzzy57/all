@@ -17,6 +17,9 @@ from visiox_api.routes.base_models import router as base_models_router
 from visiox_api.routes.dataset_samples import router as dataset_samples_router
 from visiox_api.routes.datasets import router as datasets_router
 from visiox_api.routes.edge_ssh import router as edge_ssh_router
+from visiox_api.routes.framework_capabilities import (
+    router as framework_capabilities_router,
+)
 from visiox_api.routes.label_projects import router as label_projects_router
 from visiox_api.routes.label_webhooks import router as label_webhooks_router
 from visiox_api.routes.llm import router as llm_router
@@ -153,6 +156,7 @@ def create_app() -> FastAPI:
     app.include_router(llm_datasets_router)
     app.include_router(datasets_router)
     app.include_router(edge_ssh_router)
+    app.include_router(framework_capabilities_router)
     app.include_router(dataset_samples_router)
     app.include_router(label_projects_router)
     app.include_router(label_webhooks_router)

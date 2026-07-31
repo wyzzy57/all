@@ -51,7 +51,10 @@ class Settings(BaseSettings):
     tensorboard_public_url: str = "http://127.0.0.1:6006"
     tensorboard_histogram_interval: int = 5
     training_runs_root: Path = Path("/workspace/training-runs")
+    ultralytics_training_image_digest: str = ""
+    paddlex_training_image_digest: str = ""
     llm_training_image_digest: str = ""
+    paddlex_inference_image_digest: str = ""
     observability_max_points: int = 2000
     observability_event_cache_size: int = 32
     observability_live_poll_seconds: int = 5
