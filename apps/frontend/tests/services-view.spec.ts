@@ -4,6 +4,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import ServicesView from "@/views/services/ServicesView.vue";
 import servicesViewSource from "@/views/services/ServicesView.vue?raw";
 
+function ruleBody(source: string, selector: string, declaration: string) {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rules = [...source.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
+    .filter((match) => new RegExp(`(?:^|;)\\s*${declaration}\\s*:`).test(match[1]));
+  expect(rules, `expected one exact ${selector} rule`).toHaveLength(1);
+  return rules[0]![1];
+}
+
 const pushMock = vi.hoisted(() => vi.fn());
 const routeState = vi.hoisted(() => ({ params: {} as Record<string, string | undefined> }));
 const apiMock = vi.hoisted(() => ({
@@ -55,6 +63,20 @@ function mountView() {
 }
 
 describe("ServicesView", () => {
+  it("uses the standard shared service card surface", () => {
+    const cardRule = ruleBody(servicesViewSource, ".service-card", "background");
+    expect(cardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);
+    expect(cardRule).toMatch(/border:\s*1px solid var\(--visiox-card-border\)\s*;/);
+    expect(cardRule).toMatch(/border-radius:\s*var\(--visiox-card-radius\)\s*;/);
+  });
+
+  it("does not lift service cards on hover", () => {
+    const hoverRule = ruleBody(servicesViewSource, ".service-card:hover", "box-shadow");
+    expect([...hoverRule.matchAll(/box-shadow\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
+    expect([...hoverRule.matchAll(/transform\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
+    expect(hoverRule).not.toMatch(/translateY\s*\(/);
+  });
+
   it("uses the shared resource dialog for service access", () => {
     expect(servicesViewSource).toContain("ResourceSharingDialog");
     expect(servicesViewSource).toContain("openServiceSharing(selectedService)");

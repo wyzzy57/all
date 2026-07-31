@@ -2,7 +2,15 @@ import { mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
 
 import DataAssetCard from "@/components/data/DataAssetCard.vue";
+import dataAssetCardSource from "@/components/data/DataAssetCard.vue?raw";
 
+function ruleBody(source: string, selector: string, declaration: string) {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rules = [...source.matchAll(new RegExp(`^\\s*${escapedSelector}\\s*\\{([^{}]*)\\}`, "gm"))]
+    .filter((match) => new RegExp(`(?:^|;)\\s*${declaration}\\s*:`).test(match[1]));
+  expect(rules, `expected one exact ${selector} rule`).toHaveLength(1);
+  return rules[0]![1];
+}
 
 const asset = {
   id: "dataset-1",
@@ -19,6 +27,20 @@ const asset = {
 
 
 describe("DataAssetCard", () => {
+  it("uses the standard shared card surface", () => {
+    const cardRule = ruleBody(dataAssetCardSource, ".data-asset-card", "background");
+    expect(cardRule).toMatch(/background:\s*var\(--visiox-card-surface\)\s*;/);
+    expect(cardRule).toMatch(/border:\s*1px solid var\(--visiox-card-border\)\s*;/);
+    expect(cardRule).toMatch(/border-radius:\s*var\(--visiox-card-radius\)\s*;/);
+  });
+
+  it("does not lift the shared card on hover", () => {
+    const hoverRule = ruleBody(dataAssetCardSource, ".data-asset-card:hover", "box-shadow");
+    expect([...hoverRule.matchAll(/box-shadow\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
+    expect([...hoverRule.matchAll(/transform\s*:\s*([^;{}]+)/g)].map((match) => match[1].trim())).toEqual(["none"]);
+    expect(hoverRule).not.toMatch(/translateY\s*\(/);
+  });
+
   it("renders preparation metadata in stable rows and emits workflow actions", async () => {
     const wrapper = mount(DataAssetCard, {
       props: {

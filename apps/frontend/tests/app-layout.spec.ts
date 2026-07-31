@@ -9,11 +9,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "@/App.vue";
 import appSource from "@/App.vue?raw";
 import UserAccountMenu from "@/components/account/UserAccountMenu.vue";
+import stylesRawSource from "@/styles.css?raw";
 import adminOverviewSource from "@/views/admin/AdminOverviewView.vue?raw";
 import auditLogSource from "@/views/admin/AuditLogView.vue?raw";
 import workbenchSource from "@/views/workbench/WorkbenchView.vue?raw";
 
-const stylesSource = readFileSync("src/styles.css", "utf8");
+const stylesSource = stylesRawSource || readFileSync("src/styles.css", "utf8");
 
 describe("global application header", () => {
   afterEach(() => {
@@ -69,6 +70,17 @@ describe("global application header", () => {
     expect(stylesSource).toContain(".nav-group");
     expect(stylesSource).toContain(".app-sidebar:hover .sidebar-toggle");
     expect(stylesSource).toContain(".app-sidebar:focus-within .sidebar-toggle");
+  });
+
+  it("defines the shared business card surface tokens on the root", () => {
+    const rootRules = [...stylesSource.matchAll(/^\s*:root\s*\{([^{}]*)\}/gm)];
+    expect(rootRules).toHaveLength(1);
+
+    const rootRule = rootRules[0]![1];
+    expect(rootRule).toMatch(/--visiox-card-surface:\s*#f3f4f6\s*;/);
+    expect(rootRule).toMatch(/--visiox-card-surface-raised:\s*#f6f7f8\s*;/);
+    expect(rootRule).toMatch(/--visiox-card-border:\s*#e0e2e6\s*;/);
+    expect(rootRule).toMatch(/--visiox-card-radius:\s*8px\s*;/);
   });
 
   it("visually collapses the sidebar on narrow screens and keeps an explicit account focus ring", () => {
