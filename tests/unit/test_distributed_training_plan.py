@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine
 
+from visiox_api.services.resource_scheduler import freeze_distributed_allocation
 from visiox_db.base import Base
 from visiox_db.models import (
     DistributedTrainingRun,
@@ -77,6 +78,26 @@ def test_scheduler_assigns_stable_node_and_gpu_ranks() -> None:
         ("GPU-0", "GPU-1"),
         ("GPU-0", "GPU-1"),
     ]
+
+
+def test_distributed_allocation_snapshot_is_stable_json_data() -> None:
+    plan = build_distributed_plan(
+        [_node("node-2"), _node("node-1")],
+        requested_gpus=4,
+        master_port=29600,
+    )
+
+    request, allocation = freeze_distributed_allocation(plan)
+
+    assert request == {
+        "kind": "distributed",
+        "resource_pool_id": "pool-x86",
+        "gpu_count": 4,
+    }
+    assert allocation["node_ids"] == ["node-1", "node-2"]
+    assert allocation["ranks"][0]["gpu_uuids"] == ["GPU-0", "GPU-1"]
+    assert allocation["world_size"] == 4
+    assert allocation["master_port"] == 29600
 
 
 @pytest.mark.parametrize(
@@ -609,7 +630,7 @@ def test_alpaca_dataset_info_only_maps_canonical_required_columns() -> None:
 def test_remote_rank_script_launches_llm_worker_with_persistent_model_cache() -> None:
     script = load_packaged_script("launch_rank.sh").decode("utf-8")
 
-    assert 'dst=/workspace/model-cache' in script
+    assert "dst=/workspace/model-cache" in script
     assert '"HF_HOME=/workspace/model-cache/huggingface"' in script
     assert '"MODELSCOPE_CACHE=/workspace/model-cache/modelscope"' in script
     assert '"USE_MODELSCOPE_HUB=1"' in script

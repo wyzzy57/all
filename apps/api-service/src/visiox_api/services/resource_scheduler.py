@@ -19,6 +19,7 @@ from visiox_db.models.identity import (
     PRINCIPAL_USER,
     ROLE_ADMIN,
 )
+from visiox_edge_executor_worker.distributed import DistributedPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,38 @@ class ResourceSchedulingError(Exception):
         self.constraints = constraints or {}
 
 
+def freeze_distributed_allocation(
+    plan: DistributedPlan,
+) -> tuple[dict[str, object], dict[str, object]]:
+    ranks = [
+        {
+            "node_id": rank.node_id,
+            "node_rank": rank.node_rank,
+            "lan_address": rank.lan_address,
+            "gpu_uuids": list(rank.gpu_uuids),
+        }
+        for rank in plan.nodes
+    ]
+    return (
+        {
+            "kind": "distributed",
+            "resource_pool_id": plan.resource_pool_id,
+            "gpu_count": plan.world_size,
+        },
+        {
+            "kind": "distributed",
+            "resource_pool_id": plan.resource_pool_id,
+            "node_ids": [rank.node_id for rank in plan.nodes],
+            "ranks": ranks,
+            "world_size": plan.world_size,
+            "master_addr": plan.master_addr,
+            "master_port": plan.master_port,
+            "platform_kind": plan.platform_kind,
+            "compatibility_key": plan.compatibility_key,
+        },
+    )
+
+
 def list_schedulable_nodes(
     session: Session,
     actor: User,
@@ -45,11 +78,13 @@ def list_schedulable_nodes(
 ) -> list[ComputeNode]:
     nodes = list(
         session.scalars(
-            select(ComputeNode).where(
+            select(ComputeNode)
+            .where(
                 ComputeNode.enabled.is_(True),
                 ComputeNode.status == "online",
                 ComputeNode.resource_pool_id.is_not(None),
-            ).order_by(ComputeNode.id)
+            )
+            .order_by(ComputeNode.id)
         )
     )
     result: list[ComputeNode] = []
@@ -73,20 +108,28 @@ def assert_allocation_available(
 ) -> None:
     pool = session.get(ResourcePool, resource_pool_id)
     if pool is None or not pool.enabled:
-        raise ResourceSchedulingError("NO_COMPATIBLE_NODE", {"resource_pool_id": resource_pool_id})
+        raise ResourceSchedulingError(
+            "NO_COMPATIBLE_NODE", {"resource_pool_id": resource_pool_id}
+        )
 
     if actor.role != ROLE_ADMIN:
         if not _can_use_pool(session, actor, pool.id):
             raise ResourceSchedulingError("NO_COMPATIBLE_NODE")
         policies = _active_policies(session, actor, pool.id)
         if not policies:
-            raise ResourceSchedulingError("RESOURCE_QUOTA_EXCEEDED", {"reason": "allocation_missing"})
+            raise ResourceSchedulingError(
+                "RESOURCE_QUOTA_EXCEEDED", {"reason": "allocation_missing"}
+            )
         gpu_limit = _effective_limit(policies, "max_gpu_count")
         service_limit = _effective_limit(policies, "max_service_instances")
         if gpu_limit is not None and workload.gpu_count > gpu_limit:
             raise ResourceSchedulingError(
                 "RESOURCE_QUOTA_EXCEEDED",
-                {"resource": "gpu_count", "limit": gpu_limit, "requested": workload.gpu_count},
+                {
+                    "resource": "gpu_count",
+                    "limit": gpu_limit,
+                    "requested": workload.gpu_count,
+                },
             )
         if (
             workload.workload_kind == "service"
@@ -206,14 +249,21 @@ def _effective_limit(
     policies: list[ResourceAllocationPolicy],
     field: str,
 ) -> int | None:
-    limits = [getattr(policy, field) for policy in policies if getattr(policy, field) is not None]
+    limits = [
+        getattr(policy, field)
+        for policy in policies
+        if getattr(policy, field) is not None
+    ]
     return max(limits) if limits else None
 
 
 def _node_satisfies(node: ComputeNode, workload: WorkloadRequirements) -> bool:
     if workload.architecture is not None and node.architecture != workload.architecture:
         return False
-    if workload.platform_kind is not None and node.platform_kind != workload.platform_kind:
+    if (
+        workload.platform_kind is not None
+        and node.platform_kind != workload.platform_kind
+    ):
         return False
     gpu_count = int(node.resources.get("gpu_count") or 0)
     gpu_memory = int(node.resources.get("gpu_memory_total_mib") or 0)

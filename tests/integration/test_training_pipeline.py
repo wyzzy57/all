@@ -40,6 +40,7 @@ from visiox_db.models import (
     Task,
     TrainedModel,
     TrainingJob,
+    TrainingJobAttempt,
     TrainingPipeline,
     Organization,
     User,
@@ -220,6 +221,8 @@ def client(
     app.dependency_overrides[get_training_stream_producer] = lambda: stream_producer
     app.dependency_overrides[get_settings] = lambda: Settings(
         _env_file=None,
+        ultralytics_training_image_digest=f"registry.example/visiox/ultralytics-training@sha256:{'a' * 64}",
+        paddlex_training_image_digest=f"registry.example/visiox/paddlex-training@sha256:{'c' * 64}",
         llm_training_image_digest=f"registry.example/visiox/llm-training@sha256:{'b' * 64}",
     )
 
@@ -250,6 +253,7 @@ def seed_training_ready_rows(
             filename=base_filename or f"yolo26{scale}-{task}.pt",
             source_path=f"yolo26{scale}-{task}.pt",
             local_uri=f"memory://models/base/{task}-{scale}.pt",
+            checksum="a" * 64,
             status=base_status,
         )
         dataset = Dataset(
@@ -260,9 +264,29 @@ def seed_training_ready_rows(
             sample_count=sample_count,
             annotation_count=annotation_count,
             source="upload",
+            manifest_checksum="b" * 64,
+            storage_uri=f"memory://datasets/{dataset_task}/current",
         )
         session.add_all([base_model, dataset])
         session.flush()
+        session.add(
+            DatasetVersion(
+                dataset_id=dataset.id,
+                version=1,
+                status="published",
+                format=dataset.format,
+                object_uri=f"memory://datasets/{dataset.id}/versions/1",
+                manifest_uri=f"memory://datasets/{dataset.id}/versions/1/manifest.json",
+                manifest_checksum="b" * 64,
+                total_count=sample_count,
+                valid_count=sample_count,
+                invalid_count=0,
+                skipped_count=0,
+                size_bytes=0,
+                schema_snapshot={},
+                published_at=datetime.now(UTC),
+            )
+        )
         sample_id = None
         if sample_count:
             sample = DatasetSample(
@@ -1286,9 +1310,146 @@ def test_create_training_job_creates_task_and_enqueues_command(
     assert detail_response.json()["task_id"] == body["task_id"]
     with session_factory() as session:
         pipeline = session.get(TrainingPipeline, pipeline_id)
+        job = session.get(TrainingJob, body["id"])
+        attempt = session.scalar(
+            select(TrainingJobAttempt).where(
+                TrainingJobAttempt.training_job_id == body["id"]
+            )
+        )
         assert pipeline.status == "running"
         assert pipeline.framework_locked_at is not None
         assert pipeline.first_submitted_job_id == body["id"]
+        assert attempt is not None
+        assert attempt.attempt_number == 1
+        assert attempt.launch_spec["adapter_key"] == "ultralytics.object_detection.v1"
+        assert job.launch_spec_checksum
+        assert job.resolved_snapshot == {
+            "schema_version": "1.0",
+            "task_kind": "object_detection",
+            "framework": "ultralytics",
+            "adapter_key": "ultralytics.object_detection.v1",
+            "adapter_version": "1.0.0",
+            "runtime_image_digest": f"registry.example/visiox/ultralytics-training@sha256:{'a' * 64}",
+            "model": {
+                "source": "base_model",
+                "id": base_model_id,
+                "family": "yolo26",
+                "runtime_id": "yolo26n.pt",
+                "checksum": "a" * 64,
+                "revision": None,
+            },
+            "dataset": {
+                "id": dataset_id,
+                "version_id": job.resolved_snapshot["dataset"]["version_id"],
+                "version": 1,
+                "format": "yolo",
+                "uri": f"memory://datasets/{dataset_id}/versions/1",
+                "manifest_checksum": "b" * 64,
+            },
+            "parameters": body["params"],
+            "environment": body["environment"],
+            "resource_request": {"kind": "local", "gpu_count": 0},
+            "allocation": {"kind": "local", "device": "0"},
+            "recipe": pipeline.recipe,
+            "runtime_model_id": "yolo26n.pt",
+        }
+
+
+def test_training_snapshot_is_independent_from_request_and_pipeline_mutation(
+    client: TestClient,
+    session_factory,
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    request_params = {"epochs": 3, "classes": [0, 1]}
+
+    response = client.post(
+        f"/pipelines/{pipeline_id}/jobs", json={"params": request_params}
+    )
+    assert response.status_code == 201, response.text
+    request_params["classes"].append(2)
+    with session_factory() as session:
+        pipeline = session.get(TrainingPipeline, pipeline_id)
+        pipeline.params_template = {"epochs": 999}
+        pipeline.recipe = {"model": {"runtime_id": "changed.pt"}}
+        session.commit()
+    with session_factory() as session:
+        job = session.get(TrainingJob, response.json()["id"])
+        assert job.resolved_snapshot["parameters"]["classes"] == [0, 1]
+        assert job.resolved_snapshot["parameters"]["epochs"] == 3
+        assert job.resolved_snapshot["runtime_model_id"] == "yolo26n.pt"
+
+
+def test_create_paddlex_training_job_freezes_official_model_snapshot(
+    client: TestClient,
+    session_factory,
+    stream_producer: FakeStreamProducer,
+):
+    _, dataset_id, _ = seed_training_ready_rows(session_factory)
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            name="paddlex-real-job",
+            engine="paddlex",
+            task="detect",
+            scale="s",
+            task_kind="object_detection",
+            framework="paddlex",
+            adapter_key="paddlex.object_detection.v1",
+            adapter_version="1.0.0",
+            model_family="PP-YOLOE",
+            recipe={
+                "model": {
+                    "key": "pp-yoloe-s",
+                    "label": "PP-YOLOE-S",
+                    "runtime_id": "PP-YOLOE_plus-S",
+                    "family": "PP-YOLOE",
+                    "variant": "S",
+                }
+            },
+            dataset_id=dataset_id,
+            params_template={"epochs": 10},
+            default_environment={"device": "remote"},
+            status="ready",
+        )
+        session.add(pipeline)
+        session.commit()
+        pipeline_id = pipeline.id
+    pool_id, node_ids = seed_distributed_pool(session_factory, node_count=1)
+
+    response = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "params": {"epochs": 2, "batch_size": 4},
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 1,
+                "node_ids": node_ids,
+            },
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    with session_factory() as session:
+        job = session.get(TrainingJob, response.json()["id"])
+        attempt = session.scalar(
+            select(TrainingJobAttempt).where(
+                TrainingJobAttempt.training_job_id == job.id
+            )
+        )
+    assert job.resolved_snapshot["framework"] == "paddlex"
+    assert job.resolved_snapshot["runtime_image_digest"].endswith("c" * 64)
+    assert job.resolved_snapshot["runtime_model_id"] == "PP-YOLOE_plus-S"
+    assert job.resolved_snapshot["model"]["revision"] == "3.0.3"
+    assert job.resolved_snapshot["dataset"]["manifest_checksum"] == "b" * 64
+    assert job.resolved_snapshot["parameters"]["epochs"] == 2
+    assert job.resolved_snapshot["parameters"]["batch_size"] == 4
+    assert job.resolved_snapshot["allocation"]["world_size"] == 1
+    assert attempt is not None and attempt.attempt_number == 1
+    assert stream_producer.edge_commands[0].keys() == {
+        "task_id",
+        "task_type",
+        "remote_execution_id",
+    }
 
 
 def test_create_distributed_training_job_persists_plan_and_enqueues_id_only_edge_command(
@@ -1330,12 +1491,27 @@ def test_create_distributed_training_job_persists_plan_and_enqueues_id_only_edge
 
     with session_factory() as session:
         job = session.get(TrainingJob, body["id"])
+        attempt = session.scalar(
+            select(TrainingJobAttempt).where(
+                TrainingJobAttempt.training_job_id == body["id"]
+            )
+        )
         task = session.get(Task, body["task_id"])
         run = session.get(DistributedTrainingRun, body["distributed_run_id"])
         execution = session.get(RemoteExecution, body["remote_execution_id"])
         pipeline = session.get(TrainingPipeline, pipeline_id)
 
     assert job.task_id == task.id
+    assert job.resolved_snapshot["framework"] == "ultralytics"
+    assert job.resolved_snapshot["runtime_image_digest"].endswith("a" * 64)
+    assert job.resolved_snapshot["resource_request"] == {
+        "kind": "distributed",
+        "resource_pool_id": pool_id,
+        "gpu_count": 2,
+    }
+    assert job.resolved_snapshot["allocation"]["world_size"] == 2
+    assert job.resolved_snapshot["allocation"]["node_ids"] == sorted(node_ids)
+    assert attempt is not None and attempt.attempt_number == 1
     assert pipeline.framework_locked_at is not None
     assert pipeline.first_submitted_job_id == body["id"]
     assert task.task_type == TaskType.EDGE_TRAIN.value
@@ -1446,6 +1622,12 @@ def test_create_llm_training_job_uses_platform_image_and_model_reference(
     with session_factory() as session:
         task = session.get(Task, body["task_id"])
         run = session.get(DistributedTrainingRun, body["distributed_run_id"])
+        job = session.get(TrainingJob, body["id"])
+        attempt = session.scalar(
+            select(TrainingJobAttempt).where(
+                TrainingJobAttempt.training_job_id == body["id"]
+            )
+        )
         pipeline = session.get(TrainingPipeline, pipeline_id)
     assert task.payload["engine"] == "llamafactory"
     assert pipeline.framework_locked_at is not None
@@ -1461,6 +1643,12 @@ def test_create_llm_training_job_uses_platform_image_and_model_reference(
         run.training_image_digest
         == f"registry.example/visiox/llm-training@sha256:{'b' * 64}"
     )
+    assert job.resolved_snapshot["framework"] == "llamafactory"
+    assert job.resolved_snapshot["model"]["revision"] == "d" * 40
+    assert job.resolved_snapshot["dataset"]["version"] == 1
+    assert job.resolved_snapshot["dataset"]["manifest_checksum"] == "c" * 64
+    assert job.resolved_snapshot["runtime_model_id"] == "Qwen/Qwen3-0.6B"
+    assert attempt is not None and attempt.attempt_number == 1
 
 
 def test_delete_pipeline_removes_distributed_training_dependencies(
@@ -1726,12 +1914,71 @@ def test_resume_distributed_training_uses_checkpoint_and_increments_attempt(
     with session_factory() as session:
         resumed = session.get(DistributedTrainingRun, body["distributed_run_id"])
         execution = session.get(RemoteExecution, body["remote_execution_id"])
+        attempts = list(
+            session.scalars(
+                select(TrainingJobAttempt)
+                .where(TrainingJobAttempt.training_job_id == created["id"])
+                .order_by(TrainingJobAttempt.attempt_number)
+            )
+        )
     assert resumed.attempt == 2
     assert resumed.resource_pool_id == pool_id
     assert resumed.node_ids == sorted(node_ids)
     assert resumed.checkpoint_uri == checkpoint_uri
     assert resumed.checkpoint_checksum == checkpoint_checksum
     assert execution.operation == "resume_training"
+    assert [attempt.attempt_number for attempt in attempts] == [1, 2]
+    assert attempts[0].launch_spec != attempts[1].launch_spec
+    assert attempts[0].launch_spec["env"]["VISIOX_TRAINING_ATTEMPT"] == "1"
+    assert attempts[1].launch_spec["env"]["VISIOX_TRAINING_ATTEMPT"] == "2"
+
+
+def test_resume_distributed_training_rejects_incompatible_checkpoint_identity(
+    client: TestClient,
+    session_factory,
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+    created = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 2,
+                "node_ids": node_ids,
+                "training_image_digest": f"registry.example/visiox/training@sha256:{'d' * 64}",
+            }
+        },
+    ).json()
+    with session_factory() as session:
+        run = session.get(DistributedTrainingRun, created["distributed_run_id"])
+        job = session.get(TrainingJob, created["id"])
+        run.status = "failed"
+        run.checkpoint_uri = "minio://training/checkpoints/last.pt"
+        run.checkpoint_checksum = "e" * 64
+        job.status = "failed"
+        session.commit()
+
+    response = client.post(
+        f"/training-jobs/{created['id']}/resume",
+        json={
+            "checkpoint_framework": "paddlex",
+            "checkpoint_model_family": "PP-YOLOE",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "checkpoint" in response.json()["detail"].lower()
+    with session_factory() as session:
+        attempts = list(
+            session.scalars(
+                select(TrainingJobAttempt).where(
+                    TrainingJobAttempt.training_job_id == created["id"]
+                )
+            )
+        )
+    assert len(attempts) == 1
 
 
 def test_resume_distributed_training_rejects_pool_change(
@@ -1832,6 +2079,10 @@ def test_create_training_job_marks_job_and_task_failed_when_enqueue_fails(
     app.dependency_overrides[get_training_job_session] = override_session
     app.dependency_overrides[get_training_stream_producer] = lambda: (
         FailingStreamProducer()
+    )
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None,
+        ultralytics_training_image_digest=f"registry.example/visiox/ultralytics-training@sha256:{'a' * 64}",
     )
     with TestClient(app) as client:
         base_model_id, dataset_id, _sample_id = seed_training_ready_rows(

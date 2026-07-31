@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import inspect
 import shutil
 from datetime import UTC, datetime
@@ -24,6 +25,11 @@ from visiox_api.services.pipeline_locking import (
     get_pipeline_for_update,
     lock_pipeline_to_first_job,
 )
+from visiox_api.services.training_submission import (
+    TrainingSubmissionError,
+    TrainingSubmissionService,
+)
+from visiox_api.services.resource_scheduler import freeze_distributed_allocation
 from visiox_common.settings import Settings, get_settings
 from visiox_db.base import new_id
 from visiox_db.models import (
@@ -35,6 +41,7 @@ from visiox_db.models import (
     Task,
     TrainedModel,
     TrainingJob,
+    TrainingJobAttempt,
     TrainingPipeline,
 )
 from visiox_db.models.identity import (
@@ -91,6 +98,10 @@ class DistributedTrainingResumeRequest(PydanticBaseModel):
     checkpoint_checksum: str | None = Field(
         default=None,
         pattern=r"^[0-9a-fA-F]{64,128}$",
+    )
+    checkpoint_framework: str | None = Field(default=None, min_length=1, max_length=80)
+    checkpoint_model_family: str | None = Field(
+        default=None, min_length=1, max_length=120
     )
 
 
@@ -259,6 +270,44 @@ async def create_training_job(
             settings=settings,
             actor=actor,
         )
+    if pipeline.framework == "paddlex":
+        if request.distributed is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="PaddleX training requires an edge GPU allocation",
+            )
+        if not settings.paddlex_training_image_digest.strip():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="PaddleX training image digest is not configured",
+            )
+        try:
+            submission_service = TrainingSubmissionService(session, settings)
+            params = submission_service.normalize_parameters(pipeline, request.params)
+        except TrainingSubmissionError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        environment = {
+            **copy.deepcopy(pipeline.default_environment or {}),
+            **copy.deepcopy(request.environment),
+        }
+        return await _create_distributed_training_job(
+            session=session,
+            producer=producer,
+            pipeline=pipeline,
+            context_payload={
+                "engine": "paddlex",
+                "dataset_id": pipeline.dataset_id,
+                "resolved_config": params,
+            },
+            params=params,
+            environment=environment,
+            distributed=request.distributed,
+            response=response,
+            image_digest_override=settings.paddlex_training_image_digest,
+            actor=actor,
+            settings=settings,
+            dataset_version_id=request.dataset_version_id,
+        )
     try:
         resources = validate_training_resources(
             session,
@@ -297,12 +346,34 @@ async def create_training_job(
             distributed=request.distributed,
             response=response,
             actor=actor,
+            settings=settings,
+            dataset_version_id=request.dataset_version_id,
         )
 
+    job_id = new_id()
+    try:
+        submission = TrainingSubmissionService(session, settings).resolve(
+            pipeline=pipeline,
+            job_id=job_id,
+            attempt_number=1,
+            parameters=params,
+            environment=environment,
+            resource_request={"kind": "local", "gpu_count": 0},
+            allocation={
+                "kind": "local",
+                "device": str(environment.get("device", "cpu")),
+            },
+            dataset_version_id=request.dataset_version_id,
+        )
+    except TrainingSubmissionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     job = TrainingJob(
+        id=job_id,
         pipeline_id=pipeline.id,
         status="queued",
         params=params,
+        resolved_snapshot=submission.snapshot.model_dump(mode="json"),
+        launch_spec_checksum=submission.launch_spec_checksum,
         organization_id=actor.organization_id,
         owner_user_id=actor.id,
         visibility="private",
@@ -314,7 +385,13 @@ async def create_training_job(
         resource_type="training_job",
         payload={},
     )
-    session.add_all([job, task])
+    attempt = TrainingJobAttempt(
+        training_job_id=job_id,
+        attempt_number=1,
+        status="queued",
+        launch_spec=submission.launch_spec.model_dump(mode="json"),
+    )
+    session.add_all([job, task, attempt])
     session.flush()
     task.resource_id = job.id
     job.task_id = task.id
@@ -449,6 +526,8 @@ async def _create_llm_training_job(
         response=response,
         image_digest_override=image_digest,
         actor=actor,
+        settings=settings,
+        dataset_version_id=dataset_version.id,
     )
 
 
@@ -464,6 +543,8 @@ async def _create_distributed_training_job(
     response: Response,
     image_digest_override: str | None = None,
     actor: User,
+    settings: Settings,
+    dataset_version_id: str | None = None,
 ) -> TrainingJobResponse:
     plan, image_digest = _distributed_plan(
         session,
@@ -476,11 +557,28 @@ async def _create_distributed_training_job(
     run_id = new_id()
     execution_id = new_id()
     ranks = _rank_payloads(plan)
+    resource_request, allocation = freeze_distributed_allocation(plan)
+    try:
+        submission = TrainingSubmissionService(session, settings).resolve(
+            pipeline=pipeline,
+            job_id=job_id,
+            attempt_number=1,
+            parameters=params,
+            environment=environment,
+            resource_request=resource_request,
+            allocation=allocation,
+            runtime_image_digest=image_digest,
+            dataset_version_id=dataset_version_id,
+        )
+    except TrainingSubmissionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     job = TrainingJob(
         id=job_id,
         pipeline_id=pipeline.id,
         status="queued",
         params=params,
+        resolved_snapshot=submission.snapshot.model_dump(mode="json"),
+        launch_spec_checksum=submission.launch_spec_checksum,
         metrics={"dataset_snapshot": context_payload}
         if context_payload.get("dataset_version_id")
         else {},
@@ -531,10 +629,16 @@ async def _create_distributed_training_job(
         idempotency_key=f"train:{run_id}:1",
     )
     job.task_id = task_id
+    attempt_record = TrainingJobAttempt(
+        training_job_id=job_id,
+        attempt_number=1,
+        status="queued",
+        launch_spec=submission.launch_spec.model_dump(mode="json"),
+    )
     pipeline.status = "running"
     session.add(task)
     session.flush()
-    session.add_all([job, pipeline])
+    session.add_all([job, pipeline, attempt_record])
     session.flush()
     lock_pipeline_to_first_job(pipeline, job_id)
     session.add(pipeline)
@@ -672,8 +776,11 @@ async def resume_distributed_training_job(
     session: Session = Depends(get_training_job_session),
     producer: Any = Depends(get_training_stream_producer),
     actor: User = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
 ) -> TrainingJobResponse:
-    job = session.get(TrainingJob, training_job_id)
+    job = session.scalar(
+        select(TrainingJob).where(TrainingJob.id == training_job_id).with_for_update()
+    )
     if job is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Training job not found"
@@ -723,14 +830,25 @@ async def resume_distributed_training_job(
     attempt = (
         int(
             session.scalar(
-                select(func.max(DistributedTrainingRun.attempt)).where(
-                    DistributedTrainingRun.training_job_id == job.id
+                select(func.max(TrainingJobAttempt.attempt_number)).where(
+                    TrainingJobAttempt.training_job_id == job.id
                 )
             )
             or 0
         )
         + 1
     )
+    try:
+        submission = TrainingSubmissionService(session, settings).resolve_retry(
+            job=job,
+            attempt_number=attempt,
+            checkpoint_uri=checkpoint_uri,
+            checkpoint_checksum=checkpoint_checksum,
+            checkpoint_framework=request.checkpoint_framework,
+            checkpoint_model_family=request.checkpoint_model_family,
+        )
+    except TrainingSubmissionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     run_id = new_id()
     task_id = new_id()
     execution_id = new_id()
@@ -772,7 +890,13 @@ async def resume_distributed_training_job(
         idempotency_key=f"resume_training:{run_id}:{attempt}",
     )
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
-    session.add(task)
+    attempt_record = TrainingJobAttempt(
+        training_job_id=job.id,
+        attempt_number=attempt,
+        status="queued",
+        launch_spec=submission.launch_spec.model_dump(mode="json"),
+    )
+    session.add_all([task, attempt_record])
     session.flush()
     job.task_id = task_id
     job.status = "queued"
@@ -1174,6 +1298,10 @@ def delete_training_job(
     ).all():
         model.training_job_id = None
         session.add(model)
+    for attempt in session.scalars(
+        select(TrainingJobAttempt).where(TrainingJobAttempt.training_job_id == job.id)
+    ).all():
+        session.delete(attempt)
     session.flush()
     session.delete(job)
     session.flush()
