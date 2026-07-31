@@ -1,4 +1,5 @@
 import ast
+from hashlib import sha256
 import json
 import sys
 from pathlib import Path
@@ -853,12 +854,6 @@ def test_multi_framework_training_migration_preserves_and_backfills_legacy_rows(
 
     inspector = inspect(engine)
     assert "training_job_attempts" in inspector.get_table_names()
-    attempt_columns = {
-        column["name"]: column
-        for column in inspector.get_columns("training_job_attempts")
-    }
-    assert "launch_spec_checksum" in attempt_columns
-    assert attempt_columns["launch_spec_checksum"]["nullable"] is False
     pipeline_columns = {
         column["name"]: column for column in inspector.get_columns("training_pipelines")
     }
@@ -1098,9 +1093,9 @@ def test_multi_framework_training_migration_preserves_and_backfills_legacy_rows(
         connection.execute(
             text(
                 "INSERT INTO training_job_attempts "
-                "(id, training_job_id, attempt_number, status, launch_spec, launch_spec_checksum, metrics, "
+                "(id, training_job_id, attempt_number, status, launch_spec, metrics, "
                 "artifact_manifest, container_ids, created_at, updated_at) VALUES "
-                "('attempt-yolo-1', 'job-yolo', 1, 'completed', '{}', 'legacy-test-checksum', '{}', '{}', "
+                "('attempt-yolo-1', 'job-yolo', 1, 'completed', '{}', '{}', '{}', "
                 "'[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
         )
@@ -1301,9 +1296,9 @@ def test_multi_framework_downgrade_preflight_is_atomic(tmp_path):
         connection.execute(
             text(
                 "INSERT INTO training_job_attempts "
-                "(id, training_job_id, attempt_number, status, launch_spec, launch_spec_checksum, metrics, "
+                "(id, training_job_id, attempt_number, status, launch_spec, metrics, "
                 "artifact_manifest, container_ids, created_at, updated_at) VALUES "
-                "('attempt-downgrade', 'job-downgrade', 1, 'completed', '{}', 'legacy-test-checksum', '{}', '{}', "
+                "('attempt-downgrade', 'job-downgrade', 1, 'completed', '{}', '{}', '{}', "
                 "'[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
         )
@@ -1452,6 +1447,126 @@ def test_multi_framework_training_migration_uses_bounded_backfill_reads():
         isinstance(call.func, ast.Attribute) and call.func.attr == "fetchmany"
         for call in calls
     )
+
+
+def test_attempt_checksum_migration_backfills_existing_attempt_from_canonical_json(
+    tmp_path,
+):
+    database_url = f"sqlite:///{tmp_path / 'attempt-checksum-backfill.db'}"
+    config = _alembic_config(database_url)
+    command.upgrade(config, "20260731_0001")
+    engine = create_engine(database_url)
+    assert "launch_spec_checksum" not in {
+        column["name"]
+        for column in inspect(engine).get_columns("training_job_attempts")
+    }
+    launch_spec = {
+        "working_directory": "workspace",
+        "env": {"Z_LAST": "value", "A_FIRST": "中文"},
+        "argv": ["/usr/local/bin/visiox-train", "--epochs", "2"],
+        "adapter_version": "1.0.0",
+        "adapter_key": "ultralytics.object_detection.v1",
+        "schema_version": "1.0",
+    }
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO organizations (id, name, slug, status) VALUES "
+                "('org-checksum', 'Checksum', 'checksum', 'active')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users "
+                "(id, organization_id, username, display_name, email, password_hash, "
+                "role, status, must_change_password) VALUES "
+                "('user-checksum', 'org-checksum', 'checksum', 'Checksum', "
+                "'checksum@example.test', 'hash', 'admin', 'active', false)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO training_pipelines "
+                "(id, name, organization_id, owner_user_id, visibility, engine, task, scale, "
+                "params_template, default_environment, status, is_public, public_scope, "
+                "is_favorite, task_kind, framework, adapter_key, adapter_version, "
+                "model_family, recipe, created_at, updated_at) VALUES "
+                "('pipeline-checksum', 'checksum', 'org-checksum', 'user-checksum', "
+                "'private', 'yolo26', 'detect', 'n', '{}', '{}', 'running', false, "
+                "'{}', false, 'object_detection', 'ultralytics', "
+                "'ultralytics.object_detection.v1', '1.0.0', 'yolo26', '{}', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO training_jobs "
+                "(id, pipeline_id, organization_id, owner_user_id, visibility, status, "
+                "params, metrics, resolved_snapshot, created_at, updated_at) VALUES "
+                "('job-checksum', 'pipeline-checksum', 'org-checksum', 'user-checksum', "
+                "'private', 'failed', '{}', '{}', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO training_job_attempts "
+                "(id, training_job_id, attempt_number, status, launch_spec, metrics, "
+                "artifact_manifest, container_ids, created_at, updated_at) VALUES "
+                "('attempt-checksum', 'job-checksum', 1, 'failed', :launch_spec, '{}', "
+                "'{}', '[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"launch_spec": json.dumps(launch_spec)},
+        )
+
+    command.upgrade(config, "head")
+
+    expected = sha256(
+        json.dumps(
+            launch_spec,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    columns = {
+        column["name"]: column
+        for column in inspect(engine).get_columns("training_job_attempts")
+    }
+    assert columns["launch_spec_checksum"]["nullable"] is False
+    with engine.connect() as connection:
+        actual = connection.scalar(
+            text(
+                "SELECT launch_spec_checksum FROM training_job_attempts "
+                "WHERE id='attempt-checksum'"
+            )
+        )
+    assert actual == expected
+
+
+def test_attempt_checksum_migration_upgrade_downgrade_schema_parity(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'attempt-checksum-parity.db'}"
+    config = _alembic_config(database_url)
+    engine = create_engine(database_url)
+
+    command.upgrade(config, "head")
+    assert "launch_spec_checksum" in {
+        column["name"]
+        for column in inspect(engine).get_columns("training_job_attempts")
+    }
+
+    command.downgrade(config, "20260731_0001")
+    assert "launch_spec_checksum" not in {
+        column["name"]
+        for column in inspect(engine).get_columns("training_job_attempts")
+    }
+
+    command.upgrade(config, "head")
+    columns = {
+        column["name"]: column
+        for column in inspect(engine).get_columns("training_job_attempts")
+    }
+    assert columns["launch_spec_checksum"]["nullable"] is False
 
 
 def test_session_module_import_does_not_read_settings(monkeypatch):

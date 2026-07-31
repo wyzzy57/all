@@ -129,7 +129,6 @@ def upgrade() -> None:
         sa.Column("attempt_number", sa.Integer(), nullable=False),
         sa.Column("status", sa.String(length=40), nullable=False),
         sa.Column("launch_spec", sa.JSON(), nullable=False),
-        sa.Column("launch_spec_checksum", sa.String(length=128), nullable=False),
         sa.Column("log_uri", sa.Text(), nullable=True),
         sa.Column("metrics", sa.JSON(), nullable=False),
         sa.Column("artifact_manifest", sa.JSON(), nullable=False),

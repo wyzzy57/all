@@ -2089,6 +2089,86 @@ def test_training_submission_database_failure_rolls_back_all_state(
     assert pipeline.first_submitted_job_id is None
 
 
+@pytest.mark.parametrize(
+    ("failure_point", "failing_flush_number"),
+    [("flush", 2), ("flush", 3), ("flush", 4), ("commit", None)],
+)
+def test_distributed_training_submission_database_failure_rolls_back_all_state(
+    client: TestClient,
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    failing_flush_number: int | None,
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory)
+    rollback_calls = 0
+    flush_calls = 0
+    original_flush = Session.flush
+    original_rollback = Session.rollback
+
+    def failing_flush(self, *args, **kwargs):
+        nonlocal flush_calls
+        flush_calls += 1
+        if flush_calls == failing_flush_number:
+            raise RuntimeError(f"injected distributed flush {flush_calls} failure")
+        return original_flush(self, *args, **kwargs)
+
+    def failing_commit(self, *args, **kwargs):
+        del self, args, kwargs
+        raise RuntimeError("injected distributed commit failure")
+
+    def recording_rollback(self, *args, **kwargs):
+        nonlocal rollback_calls
+        rollback_calls += 1
+        return original_rollback(self, *args, **kwargs)
+
+    with monkeypatch.context() as patcher:
+        if failure_point == "flush":
+            patcher.setattr(Session, "flush", failing_flush)
+            expected = rf"injected distributed flush {failing_flush_number} failure"
+        else:
+            patcher.setattr(Session, "commit", failing_commit)
+            expected = "injected distributed commit failure"
+        patcher.setattr(Session, "rollback", recording_rollback)
+        with pytest.raises(RuntimeError, match=expected):
+            client.post(
+                f"/pipelines/{pipeline_id}/jobs",
+                json={
+                    "distributed": {
+                        "resource_pool_id": pool_id,
+                        "requested_gpus": 2,
+                        "node_ids": node_ids,
+                        "training_image_digest": f"registry.example/visiox/training@sha256:{'d' * 64}",
+                    }
+                },
+            )
+
+    assert rollback_calls >= 1
+    with session_factory() as session:
+        pipeline = session.get(TrainingPipeline, pipeline_id)
+        jobs = list(
+            session.scalars(
+                select(TrainingJob).where(TrainingJob.pipeline_id == pipeline_id)
+            )
+        )
+        tasks = list(
+            session.scalars(select(Task).where(Task.resource_type == "training_job"))
+        )
+        attempts = list(session.scalars(select(TrainingJobAttempt)))
+        runs = list(session.scalars(select(DistributedTrainingRun)))
+        executions = list(session.scalars(select(RemoteExecution)))
+    assert jobs == []
+    assert tasks == []
+    assert attempts == []
+    assert runs == []
+    assert executions == []
+    assert pipeline.status == "ready"
+    assert pipeline.framework_locked_at is None
+    assert pipeline.first_submitted_job_id is None
+
+
 def test_resume_distributed_training_rejects_pool_change(
     client: TestClient,
     session_factory,
