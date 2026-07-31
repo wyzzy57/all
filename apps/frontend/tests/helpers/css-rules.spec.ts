@@ -48,6 +48,9 @@ describe("CSS rule helpers", () => {
   it.each([
     "transform: var(--hover-transform);",
     "transform: translateY(var(--hover-lift));",
+    "transform: translateX(var(--hover-x));",
+    "transform: translateZ(calc(var(--hover-z)));",
+    "transform: unknownTransform(1px);",
     "translate: var(--hover-translate);",
     "translate: 0 var(--hover-lift);",
   ])("conservatively rejects indeterminate movement from %s", (css) => {
@@ -59,6 +62,8 @@ describe("CSS rule helpers", () => {
     expect(hasForbiddenHoverElevation(declarations("translate: none;"))).toBe(false);
     expect(hasForbiddenHoverElevation(declarations("translate: 0;"))).toBe(false);
     expect(hasForbiddenHoverElevation(declarations("transform: translate(-1px, 0);"))).toBe(false);
+    expect(hasForbiddenHoverElevation(declarations("transform: translateX(-8px);"))).toBe(false);
+    expect(hasForbiddenHoverElevation(declarations("transform: translateZ(calc(-2px));"))).toBe(false);
     expect(hasForbiddenHoverElevation(declarations("transform: translateY(1px);"))).toBe(false);
     expect(hasForbiddenHoverElevation(declarations("transform: translateY(calc(0px));"))).toBe(false);
     expect(hasForbiddenHoverElevation(declarations("transform: matrix(1, 0, 0, 1, 0, 0);"))).toBe(false);

@@ -83,6 +83,10 @@ function transformCallLiftStatus(call: { name: string; arguments: string }): Lif
 
   const values = functionArguments(call.arguments);
   if (call.name === "translatey") return fixedArityLiftStatus(values, 1, 0, lengthLiftStatus);
+  if (call.name === "translatex" || call.name === "translatez") {
+    if (values.length !== 1 || lengthLiftStatus(values[0]) === "unknown") return "unknown";
+    return "safe";
+  }
   if (call.name === "translate") {
     if (values.length < 1 || values.length > 2) return "unknown";
     if (values.some((value) => lengthLiftStatus(value) === "unknown")) return "unknown";
