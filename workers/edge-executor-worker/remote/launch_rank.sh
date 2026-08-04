@@ -22,6 +22,11 @@ FIXED_ENTRYPOINT = "/usr/local/bin/visiox-train"
 MAX_ARTIFACT_COUNT = 256
 MAX_ARTIFACT_SIZE_BYTES = 8 * 1024 * 1024 * 1024
 MAX_ARTIFACT_TOTAL_BYTES = 32 * 1024 * 1024 * 1024
+ALLOWED_ARTIFACT_TARGETS = {
+    "/workspace/dataset",
+    "/workspace/model/base.pt",
+    "/workspace/checkpoint/last.pt",
+}
 
 
 class RequestValidationError(ValueError):
@@ -43,27 +48,7 @@ def safe_relative_path(value):
     if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
         return False
     path = PurePosixPath(value)
-    return (
-        not path.is_absolute()
-        and not (len(value) >= 2 and value[0].isalpha() and value[1] == ":")
-        and all(part not in {"", ".", ".."} for part in value.split("/"))
-        and path.as_posix() == value
-    )
-
-
-def managed_paths(paths):
-    if not isinstance(paths, dict) or set(paths) != {"input", "output", "launch_spec"}:
-        invalid("paths-shape")
-    if any(not isinstance(value, str) or any(char in value for char in "\x00\r\n") for value in paths.values()):
-        invalid("path")
-    input_path = Path(paths["input"])
-    output_path = Path(paths["output"])
-    spec_path = Path(paths["launch_spec"])
-    if not input_path.is_absolute() or not output_path.is_absolute() or not spec_path.is_absolute():
-        invalid("path")
-    if input_path.parent != output_path.parent or spec_path != input_path / "launch-spec.json":
-        invalid("path-boundary")
-    return paths
+    return not path.is_absolute() and not (len(value) >= 2 and value[0].isalpha() and value[1] == ":") and all(part not in {"", ".", ".."} for part in value.split("/")) and path.as_posix() == value
 
 
 def valid_upload_url(value):
@@ -71,18 +56,30 @@ def valid_upload_url(value):
     return bool(parsed and parsed.scheme in {"http", "https"} and parsed.hostname and not parsed.username and not parsed.password and not parsed.fragment)
 
 
+def managed_paths(paths):
+    if not isinstance(paths, dict) or set(paths) != {"output", "launch_spec"}:
+        invalid("paths-shape")
+    if any(not isinstance(value, str) or not Path(value).is_absolute() or any(char in value for char in "\x00\r\n") for value in paths.values()):
+        invalid("path")
+    output_path = Path(paths["output"])
+    spec_path = Path(paths["launch_spec"])
+    if output_path.parent != spec_path.parent.parent or spec_path.name != "launch-spec.json":
+        invalid("path-boundary")
+    return paths
+
+
 def validate(request):
-    if isinstance(request, dict) and request.get("action") == "inspect":
+    if isinstance(request, dict) and request.get("action") in {"inspect", "logs"}:
         if set(request) != {"action", "container_id"} or not isinstance(request["container_id"], str) or not CONTAINER_ID.fullmatch(request["container_id"]):
-            invalid("inspect-request")
-        return request
-    if isinstance(request, dict) and request.get("action") == "logs":
-        if set(request) != {"action", "container_id"} or not isinstance(request["container_id"], str) or not CONTAINER_ID.fullmatch(request["container_id"]):
-            invalid("logs-request")
+            invalid(f"{request.get('action')}-request")
         return request
     if isinstance(request, dict) and request.get("action") == "manifest":
-        if set(request) != {"action", "output_path"} or not isinstance(request["output_path"], str) or not Path(request["output_path"]).is_absolute():
+        expected = {"action", "output_path", "task_id", "adapter_key", "adapter_version"}
+        if set(request) != expected or not isinstance(request["output_path"], str) or not Path(request["output_path"]).is_absolute():
             invalid("manifest-request")
+        for key in ("task_id", "adapter_key", "adapter_version"):
+            if not isinstance(request[key], str) or not IDENTIFIER.fullmatch(request[key]):
+                invalid("manifest-identity")
         return request
     if isinstance(request, dict) and request.get("action") == "collect":
         if set(request) != {"action", "output_path", "artifact_manifest", "uploads"} or not isinstance(request["output_path"], str) or not Path(request["output_path"]).is_absolute():
@@ -95,12 +92,12 @@ def validate(request):
         return request
     expected = {
         "schema_version", "action", "run_id", "attempt", "runtime_image_digest",
-        "framework", "adapter_key", "gpu_uuids", "node_rank",
-        "launch_spec_checksum", "paths",
+        "framework", "adapter_key", "adapter_version", "gpu_uuids", "node_rank",
+        "launch_spec_checksum", "paths", "mounts",
     }
     if not isinstance(request, dict) or set(request) != expected or request.get("schema_version") != "1.0" or request.get("action") != "launch":
         invalid("launch-shape")
-    for key in ("run_id", "framework", "adapter_key"):
+    for key in ("run_id", "framework", "adapter_key", "adapter_version"):
         if not isinstance(request[key], str) or not IDENTIFIER.fullmatch(request[key]):
             invalid("identifier")
     if not isinstance(request["attempt"], int) or isinstance(request["attempt"], bool) or not 1 <= request["attempt"] <= 100000:
@@ -112,11 +109,23 @@ def validate(request):
     if not isinstance(request["launch_spec_checksum"], str) or not SHA256.fullmatch(request["launch_spec_checksum"]):
         invalid("launch-spec-checksum")
     gpus = request["gpu_uuids"]
-    if not isinstance(gpus, list) or not gpus or len(gpus) > 64 or len(set(gpus)) != len(gpus):
-        invalid("gpu-layout")
-    if any(not isinstance(item, str) or not GPU_UUID.fullmatch(item) for item in gpus):
+    if not isinstance(gpus, list) or not gpus or len(gpus) > 64 or len(set(gpus)) != len(gpus) or any(not isinstance(item, str) or not GPU_UUID.fullmatch(item) for item in gpus):
         invalid("gpu-layout")
     managed_paths(request["paths"])
+    mounts = request["mounts"]
+    root = Path(request["paths"]["launch_spec"]).parent.parent.resolve()
+    if not isinstance(mounts, list) or len(mounts) > 3:
+        invalid("mounts")
+    targets = set()
+    for mount in mounts:
+        if not isinstance(mount, dict) or set(mount) != {"source", "target", "read_only"} or mount["read_only"] is not True:
+            invalid("mount")
+        if mount["target"] not in ALLOWED_ARTIFACT_TARGETS or mount["target"] in targets:
+            invalid("mount-target")
+        source = Path(mount["source"]).resolve() if isinstance(mount["source"], str) else None
+        if source is None or root not in source.parents or not source.exists():
+            invalid("mount-source")
+        targets.add(mount["target"])
     return request
 
 
@@ -126,39 +135,35 @@ def load_launch_spec(request):
     if hashlib.sha256(payload).hexdigest() != request["launch_spec_checksum"]:
         invalid("launch-spec-file-checksum")
     spec = json.loads(payload)
-    if not isinstance(spec, dict) or spec.get("schema_version") != "1.0" or spec.get("entrypoint") != FIXED_ENTRYPOINT:
+    expected = {"schema_version", "adapter_key", "adapter_version", "argv", "env", "working_directory"}
+    if not isinstance(spec, dict) or set(spec) != expected or spec.get("schema_version") != "1.0" or spec.get("argv") != [FIXED_ENTRYPOINT] or spec.get("working_directory") != "workspace":
         invalid("launch-spec")
-    distributed = spec.get("distributed")
-    if not isinstance(distributed, dict):
-        invalid("launch-spec-distributed")
-    expected = {
-        "training_job_id": None,
-        "run_id": request["run_id"],
-        "attempt": request["attempt"],
-        "framework": request["framework"],
-        "adapter_key": request["adapter_key"],
+    if spec.get("adapter_key") != request["adapter_key"] or spec.get("adapter_version") != request["adapter_version"]:
+        invalid("launch-spec-adapter")
+    env = spec.get("env")
+    if not isinstance(env, dict) or any(not isinstance(key, str) or not key or "=" in key or not isinstance(value, str) or any(char in key + value for char in "\x00\r\n") for key, value in env.items()):
+        invalid("launch-spec-env")
+    expected_env = {
+        "VISIOX_TRAINING_RUN_ID": request["run_id"],
+        "VISIOX_TRAINING_ATTEMPT": str(request["attempt"]),
+        "VISIOX_FRAMEWORK": request["framework"],
+        "VISIOX_NODE_RANK": str(request["node_rank"]),
+        "VISIOX_GPU_UUIDS_JSON": json.dumps(request["gpu_uuids"], separators=(",", ":")),
+        "VISIOX_OUTPUT_DIR": "/workspace/output",
     }
-    for key, value in expected.items():
-        if value is not None and spec.get(key) != value:
-            invalid("launch-spec-identity")
-    if not isinstance(spec.get("training_job_id"), str) or not IDENTIFIER.fullmatch(spec["training_job_id"]):
+    if any(env.get(key) != value for key, value in expected_env.items()):
+        invalid("launch-spec-identity")
+    if not isinstance(env.get("VISIOX_TRAINING_JOB_ID"), str) or not IDENTIFIER.fullmatch(env["VISIOX_TRAINING_JOB_ID"]):
         invalid("launch-spec-job")
-    if distributed.get("node_rank") != request["node_rank"] or distributed.get("gpu_uuids") != request["gpu_uuids"]:
-        invalid("launch-spec-rank")
-    if spec.get("paths", {}).get("launch_spec") != "/workspace/input/launch-spec.json" or spec.get("paths", {}).get("output") != "/workspace/output":
-        invalid("launch-spec-paths")
     return spec
 
 
 def inspect_container(container_id):
     result = subprocess.run(["docker", "inspect", "--format", "{{json .State}}", container_id], check=True, capture_output=True, text=True, timeout=30)
     state = json.loads(result.stdout)
-    if not isinstance(state, dict) or not isinstance(state.get("Running"), bool):
+    if not isinstance(state, dict) or not isinstance(state.get("Running"), bool) or isinstance(state.get("ExitCode"), bool) or not isinstance(state.get("ExitCode"), int):
         invalid("inspect-state")
-    exit_code = state.get("ExitCode")
-    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
-        invalid("inspect-exit-code")
-    return {"running": state["Running"], "exit_code": exit_code}
+    return {"running": state["Running"], "exit_code": state["ExitCode"]}
 
 
 def collect_logs(container_id):
@@ -166,42 +171,28 @@ def collect_logs(container_id):
     return {"stdout": result.stdout, "stderr": result.stderr}
 
 
-def build_artifact_manifest(output_path):
+def validate_artifact_manifest(manifest, output_path, expected_identity=None):
     root = Path(output_path).resolve()
-    files = sorted(path for path in root.rglob("*") if path.is_file() and path.name != "artifact-manifest.json")
-    if len(files) > MAX_ARTIFACT_COUNT:
-        raise ValueError("artifact manifest contains too many files")
-    artifacts = []
-    total = 0
-    for path in files:
-        resolved = path.resolve()
-        if root not in resolved.parents:
-            raise ValueError("artifact path escaped output root")
-        size = resolved.stat().st_size
-        if size > MAX_ARTIFACT_SIZE_BYTES:
-            raise ValueError("artifact exceeds size limit")
-        total += size
-        if total > MAX_ARTIFACT_TOTAL_BYTES:
-            raise ValueError("artifact manifest exceeds total size limit")
-        digest = hashlib.sha256()
-        with resolved.open("rb") as source:
-            while chunk := source.read(1024 * 1024):
-                digest.update(chunk)
-        artifacts.append({"path": resolved.relative_to(root).as_posix(), "size_bytes": size, "checksum_sha256": digest.hexdigest()})
-    return {"schema_version": "1.0", "artifacts": artifacts}
-
-
-def validate_artifact_manifest(manifest, output_path):
-    root = Path(output_path).resolve()
-    if not isinstance(manifest, dict) or set(manifest) != {"schema_version", "artifacts"} or manifest.get("schema_version") != "1.0":
+    expected = {"schema_version", "task_id", "adapter_key", "adapter_version", "artifacts", "checksum_sha256"}
+    if not isinstance(manifest, dict) or set(manifest) != expected or manifest.get("schema_version") != "1.0":
         raise ValueError("invalid artifact manifest")
+    if expected_identity and any(manifest.get(key) != value for key, value in expected_identity.items()):
+        raise ValueError("artifact manifest identity mismatch")
+    checksum = manifest.get("checksum_sha256")
+    if not isinstance(checksum, str) or not SHA256.fullmatch(checksum):
+        raise ValueError("invalid artifact manifest checksum")
+    unsigned = dict(manifest)
+    unsigned.pop("checksum_sha256")
+    if canonical_checksum(unsigned) != checksum:
+        raise ValueError("artifact manifest checksum mismatch")
     artifacts = manifest["artifacts"]
     if not isinstance(artifacts, list) or len(artifacts) > MAX_ARTIFACT_COUNT:
         raise ValueError("invalid artifact manifest")
     seen = set()
     total = 0
     for artifact in artifacts:
-        if not isinstance(artifact, dict) or set(artifact) != {"path", "size_bytes", "checksum_sha256"}:
+        fields = {"schema_version", "path", "size_bytes", "checksum_sha256", "artifact_type"}
+        if not isinstance(artifact, dict) or set(artifact) != fields or artifact.get("schema_version") != "1.0" or not isinstance(artifact.get("artifact_type"), str) or not artifact["artifact_type"]:
             raise ValueError("invalid artifact manifest")
         relative = artifact["path"]
         if not safe_relative_path(relative) or relative in seen:
@@ -215,35 +206,31 @@ def validate_artifact_manifest(manifest, output_path):
         total += size
         if total > MAX_ARTIFACT_TOTAL_BYTES:
             raise ValueError("artifact manifest exceeds total size limit")
-        checksum = artifact["checksum_sha256"]
-        if not isinstance(checksum, str) or not SHA256.fullmatch(checksum):
-            raise ValueError("invalid artifact checksum")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if digest != checksum:
+        if artifact.get("checksum_sha256") != digest:
             raise ValueError("artifact checksum mismatch")
         seen.add(relative)
     return manifest
 
 
-def collect_artifacts(output_path, uploads, artifact_manifest=None):
-    root = Path(output_path).resolve()
-    manifest = validate_artifact_manifest(artifact_manifest or build_artifact_manifest(root), root)
+def load_artifact_manifest(output_path, expected_identity):
+    path = Path(output_path).resolve() / "artifact-manifest.json"
+    return validate_artifact_manifest(json.loads(path.read_text(encoding="utf-8")), output_path, expected_identity)
+
+
+def collect_artifacts(output_path, uploads, artifact_manifest):
+    manifest = validate_artifact_manifest(artifact_manifest, output_path)
     entries = {item["path"]: item for item in manifest["artifacts"]}
     results = {}
-    for requested_path, url in uploads.items():
-        relative = requested_path
+    for relative, url in uploads.items():
         if relative not in entries:
-            matches = [path for path in entries if PurePosixPath(path).name == requested_path]
-            if len(matches) != 1:
-                raise ValueError("requested artifact is not in trusted manifest")
-            relative = matches[0]
-        path = (root / relative).resolve()
-        payload = path.read_bytes()
+            raise ValueError("requested artifact is not in trusted manifest")
+        payload = (Path(output_path).resolve() / relative).read_bytes()
         request = Request(url, data=payload, method="PUT", headers={"Content-Type": "application/octet-stream"})
         with urlopen(request, timeout=600) as response:
             if not 200 <= int(response.status) < 300:
                 raise ValueError("training artifact upload failed")
-        results[requested_path] = {"checksum": entries[relative]["checksum_sha256"], "size_bytes": entries[relative]["size_bytes"]}
+        results[relative] = {"checksum": entries[relative]["checksum_sha256"], "size_bytes": entries[relative]["size_bytes"]}
     return results
 
 
@@ -255,19 +242,16 @@ def main():
         with open(sys.argv[1], "r", encoding="utf-8") as source:
             request = validate(json.load(source))
         if request["action"] == "inspect":
-            stage = "container-inspect"
             print(json.dumps(inspect_container(request["container_id"]), ensure_ascii=True, separators=(",", ":"), sort_keys=True))
             return 0
         if request["action"] == "logs":
-            stage = "container-logs"
             print(json.dumps(collect_logs(request["container_id"]), ensure_ascii=True, separators=(",", ":"), sort_keys=True))
             return 0
         if request["action"] == "manifest":
-            stage = "artifact-manifest"
-            print(json.dumps(build_artifact_manifest(request["output_path"]), ensure_ascii=True, separators=(",", ":"), sort_keys=True))
+            identity = {key: request[key] for key in ("task_id", "adapter_key", "adapter_version")}
+            print(json.dumps(load_artifact_manifest(request["output_path"], identity), ensure_ascii=True, separators=(",", ":"), sort_keys=True))
             return 0
         if request["action"] == "collect":
-            stage = "artifact-collect"
             artifacts = collect_artifacts(request["output_path"], request["uploads"], request["artifact_manifest"])
             print(json.dumps({"artifacts": artifacts}, ensure_ascii=True, separators=(",", ":"), sort_keys=True))
             return 0
@@ -275,27 +259,30 @@ def main():
         name = f"visiox-train-{request['run_id']}-{request['attempt']}-rank-{request['node_rank']}"
         stage = "previous-container-cleanup"
         subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True, text=True, timeout=30)
+        cache_root = Path.home() / ".cache" / "visiox" / "models"
+        cache_root.mkdir(mode=0o750, parents=True, exist_ok=True)
         command = [
             "docker", "run", "-d", "--name", name,
-            "--user", f"{os.getuid()}:{os.getgid()}",
-            "--network", "host", "--shm-size", "4g",
+            "--user", f"{os.getuid()}:{os.getgid()}", "--network", "host", "--shm-size", "4g",
             "--gpus", "device=" + ",".join(request["gpu_uuids"]),
             "--label", "com.visiox.managed=true",
-            "--label", f"com.visiox.training-job-id={spec['training_job_id']}",
+            "--label", f"com.visiox.training-job-id={spec['env']['VISIOX_TRAINING_JOB_ID']}",
             "--label", f"com.visiox.training-run-id={request['run_id']}",
             "--label", f"com.visiox.training-attempt={request['attempt']}",
             "--label", f"com.visiox.training-node-rank={request['node_rank']}",
             "--label", f"com.visiox.training-framework={request['framework']}",
             "--label", f"com.visiox.training-adapter-key={request['adapter_key']}",
             "--label", f"com.visiox.launch-spec-checksum={request['launch_spec_checksum']}",
-            "--mount", f"type=bind,src={request['paths']['input']},dst=/workspace/input,readonly",
+            "--mount", f"type=bind,src={request['paths']['launch_spec']},dst=/workspace/input/launch-spec.json,readonly",
             "--mount", f"type=bind,src={request['paths']['output']},dst=/workspace/output",
-            "-e", "HOME=/tmp", "-e", "USER=visiox-edge", "-e", "LOGNAME=visiox-edge",
-            "-e", "YOLO_CONFIG_DIR=/tmp", "-e", "MPLCONFIGDIR=/tmp",
-            "-e", "TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor",
-            request["runtime_image_digest"],
-            "/usr/local/bin/visiox-train",
+            "--mount", f"type=bind,src={cache_root},dst=/workspace/model-cache",
         ]
+        for mount in request["mounts"]:
+            command.extend(["--mount", f"type=bind,src={mount['source']},dst={mount['target']},readonly"])
+        base_environment = {"HOME": "/tmp", "USER": "visiox-edge", "LOGNAME": "visiox-edge", "YOLO_CONFIG_DIR": "/tmp", "MPLCONFIGDIR": "/tmp", "TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor"}
+        for key, value in {**base_environment, **spec["env"]}.items():
+            command.extend(["-e", f"{key}={value}"])
+        command.extend([request["runtime_image_digest"], FIXED_ENTRYPOINT])
         stage = "container-launch"
         result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
         container_id = result.stdout.strip()

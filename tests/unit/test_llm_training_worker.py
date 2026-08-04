@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import visiox_llm_training_worker.entrypoint as worker
+from visiox_llm_training_worker.fixed_entrypoint import build_worker_command
 
 
 def test_edge_image_installs_tensorboard_for_training_observability() -> None:
@@ -12,6 +13,43 @@ def test_edge_image_installs_tensorboard_for_training_observability() -> None:
     )
 
     assert '"tensorboard>=2.18,<3"' in dockerfile
+
+
+def test_edge_image_exposes_fixed_training_entrypoint() -> None:
+    dockerfile = Path("workers/llm-training-worker/Dockerfile.edge").read_text(
+        encoding="utf-8"
+    )
+
+    assert "/usr/local/bin/visiox-train" in dockerfile
+    assert "visiox_llm_training_worker.fixed_entrypoint" in dockerfile
+
+
+def test_fixed_entrypoint_preserves_llamafactory_worker_call() -> None:
+    command, environment = build_worker_command(
+        {
+            "schema_version": "1.0",
+            "adapter_key": "llamafactory.llm_sft.v1",
+            "adapter_version": "1.0.0",
+            "argv": ["/usr/local/bin/visiox-train"],
+            "env": {
+                "VISIOX_LLM_CONFIG_PATH": "/workspace/dataset/train.yaml",
+                "HF_HOME": "/workspace/model-cache/huggingface",
+                "MODELSCOPE_CACHE": "/workspace/model-cache/modelscope",
+                "USE_MODELSCOPE_HUB": "1",
+            },
+            "working_directory": "workspace",
+        },
+        base_environment={},
+    )
+
+    assert command[-3:] == (
+        "-m",
+        "visiox_llm_training_worker.entrypoint",
+        "/workspace/dataset/train.yaml",
+    )
+    assert environment["HF_HOME"] == "/workspace/model-cache/huggingface"
+    assert environment["MODELSCOPE_CACHE"] == "/workspace/model-cache/modelscope"
+    assert environment["USE_MODELSCOPE_HUB"] == "1"
 
 
 def test_latest_trainer_log_skips_malformed_tail(tmp_path: Path) -> None:
@@ -26,7 +64,7 @@ def test_latest_trainer_log_skips_malformed_tail(tmp_path: Path) -> None:
 
 def test_latest_trainer_log_merges_recent_scalar_events(tmp_path: Path) -> None:
     (tmp_path / "trainer_log.jsonl").write_text(
-        '\n'.join(
+        "\n".join(
             (
                 '{"current_steps": 6, "total_steps": 6, "loss": 1.7, "lr": 0.00001}',
                 '{"current_steps": 6, "total_steps": 6, "eval_loss": 3.8}',
@@ -60,7 +98,9 @@ def test_progress_snapshot_contains_llm_metrics(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(worker, "_resource_snapshot", lambda: {"system.cpu_percent": 12.0})
+    monkeypatch.setattr(
+        worker, "_resource_snapshot", lambda: {"system.cpu_percent": 12.0}
+    )
 
     worker._write_progress(
         tmp_path,
@@ -68,7 +108,9 @@ def test_progress_snapshot_contains_llm_metrics(
         state="running",
     )
 
-    payload = json.loads((tmp_path / "visiox-progress.json").read_text(encoding="utf-8"))
+    payload = json.loads(
+        (tmp_path / "visiox-progress.json").read_text(encoding="utf-8")
+    )
     assert payload["engine"] == "llamafactory"
     assert payload["progress"]["percent"] == 50
     assert payload["latest_metrics"]["loss"] == 0.75
@@ -80,7 +122,12 @@ def test_artifact_manifest_hashes_adapter_outputs(tmp_path: Path) -> None:
     (tmp_path / "adapter_model.safetensors").write_bytes(b"adapter")
     (tmp_path / "adapter_config.json").write_text("{}", encoding="utf-8")
 
-    worker._write_artifact_manifest(tmp_path)
+    worker._write_artifact_manifest(
+        tmp_path,
+        task_id="job-1",
+        adapter_key="llamafactory.llm_sft.v1",
+        adapter_version="1.0.0",
+    )
 
     manifest = json.loads(
         (tmp_path / "artifact-manifest.json").read_text(encoding="utf-8")
@@ -89,4 +136,8 @@ def test_artifact_manifest_hashes_adapter_outputs(tmp_path: Path) -> None:
         "adapter_config.json",
         "adapter_model.safetensors",
     }
-    assert all(len(entry["sha256"]) == 64 for entry in manifest["artifacts"])
+    assert manifest["task_id"] == "job-1"
+    assert manifest["adapter_key"] == "llamafactory.llm_sft.v1"
+    assert all(len(entry["checksum_sha256"]) == 64 for entry in manifest["artifacts"])
+    assert all(entry["artifact_type"] for entry in manifest["artifacts"])
+    assert len(manifest["checksum_sha256"]) == 64

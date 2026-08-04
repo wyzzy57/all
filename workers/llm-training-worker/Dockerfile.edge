@@ -6,6 +6,9 @@ RUN pip install --no-cache-dir \
     "tensorboard>=2.18,<3" \
     "mlflow-skinny>=3,<4"
 COPY workers/llm-training-worker/src/visiox_llm_training_worker /app/visiox_llm_training_worker
+COPY packages/visiox-training/src/visiox_training /app/visiox_training
+RUN printf '#!/bin/sh\nexec python -m visiox_llm_training_worker.fixed_entrypoint "$@"\n' > /usr/local/bin/visiox-train \
+    && chmod 0755 /usr/local/bin/visiox-train
 ENV PYTHONPATH=/app
 
 HEALTHCHECK NONE

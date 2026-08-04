@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-import hashlib
 import json
 from pathlib import Path
 import signal
@@ -12,6 +11,8 @@ from typing import Any
 
 import psutil
 import yaml
+
+from visiox_training.runtime import write_artifact_manifest
 
 from visiox_llm_training_worker.config import apply_managed_config, load_run_identity
 from visiox_llm_training_worker.resources import ResourceSampler
@@ -26,7 +27,10 @@ def main() -> int:
     global _stop_requested
     _stop_requested = False
     if len(sys.argv) != 2:
-        print("usage: python -m visiox_llm_training_worker.entrypoint CONFIG", file=sys.stderr)
+        print(
+            "usage: python -m visiox_llm_training_worker.entrypoint CONFIG",
+            file=sys.stderr,
+        )
         return 2
     config_path = Path(sys.argv[1]).resolve()
     telemetry: TelemetryRecorder | None = None
@@ -45,7 +49,9 @@ def main() -> int:
         telemetry = TelemetryRecorder(output_dir, identity)
         resources = ResourceSampler(output_dir)
         resources.start()
-        process = subprocess.Popen(["llamafactory-cli", "train", str(managed_config_path)])
+        process = subprocess.Popen(
+            ["llamafactory-cli", "train", str(managed_config_path)]
+        )
         while process.poll() is None:
             latest = _latest_trainer_log(output_dir)
             telemetry.record(latest)
@@ -62,11 +68,23 @@ def main() -> int:
                 process.terminate()
             time.sleep(5)
         exit_code = int(process.returncode or 0)
-        state = "canceled" if _stop_requested else "completed" if exit_code == 0 else "failed"
+        state = (
+            "canceled"
+            if _stop_requested
+            else "completed"
+            if exit_code == 0
+            else "failed"
+        )
         latest = _latest_trainer_log(output_dir)
         telemetry.record(latest)
         resources.stop()
-        telemetry.close(status="FINISHED" if exit_code == 0 else "KILLED" if _stop_requested else "FAILED")
+        telemetry.close(
+            status="FINISHED"
+            if exit_code == 0
+            else "KILLED"
+            if _stop_requested
+            else "FAILED"
+        )
         _write_progress(
             output_dir,
             config,
@@ -77,14 +95,23 @@ def main() -> int:
             telemetry=telemetry,
         )
         if exit_code == 0:
-            _write_artifact_manifest(output_dir)
+            identity = load_run_identity(config_path)
+            _write_artifact_manifest(
+                output_dir,
+                task_id=identity.training_job_id,
+                adapter_key="llamafactory.llm_sft.v1",
+                adapter_version="1.0.0",
+            )
         return exit_code
     except Exception as exc:
         if resources is not None:
             resources.stop()
         if telemetry is not None:
             telemetry.close(status="FAILED")
-        print(f"LLM training entrypoint failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(
+            f"LLM training entrypoint failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return 1
 
 
@@ -94,7 +121,14 @@ def _load_config(path: Path) -> dict[str, Any]:
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("training config must be a YAML object")
-    required = {"model_name_or_path", "dataset", "dataset_dir", "output_dir", "stage", "finetuning_type"}
+    required = {
+        "model_name_or_path",
+        "dataset",
+        "dataset_dir",
+        "output_dir",
+        "stage",
+        "finetuning_type",
+    }
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"training config is missing: {', '.join(missing)}")
@@ -154,7 +188,9 @@ def _resource_snapshot() -> dict[str, float]:
             text=True,
             timeout=5,
         )
-        utilization, used, total = [float(item.strip()) for item in result.stdout.splitlines()[0].split(",")]
+        utilization, used, total = [
+            float(item.strip()) for item in result.stdout.splitlines()[0].split(",")
+        ]
         metrics.update(
             {
                 "system.gpu_utilization_percent": utilization,
@@ -205,8 +241,12 @@ def _write_progress(
         "resources": [resource_sample or _resource_snapshot()],
         "availability": {
             "mlflow": {
-                "available": telemetry.mlflow_available if telemetry is not None else False,
-                "reason": telemetry.mlflow_reason if telemetry is not None else "not initialized",
+                "available": telemetry.mlflow_available
+                if telemetry is not None
+                else False,
+                "reason": telemetry.mlflow_reason
+                if telemetry is not None
+                else "not initialized",
             },
             "tensorboard": {"available": True, "reason": None},
         },
@@ -217,22 +257,18 @@ def _write_progress(
     temporary.replace(path)
 
 
-def _write_artifact_manifest(output_dir: Path) -> None:
-    artifacts = []
-    for path in sorted(output_dir.rglob("*")):
-        if not path.is_file() or path.name == "artifact-manifest.json":
-            continue
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        artifacts.append(
-            {
-                "path": path.relative_to(output_dir).as_posix(),
-                "size_bytes": path.stat().st_size,
-                "sha256": digest,
-            }
-        )
-    (output_dir / "artifact-manifest.json").write_text(
-        json.dumps({"artifacts": artifacts}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+def _write_artifact_manifest(
+    output_dir: Path,
+    *,
+    task_id: str,
+    adapter_key: str,
+    adapter_version: str,
+) -> None:
+    write_artifact_manifest(
+        output_dir,
+        task_id=task_id,
+        adapter_key=adapter_key,
+        adapter_version=adapter_version,
     )
 
 

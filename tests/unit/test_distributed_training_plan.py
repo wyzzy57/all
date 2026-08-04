@@ -28,14 +28,18 @@ from visiox_edge_executor_worker.distributed import (
 from visiox_edge_executor_worker.distributed_execution import (
     DistributedTrainingHandler,
     StopDistributedTrainingHandler,
+    _require_remote_adapter,
     _llamafactory_dataset_info,
     _launch_request,
     _set_container_dataset_root,
     _staging_request,
+    _validate_remote_artifact_manifest,
     build_distributed_handlers,
     _training_arguments,
 )
 from visiox_edge_executor_worker.scripts import load_packaged_script
+from visiox_training.contracts import ArtifactEntry, ArtifactManifest, LaunchSpec
+from visiox_training.runtime import write_artifact_manifest
 
 
 def _canonical_checksum(payload: dict[str, object]) -> str:
@@ -226,11 +230,12 @@ def test_remote_rank_container_uses_edge_user_for_writable_output_mount() -> Non
     script = load_packaged_script("launch_rank.sh").decode("utf-8")
 
     assert '"--user", f"{os.getuid()}:{os.getgid()}"' in script
-    assert "dst=/workspace/input,readonly" in script
+    assert "dst=/workspace/input/launch-spec.json,readonly" in script
+    assert "dst=/workspace/input,readonly" not in script
     assert "dst=/workspace/output" in script
-    assert '"USER=visiox-edge"' in script
-    assert '"LOGNAME=visiox-edge"' in script
-    assert '"TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor"' in script
+    assert '"USER": "visiox-edge"' in script
+    assert '"LOGNAME": "visiox-edge"' in script
+    assert '"TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor"' in script
 
 
 def test_remote_staging_failure_reports_safe_stage_only(
@@ -269,6 +274,46 @@ def test_remote_staging_uses_ssh_user_owned_workspace() -> None:
 
     assert 'Path.home() / ".local" / "share" / "visiox" / "training"' in script
     assert 'Path("/var/lib/visiox/training")' not in script
+
+
+def test_remote_staging_verifies_fixed_entrypoint_exists_in_image() -> None:
+    script = load_packaged_script("stage_training.sh").decode("utf-8")
+
+    assert '"--entrypoint", "/usr/bin/test"' in script
+    assert '"-x", FIXED_ENTRYPOINT' in script
+
+
+def test_remote_staging_rejects_downloaded_artifact_checksum_mismatch(
+    tmp_path: Path,
+) -> None:
+    script = load_packaged_script("stage_training.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "stage_training.sh", "exec"), namespace)
+
+    class Response:
+        sent = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size: int) -> bytes:
+            if self.sent:
+                return b""
+            self.sent = True
+            return b"wrong payload"
+
+    namespace["urlopen"] = lambda *_args, **_kwargs: Response()
+
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        namespace["download"](  # type: ignore[operator]
+            "https://storage.invalid/model.pt",
+            tmp_path / "model.pt",
+            "0" * 64,
+        )
 
 
 def test_production_handler_factory_registers_train_resume_and_stop() -> None:
@@ -370,6 +415,23 @@ def test_distributed_training_arguments_remove_global_device_selection() -> None
     assert not any(argument.startswith("device=") for argument in arguments)
 
 
+def test_unimplemented_remote_adapter_is_rejected_instead_of_using_yolo() -> None:
+    pipeline = SimpleNamespace(
+        framework="paddlex",
+        adapter_key="paddlex.object_detection.v1",
+        adapter_version="1.0.0",
+        engine="paddlex",
+    )
+    launch_spec = LaunchSpec(
+        adapter_key="paddlex.object_detection.v1",
+        adapter_version="1.0.0",
+        argv=("/usr/local/bin/visiox-train",),
+    )
+
+    with pytest.raises(ValueError, match="not implemented"):
+        _require_remote_adapter(pipeline, launch_spec)  # type: ignore[arg-type]
+
+
 def test_staging_request_matches_remote_script_contract() -> None:
     artifacts = [
         {
@@ -403,14 +465,15 @@ def test_staging_request_matches_remote_script_contract() -> None:
     assert request["schema_version"] == "1.0"
     assert request["runtime_image_digest"].endswith("@sha256:" + "a" * 64)
     assert request["artifacts"] == artifacts
-    assert request["launch_spec"]["framework"] == "paddlex"
-    assert request["launch_spec"]["entrypoint"] == "/usr/local/bin/visiox-train"
-    assert request["launch_spec"]["distributed"]["gpu_uuids"] == ["GPU-one"]
-    assert request["launch_spec"]["distributed"]["rendezvous"] == {
-        "master_addr": "10.10.40.10",
-        "master_port": 29500,
-    }
-    assert request["launch_spec"]["paths"]["output"] == "/workspace/output"
+    spec = LaunchSpec.model_validate(request["launch_spec"])
+    assert spec.adapter_key == "paddlex.object_detection.v1"
+    assert spec.argv == ("/usr/local/bin/visiox-train",)
+    assert spec.env["VISIOX_FRAMEWORK"] == "paddlex"
+    assert spec.env["VISIOX_NODE_ID"] == "node-1"
+    assert spec.env["VISIOX_GPU_UUIDS_JSON"] == '["GPU-one"]'
+    assert spec.env["VISIOX_MASTER_ADDR"] == "10.10.40.10"
+    assert spec.env["VISIOX_MASTER_PORT"] == "29500"
+    assert spec.env["VISIOX_OUTPUT_DIR"] == "/workspace/output"
     assert len(request["launch_spec_checksum"]) == 64
     assert "action" not in request
     assert "engine" not in request
@@ -446,9 +509,9 @@ def test_launch_request_matches_remote_script_contract() -> None:
         [],
     )
     stage.paths = {
-        "input": "/home/edge/run/input",
         "output": "/home/edge/run/output",
         "launch_spec": "/home/edge/run/input/launch-spec.json",
+        "artifacts": {},
     }
     request = _launch_request(run, rank, stage, staged_request)  # type: ignore[arg-type]
 
@@ -461,10 +524,12 @@ def test_launch_request_matches_remote_script_contract() -> None:
         "runtime_image_digest",
         "framework",
         "adapter_key",
+        "adapter_version",
         "gpu_uuids",
         "node_rank",
         "launch_spec_checksum",
         "paths",
+        "mounts",
     }
 
 
@@ -489,9 +554,10 @@ def test_remote_rank_script_rejects_control_characters() -> None:
     exec(compile(embedded, "stage_training.sh", "exec"), namespace)
     namespace["Path"] = PurePosixPath
     validate = namespace["validate"]
-    rank = SimpleNamespace(node_id="node-1", gpu_uuids=("GPU-one",), node_rank=0)
     request = _generic_staging_request()
-    request["launch_spec"]["parameters"]["arguments"] = ["epochs=2\nwhoami"]
+    request["launch_spec"]["env"]["VISIOX_TRAINING_ARGUMENTS_JSON"] = (
+        '["epochs=2\\nwhoami"]'
+    )
     request["launch_spec_checksum"] = _canonical_checksum(request["launch_spec"])
 
     with pytest.raises(ValueError, match="request"):
@@ -534,9 +600,9 @@ def test_remote_rank_failure_reports_safe_stage_only(
         SimpleNamespace(node_rank=0, gpu_uuids=("GPU-one",)),
         SimpleNamespace(
             paths={
-                "input": str(input_path),
                 "output": str(output_path),
                 "launch_spec": str(launch_spec_path),
+                "artifacts": {},
             }
         ),
         staged_request,
@@ -591,13 +657,21 @@ def test_remote_rank_collect_uploads_last_checkpoint(tmp_path: Path) -> None:
         return Response()
 
     namespace["urlopen"] = urlopen
+    manifest = write_artifact_manifest(
+        output,
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+    ).model_dump(mode="json")
+    relative = "runs/job-1/weights/last.pt"
     result = namespace["collect_artifacts"](  # type: ignore[operator]
         str(output),
-        {"last.pt": "https://minio.internal/checkpoint?signature=short-lived"},
+        {relative: "https://minio.internal/checkpoint?signature=short-lived"},
+        manifest,
     )
 
     assert uploaded == [b"checkpoint"]
-    assert result["last.pt"]["size_bytes"] == 10
+    assert result[relative]["size_bytes"] == 10
 
 
 def test_remote_rank_collect_uploads_ultralytics_visualizations(tmp_path: Path) -> None:
@@ -633,13 +707,23 @@ def test_remote_rank_collect_uploads_ultralytics_visualizations(tmp_path: Path) 
         return Response()
 
     namespace["urlopen"] = urlopen
+    manifest = write_artifact_manifest(
+        output,
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+    ).model_dump(mode="json")
+    uploads = {
+        f"runs/job-1/{name}": f"https://minio.internal/{name}" for name in expected
+    }
     result = namespace["collect_artifacts"](  # type: ignore[operator]
         str(output),
-        {name: f"https://minio.internal/{name}" for name in expected},
+        uploads,
+        manifest,
     )
 
     assert uploaded == list(expected.values())
-    assert set(result) == set(expected)
+    assert set(result) == set(uploads)
 
 
 def test_llm_launch_spec_preserves_model_source_without_shell_branch() -> None:
@@ -651,13 +735,6 @@ def test_llm_launch_spec_preserves_model_source_without_shell_branch() -> None:
         master_port=29500,
     )
     rank = SimpleNamespace(node_id="node-1", gpu_uuids=("GPU-one",), node_rank=0)
-    stage = SimpleNamespace(
-        paths={
-            "dataset": "/home/edge/llm-dataset",
-            "output": "/home/edge/llm-output",
-        }
-    )
-
     request = _staging_request(  # type: ignore[arg-type]
         run,
         SimpleNamespace(id="job-llm"),
@@ -672,12 +749,16 @@ def test_llm_launch_spec_preserves_model_source_without_shell_branch() -> None:
     )
 
     spec = request["launch_spec"]
-    assert spec["framework"] == "llamafactory"
-    assert spec["parameters"] == {
-        "arguments": [],
-        "model_source": "modelscope",
-    }
-    assert spec["entrypoint"] == "/usr/local/bin/visiox-train"
+    parsed = LaunchSpec.model_validate(spec)
+    assert parsed.adapter_key == "llamafactory.llm_sft.v1"
+    assert parsed.argv == ("/usr/local/bin/visiox-train",)
+    assert parsed.env["VISIOX_FRAMEWORK"] == "llamafactory"
+    assert parsed.env["VISIOX_FRAMEWORK_PARAMETERS_JSON"] == (
+        '{"model_source":"modelscope"}'
+    )
+    assert parsed.env["USE_MODELSCOPE_HUB"] == "1"
+    assert parsed.env["HF_HOME"] == "/workspace/model-cache/huggingface"
+    assert parsed.env["MODELSCOPE_CACHE"] == "/workspace/model-cache/modelscope"
 
 
 def test_alpaca_dataset_info_only_maps_canonical_required_columns() -> None:
@@ -702,8 +783,8 @@ def test_remote_rank_script_uses_only_fixed_image_entrypoint() -> None:
     assert "visiox_training_worker.train_entrypoint" not in script
     assert "visiox_llm_training_worker.entrypoint" not in script
     assert '"/usr/local/bin/visiox-train"' in script
-    assert "dst=/workspace/input,readonly" in script
-    assert "dst=/workspace/input/launch-spec.json,readonly" not in script
+    assert "dst=/workspace/input/launch-spec.json,readonly" in script
+    assert "dst=/workspace/input,readonly" not in script
     for label in (
         "training-job-id",
         "training-attempt",
@@ -757,15 +838,61 @@ def test_remote_staging_accepts_generic_framework_without_engine_allowlist() -> 
 @pytest.mark.parametrize(
     ("case", "mutate", "resign"),
     [
-        ("unknown request schema", lambda request: request.__setitem__("schema_version", "2.0"), False),
-        ("mutable image", lambda request: request.__setitem__("runtime_image_digest", "registry.local/visiox/paddlex:latest"), False),
-        ("unsafe artifact path", lambda request: request["artifacts"][0].__setitem__("target_path", "../dataset.tar.gz"), False),
-        ("host artifact path", lambda request: request["artifacts"][0].__setitem__("target_path", "C:/dataset.tar.gz"), False),
-        ("unknown launch schema", lambda request: request["launch_spec"].__setitem__("schema_version", "2.0"), True),
-        ("arbitrary entrypoint", lambda request: request["launch_spec"].__setitem__("entrypoint", "/bin/sh"), True),
-        ("newline argument", lambda request: request["launch_spec"]["parameters"]["arguments"].__setitem__(0, "epochs=1\nwhoami"), True),
-        ("host runtime path", lambda request: request["launch_spec"]["paths"].__setitem__("dataset", "/home/user/dataset"), True),
-        ("checksum mismatch", lambda request: request.__setitem__("launch_spec_checksum", "0" * 64), False),
+        (
+            "unknown request schema",
+            lambda request: request.__setitem__("schema_version", "2.0"),
+            False,
+        ),
+        (
+            "mutable image",
+            lambda request: request.__setitem__(
+                "runtime_image_digest", "registry.local/visiox/paddlex:latest"
+            ),
+            False,
+        ),
+        (
+            "unsafe artifact path",
+            lambda request: request["artifacts"][0].__setitem__(
+                "target_path", "../dataset.tar.gz"
+            ),
+            False,
+        ),
+        (
+            "host artifact path",
+            lambda request: request["artifacts"][0].__setitem__(
+                "target_path", "C:/dataset.tar.gz"
+            ),
+            False,
+        ),
+        (
+            "unknown launch schema",
+            lambda request: request["launch_spec"].__setitem__("schema_version", "2.0"),
+            True,
+        ),
+        (
+            "arbitrary entrypoint",
+            lambda request: request["launch_spec"].__setitem__("argv", ["/bin/sh"]),
+            True,
+        ),
+        (
+            "newline argument",
+            lambda request: request["launch_spec"]["env"].__setitem__(
+                "VISIOX_TRAINING_ARGUMENTS_JSON", '["epochs=1\\nwhoami"]'
+            ),
+            True,
+        ),
+        (
+            "host runtime path",
+            lambda request: request["launch_spec"].__setitem__(
+                "working_directory", "C:/workspace"
+            ),
+            True,
+        ),
+        (
+            "checksum mismatch",
+            lambda request: request.__setitem__("launch_spec_checksum", "0" * 64),
+            False,
+        ),
     ],
 )
 def test_remote_staging_rejects_untrusted_launch_contracts(
@@ -797,27 +924,85 @@ def test_artifact_manifest_is_bounded_and_checksum_verified(tmp_path: Path) -> N
     embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     namespace: dict[str, object] = {"__name__": "visiox_script_test"}
     exec(compile(embedded, "launch_rank.sh", "exec"), namespace)
-    manifest = {
-        "schema_version": "1.0",
-        "artifacts": [
-            {
-                "path": "weights/best.bin",
-                "size_bytes": len(b"trusted model"),
-                "checksum_sha256": hashlib.sha256(b"trusted model").hexdigest(),
-            }
-        ],
-    }
+    unsigned = ArtifactManifest(
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        artifacts=(
+            ArtifactEntry(
+                path="weights/best.bin",
+                size_bytes=len(b"trusted model"),
+                checksum_sha256=hashlib.sha256(b"trusted model").hexdigest(),
+                artifact_type="model_weight",
+            ),
+        ),
+    )
+    manifest = unsigned.model_copy(
+        update={"checksum_sha256": unsigned.canonical_checksum_sha256()}
+    ).model_dump(mode="json")
 
-    assert namespace["validate_artifact_manifest"](  # type: ignore[operator]
-        manifest, output
-    ) == manifest
+    assert (
+        namespace["validate_artifact_manifest"](  # type: ignore[operator]
+            manifest, output
+        )
+        == manifest
+    )
 
     for invalid_manifest in (
         {**manifest, "schema_version": "2.0"},
-        {**manifest, "artifacts": [{**manifest["artifacts"][0], "path": "../best.bin"}]},
+        {
+            **manifest,
+            "artifacts": [{**manifest["artifacts"][0], "path": "../best.bin"}],
+        },
         {**manifest, "artifacts": [{**manifest["artifacts"][0], "size_bytes": 1}]},
-        {**manifest, "artifacts": [{**manifest["artifacts"][0], "checksum_sha256": "0" * 64}]},
-        {**manifest, "artifacts": manifest["artifacts"] * (namespace["MAX_ARTIFACT_COUNT"] + 1)},
+        {
+            **manifest,
+            "artifacts": [{**manifest["artifacts"][0], "checksum_sha256": "0" * 64}],
+        },
+        {
+            **manifest,
+            "artifacts": manifest["artifacts"] * (namespace["MAX_ARTIFACT_COUNT"] + 1),
+        },
     ):
         with pytest.raises(ValueError):
             namespace["validate_artifact_manifest"](invalid_manifest, output)  # type: ignore[operator]
+
+
+def test_control_plane_rejects_artifact_manifest_identity_and_checksum_mismatch() -> (
+    None
+):
+    unsigned = ArtifactManifest(
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        artifacts=(),
+    )
+    manifest = unsigned.model_copy(
+        update={"checksum_sha256": unsigned.canonical_checksum_sha256()}
+    )
+    spec = LaunchSpec(
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        argv=("/usr/local/bin/visiox-train",),
+    )
+
+    assert (
+        _validate_remote_artifact_manifest(
+            manifest.model_dump(mode="json"), task_id="job-1", launch_spec=spec
+        )
+        == manifest
+    )
+    with pytest.raises(ValueError, match="identity"):
+        _validate_remote_artifact_manifest(
+            manifest.model_copy(update={"task_id": "other"}).model_dump(mode="json"),
+            task_id="job-1",
+            launch_spec=spec,
+        )
+    with pytest.raises(ValueError, match="checksum"):
+        _validate_remote_artifact_manifest(
+            manifest.model_copy(update={"checksum_sha256": "0" * 64}).model_dump(
+                mode="json"
+            ),
+            task_id="job-1",
+            launch_spec=spec,
+        )

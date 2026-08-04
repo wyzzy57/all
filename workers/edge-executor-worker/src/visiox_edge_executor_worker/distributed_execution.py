@@ -5,6 +5,7 @@ import json
 import shutil
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -28,7 +29,7 @@ from visiox_db.models import (
 )
 from visiox_common.settings import get_settings
 from visiox_storage.client import ObjectStorageClient
-from visiox_training.contracts import LaunchSpec
+from visiox_training.contracts import ArtifactManifest, LaunchSpec
 from visiox_yolo26.converters import export_yolo26_dataset
 from visiox_yolo26.training.commands import build_train_command
 
@@ -81,7 +82,7 @@ class _StageResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     root: str
-    paths: dict[str, str]
+    paths: dict[str, Any]
 
 
 class _LaunchResult(BaseModel):
@@ -125,19 +126,39 @@ class _CollectResult(BaseModel):
     artifacts: dict[str, _CollectedArtifact]
 
 
-class _ArtifactManifestEntry(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+@dataclass(frozen=True)
+class _RemoteAdapterContract:
+    framework: str
+    engine: str
+    adapter_key: str
+    adapter_version: str
 
-    path: str
-    size_bytes: int
-    checksum_sha256: str
 
+_REMOTE_ADAPTERS = {
+    "ultralytics.object_detection.v1": _RemoteAdapterContract(
+        framework="ultralytics",
+        engine="yolo26",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+    ),
+    "llamafactory.llm_sft.v1": _RemoteAdapterContract(
+        framework="llamafactory",
+        engine="llamafactory",
+        adapter_key="llamafactory.llm_sft.v1",
+        adapter_version="1.0.0",
+    ),
+}
 
-class _ArtifactManifestResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    schema_version: str
-    artifacts: tuple[_ArtifactManifestEntry, ...]
+_MAX_ARTIFACT_COUNT = 256
+_MAX_ARTIFACT_SIZE_BYTES = 8 * 1024 * 1024 * 1024
+_MAX_ARTIFACT_TOTAL_BYTES = 32 * 1024 * 1024 * 1024
+_TRUSTED_ARTIFACT_TYPES = {
+    "model_weight",
+    "visualization",
+    "metrics",
+    "tensorboard_event",
+    "training_output",
+}
 
 
 class _ScriptRunner(_DeploymentHandlerBase):
@@ -183,6 +204,7 @@ class DistributedTrainingHandler:
                 != attempt.launch_spec_checksum
             ):
                 raise ValueError("persisted launch spec checksum did not match")
+            adapter = _require_remote_adapter(pipeline, base_launch_spec)
             log_job_id = job.id
             log_stream_id = self._ensure_log_stream(job, pipeline)
             ranks = tuple(_Rank.model_validate(item) for item in run.ranks)
@@ -190,12 +212,12 @@ class DistributedTrainingHandler:
                 raise ValueError("distributed rank plan is incomplete")
             self._transition(execution.id, "staging", 20)
             artifacts = self._prepare_artifacts(
-                run, job, task, pipeline, base_model, dataset
+                run, job, task, adapter, base_model, dataset
             )
             staged: dict[str, _StageResult] = {}
-            arguments = _training_arguments(job, task, pipeline.engine)
+            arguments = _training_arguments(job, task, adapter.adapter_key)
             framework_parameters: dict[str, Any] = {}
-            if pipeline.engine == "llamafactory":
+            if adapter.adapter_key == "llamafactory.llm_sft.v1":
                 framework_parameters["model_source"] = _llm_model_source(task)
             staged_requests: dict[str, dict[str, Any]] = {}
             for rank in ranks:
@@ -204,7 +226,7 @@ class DistributedTrainingHandler:
                     job,
                     rank,
                     ranks,
-                    pipeline.framework,
+                    adapter.framework,
                     base_launch_spec.adapter_key,
                     base_launch_spec.adapter_version,
                     arguments,
@@ -246,12 +268,20 @@ class DistributedTrainingHandler:
                 containers,
                 staged,
                 log_stream_id=log_stream_id,
+                task_id=job.id,
+                launch_spec=base_launch_spec,
             ):
                 if self._cancel_requested(execution.id):
                     self._close_log_stream(log_stream_id, "cancelled", log_job_id)
                     return ExecutionResult.succeeded(phase="canceled")
                 self._stop_peers(execution, launched)
-                self._try_collect_checkpoint(run, ranks[0], staged[ranks[0].node_id])
+                self._try_collect_checkpoint(
+                    run,
+                    ranks[0],
+                    staged[ranks[0].node_id],
+                    task_id=job.id,
+                    launch_spec=base_launch_spec,
+                )
                 self._mark_failed(execution.id)
                 self._close_log_stream(log_stream_id, "failed", log_job_id)
                 return ExecutionResult.failed(
@@ -260,7 +290,12 @@ class DistributedTrainingHandler:
                     phase="failed",
                 )
             collected = self._collect_rank_zero(
-                run, job, pipeline, ranks[0], staged[ranks[0].node_id]
+                run,
+                job,
+                pipeline,
+                ranks[0],
+                staged[ranks[0].node_id],
+                launch_spec=base_launch_spec,
             )
             self._cache_final_observability(job.id, collected)
             self._mark_succeeded(execution.id, collected)
@@ -341,12 +376,16 @@ class DistributedTrainingHandler:
                 raise ValueError("distributed execution is not runnable")
             run = session.get(DistributedTrainingRun, current.resource_id)
             job = session.get(TrainingJob, current.training_job_id)
-            attempt = session.scalar(
-                select(TrainingJobAttempt).where(
-                    TrainingJobAttempt.training_job_id == current.training_job_id,
-                    TrainingJobAttempt.attempt_number == run.attempt,
+            attempt = (
+                session.scalar(
+                    select(TrainingJobAttempt).where(
+                        TrainingJobAttempt.training_job_id == current.training_job_id,
+                        TrainingJobAttempt.attempt_number == run.attempt,
+                    )
                 )
-            ) if run is not None else None
+                if run is not None
+                else None
+            )
             task = session.get(Task, current.task_id)
             pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
             base_model = (
@@ -367,12 +406,16 @@ class DistributedTrainingHandler:
         run: DistributedTrainingRun,
         job: TrainingJob,
         task: Task,
-        pipeline: TrainingPipeline,
+        adapter: _RemoteAdapterContract,
         base_model: StoredBaseModel | None,
         dataset: Dataset,
     ) -> list[dict[str, Any]]:
-        if pipeline.engine == "llamafactory":
+        if adapter.adapter_key == "llamafactory.llm_sft.v1":
             return self._prepare_llm_artifacts(run, job, task, dataset)
+        if adapter.adapter_key != "ultralytics.object_detection.v1":
+            raise ValueError(
+                f"remote training adapter {adapter.adapter_key!r} is not implemented"
+            )
         if base_model is None:
             raise ValueError("base model is unavailable")
         checksum = (base_model.checksum or "").lower()
@@ -406,7 +449,7 @@ class DistributedTrainingHandler:
                     base_model.local_uri, expires=_PRESIGNED_URL_TTL
                 ),
                 "checksum_sha256": checksum,
-                "target_path": "artifacts/base.pt",
+                "target_path": "model/base.pt",
                 "unpack_to": None,
             },
             {
@@ -415,7 +458,7 @@ class DistributedTrainingHandler:
                     dataset_uri, expires=_PRESIGNED_URL_TTL
                 ),
                 "checksum_sha256": dataset_checksum,
-                "target_path": "archives/dataset.tar.gz",
+                "target_path": "dataset.tar.gz",
                 "unpack_to": "dataset",
             },
         ]
@@ -427,7 +470,7 @@ class DistributedTrainingHandler:
                         run.checkpoint_uri, expires=_PRESIGNED_URL_TTL
                     ),
                     "checksum_sha256": run.checkpoint_checksum,
-                    "target_path": "artifacts/last.pt",
+                    "target_path": "checkpoint/last.pt",
                     "unpack_to": None,
                 }
             )
@@ -510,7 +553,7 @@ class DistributedTrainingHandler:
                     dataset_uri, expires=_PRESIGNED_URL_TTL
                 ),
                 "checksum_sha256": archive_checksum,
-                "target_path": "archives/dataset.tar.gz",
+                "target_path": "dataset.tar.gz",
                 "unpack_to": "dataset",
             }
         ]
@@ -575,12 +618,20 @@ class DistributedTrainingHandler:
         staged: dict[str, _StageResult],
         *,
         log_stream_id: str | None,
+        task_id: str,
+        launch_spec: LaunchSpec,
     ) -> bool:
         while True:
             if self._cancel_requested(execution_id):
                 return False
             rank_zero = containers[0][0]
-            self._sync_observability(execution_id, rank_zero, staged[rank_zero.node_id])
+            self._sync_observability(
+                execution_id,
+                rank_zero,
+                staged[rank_zero.node_id],
+                task_id=task_id,
+                launch_spec=launch_spec,
+            )
             completed = 0
             for rank, container_id in containers:
                 target = self._launch._load_target(rank.node_id)
@@ -699,6 +750,9 @@ class DistributedTrainingHandler:
         execution_id: str,
         rank: _Rank,
         staged: _StageResult,
+        *,
+        task_id: str,
+        launch_spec: LaunchSpec,
     ) -> None:
         try:
             with self._session_factory() as session:
@@ -723,7 +777,12 @@ class DistributedTrainingHandler:
                 for name, object_name in object_names.items()
             }
             target = self._launch._load_target(rank.node_id)
-            manifest = self._remote_artifact_manifest(target, staged.paths["output"])
+            manifest = self._remote_artifact_manifest(
+                target,
+                staged.paths["output"],
+                task_id=task_id,
+                launch_spec=launch_spec,
+            )
             manifest_paths = _manifest_paths_by_name(manifest)
             selected_uploads = {
                 manifest_paths[name]: url
@@ -762,16 +821,25 @@ class DistributedTrainingHandler:
         self,
         target: Any,
         output_path: str,
-    ) -> _ArtifactManifestResult:
-        manifest = _ArtifactManifestResult.model_validate(
-            self._launch._run_script(
-                target,
-                {"action": "manifest", "output_path": output_path},
-            )
+        *,
+        task_id: str,
+        launch_spec: LaunchSpec,
+    ) -> ArtifactManifest:
+        payload = self._launch._run_script(
+            target,
+            {
+                "action": "manifest",
+                "output_path": output_path,
+                "task_id": task_id,
+                "adapter_key": launch_spec.adapter_key,
+                "adapter_version": launch_spec.adapter_version,
+            },
         )
-        if manifest.schema_version != "1.0":
-            raise ValueError("remote artifact manifest version is unsupported")
-        return manifest
+        return _validate_remote_artifact_manifest(
+            payload,
+            task_id=task_id,
+            launch_spec=launch_spec,
+        )
 
     def _persist_observability_snapshot(self, execution_id: str, snapshot: Any) -> None:
         if not isinstance(snapshot, dict):
@@ -828,9 +896,16 @@ class DistributedTrainingHandler:
         pipeline: TrainingPipeline,
         rank: _Rank,
         staged: _StageResult,
+        *,
+        launch_spec: LaunchSpec,
     ) -> _CollectResult:
         target = self._launch._load_target(rank.node_id)
-        manifest = self._remote_artifact_manifest(target, staged.paths["output"])
+        manifest = self._remote_artifact_manifest(
+            target,
+            staged.paths["output"],
+            task_id=job.id,
+            launch_spec=launch_spec,
+        )
         paths_by_name = _manifest_paths_by_name(manifest)
         uris = {
             entry.path: _artifact_uri(job.id, entry.path)
@@ -853,7 +928,7 @@ class DistributedTrainingHandler:
         )
         required = (
             {"adapter_model.safetensors", "adapter_config.json"}
-            if pipeline.engine == "llamafactory"
+            if launch_spec.adapter_key == "llamafactory.llm_sft.v1"
             else {"best.pt", "last.pt"}
         )
         if not required.issubset(paths_by_name):
@@ -871,11 +946,19 @@ class DistributedTrainingHandler:
         run: DistributedTrainingRun,
         rank: _Rank,
         staged: _StageResult,
+        *,
+        task_id: str,
+        launch_spec: LaunchSpec,
     ) -> None:
         checkpoint_uri = f"minio://training/checkpoints/{run.id}/{run.attempt}/last.pt"
         try:
             target = self._launch._load_target(rank.node_id)
-            manifest = self._remote_artifact_manifest(target, staged.paths["output"])
+            manifest = self._remote_artifact_manifest(
+                target,
+                staged.paths["output"],
+                task_id=task_id,
+                launch_spec=launch_spec,
+            )
             last_path = _manifest_paths_by_name(manifest).get("last.pt")
             if last_path is None:
                 return
@@ -1031,7 +1114,9 @@ class DistributedTrainingHandler:
             session.add_all([execution, run, job, task, pipeline])
             session.commit()
 
-    def _cache_final_observability(self, job_id: str, collected: _CollectResult) -> None:
+    def _cache_final_observability(
+        self, job_id: str, collected: _CollectResult
+    ) -> None:
         run_path = get_settings().training_runs_root / "runs" / f"job-{job_id}"
         run_path.mkdir(parents=True, exist_ok=True)
         object_names = {
@@ -1106,11 +1191,29 @@ class StopDistributedTrainingHandler(DistributedTrainingHandler):
                 run = session.get(
                     DistributedTrainingRun, current.resource_id if current else None
                 )
+                job = session.get(
+                    TrainingJob, current.training_job_id if current else None
+                )
+                attempt_record = (
+                    session.scalar(
+                        select(TrainingJobAttempt).where(
+                            TrainingJobAttempt.training_job_id
+                            == current.training_job_id,
+                            TrainingJobAttempt.attempt_number == run.attempt,
+                        )
+                    )
+                    if current is not None and run is not None
+                    else None
+                )
                 if current is None or run is None:
                     raise ValueError("distributed run was not found")
+                if job is None or attempt_record is None:
+                    raise ValueError("distributed training attempt was not found")
                 nodes = tuple(run.node_ids)
                 run_id = run.id
                 attempt = run.attempt
+                task_id = job.id
+                launch_spec = LaunchSpec.model_validate(attempt_record.launch_spec)
             for node_id in nodes:
                 target = self._stop._load_target(node_id)
                 _StopResult.model_validate(
@@ -1129,6 +1232,8 @@ class StopDistributedTrainingHandler(DistributedTrainingHandler):
                         "output": f"/var/lib/visiox/training/{run.id}/{run.attempt}/output"
                     },
                 ),
+                task_id=task_id,
+                launch_spec=launch_spec,
             )
             now = datetime.now(UTC)
             with self._session_factory() as session:
@@ -1182,8 +1287,10 @@ def build_distributed_handlers(
 
 
 def _training_arguments(job: TrainingJob, task: Task, engine: str) -> list[str]:
-    if engine == "llamafactory":
+    if engine in {"llamafactory", "llamafactory.llm_sft.v1"}:
         return []
+    if engine not in {"yolo26", "ultralytics.object_detection.v1"}:
+        raise ValueError(f"remote training adapter {engine!r} is not implemented")
     params: dict[str, Any] = dict(job.params or {})
     environment = (task.payload or {}).get("environment")
     if isinstance(environment, Mapping):
@@ -1220,55 +1327,56 @@ def _staging_request(
         for argument in arguments
     ):
         raise ValueError("training arguments contain unsafe control characters")
-    launch_spec = {
-        "schema_version": "1.0",
-        "training_job_id": job.id,
-        "run_id": run.id,
-        "attempt": run.attempt,
-        "framework": framework,
-        "adapter_key": adapter_key,
-        "adapter_version": adapter_version,
-        "entrypoint": "/usr/local/bin/visiox-train",
-        "parameters": {
-            "arguments": list(arguments),
-            **dict(parameters),
-        },
-        "environment": dict(environment or {}),
-        "distributed": {
-            "node_id": rank.node_id,
-            "gpu_uuids": list(rank.gpu_uuids),
-            "node_rank": rank.node_rank,
-            "nnodes": len(ranks),
-            "nproc_per_node": len(rank.gpu_uuids),
-            "rendezvous": {
-                "master_addr": run.master_addr,
-                "master_port": run.master_port,
-            },
-        },
-        "paths": {
-            "launch_spec": "/workspace/input/launch-spec.json",
-            "dataset": "/workspace/input/dataset",
-            "model": "/workspace/input/artifacts/base.pt",
-            "checkpoint": "/workspace/input/artifacts/last.pt",
-            "output": "/workspace/output",
-        },
+    framework_parameters = json.dumps(
+        dict(parameters),
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    signed_environment = {
+        **dict(environment or {}),
+        "VISIOX_TRAINING_JOB_ID": job.id,
+        "VISIOX_TRAINING_RUN_ID": run.id,
+        "VISIOX_TRAINING_ATTEMPT": str(run.attempt),
+        "VISIOX_FRAMEWORK": framework,
+        "VISIOX_NODE_ID": rank.node_id,
+        "VISIOX_NODE_RANK": str(rank.node_rank),
+        "VISIOX_NNODES": str(len(ranks)),
+        "VISIOX_NPROC_PER_NODE": str(len(rank.gpu_uuids)),
+        "VISIOX_GPU_UUIDS_JSON": json.dumps(
+            list(rank.gpu_uuids), separators=(",", ":")
+        ),
+        "VISIOX_MASTER_ADDR": run.master_addr,
+        "VISIOX_MASTER_PORT": str(run.master_port),
+        "VISIOX_OUTPUT_DIR": "/workspace/output",
+        "VISIOX_DATASET_DIR": "/workspace/dataset",
+        "VISIOX_MODEL_PATH": "/workspace/model/base.pt",
+        "VISIOX_CHECKPOINT_PATH": "/workspace/checkpoint/last.pt",
+        "VISIOX_LLM_CONFIG_PATH": "/workspace/dataset/train.yaml",
+        "VISIOX_TRAINING_ARGUMENTS_JSON": json.dumps(
+            list(arguments), separators=(",", ":")
+        ),
+        "VISIOX_FRAMEWORK_PARAMETERS_JSON": framework_parameters,
+        "HF_HOME": "/workspace/model-cache/huggingface",
+        "MODELSCOPE_CACHE": "/workspace/model-cache/modelscope",
     }
-    checksum = hashlib.sha256(
-        json.dumps(
-            launch_spec,
-            ensure_ascii=True,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
+    if parameters.get("model_source") == "modelscope":
+        signed_environment["USE_MODELSCOPE_HUB"] = "1"
+    launch_spec_model = LaunchSpec(
+        adapter_key=adapter_key,
+        adapter_version=adapter_version,
+        argv=("/usr/local/bin/visiox-train",),
+        env=signed_environment,
+        working_directory="workspace",
+    )
+    launch_spec = launch_spec_model.model_dump(mode="json")
+    checksum = launch_spec_model.canonical_checksum_sha256()
     return {
         "schema_version": "1.0",
         "run_id": run.id,
         "attempt": run.attempt,
-        "runtime_image_digest": validate_image_digest(
-            str(run.training_image_digest)
-        ),
+        "runtime_image_digest": validate_image_digest(str(run.training_image_digest)),
         "launch_spec": launch_spec,
         "launch_spec_checksum": checksum,
         "artifacts": artifacts,
@@ -1276,21 +1384,72 @@ def _staging_request(
 
 
 def _manifest_paths_by_name(
-    manifest: _ArtifactManifestResult,
+    manifest: ArtifactManifest,
 ) -> dict[str, str]:
     grouped: dict[str, list[str]] = {}
     for entry in manifest.artifacts:
         grouped.setdefault(PurePosixPath(entry.path).name, []).append(entry.path)
-    return {
-        name: paths[0]
-        for name, paths in grouped.items()
-        if len(paths) == 1
-    }
+    return {name: paths[0] for name, paths in grouped.items() if len(paths) == 1}
+
+
+def _validate_remote_artifact_manifest(
+    payload: Any,
+    *,
+    task_id: str,
+    launch_spec: LaunchSpec,
+) -> ArtifactManifest:
+    manifest = ArtifactManifest.model_validate(payload)
+    if (
+        manifest.task_id != task_id
+        or manifest.adapter_key != launch_spec.adapter_key
+        or manifest.adapter_version != launch_spec.adapter_version
+    ):
+        raise ValueError("remote artifact manifest identity did not match")
+    if manifest.checksum_sha256 != manifest.canonical_checksum_sha256():
+        raise ValueError("remote artifact manifest checksum did not match")
+    if len(manifest.artifacts) > _MAX_ARTIFACT_COUNT:
+        raise ValueError("remote artifact manifest contains too many artifacts")
+    total = 0
+    for artifact in manifest.artifacts:
+        if artifact.artifact_type not in _TRUSTED_ARTIFACT_TYPES:
+            raise ValueError("remote artifact type is not trusted")
+        if artifact.size_bytes > _MAX_ARTIFACT_SIZE_BYTES:
+            raise ValueError("remote artifact exceeds size limit")
+        total += artifact.size_bytes
+        if total > _MAX_ARTIFACT_TOTAL_BYTES:
+            raise ValueError("remote artifact manifest exceeds total size limit")
+    return manifest
+
+
+def _require_remote_adapter(
+    pipeline: TrainingPipeline,
+    launch_spec: LaunchSpec,
+) -> _RemoteAdapterContract:
+    adapter = _REMOTE_ADAPTERS.get(launch_spec.adapter_key)
+    if adapter is None:
+        raise ValueError(
+            f"remote training adapter {launch_spec.adapter_key!r} is not implemented"
+        )
+    if launch_spec.adapter_version != adapter.adapter_version:
+        raise ValueError("remote training adapter version is not implemented")
+    if (
+        pipeline.framework != adapter.framework
+        or pipeline.adapter_key != adapter.adapter_key
+        or pipeline.adapter_version != adapter.adapter_version
+        or pipeline.engine != adapter.engine
+    ):
+        raise ValueError("persisted pipeline does not match the trusted remote adapter")
+    return adapter
 
 
 def _artifact_uri(job_id: str, path: str) -> str:
     name = PurePosixPath(path).name
-    if name in {"best.pt", "last.pt", "adapter_model.safetensors", "adapter_config.json"}:
+    if name in {
+        "best.pt",
+        "last.pt",
+        "adapter_model.safetensors",
+        "adapter_config.json",
+    }:
         return f"minio://models/trained/{job_id}/{name}"
     if name in _VISUALIZATION_ARTIFACTS:
         return f"minio://training/jobs/{job_id}/visualizations/{name}"
@@ -1311,16 +1470,34 @@ def _launch_request(
         "action": "launch",
         "run_id": run.id,
         "attempt": run.attempt,
-        "runtime_image_digest": validate_image_digest(
-            str(run.training_image_digest)
-        ),
-        "framework": launch_spec["framework"],
+        "runtime_image_digest": validate_image_digest(str(run.training_image_digest)),
+        "framework": launch_spec["env"]["VISIOX_FRAMEWORK"],
         "adapter_key": launch_spec["adapter_key"],
+        "adapter_version": launch_spec["adapter_version"],
         "gpu_uuids": list(rank.gpu_uuids),
         "node_rank": rank.node_rank,
         "launch_spec_checksum": staging_request["launch_spec_checksum"],
-        "paths": stage.paths,
+        "paths": {
+            "launch_spec": stage.paths["launch_spec"],
+            "output": stage.paths["output"],
+        },
+        "mounts": _artifact_mounts(stage.paths.get("artifacts", {})),
     }
+
+
+def _artifact_mounts(paths: Any) -> list[dict[str, Any]]:
+    if not isinstance(paths, Mapping):
+        raise ValueError("staged artifact paths are unavailable")
+    targets = {
+        "dataset": "/workspace/dataset",
+        "model": "/workspace/model/base.pt",
+        "checkpoint": "/workspace/checkpoint/last.pt",
+    }
+    return [
+        {"source": source, "target": targets[role], "read_only": True}
+        for role, source in paths.items()
+        if role in targets
+    ]
 
 
 def _llm_model_source(task: Task) -> str:
