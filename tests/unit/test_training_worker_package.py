@@ -68,6 +68,10 @@ def test_edge_image_exposes_fixed_training_entrypoint() -> None:
 
     assert "/usr/local/bin/visiox-train" in dockerfile
     assert "visiox_training_worker.fixed_entrypoint" in dockerfile
+    assert (
+        "COPY packages/visiox-yolo26/src/visiox_yolo26 "
+        "/usr/local/lib/python3.12/site-packages/visiox_yolo26"
+    ) in dockerfile
 
 
 def test_fixed_entrypoint_preserves_ultralytics_torchrun_semantics() -> None:

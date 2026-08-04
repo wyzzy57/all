@@ -5,6 +5,7 @@ USER root
 RUN pip install --no-cache-dir "tensorboard>=2.18,<3.0"
 COPY workers/training-worker/src/visiox_training_worker /usr/local/lib/python3.12/site-packages/visiox_training_worker
 COPY packages/visiox-training/src/visiox_training /usr/local/lib/python3.12/site-packages/visiox_training
+COPY packages/visiox-yolo26/src/visiox_yolo26 /usr/local/lib/python3.12/site-packages/visiox_yolo26
 RUN printf '#!/bin/sh\nexec python -m visiox_training_worker.fixed_entrypoint "$@"\n' > /usr/local/bin/visiox-train \
     && chmod 0755 /usr/local/bin/visiox-train
 
