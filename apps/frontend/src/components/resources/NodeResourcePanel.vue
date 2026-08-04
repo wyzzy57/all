@@ -12,18 +12,34 @@ import { computed } from "vue";
 import type { ComputeNodeRecord } from "@/api/client";
 
 const props = defineProps<{ node: ComputeNodeRecord }>();
-const number = (key: string) => Number(props.node.resources[key] ?? 0);
-const percent = (key: string) => `${number(key).toFixed(1)}%`;
-const gib = (value: number) => value ? `${(value / 1024 / 1024).toFixed(1)} GiB` : "-";
-const diskGib = (value: number) => value ? `${(value / 1024 ** 3).toFixed(1)} GiB` : "-";
+
+const metric = (key: string): number | null => {
+  const value = props.node.resources[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+};
+const valueOrDash = (value: number | null) => value === null ? "-" : String(value);
+const percent = (key: string) => {
+  const value = metric(key);
+  return value === null ? "暂无数据" : `${value.toFixed(1)}%`;
+};
+const gib = (value: number | null, divisor: number) =>
+  value === null ? "-" : `${(value / divisor).toFixed(1)} GiB`;
+const temperatureAndPower = () => {
+  const temperature = metric("gpu_temperature_celsius");
+  const power = metric("gpu_power_draw_watts");
+  if (temperature === null && power === null) return "暂无数据";
+  const temperatureText = temperature === null ? "-" : `${temperature}°C`;
+  const powerText = power === null ? "-" : `${power.toFixed(0)} W`;
+  return `${temperatureText} · ${powerText}`;
+};
 
 const items = computed(() => [
-  { label: "CPU", value: `${number("cpu_logical_cores")} 核 · ${percent("cpu_utilization_percent")}` },
-  { label: "内存可用", value: gib(number("memory_available_kib")) },
-  { label: "磁盘可用", value: diskGib(number("disk_available_bytes")) },
-  { label: "GPU", value: `${number("gpu_count")} 张 · ${percent("gpu_utilization_percent")}` },
-  { label: "显存", value: `${number("gpu_memory_used_mib")} / ${number("gpu_memory_total_mib")} MiB` },
-  { label: "温度 / 功耗", value: `${number("gpu_temperature_celsius")}°C · ${number("gpu_power_draw_watts").toFixed(0)} W` },
+  { label: "CPU", value: `${valueOrDash(metric("cpu_logical_cores"))} 核 · ${percent("cpu_utilization_percent")}` },
+  { label: "内存可用", value: gib(metric("memory_available_kib"), 1024 * 1024) },
+  { label: "磁盘可用", value: gib(metric("disk_available_bytes"), 1024 ** 3) },
+  { label: "GPU", value: `${valueOrDash(metric("gpu_count"))} 张 · ${percent("gpu_utilization_percent")}` },
+  { label: "显存", value: `${valueOrDash(metric("gpu_memory_used_mib"))} / ${valueOrDash(metric("gpu_memory_total_mib"))} MiB` },
+  { label: "温度 / 功耗", value: temperatureAndPower() },
 ]);
 </script>
 
