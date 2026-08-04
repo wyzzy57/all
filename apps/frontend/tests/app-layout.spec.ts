@@ -9,11 +9,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "@/App.vue";
 import appSource from "@/App.vue?raw";
 import UserAccountMenu from "@/components/account/UserAccountMenu.vue";
+import stylesRawSource from "@/styles.css?raw";
 import adminOverviewSource from "@/views/admin/AdminOverviewView.vue?raw";
 import auditLogSource from "@/views/admin/AuditLogView.vue?raw";
 import workbenchSource from "@/views/workbench/WorkbenchView.vue?raw";
+import { topLevelRuleDeclarations } from "./helpers/css-rules";
 
-const stylesSource = readFileSync("src/styles.css", "utf8");
+const stylesSource = stylesRawSource || readFileSync("src/styles.css", "utf8");
 
 describe("global application header", () => {
   afterEach(() => {
@@ -71,6 +73,14 @@ describe("global application header", () => {
     expect(stylesSource).toContain(".app-sidebar:focus-within .sidebar-toggle");
   });
 
+  it("defines the shared business card surface tokens on the root", () => {
+    const rootRule = topLevelRuleDeclarations(stylesSource, ":root");
+    expect(rootRule?.get("--visiox-card-surface")).toEqual(["#f3f4f6"]);
+    expect(rootRule?.get("--visiox-card-surface-raised")).toEqual(["#f6f7f8"]);
+    expect(rootRule?.get("--visiox-card-border")).toEqual(["#e0e2e6"]);
+    expect(rootRule?.get("--visiox-card-radius")).toEqual(["8px"]);
+  });
+
   it("visually collapses the sidebar on narrow screens and keeps an explicit account focus ring", () => {
     expect(stylesSource).toContain("@media (max-width: 720px)");
     expect(stylesSource).toContain(".app-sidebar.mobile-expanded");
@@ -116,11 +126,18 @@ describe("global application header", () => {
   });
 
   it("defines shell containment and page overflow contracts for browser QA", () => {
+    const workbenchRootRules = [...workbenchSource.matchAll(/\.workbench-view\s*\{([^{}]*)\}/g)]
+      .map((match) => match[1]);
+
     expect(appSource).not.toContain('class="app-header"');
     expect(appSource).toContain('class="app-content-shell"');
     expect(stylesSource).toMatch(/\.app-content-shell\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden/s);
     expect(stylesSource).toMatch(/\.app-main\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*auto/s);
-    expect(workbenchSource).toContain("@container workbench (max-width: 1080px)");
+    expect(workbenchSource).toContain("@container workbench (max-width: 1060px)");
+    expect(workbenchSource).toMatch(/@media \(max-width:\s*1350px\)\s*\{\s*\.workbench-view\s*\{[^}]*grid-template-rows:\s*none/s);
+    for (const ruleBody of workbenchRootRules) {
+      expect(ruleBody).not.toMatch(/transform\s*:[^;{}]*scale\s*\(/);
+    }
     expect(adminOverviewSource).toContain("@container admin-overview (max-width: 1120px)");
     expect(adminOverviewSource).toContain(".failure-table-wrap { overflow-x: auto;");
     expect(auditLogSource).toContain(".audit-table-wrap { overflow-x: auto;");

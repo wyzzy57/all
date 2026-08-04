@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import ServicesView from "@/views/services/ServicesView.vue";
 import servicesViewSource from "@/views/services/ServicesView.vue?raw";
+import { hasForbiddenHoverElevation, topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const pushMock = vi.hoisted(() => vi.fn());
 const routeState = vi.hoisted(() => ({ params: {} as Record<string, string | undefined> }));
@@ -55,6 +56,30 @@ function mountView() {
 }
 
 describe("ServicesView", () => {
+  it("uses the standard shared service card surface", () => {
+    const cardRule = topLevelRuleDeclarations(servicesViewSource, ".service-card", "sfc");
+    expect(cardRule?.get("background")).toEqual(["var(--visiox-card-surface)"]);
+    expect(cardRule?.get("border")).toEqual(["1px solid var(--visiox-card-border)"]);
+    expect(cardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
+  });
+
+  it("does not lift service cards on hover", () => {
+    const hoverRule = topLevelRuleDeclarations(servicesViewSource, ".service-card:hover", "sfc");
+    expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
+  });
+
+  it("wraps narrow service footer actions without compressing their text", () => {
+    const narrowContainer = servicesViewSource.match(
+      /@container services \(max-width: 520px\) \{([\s\S]*?)\n\}/,
+    )?.[1];
+
+    expect(narrowContainer).toMatch(/\.service-card footer\s*\{[^}]*flex-wrap:\s*wrap/);
+    expect(narrowContainer).toMatch(
+      /\.service-status,\s*\.service-card footer button\s*\{[^}]*(?:flex:\s*none[^}]*white-space:\s*nowrap|white-space:\s*nowrap[^}]*flex:\s*none)/,
+    );
+    expect(narrowContainer).toMatch(/\.service-card footer i\s*\{[^}]*display:\s*none/);
+  });
+
   it("uses the shared resource dialog for service access", () => {
     expect(servicesViewSource).toContain("ResourceSharingDialog");
     expect(servicesViewSource).toContain("openServiceSharing(selectedService)");

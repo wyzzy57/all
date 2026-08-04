@@ -543,8 +543,8 @@ function errorMessage(error: unknown, fallback: string) {
 .services-tools, .detail-actions { display: flex; gap: 12px; }
 .sort-select { width: 130px; } .search-input { width: 280px; }
 .service-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
-.service-card { min-width: 0; min-height: 176px; border: 1px solid #dfe5ef; border-radius: 6px; background: #fff; padding: 18px; box-shadow: 0 1px 2px rgb(15 23 42 / 4%); cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
-.service-card:hover { border-color: #7eb0ff; box-shadow: 0 10px 24px rgb(15 23 42 / 7%); transform: translateY(-1px); }
+.service-card { min-width: 0; min-height: 176px; border: 1px solid var(--visiox-card-border); border-radius: var(--visiox-card-radius); background: var(--visiox-card-surface); padding: 18px; box-shadow: none; cursor: pointer; transition: border-color .15s ease; }
+.service-card:hover { border-color: #aeb7c3; box-shadow: none; transform: none; }
 .card-heading { justify-content: space-between; gap: 12px; }
 .service-card h2 { margin: 0; font-size: 16px; }
 .service-card time, .service-card p { color: #667085; font-size: 13px; }
@@ -611,6 +611,9 @@ button { font: inherit; }
   .services-tools, .detail-header, .detail-actions { align-items: stretch; flex-direction: column; }
   .sort-select, .search-input { width: 100%; }
   .service-grid, .metric-grid { grid-template-columns: 1fr; }
+  .service-card footer { flex-wrap: wrap; }
+  .service-status, .service-card footer button { flex: none; white-space: nowrap; }
+  .service-card footer i { display: none; }
   .detail-tabs { gap: 20px; overflow-x: auto; }
 }
 </style>

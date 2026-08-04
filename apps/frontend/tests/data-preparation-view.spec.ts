@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import DataPreparationView from "@/views/data-preparation/DataPreparationView.vue";
 import dataPreparationViewSource from "@/views/data-preparation/DataPreparationView.vue?raw";
+import { topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const apiMock = vi.hoisted(() => ({
   createLabelProject: vi.fn(),
@@ -67,6 +68,21 @@ function mountView() {
 }
 
 describe("DataPreparationView", () => {
+  it("uses the raised shared surface for import cards", () => {
+    const importCardRule = topLevelRuleDeclarations(dataPreparationViewSource, ".import-card", "sfc");
+    expect(importCardRule?.get("background")).toEqual(["var(--visiox-card-surface-raised)"]);
+    expect(importCardRule?.get("border")).toEqual(["1px solid var(--visiox-card-border)"]);
+    expect(importCardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
+  });
+
+  it("leaves all dataset card root ownership to DataAssetCard", () => {
+    for (const selector of [".dataset-card", ".prepare-card", ".library-card"]) {
+      expect(topLevelRuleDeclarations(dataPreparationViewSource, selector, "sfc")).toBeUndefined();
+    }
+    expect(dataPreparationViewSource).not.toContain(".dataset-card:hover");
+    expect(dataPreparationViewSource).not.toContain(".dataset-card:focus-within");
+  });
+
   it("uses the shared resource dialog for dataset visibility", () => {
     expect(dataPreparationViewSource).toContain("ResourceSharingDialog");
     expect(dataPreparationViewSource).toContain("openDatasetSharing(dataset)");

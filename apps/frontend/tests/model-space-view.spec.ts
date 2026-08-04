@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import ModelSpaceView from "@/views/model-space/ModelSpaceView.vue";
 import modelSpaceViewSource from "@/views/model-space/ModelSpaceView.vue?raw";
+import { hasForbiddenHoverElevation, topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const pushMock = vi.hoisted(() => vi.fn());
 const replaceMock = vi.hoisted(() => vi.fn());
@@ -121,6 +122,33 @@ function mockDeployablePipeline() {
 }
 
 describe("ModelSpaceView", () => {
+  it("uses the standard shared pipeline card surface", () => {
+    const cardRule = topLevelRuleDeclarations(modelSpaceViewSource, ".pipeline-card", "sfc");
+    expect(cardRule?.get("background")).toEqual(["var(--visiox-card-surface)"]);
+    expect(cardRule?.get("border")).toEqual(["1px solid var(--visiox-card-border)"]);
+    expect(cardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
+  });
+
+  it("limits restrained hover feedback to non-skeleton pipeline cards", () => {
+    expect(topLevelRuleDeclarations(modelSpaceViewSource, ".pipeline-card:hover", "sfc")).toBeUndefined();
+    const hoverRule = topLevelRuleDeclarations(
+      modelSpaceViewSource,
+      ".pipeline-card:not(.skeleton-card):hover",
+      "sfc",
+    );
+    expect(hoverRule?.get("border-color")).toEqual(["#aeb7c3"]);
+    expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
+  });
+
+  it("keeps the narrowest pipeline and scenario grids shrinkable", () => {
+    const narrowContainer = modelSpaceViewSource.match(
+      /@container model-space \(max-width: 480px\) \{([\s\S]*?)\n\}/,
+    )?.[1];
+
+    expect(narrowContainer).toMatch(/\.pipeline-grid,\s*\.scenario-grid/);
+    expect(narrowContainer).toContain("grid-template-columns: minmax(0, 1fr)");
+  });
+
   it("uses the real shared resource dialog instead of hard-coded public scopes", () => {
     expect(modelSpaceViewSource).toContain("ResourceSharingDialog");
     expect(modelSpaceViewSource).not.toContain('const scopeOptions = [');

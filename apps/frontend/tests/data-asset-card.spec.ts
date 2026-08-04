@@ -2,7 +2,8 @@ import { mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
 
 import DataAssetCard from "@/components/data/DataAssetCard.vue";
-
+import dataAssetCardSource from "@/components/data/DataAssetCard.vue?raw";
+import { hasForbiddenHoverElevation, topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const asset = {
   id: "dataset-1",
@@ -19,6 +20,34 @@ const asset = {
 
 
 describe("DataAssetCard", () => {
+  it("uses the standard shared card surface", () => {
+    const cardRule = topLevelRuleDeclarations(dataAssetCardSource, ".data-asset-card", "sfc");
+    expect(cardRule?.get("background")).toEqual(["var(--visiox-card-surface)"]);
+    expect(cardRule?.get("border")).toEqual(["1px solid var(--visiox-card-border)"]);
+    expect(cardRule?.get("border-radius")).toEqual(["var(--visiox-card-radius)"]);
+  });
+
+  it("owns the root card layout and mode dimensions", () => {
+    const cardRule = topLevelRuleDeclarations(dataAssetCardSource, ".data-asset-card", "sfc");
+    expect(cardRule?.get("box-sizing")).toEqual(["border-box"]);
+    expect(cardRule?.get("cursor")).toEqual(["pointer"]);
+    expect(cardRule?.get("min-height")).toEqual(["138px"]);
+    expect(cardRule?.get("padding")).toEqual(["18px 18px 16px"]);
+    expect(cardRule?.get("position")).toEqual(["relative"]);
+    expect(cardRule?.get("text-align")).toEqual(["left"]);
+
+    const prepareRule = topLevelRuleDeclarations(dataAssetCardSource, ".prepare-card", "sfc");
+    const libraryRule = topLevelRuleDeclarations(dataAssetCardSource, ".library-card", "sfc");
+    expect(prepareRule?.get("height")).toEqual(["220px"]);
+    expect(libraryRule?.get("min-height")).toEqual(["122px"]);
+    expect(libraryRule?.get("padding")).toEqual(["16px 16px 14px"]);
+  });
+
+  it("does not lift the shared card on hover", () => {
+    const hoverRule = topLevelRuleDeclarations(dataAssetCardSource, ".data-asset-card:hover", "sfc");
+    expect(hasForbiddenHoverElevation(hoverRule)).toBe(false);
+  });
+
   it("renders preparation metadata in stable rows and emits workflow actions", async () => {
     const wrapper = mount(DataAssetCard, {
       props: {
@@ -59,7 +88,7 @@ describe("DataAssetCard", () => {
       },
     });
 
-    expect(wrapper.classes()).toContain("dataset-card");
+    expect(wrapper.classes()).toEqual(expect.arrayContaining(["dataset-card", "data-asset-card"]));
     await wrapper.get("[data-testid='validate-dataset-dataset-1']").trigger("click");
     await wrapper.get("[data-testid='process-dataset-dataset-1']").trigger("click");
     expect(wrapper.emitted("validate")).toHaveLength(1);
