@@ -2,6 +2,11 @@ from importlib import resources
 from pathlib import Path
 
 
+TRAINING_REMOTE_SCRIPTS = frozenset(
+    {"stage_training.sh", "launch_rank.sh", "stop_training.sh"}
+)
+
+
 _PACKAGED_SCRIPTS = frozenset(
     {
         "bootstrap_user.sh",
@@ -15,7 +20,7 @@ _PACKAGED_SCRIPTS = frozenset(
         "start_deployment.sh",
         "stop_training.sh",
     }
-)
+) | TRAINING_REMOTE_SCRIPTS
 
 
 def load_packaged_script(name: str) -> bytes:

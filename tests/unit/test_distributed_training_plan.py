@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -34,6 +36,61 @@ from visiox_edge_executor_worker.distributed_execution import (
     _training_arguments,
 )
 from visiox_edge_executor_worker.scripts import load_packaged_script
+
+
+def _canonical_checksum(payload: dict[str, object]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _generic_staging_request() -> dict[str, object]:
+    rank = SimpleNamespace(node_id="node-1", gpu_uuids=("GPU-one",), node_rank=0)
+    return _staging_request(  # type: ignore[arg-type]
+        SimpleNamespace(
+            id="run-1",
+            attempt=1,
+            training_image_digest="registry.local/visiox/paddlex@sha256:" + "a" * 64,
+            master_addr="10.10.40.10",
+            master_port=29500,
+        ),
+        SimpleNamespace(id="job-1"),
+        rank,
+        (rank,),
+        "paddlex",
+        "paddlex.object_detection.v1",
+        "1.0.0",
+        ["epochs=1"],
+        {},
+        [
+            {
+                "role": "dataset",
+                "download_url": "https://storage.invalid/dataset.tar.gz",
+                "checksum_sha256": "b" * 64,
+                "target_path": "archives/dataset.tar.gz",
+                "unpack_to": "dataset",
+            },
+            {
+                "role": "model",
+                "download_url": "https://storage.invalid/model.bin",
+                "checksum_sha256": "c" * 64,
+                "target_path": "artifacts/model.bin",
+                "unpack_to": None,
+            },
+            {
+                "role": "checkpoint",
+                "download_url": "https://storage.invalid/checkpoint.bin",
+                "checksum_sha256": "d" * 64,
+                "target_path": "artifacts/checkpoint.bin",
+                "unpack_to": None,
+            },
+        ],
+    )
 
 
 def _node(
@@ -169,9 +226,8 @@ def test_remote_rank_container_uses_edge_user_for_writable_output_mount() -> Non
     script = load_packaged_script("launch_rank.sh").decode("utf-8")
 
     assert '"--user", f"{os.getuid()}:{os.getgid()}"' in script
-    assert "dst=/workspace/model/base.pt,readonly" in script
-    assert "dst=/workspace/dataset,readonly" not in script
-    assert "dst=/workspace/dataset" in script
+    assert "dst=/workspace/input,readonly" in script
+    assert "dst=/workspace/output" in script
     assert '"USER=visiox-edge"' in script
     assert '"LOGNAME=visiox-edge"' in script
     assert '"TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor"' in script
@@ -187,31 +243,11 @@ def test_remote_staging_failure_reports_safe_stage_only(
     namespace: dict[str, object] = {"__name__": "visiox_script_test"}
     exec(compile(embedded, "stage_training.sh", "exec"), namespace)
     request_path = tmp_path / "request.json"
-    request_path.write_text(
-        json.dumps(
-            {
-                "run_id": "run-1",
-                "attempt": 1,
-                "engine": "yolo26",
-                "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
-                "artifacts": [
-                    {
-                        "name": "model",
-                        "download_url": "https://minio.invalid/model?X-Amz-Signature=secret",
-                        "checksum": "b" * 64,
-                        "filename": "base.pt",
-                    },
-                    {
-                        "name": "dataset",
-                        "download_url": "https://minio.invalid/dataset?X-Amz-Signature=secret",
-                        "checksum": "c" * 64,
-                        "filename": "dataset.zip",
-                    },
-                ],
-            }
-        ),
-        encoding="utf-8",
+    request = _generic_staging_request()
+    request["artifacts"][0]["download_url"] = (
+        "https://minio.invalid/dataset?X-Amz-Signature=secret"
     )
+    request_path.write_text(json.dumps(request), encoding="utf-8")
 
     def fail_pull(*_args, **_kwargs):
         raise RuntimeError("X-Amz-Signature=must-not-appear")
@@ -335,25 +371,49 @@ def test_distributed_training_arguments_remove_global_device_selection() -> None
 
 
 def test_staging_request_matches_remote_script_contract() -> None:
-    artifacts = [{"name": "model"}]
+    artifacts = [
+        {
+            "role": "dataset",
+            "download_url": "https://storage.invalid/dataset.tar.gz",
+            "checksum_sha256": "b" * 64,
+            "target_path": "archives/dataset.tar.gz",
+            "unpack_to": "dataset",
+        }
+    ]
+    rank = SimpleNamespace(node_id="node-1", gpu_uuids=("GPU-one",), node_rank=0)
     request = _staging_request(  # type: ignore[arg-type]
         SimpleNamespace(
             id="run-1",
             attempt=1,
             training_image_digest="registry.local/visiox/train@sha256:" + "a" * 64,
+            master_addr="10.10.40.10",
+            master_port=29500,
         ),
-        "yolo26",
-        artifacts,  # type: ignore[arg-type]
+        SimpleNamespace(id="job-1"),
+        rank,
+        (rank,),
+        "paddlex",
+        "paddlex.object_detection.v1",
+        "1.0.0",
+        ["epochs=1"],
+        {},
+        artifacts,
     )
 
-    assert request == {
-        "run_id": "run-1",
-        "attempt": 1,
-        "engine": "yolo26",
-        "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
-        "artifacts": artifacts,
+    assert request["schema_version"] == "1.0"
+    assert request["runtime_image_digest"].endswith("@sha256:" + "a" * 64)
+    assert request["artifacts"] == artifacts
+    assert request["launch_spec"]["framework"] == "paddlex"
+    assert request["launch_spec"]["entrypoint"] == "/usr/local/bin/visiox-train"
+    assert request["launch_spec"]["distributed"]["gpu_uuids"] == ["GPU-one"]
+    assert request["launch_spec"]["distributed"]["rendezvous"] == {
+        "master_addr": "10.10.40.10",
+        "master_port": 29500,
     }
+    assert request["launch_spec"]["paths"]["output"] == "/workspace/output"
+    assert len(request["launch_spec_checksum"]) == 64
     assert "action" not in request
+    assert "engine" not in request
 
 
 def test_launch_request_matches_remote_script_contract() -> None:
@@ -373,30 +433,37 @@ def test_launch_request_matches_remote_script_contract() -> None:
         }
     )
 
-    request = _launch_request(  # type: ignore[arg-type]
+    staged_request = _staging_request(  # type: ignore[arg-type]
         run,
+        SimpleNamespace(id="job-1"),
         rank,
-        (rank,),  # type: ignore[arg-type]
-        stage,
+        (rank,),
+        "ultralytics",
+        "ultralytics.object_detection.v1",
+        "1.0.0",
         ["epochs=1"],
-        "yolo26",
+        {},
+        [],
     )
+    stage.paths = {
+        "input": "/home/edge/run/input",
+        "output": "/home/edge/run/output",
+        "launch_spec": "/home/edge/run/input/launch-spec.json",
+    }
+    request = _launch_request(run, rank, stage, staged_request)  # type: ignore[arg-type]
 
     assert request["action"] == "launch"
     assert set(request) == {
+        "schema_version",
         "action",
         "run_id",
         "attempt",
-        "engine",
-        "image_digest",
-        "node_id",
+        "runtime_image_digest",
+        "framework",
+        "adapter_key",
         "gpu_uuids",
         "node_rank",
-        "nnodes",
-        "nproc_per_node",
-        "master_addr",
-        "master_port",
-        "training_arguments",
+        "launch_spec_checksum",
         "paths",
     }
 
@@ -416,32 +483,16 @@ def test_exported_dataset_uses_training_container_mount_root(tmp_path: Path) -> 
 
 
 def test_remote_rank_script_rejects_control_characters() -> None:
-    script = load_packaged_script("launch_rank.sh").decode("utf-8")
+    script = load_packaged_script("stage_training.sh").decode("utf-8")
     embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     namespace: dict[str, object] = {"__name__": "visiox_script_test"}
-    exec(compile(embedded, "launch_rank.sh", "exec"), namespace)
+    exec(compile(embedded, "stage_training.sh", "exec"), namespace)
     namespace["Path"] = PurePosixPath
     validate = namespace["validate"]
-    request = {
-        "action": "launch",
-        "run_id": "run-1",
-        "attempt": 1,
-        "engine": "yolo26",
-        "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
-        "node_id": "node-1",
-        "gpu_uuids": ["GPU-one"],
-        "node_rank": 0,
-        "nnodes": 1,
-        "nproc_per_node": 1,
-        "master_addr": "10.10.40.10",
-        "master_port": 29500,
-        "training_arguments": ["epochs=2\nwhoami"],
-        "paths": {
-            "model": "/var/lib/visiox/base.pt",
-            "dataset": "/var/lib/visiox/dataset",
-            "output": "/var/lib/visiox/output",
-        },
-    }
+    rank = SimpleNamespace(node_id="node-1", gpu_uuids=("GPU-one",), node_rank=0)
+    request = _generic_staging_request()
+    request["launch_spec"]["parameters"]["arguments"] = ["epochs=2\nwhoami"]
+    request["launch_spec_checksum"] = _canonical_checksum(request["launch_spec"])
 
     with pytest.raises(ValueError, match="request"):
         validate(request)  # type: ignore[operator]
@@ -456,28 +507,40 @@ def test_remote_rank_failure_reports_safe_stage_only(
     embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     namespace: dict[str, object] = {"__name__": "visiox_script_test"}
     exec(compile(embedded, "launch_rank.sh", "exec"), namespace)
-    namespace["Path"] = PurePosixPath
     namespace["os"] = SimpleNamespace(getuid=lambda: 1000, getgid=lambda: 1000)
-    request = {
-        "action": "launch",
-        "run_id": "run-1",
-        "attempt": 1,
-        "engine": "yolo26",
-        "image_digest": "registry.local/visiox/train@sha256:" + "a" * 64,
-        "node_id": "node-1",
-        "gpu_uuids": ["GPU-one"],
-        "node_rank": 0,
-        "nnodes": 1,
-        "nproc_per_node": 1,
-        "master_addr": "10.10.40.10",
-        "master_port": 29500,
-        "training_arguments": ["epochs=1"],
-        "paths": {
-            "model": "/home/edge/model.pt",
-            "dataset": "/home/edge/dataset",
-            "output": "/home/edge/output",
-        },
-    }
+    staged_request = _generic_staging_request()
+    root = tmp_path / "run"
+    input_path = root / "input"
+    output_path = root / "output"
+    input_path.mkdir(parents=True)
+    output_path.mkdir()
+    launch_spec_path = input_path / "launch-spec.json"
+    launch_spec_path.write_text(
+        json.dumps(
+            staged_request["launch_spec"],
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    request = _launch_request(  # type: ignore[arg-type]
+        SimpleNamespace(
+            id="run-1",
+            attempt=1,
+            training_image_digest=staged_request["runtime_image_digest"],
+        ),
+        SimpleNamespace(node_rank=0, gpu_uuids=("GPU-one",)),
+        SimpleNamespace(
+            paths={
+                "input": str(input_path),
+                "output": str(output_path),
+                "launch_spec": str(launch_spec_path),
+            }
+        ),
+        staged_request,
+    )
     request_path = tmp_path / "request.json"
     request_path.write_text(json.dumps(request), encoding="utf-8")
     calls = 0
@@ -579,7 +642,7 @@ def test_remote_rank_collect_uploads_ultralytics_visualizations(tmp_path: Path) 
     assert set(result) == set(expected)
 
 
-def test_llm_launch_request_uses_dataset_only_contract() -> None:
+def test_llm_launch_spec_preserves_model_source_without_shell_branch() -> None:
     run = SimpleNamespace(
         id="run-llm",
         attempt=1,
@@ -595,21 +658,26 @@ def test_llm_launch_request_uses_dataset_only_contract() -> None:
         }
     )
 
-    request = _launch_request(  # type: ignore[arg-type]
+    request = _staging_request(  # type: ignore[arg-type]
         run,
+        SimpleNamespace(id="job-llm"),
         rank,
         (rank,),  # type: ignore[arg-type]
-        stage,
-        [],
         "llamafactory",
-        model_source="modelscope",
+        "llamafactory.llm_sft.v1",
+        "1.0.0",
+        [],
+        {"model_source": "modelscope"},
+        [],
     )
 
-    assert request["engine"] == "llamafactory"
-    assert request["model_source"] == "modelscope"
-    assert request["training_arguments"] == []
-    assert request["paths"] == stage.paths
-    assert "model" not in request["paths"]
+    spec = request["launch_spec"]
+    assert spec["framework"] == "llamafactory"
+    assert spec["parameters"] == {
+        "arguments": [],
+        "model_source": "modelscope",
+    }
+    assert spec["entrypoint"] == "/usr/local/bin/visiox-train"
 
 
 def test_alpaca_dataset_info_only_maps_canonical_required_columns() -> None:
@@ -627,37 +695,129 @@ def test_alpaca_dataset_info_only_maps_canonical_required_columns() -> None:
     }
 
 
-def test_remote_rank_script_launches_llm_worker_with_persistent_model_cache() -> None:
+def test_remote_rank_script_uses_only_fixed_image_entrypoint() -> None:
     script = load_packaged_script("launch_rank.sh").decode("utf-8")
 
-    assert "dst=/workspace/model-cache" in script
-    assert '"HF_HOME=/workspace/model-cache/huggingface"' in script
-    assert '"MODELSCOPE_CACHE=/workspace/model-cache/modelscope"' in script
-    assert '"USE_MODELSCOPE_HUB=1"' in script
-    assert '"visiox_llm_training_worker.entrypoint"' in script
-    assert '"/workspace/dataset/train.yaml"' in script
+    assert "ENGINES" not in script
+    assert "visiox_training_worker.train_entrypoint" not in script
+    assert "visiox_llm_training_worker.entrypoint" not in script
+    assert '"/usr/local/bin/visiox-train"' in script
+    assert "dst=/workspace/input,readonly" in script
+    assert "dst=/workspace/input/launch-spec.json,readonly" not in script
+    for label in (
+        "training-job-id",
+        "training-attempt",
+        "training-node-rank",
+        "training-framework",
+        "training-adapter-key",
+        "launch-spec-checksum",
+    ):
+        assert label in script
 
 
-def test_remote_staging_accepts_llm_dataset_without_model() -> None:
+def test_remote_staging_accepts_generic_framework_without_engine_allowlist() -> None:
     script = load_packaged_script("stage_training.sh").decode("utf-8")
     embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     namespace: dict[str, object] = {"__name__": "visiox_script_test"}
     exec(compile(embedded, "stage_training.sh", "exec"), namespace)
     validate = namespace["validate"]
 
-    request = {
-        "run_id": "run-llm",
-        "attempt": 1,
-        "engine": "llamafactory",
-        "image_digest": "registry.local/visiox/llm@sha256:" + "a" * 64,
+    rank = SimpleNamespace(node_id="node-1", gpu_uuids=("GPU-one",), node_rank=0)
+    request = _staging_request(  # type: ignore[arg-type]
+        SimpleNamespace(
+            id="run-paddlex",
+            attempt=1,
+            training_image_digest="registry.local/visiox/paddlex@sha256:" + "a" * 64,
+            master_addr="10.10.40.10",
+            master_port=29500,
+        ),
+        SimpleNamespace(id="job-paddlex"),
+        rank,
+        (rank,),
+        "paddlex",
+        "paddlex.object_detection.v1",
+        "1.0.0",
+        ["epochs=1"],
+        {},
+        [
+            {
+                "role": "dataset",
+                "download_url": "https://minio.internal/dataset?signature=short-lived",
+                "checksum_sha256": "b" * 64,
+                "target_path": "archives/dataset.tar.gz",
+                "unpack_to": "dataset",
+            }
+        ],
+    )
+
+    assert validate(request) == request  # type: ignore[operator]
+    assert "ENGINES" not in script
+
+
+@pytest.mark.parametrize(
+    ("case", "mutate", "resign"),
+    [
+        ("unknown request schema", lambda request: request.__setitem__("schema_version", "2.0"), False),
+        ("mutable image", lambda request: request.__setitem__("runtime_image_digest", "registry.local/visiox/paddlex:latest"), False),
+        ("unsafe artifact path", lambda request: request["artifacts"][0].__setitem__("target_path", "../dataset.tar.gz"), False),
+        ("host artifact path", lambda request: request["artifacts"][0].__setitem__("target_path", "C:/dataset.tar.gz"), False),
+        ("unknown launch schema", lambda request: request["launch_spec"].__setitem__("schema_version", "2.0"), True),
+        ("arbitrary entrypoint", lambda request: request["launch_spec"].__setitem__("entrypoint", "/bin/sh"), True),
+        ("newline argument", lambda request: request["launch_spec"]["parameters"]["arguments"].__setitem__(0, "epochs=1\nwhoami"), True),
+        ("host runtime path", lambda request: request["launch_spec"]["paths"].__setitem__("dataset", "/home/user/dataset"), True),
+        ("checksum mismatch", lambda request: request.__setitem__("launch_spec_checksum", "0" * 64), False),
+    ],
+)
+def test_remote_staging_rejects_untrusted_launch_contracts(
+    case: str,
+    mutate,
+    resign: bool,
+) -> None:
+    del case
+    script = load_packaged_script("stage_training.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "stage_training.sh", "exec"), namespace)
+    request = copy.deepcopy(_generic_staging_request())
+    mutate(request)
+    if resign:
+        request["launch_spec_checksum"] = _canonical_checksum(request["launch_spec"])
+
+    with pytest.raises(ValueError, match="staging request"):
+        namespace["validate"](request)  # type: ignore[operator]
+
+
+def test_artifact_manifest_is_bounded_and_checksum_verified(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    artifact = output / "weights" / "best.bin"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"trusted model")
+    script = load_packaged_script("launch_rank.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "launch_rank.sh", "exec"), namespace)
+    manifest = {
+        "schema_version": "1.0",
         "artifacts": [
             {
-                "name": "dataset",
-                "download_url": "https://minio.internal/dataset?signature=short-lived",
-                "checksum": "b" * 64,
-                "filename": "dataset.tar.gz",
+                "path": "weights/best.bin",
+                "size_bytes": len(b"trusted model"),
+                "checksum_sha256": hashlib.sha256(b"trusted model").hexdigest(),
             }
         ],
     }
 
-    assert validate(request) == request  # type: ignore[operator]
+    assert namespace["validate_artifact_manifest"](  # type: ignore[operator]
+        manifest, output
+    ) == manifest
+
+    for invalid_manifest in (
+        {**manifest, "schema_version": "2.0"},
+        {**manifest, "artifacts": [{**manifest["artifacts"][0], "path": "../best.bin"}]},
+        {**manifest, "artifacts": [{**manifest["artifacts"][0], "size_bytes": 1}]},
+        {**manifest, "artifacts": [{**manifest["artifacts"][0], "checksum_sha256": "0" * 64}]},
+        {**manifest, "artifacts": manifest["artifacts"] * (namespace["MAX_ARTIFACT_COUNT"] + 1)},
+    ):
+        with pytest.raises(ValueError):
+            namespace["validate_artifact_manifest"](invalid_manifest, output)  # type: ignore[operator]

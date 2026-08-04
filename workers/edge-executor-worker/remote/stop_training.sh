@@ -13,7 +13,9 @@ CONTAINER_ID = re.compile(r"[a-f0-9]{12,64}\Z")
 
 
 def validate(request):
-    if not isinstance(request, dict) or set(request) != {"run_id", "attempt"}:
+    if not isinstance(request, dict) or set(request) != {"schema_version", "run_id", "attempt"}:
+        raise ValueError("invalid distributed stop request")
+    if request["schema_version"] != "1.0":
         raise ValueError("invalid distributed stop request")
     if not isinstance(request["run_id"], str) or not IDENTIFIER.fullmatch(request["run_id"]):
         raise ValueError("invalid distributed stop request")

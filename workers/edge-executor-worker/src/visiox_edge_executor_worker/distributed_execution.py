@@ -12,6 +12,7 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, field_validator
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from visiox_db.models import (
@@ -21,11 +22,13 @@ from visiox_db.models import (
     RemoteExecution,
     Task,
     TrainingJob,
+    TrainingJobAttempt,
     TrainingPipeline,
     TrainedModel,
 )
 from visiox_common.settings import get_settings
 from visiox_storage.client import ObjectStorageClient
+from visiox_training.contracts import LaunchSpec
 from visiox_yolo26.converters import export_yolo26_dataset
 from visiox_yolo26.training.commands import build_train_command
 
@@ -122,6 +125,21 @@ class _CollectResult(BaseModel):
     artifacts: dict[str, _CollectedArtifact]
 
 
+class _ArtifactManifestEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: str
+    size_bytes: int
+    checksum_sha256: str
+
+
+class _ArtifactManifestResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: str
+    artifacts: tuple[_ArtifactManifestEntry, ...]
+
+
 class _ScriptRunner(_DeploymentHandlerBase):
     failure_code = "EDGE_TRAIN_SCRIPT_FAILED"
     failure_message = "Distributed training remote script failed"
@@ -158,7 +176,13 @@ class DistributedTrainingHandler:
             if self._converge_existing_success(execution.id):
                 return ExecutionResult.succeeded(phase="succeeded")
             context = self._load(execution)
-            run, job, task, pipeline, base_model, dataset = context
+            run, job, attempt, task, pipeline, base_model, dataset = context
+            base_launch_spec = LaunchSpec.model_validate(attempt.launch_spec)
+            if (
+                base_launch_spec.canonical_checksum_sha256()
+                != attempt.launch_spec_checksum
+            ):
+                raise ValueError("persisted launch spec checksum did not match")
             log_job_id = job.id
             log_stream_id = self._ensure_log_stream(job, pipeline)
             ranks = tuple(_Rank.model_validate(item) for item in run.ranks)
@@ -169,32 +193,40 @@ class DistributedTrainingHandler:
                 run, job, task, pipeline, base_model, dataset
             )
             staged: dict[str, _StageResult] = {}
+            arguments = _training_arguments(job, task, pipeline.engine)
+            framework_parameters: dict[str, Any] = {}
+            if pipeline.engine == "llamafactory":
+                framework_parameters["model_source"] = _llm_model_source(task)
+            staged_requests: dict[str, dict[str, Any]] = {}
             for rank in ranks:
+                staging_request = _staging_request(
+                    run,
+                    job,
+                    rank,
+                    ranks,
+                    pipeline.framework,
+                    base_launch_spec.adapter_key,
+                    base_launch_spec.adapter_version,
+                    arguments,
+                    framework_parameters,
+                    artifacts,
+                    environment=dict(base_launch_spec.env),
+                )
                 target = self._stage._load_target(rank.node_id)
                 response = self._stage._run_script(
                     target,
-                    _staging_request(run, pipeline.engine, artifacts),
+                    staging_request,
                 )
                 staged[rank.node_id] = _StageResult.model_validate(response)
+                staged_requests[rank.node_id] = staging_request
 
             self._transition(execution.id, "launching", 55)
-            arguments = _training_arguments(job, task, pipeline.engine)
             for rank in ranks:
                 stage = staged[rank.node_id]
                 target = self._launch._load_target(rank.node_id)
                 response = self._launch._run_script(
                     target,
-                    _launch_request(
-                        run,
-                        rank,
-                        ranks,
-                        stage,
-                        arguments,
-                        pipeline.engine,
-                        model_source=_llm_model_source(task)
-                        if pipeline.engine == "llamafactory"
-                        else None,
-                    ),
+                    _launch_request(run, rank, stage, staged_requests[rank.node_id]),
                 )
                 launched_rank = _LaunchResult.model_validate(response)
                 if launched_rank.node_rank != rank.node_rank:
@@ -309,6 +341,12 @@ class DistributedTrainingHandler:
                 raise ValueError("distributed execution is not runnable")
             run = session.get(DistributedTrainingRun, current.resource_id)
             job = session.get(TrainingJob, current.training_job_id)
+            attempt = session.scalar(
+                select(TrainingJobAttempt).where(
+                    TrainingJobAttempt.training_job_id == current.training_job_id,
+                    TrainingJobAttempt.attempt_number == run.attempt,
+                )
+            ) if run is not None else None
             task = session.get(Task, current.task_id)
             pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
             base_model = (
@@ -317,12 +355,12 @@ class DistributedTrainingHandler:
                 else None
             )
             dataset = session.get(Dataset, pipeline.dataset_id if pipeline else None)
-            if not all((run, job, task, pipeline, dataset)):
+            if not all((run, job, attempt, task, pipeline, dataset)):
                 raise ValueError("distributed training resources are incomplete")
             if pipeline.engine == "yolo26" and base_model is None:
                 raise ValueError("distributed YOLO training model is incomplete")
             session.expunge_all()
-            return run, job, task, pipeline, base_model, dataset
+            return run, job, attempt, task, pipeline, base_model, dataset
 
     def _prepare_artifacts(
         self,
@@ -332,7 +370,7 @@ class DistributedTrainingHandler:
         pipeline: TrainingPipeline,
         base_model: StoredBaseModel | None,
         dataset: Dataset,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         if pipeline.engine == "llamafactory":
             return self._prepare_llm_artifacts(run, job, task, dataset)
         if base_model is None:
@@ -363,31 +401,34 @@ class DistributedTrainingHandler:
             )
         artifacts = [
             {
-                "name": "model",
+                "role": "model",
                 "download_url": self._storage.presigned_get_url(
                     base_model.local_uri, expires=_PRESIGNED_URL_TTL
                 ),
-                "checksum": checksum,
-                "filename": "base.pt",
+                "checksum_sha256": checksum,
+                "target_path": "artifacts/base.pt",
+                "unpack_to": None,
             },
             {
-                "name": "dataset",
+                "role": "dataset",
                 "download_url": self._storage.presigned_get_url(
                     dataset_uri, expires=_PRESIGNED_URL_TTL
                 ),
-                "checksum": dataset_checksum,
-                "filename": "dataset.tar.gz",
+                "checksum_sha256": dataset_checksum,
+                "target_path": "archives/dataset.tar.gz",
+                "unpack_to": "dataset",
             },
         ]
         if run.checkpoint_uri and run.checkpoint_checksum:
             artifacts.append(
                 {
-                    "name": "checkpoint",
+                    "role": "checkpoint",
                     "download_url": self._storage.presigned_get_url(
                         run.checkpoint_uri, expires=_PRESIGNED_URL_TTL
                     ),
-                    "checksum": run.checkpoint_checksum,
-                    "filename": "last.pt",
+                    "checksum_sha256": run.checkpoint_checksum,
+                    "target_path": "artifacts/last.pt",
+                    "unpack_to": None,
                 }
             )
         return artifacts
@@ -398,7 +439,7 @@ class DistributedTrainingHandler:
         job: TrainingJob,
         task: Task,
         dataset: Dataset,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         payload = task.payload if isinstance(task.payload, dict) else {}
         manifest_checksum = str(payload.get("dataset_manifest_checksum") or "").lower()
         if len(manifest_checksum) != 64 or any(
@@ -464,12 +505,13 @@ class DistributedTrainingHandler:
             )
         return [
             {
-                "name": "dataset",
+                "role": "dataset",
                 "download_url": self._storage.presigned_get_url(
                     dataset_uri, expires=_PRESIGNED_URL_TTL
                 ),
-                "checksum": archive_checksum,
-                "filename": "dataset.tar.gz",
+                "checksum_sha256": archive_checksum,
+                "target_path": "archives/dataset.tar.gz",
+                "unpack_to": "dataset",
             }
         ]
 
@@ -681,20 +723,31 @@ class DistributedTrainingHandler:
                 for name, object_name in object_names.items()
             }
             target = self._launch._load_target(rank.node_id)
+            manifest = self._remote_artifact_manifest(target, staged.paths["output"])
+            manifest_paths = _manifest_paths_by_name(manifest)
+            selected_uploads = {
+                manifest_paths[name]: url
+                for name, url in uploads.items()
+                if name in manifest_paths
+            }
+            if not selected_uploads:
+                return
             result = _CollectResult.model_validate(
                 self._launch._run_script(
                     target,
                     {
                         "action": "collect",
                         "output_path": staged.paths["output"],
-                        "uploads": uploads,
+                        "artifact_manifest": manifest.model_dump(mode="json"),
+                        "uploads": selected_uploads,
                     },
                 )
             )
             run_path = get_settings().training_runs_root / "runs" / f"job-{job_id}"
             run_path.mkdir(parents=True, exist_ok=True)
             for name, object_name in object_names.items():
-                if name not in result.artifacts:
+                path = manifest_paths.get(name)
+                if path is None or path not in result.artifacts:
                     continue
                 destination = run_path / name
                 self._storage.get_file("training", object_name, destination)
@@ -704,6 +757,21 @@ class DistributedTrainingHandler:
                 self._persist_observability_snapshot(execution_id, snapshot)
         except Exception:
             return
+
+    def _remote_artifact_manifest(
+        self,
+        target: Any,
+        output_path: str,
+    ) -> _ArtifactManifestResult:
+        manifest = _ArtifactManifestResult.model_validate(
+            self._launch._run_script(
+                target,
+                {"action": "manifest", "output_path": output_path},
+            )
+        )
+        if manifest.schema_version != "1.0":
+            raise ValueError("remote artifact manifest version is unsupported")
+        return manifest
 
     def _persist_observability_snapshot(self, execution_id: str, snapshot: Any) -> None:
         if not isinstance(snapshot, dict):
@@ -761,45 +829,24 @@ class DistributedTrainingHandler:
         rank: _Rank,
         staged: _StageResult,
     ) -> _CollectResult:
-        if pipeline.engine == "llamafactory":
-            uris = {
-                "adapter_model.safetensors": f"minio://models/trained/{job.id}/adapter_model.safetensors",
-                "adapter_config.json": f"minio://models/trained/{job.id}/adapter_config.json",
-                "trainer_state.json": f"minio://training/jobs/{job.id}/artifacts/trainer_state.json",
-                "trainer_log.jsonl": f"minio://training/jobs/{job.id}/artifacts/trainer_log.jsonl",
-                "train_results.json": f"minio://training/jobs/{job.id}/artifacts/train_results.json",
-                "all_results.json": f"minio://training/jobs/{job.id}/artifacts/all_results.json",
-                "training_args.yaml": f"minio://training/jobs/{job.id}/artifacts/training_args.yaml",
-                "artifact-manifest.json": f"minio://training/jobs/{job.id}/artifacts/artifact-manifest.json",
-                "visiox-metrics.jsonl": f"minio://training/jobs/{job.id}/observability/visiox-metrics.jsonl",
-                "resource_metrics.jsonl": f"minio://training/jobs/{job.id}/observability/resource_metrics.jsonl",
-                "visiox-progress.json": f"minio://training/jobs/{job.id}/observability/visiox-progress.json",
-                "events.out.tfevents.remote": f"minio://training/jobs/{job.id}/observability/events.out.tfevents.remote",
-            }
-        else:
-            uris = {
-                "best.pt": f"minio://models/trained/{job.id}/best.pt",
-                "last.pt": f"minio://models/trained/{job.id}/last.pt",
-                "visiox-progress.json": f"minio://training/jobs/{job.id}/observability/visiox-progress.json",
-                "events.out.tfevents.remote": f"minio://training/jobs/{job.id}/observability/events.out.tfevents.remote",
-            }
-            uris.update(
-                {
-                    name: f"minio://training/jobs/{job.id}/visualizations/{name}"
-                    for name in _VISUALIZATION_ARTIFACTS
-                }
-            )
-        uploads = {
-            name: self._storage.presigned_put_url(uri, expires=_PRESIGNED_URL_TTL)
-            for name, uri in uris.items()
-        }
         target = self._launch._load_target(rank.node_id)
-        result = _CollectResult.model_validate(
+        manifest = self._remote_artifact_manifest(target, staged.paths["output"])
+        paths_by_name = _manifest_paths_by_name(manifest)
+        uris = {
+            entry.path: _artifact_uri(job.id, entry.path)
+            for entry in manifest.artifacts
+        }
+        uploads = {
+            path: self._storage.presigned_put_url(uri, expires=_PRESIGNED_URL_TTL)
+            for path, uri in uris.items()
+        }
+        raw_result = _CollectResult.model_validate(
             self._launch._run_script(
                 target,
                 {
                     "action": "collect",
                     "output_path": staged.paths["output"],
+                    "artifact_manifest": manifest.model_dump(mode="json"),
                     "uploads": uploads,
                 },
             )
@@ -809,9 +856,15 @@ class DistributedTrainingHandler:
             if pipeline.engine == "llamafactory"
             else {"best.pt", "last.pt"}
         )
-        if not required.issubset(result.artifacts):
+        if not required.issubset(paths_by_name):
             raise ValueError("rank zero did not upload required training artifacts")
-        return result
+        return _CollectResult(
+            artifacts={
+                PurePosixPath(path).name: artifact
+                for path, artifact in raw_result.artifacts.items()
+                if path in {entry.path for entry in manifest.artifacts}
+            }
+        )
 
     def _try_collect_checkpoint(
         self,
@@ -822,14 +875,19 @@ class DistributedTrainingHandler:
         checkpoint_uri = f"minio://training/checkpoints/{run.id}/{run.attempt}/last.pt"
         try:
             target = self._launch._load_target(rank.node_id)
+            manifest = self._remote_artifact_manifest(target, staged.paths["output"])
+            last_path = _manifest_paths_by_name(manifest).get("last.pt")
+            if last_path is None:
+                return
             result = _CollectResult.model_validate(
                 self._launch._run_script(
                     target,
                     {
                         "action": "collect",
                         "output_path": staged.paths["output"],
+                        "artifact_manifest": manifest.model_dump(mode="json"),
                         "uploads": {
-                            "last.pt": self._storage.presigned_put_url(
+                            last_path: self._storage.presigned_put_url(
                                 checkpoint_uri,
                                 expires=_PRESIGNED_URL_TTL,
                             )
@@ -837,7 +895,7 @@ class DistributedTrainingHandler:
                     },
                 )
             )
-            artifact = result.artifacts.get("last.pt")
+            artifact = result.artifacts.get(last_path)
             if artifact is None:
                 return
             with self._session_factory() as session:
@@ -1003,7 +1061,10 @@ class DistributedTrainingHandler:
         for node_id, _rank in launched:
             try:
                 target = self._stop._load_target(node_id)
-                self._stop._run_script(target, {"run_id": run_id, "attempt": attempt})
+                self._stop._run_script(
+                    target,
+                    {"schema_version": "1.0", "run_id": run_id, "attempt": attempt},
+                )
             except Exception:
                 continue
 
@@ -1054,7 +1115,8 @@ class StopDistributedTrainingHandler(DistributedTrainingHandler):
                 target = self._stop._load_target(node_id)
                 _StopResult.model_validate(
                     self._stop._run_script(
-                        target, {"run_id": run_id, "attempt": attempt}
+                        target,
+                        {"schema_version": "1.0", "run_id": run_id, "attempt": attempt},
                     )
                 )
             rank_zero = _Rank.model_validate(run.ranks[0])
@@ -1139,49 +1201,126 @@ def _training_arguments(job: TrainingJob, task: Task, engine: str) -> list[str]:
 
 def _staging_request(
     run: DistributedTrainingRun,
-    engine: str,
-    artifacts: list[dict[str, str]],
+    job: TrainingJob,
+    rank: _Rank,
+    ranks: tuple[_Rank, ...],
+    framework: str,
+    adapter_key: str,
+    adapter_version: str,
+    arguments: list[str],
+    parameters: Mapping[str, Any],
+    artifacts: list[dict[str, Any]],
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    if any(
+        not isinstance(argument, str)
+        or not argument
+        or any(character in argument for character in "\x00\r\n")
+        for argument in arguments
+    ):
+        raise ValueError("training arguments contain unsafe control characters")
+    launch_spec = {
+        "schema_version": "1.0",
+        "training_job_id": job.id,
         "run_id": run.id,
         "attempt": run.attempt,
-        "engine": engine,
-        "image_digest": validate_image_digest(str(run.training_image_digest)),
+        "framework": framework,
+        "adapter_key": adapter_key,
+        "adapter_version": adapter_version,
+        "entrypoint": "/usr/local/bin/visiox-train",
+        "parameters": {
+            "arguments": list(arguments),
+            **dict(parameters),
+        },
+        "environment": dict(environment or {}),
+        "distributed": {
+            "node_id": rank.node_id,
+            "gpu_uuids": list(rank.gpu_uuids),
+            "node_rank": rank.node_rank,
+            "nnodes": len(ranks),
+            "nproc_per_node": len(rank.gpu_uuids),
+            "rendezvous": {
+                "master_addr": run.master_addr,
+                "master_port": run.master_port,
+            },
+        },
+        "paths": {
+            "launch_spec": "/workspace/input/launch-spec.json",
+            "dataset": "/workspace/input/dataset",
+            "model": "/workspace/input/artifacts/base.pt",
+            "checkpoint": "/workspace/input/artifacts/last.pt",
+            "output": "/workspace/output",
+        },
+    }
+    checksum = hashlib.sha256(
+        json.dumps(
+            launch_spec,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": "1.0",
+        "run_id": run.id,
+        "attempt": run.attempt,
+        "runtime_image_digest": validate_image_digest(
+            str(run.training_image_digest)
+        ),
+        "launch_spec": launch_spec,
+        "launch_spec_checksum": checksum,
         "artifacts": artifacts,
     }
+
+
+def _manifest_paths_by_name(
+    manifest: _ArtifactManifestResult,
+) -> dict[str, str]:
+    grouped: dict[str, list[str]] = {}
+    for entry in manifest.artifacts:
+        grouped.setdefault(PurePosixPath(entry.path).name, []).append(entry.path)
+    return {
+        name: paths[0]
+        for name, paths in grouped.items()
+        if len(paths) == 1
+    }
+
+
+def _artifact_uri(job_id: str, path: str) -> str:
+    name = PurePosixPath(path).name
+    if name in {"best.pt", "last.pt", "adapter_model.safetensors", "adapter_config.json"}:
+        return f"minio://models/trained/{job_id}/{name}"
+    if name in _VISUALIZATION_ARTIFACTS:
+        return f"minio://training/jobs/{job_id}/visualizations/{name}"
+    return f"minio://training/jobs/{job_id}/artifacts/{path}"
 
 
 def _launch_request(
     run: DistributedTrainingRun,
     rank: _Rank,
-    ranks: tuple[_Rank, ...],
     stage: _StageResult,
-    arguments: list[str],
-    engine: str,
-    *,
-    model_source: str | None = None,
+    staging_request: Mapping[str, Any],
 ) -> dict[str, Any]:
-    request = {
+    launch_spec = staging_request["launch_spec"]
+    if not isinstance(launch_spec, Mapping):
+        raise ValueError("staging launch spec is unavailable")
+    return {
+        "schema_version": "1.0",
         "action": "launch",
         "run_id": run.id,
         "attempt": run.attempt,
-        "engine": engine,
-        "image_digest": validate_image_digest(str(run.training_image_digest)),
-        "node_id": rank.node_id,
+        "runtime_image_digest": validate_image_digest(
+            str(run.training_image_digest)
+        ),
+        "framework": launch_spec["framework"],
+        "adapter_key": launch_spec["adapter_key"],
         "gpu_uuids": list(rank.gpu_uuids),
         "node_rank": rank.node_rank,
-        "nnodes": len(ranks),
-        "nproc_per_node": len(rank.gpu_uuids),
-        "master_addr": run.master_addr,
-        "master_port": run.master_port,
-        "training_arguments": arguments,
+        "launch_spec_checksum": staging_request["launch_spec_checksum"],
         "paths": stage.paths,
     }
-    if engine == "llamafactory":
-        if model_source not in {"huggingface", "modelscope"}:
-            raise ValueError("LLM model source is unavailable")
-        request["model_source"] = model_source
-    return request
 
 
 def _llm_model_source(task: Task) -> str:

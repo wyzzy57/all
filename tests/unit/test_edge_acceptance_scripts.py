@@ -5,6 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from visiox_edge_executor_worker.scripts import (
+    TRAINING_REMOTE_SCRIPTS,
+    load_packaged_script,
+)
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = {
@@ -136,3 +141,25 @@ def test_runbook_documents_safe_execution_and_evidence_rules() -> None:
     assert "不得" in runbook
     assert "visiox.edge-acceptance.v1" in runbook
     assert "ssh-docker-edge-runtime.md" in readme
+
+
+def test_framework_neutral_training_scripts_are_packaged_as_one_contract() -> None:
+    assert TRAINING_REMOTE_SCRIPTS == {
+        "stage_training.sh",
+        "launch_rank.sh",
+        "stop_training.sh",
+    }
+    for name in TRAINING_REMOTE_SCRIPTS:
+        script = load_packaged_script(name).decode("utf-8")
+        assert "json.load" in script
+        assert "ENGINES" not in script
+
+
+def test_stop_training_uses_versioned_run_labels_without_framework_branch() -> None:
+    script = load_packaged_script("stop_training.sh").decode("utf-8")
+
+    assert '{"schema_version", "run_id", "attempt"}' in script
+    assert 'request["schema_version"] != "1.0"' in script
+    assert "com.visiox.training-run-id" in script
+    assert "com.visiox.training-attempt" in script
+    assert "framework" not in script.casefold()

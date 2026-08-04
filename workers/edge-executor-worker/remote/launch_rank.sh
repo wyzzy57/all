@@ -2,10 +2,10 @@
 set -euo pipefail
 
 exec python3 - "$@" <<'PY'
-import json
 import hashlib
+import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -15,44 +15,13 @@ from urllib.request import Request, urlopen
 
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}\Z")
 IMAGE_DIGEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,430}@sha256:[a-f0-9]{64}\Z")
+SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 GPU_UUID = re.compile(r"GPU-[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z")
 CONTAINER_ID = re.compile(r"[a-f0-9]{12,64}\Z")
-LAN_ADDRESS = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]{0,253}\Z")
-COLLECTABLE_ARTIFACTS = {
-    "best.pt",
-    "last.pt",
-    "results.csv",
-    "results.png",
-    "confusion_matrix.png",
-    "confusion_matrix_normalized.png",
-    "BoxPR_curve.png",
-    "BoxP_curve.png",
-    "BoxR_curve.png",
-    "BoxF1_curve.png",
-    "labels.jpg",
-    "train_batch0.jpg",
-    "train_batch1.jpg",
-    "train_batch2.jpg",
-    "val_batch0_labels.jpg",
-    "val_batch0_pred.jpg",
-    "val_batch1_labels.jpg",
-    "val_batch1_pred.jpg",
-    "val_batch2_labels.jpg",
-    "val_batch2_pred.jpg",
-    "visiox-progress.json",
-    "events.out.tfevents.remote",
-    "adapter_model.safetensors",
-    "adapter_config.json",
-    "trainer_state.json",
-    "trainer_log.jsonl",
-    "train_results.json",
-    "all_results.json",
-    "training_args.yaml",
-    "artifact-manifest.json",
-    "visiox-metrics.jsonl",
-    "resource_metrics.jsonl",
-}
-ENGINES = {"yolo26", "llamafactory"}
+FIXED_ENTRYPOINT = "/usr/local/bin/visiox-train"
+MAX_ARTIFACT_COUNT = 256
+MAX_ARTIFACT_SIZE_BYTES = 8 * 1024 * 1024 * 1024
+MAX_ARTIFACT_TOTAL_BYTES = 32 * 1024 * 1024 * 1024
 
 
 class RequestValidationError(ValueError):
@@ -65,6 +34,43 @@ def invalid(code):
     raise RequestValidationError(code)
 
 
+def canonical_checksum(value):
+    encoded = json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def safe_relative_path(value):
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        return False
+    path = PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and not (len(value) >= 2 and value[0].isalpha() and value[1] == ":")
+        and all(part not in {"", ".", ".."} for part in value.split("/"))
+        and path.as_posix() == value
+    )
+
+
+def managed_paths(paths):
+    if not isinstance(paths, dict) or set(paths) != {"input", "output", "launch_spec"}:
+        invalid("paths-shape")
+    if any(not isinstance(value, str) or any(char in value for char in "\x00\r\n") for value in paths.values()):
+        invalid("path")
+    input_path = Path(paths["input"])
+    output_path = Path(paths["output"])
+    spec_path = Path(paths["launch_spec"])
+    if not input_path.is_absolute() or not output_path.is_absolute() or not spec_path.is_absolute():
+        invalid("path")
+    if input_path.parent != output_path.parent or spec_path != input_path / "launch-spec.json":
+        invalid("path-boundary")
+    return paths
+
+
+def valid_upload_url(value):
+    parsed = urlsplit(value) if isinstance(value, str) else None
+    return bool(parsed and parsed.scheme in {"http", "https"} and parsed.hostname and not parsed.username and not parsed.password and not parsed.fragment)
+
+
 def validate(request):
     if isinstance(request, dict) and request.get("action") == "inspect":
         if set(request) != {"action", "container_id"} or not isinstance(request["container_id"], str) or not CONTAINER_ID.fullmatch(request["container_id"]):
@@ -74,69 +80,78 @@ def validate(request):
         if set(request) != {"action", "container_id"} or not isinstance(request["container_id"], str) or not CONTAINER_ID.fullmatch(request["container_id"]):
             invalid("logs-request")
         return request
+    if isinstance(request, dict) and request.get("action") == "manifest":
+        if set(request) != {"action", "output_path"} or not isinstance(request["output_path"], str) or not Path(request["output_path"]).is_absolute():
+            invalid("manifest-request")
+        return request
     if isinstance(request, dict) and request.get("action") == "collect":
-        if set(request) != {"action", "output_path", "uploads"} or not isinstance(request["output_path"], str) or not Path(request["output_path"]).is_absolute():
+        if set(request) != {"action", "output_path", "artifact_manifest", "uploads"} or not isinstance(request["output_path"], str) or not Path(request["output_path"]).is_absolute():
             invalid("collect-request")
         uploads = request["uploads"]
-        if not isinstance(uploads, dict) or not uploads or set(uploads) - COLLECTABLE_ARTIFACTS:
+        if not isinstance(uploads, dict) or len(uploads) > MAX_ARTIFACT_COUNT:
             invalid("collect-uploads")
-        for url in uploads.values():
-            parsed = urlsplit(url) if isinstance(url, str) else None
-            if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
-                invalid("collect-url")
+        if any(not safe_relative_path(path) or not valid_upload_url(url) for path, url in uploads.items()):
+            invalid("collect-upload")
         return request
-    expected = {"run_id", "attempt", "engine", "image_digest", "node_id", "gpu_uuids", "node_rank", "nnodes", "nproc_per_node", "master_addr", "master_port", "training_arguments", "paths"}
-    expected_shape = expected | {"action"}
-    if isinstance(request, dict) and request.get("engine") == "llamafactory":
-        expected_shape.add("model_source")
-    if not isinstance(request, dict) or request.get("action") != "launch" or set(request) != expected_shape:
+    expected = {
+        "schema_version", "action", "run_id", "attempt", "runtime_image_digest",
+        "framework", "adapter_key", "gpu_uuids", "node_rank",
+        "launch_spec_checksum", "paths",
+    }
+    if not isinstance(request, dict) or set(request) != expected or request.get("schema_version") != "1.0" or request.get("action") != "launch":
         invalid("launch-shape")
-    for key in ("run_id", "node_id"):
+    for key in ("run_id", "framework", "adapter_key"):
         if not isinstance(request[key], str) or not IDENTIFIER.fullmatch(request[key]):
             invalid("identifier")
-    if not isinstance(request["image_digest"], str) or not IMAGE_DIGEST.fullmatch(request["image_digest"]):
+    if not isinstance(request["attempt"], int) or isinstance(request["attempt"], bool) or not 1 <= request["attempt"] <= 100000:
+        invalid("attempt")
+    if not isinstance(request["node_rank"], int) or isinstance(request["node_rank"], bool) or not 0 <= request["node_rank"] <= 1023:
+        invalid("node-rank")
+    if not isinstance(request["runtime_image_digest"], str) or not IMAGE_DIGEST.fullmatch(request["runtime_image_digest"]):
         invalid("image-digest")
-    if request["engine"] not in ENGINES:
-        invalid("engine")
-    if request["engine"] == "llamafactory" and request["model_source"] not in {"huggingface", "modelscope"}:
-        invalid("model-source")
-    integer_limits = {"attempt": (1, 100000), "node_rank": (0, 1023), "nnodes": (1, 1024), "nproc_per_node": (1, 64), "master_port": (1024, 65535)}
-    for key, (minimum, maximum) in integer_limits.items():
-        value = request[key]
-        if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
-            invalid("integer-field")
-    if request["node_rank"] >= request["nnodes"]:
-        invalid("rank-layout")
+    if not isinstance(request["launch_spec_checksum"], str) or not SHA256.fullmatch(request["launch_spec_checksum"]):
+        invalid("launch-spec-checksum")
     gpus = request["gpu_uuids"]
-    if not isinstance(gpus, list) or len(gpus) != request["nproc_per_node"] or len(set(gpus)) != len(gpus) or any(not isinstance(item, str) or not GPU_UUID.fullmatch(item) for item in gpus):
+    if not isinstance(gpus, list) or not gpus or len(gpus) > 64 or len(set(gpus)) != len(gpus):
         invalid("gpu-layout")
-    if not isinstance(request["master_addr"], str) or not LAN_ADDRESS.fullmatch(request["master_addr"]) or ".." in request["master_addr"]:
-        invalid("master-address")
-    arguments = request["training_arguments"]
-    if not isinstance(arguments, list) or (request["engine"] == "yolo26" and not arguments) or any(not isinstance(item, str) or not item or any(char in item for char in "\x00\r\n") for item in arguments):
-        invalid("training-arguments")
-    paths = request["paths"]
-    valid_path_shapes = (
-        ({"model", "dataset", "output"}, {"model", "dataset", "checkpoint", "output"})
-        if request["engine"] == "yolo26"
-        else ({"dataset", "output"}, {"dataset", "checkpoint", "output"})
-    )
-    if not isinstance(paths, dict) or set(paths) not in valid_path_shapes:
-        invalid("paths-shape")
-    for value in paths.values():
-        if not isinstance(value, str) or not Path(value).is_absolute() or any(char in value for char in "\x00\r\n"):
-            invalid("path")
+    if any(not isinstance(item, str) or not GPU_UUID.fullmatch(item) for item in gpus):
+        invalid("gpu-layout")
+    managed_paths(request["paths"])
     return request
 
 
+def load_launch_spec(request):
+    path = Path(request["paths"]["launch_spec"])
+    payload = path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != request["launch_spec_checksum"]:
+        invalid("launch-spec-file-checksum")
+    spec = json.loads(payload)
+    if not isinstance(spec, dict) or spec.get("schema_version") != "1.0" or spec.get("entrypoint") != FIXED_ENTRYPOINT:
+        invalid("launch-spec")
+    distributed = spec.get("distributed")
+    if not isinstance(distributed, dict):
+        invalid("launch-spec-distributed")
+    expected = {
+        "training_job_id": None,
+        "run_id": request["run_id"],
+        "attempt": request["attempt"],
+        "framework": request["framework"],
+        "adapter_key": request["adapter_key"],
+    }
+    for key, value in expected.items():
+        if value is not None and spec.get(key) != value:
+            invalid("launch-spec-identity")
+    if not isinstance(spec.get("training_job_id"), str) or not IDENTIFIER.fullmatch(spec["training_job_id"]):
+        invalid("launch-spec-job")
+    if distributed.get("node_rank") != request["node_rank"] or distributed.get("gpu_uuids") != request["gpu_uuids"]:
+        invalid("launch-spec-rank")
+    if spec.get("paths", {}).get("launch_spec") != "/workspace/input/launch-spec.json" or spec.get("paths", {}).get("output") != "/workspace/output":
+        invalid("launch-spec-paths")
+    return spec
+
+
 def inspect_container(container_id):
-    result = subprocess.run(
-        ["docker", "inspect", "--format", "{{json .State}}", container_id],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    result = subprocess.run(["docker", "inspect", "--format", "{{json .State}}", container_id], check=True, capture_output=True, text=True, timeout=30)
     state = json.loads(result.stdout)
     if not isinstance(state, dict) or not isinstance(state.get("Running"), bool):
         invalid("inspect-state")
@@ -147,39 +162,88 @@ def inspect_container(container_id):
 
 
 def collect_logs(container_id):
-    result = subprocess.run(
-        ["docker", "logs", "--timestamps", container_id],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    result = subprocess.run(["docker", "logs", "--timestamps", container_id], check=False, capture_output=True, text=True, timeout=60)
     return {"stdout": result.stdout, "stderr": result.stderr}
 
 
-def collect_artifacts(output_path, uploads):
+def build_artifact_manifest(output_path):
     root = Path(output_path).resolve()
+    files = sorted(path for path in root.rglob("*") if path.is_file() and path.name != "artifact-manifest.json")
+    if len(files) > MAX_ARTIFACT_COUNT:
+        raise ValueError("artifact manifest contains too many files")
+    artifacts = []
+    total = 0
+    for path in files:
+        resolved = path.resolve()
+        if root not in resolved.parents:
+            raise ValueError("artifact path escaped output root")
+        size = resolved.stat().st_size
+        if size > MAX_ARTIFACT_SIZE_BYTES:
+            raise ValueError("artifact exceeds size limit")
+        total += size
+        if total > MAX_ARTIFACT_TOTAL_BYTES:
+            raise ValueError("artifact manifest exceeds total size limit")
+        digest = hashlib.sha256()
+        with resolved.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        artifacts.append({"path": resolved.relative_to(root).as_posix(), "size_bytes": size, "checksum_sha256": digest.hexdigest()})
+    return {"schema_version": "1.0", "artifacts": artifacts}
+
+
+def validate_artifact_manifest(manifest, output_path):
+    root = Path(output_path).resolve()
+    if not isinstance(manifest, dict) or set(manifest) != {"schema_version", "artifacts"} or manifest.get("schema_version") != "1.0":
+        raise ValueError("invalid artifact manifest")
+    artifacts = manifest["artifacts"]
+    if not isinstance(artifacts, list) or len(artifacts) > MAX_ARTIFACT_COUNT:
+        raise ValueError("invalid artifact manifest")
+    seen = set()
+    total = 0
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != {"path", "size_bytes", "checksum_sha256"}:
+            raise ValueError("invalid artifact manifest")
+        relative = artifact["path"]
+        if not safe_relative_path(relative) or relative in seen:
+            raise ValueError("invalid artifact path")
+        path = (root / relative).resolve()
+        if root not in path.parents or not path.is_file():
+            raise ValueError("artifact path escaped output root")
+        size = artifact["size_bytes"]
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0 or size > MAX_ARTIFACT_SIZE_BYTES or path.stat().st_size != size:
+            raise ValueError("artifact size mismatch")
+        total += size
+        if total > MAX_ARTIFACT_TOTAL_BYTES:
+            raise ValueError("artifact manifest exceeds total size limit")
+        checksum = artifact["checksum_sha256"]
+        if not isinstance(checksum, str) or not SHA256.fullmatch(checksum):
+            raise ValueError("invalid artifact checksum")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != checksum:
+            raise ValueError("artifact checksum mismatch")
+        seen.add(relative)
+    return manifest
+
+
+def collect_artifacts(output_path, uploads, artifact_manifest=None):
+    root = Path(output_path).resolve()
+    manifest = validate_artifact_manifest(artifact_manifest or build_artifact_manifest(root), root)
+    entries = {item["path"]: item for item in manifest["artifacts"]}
     results = {}
-    for name, url in uploads.items():
-        pattern = "**/events.out.tfevents.*" if name == "events.out.tfevents.remote" else f"**/{name}"
-        matches = sorted(root.glob(pattern))
-        if not matches:
-            if name in {"best.pt", "last.pt"}:
-                raise ValueError("required training artifact is missing")
-            continue
-        path = (
-            max(matches, key=lambda candidate: candidate.stat().st_size)
-            if name == "events.out.tfevents.remote"
-            else matches[-1]
-        ).resolve()
-        if root not in path.parents:
-            invalid("collect-path")
+    for requested_path, url in uploads.items():
+        relative = requested_path
+        if relative not in entries:
+            matches = [path for path in entries if PurePosixPath(path).name == requested_path]
+            if len(matches) != 1:
+                raise ValueError("requested artifact is not in trusted manifest")
+            relative = matches[0]
+        path = (root / relative).resolve()
         payload = path.read_bytes()
         request = Request(url, data=payload, method="PUT", headers={"Content-Type": "application/octet-stream"})
         with urlopen(request, timeout=600) as response:
             if not 200 <= int(response.status) < 300:
                 raise ValueError("training artifact upload failed")
-        results[name] = {"checksum": hashlib.sha256(payload).hexdigest(), "size_bytes": len(payload)}
+        results[requested_path] = {"checksum": entries[relative]["checksum_sha256"], "size_bytes": entries[relative]["size_bytes"]}
     return results
 
 
@@ -198,11 +262,16 @@ def main():
             stage = "container-logs"
             print(json.dumps(collect_logs(request["container_id"]), ensure_ascii=True, separators=(",", ":"), sort_keys=True))
             return 0
+        if request["action"] == "manifest":
+            stage = "artifact-manifest"
+            print(json.dumps(build_artifact_manifest(request["output_path"]), ensure_ascii=True, separators=(",", ":"), sort_keys=True))
+            return 0
         if request["action"] == "collect":
             stage = "artifact-collect"
-            artifacts = collect_artifacts(request["output_path"], request["uploads"])
+            artifacts = collect_artifacts(request["output_path"], request["uploads"], request["artifact_manifest"])
             print(json.dumps({"artifacts": artifacts}, ensure_ascii=True, separators=(",", ":"), sort_keys=True))
             return 0
+        spec = load_launch_spec(request)
         name = f"visiox-train-{request['run_id']}-{request['attempt']}-rank-{request['node_rank']}"
         stage = "previous-container-cleanup"
         subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True, text=True, timeout=30)
@@ -212,50 +281,21 @@ def main():
             "--network", "host", "--shm-size", "4g",
             "--gpus", "device=" + ",".join(request["gpu_uuids"]),
             "--label", "com.visiox.managed=true",
+            "--label", f"com.visiox.training-job-id={spec['training_job_id']}",
             "--label", f"com.visiox.training-run-id={request['run_id']}",
             "--label", f"com.visiox.training-attempt={request['attempt']}",
             "--label", f"com.visiox.training-node-rank={request['node_rank']}",
-            "--mount", f"type=bind,src={request['paths']['dataset']},dst=/workspace/dataset",
+            "--label", f"com.visiox.training-framework={request['framework']}",
+            "--label", f"com.visiox.training-adapter-key={request['adapter_key']}",
+            "--label", f"com.visiox.launch-spec-checksum={request['launch_spec_checksum']}",
+            "--mount", f"type=bind,src={request['paths']['input']},dst=/workspace/input,readonly",
             "--mount", f"type=bind,src={request['paths']['output']},dst=/workspace/output",
-            "-e", "HOME=/tmp",
-            "-e", "USER=visiox-edge",
-            "-e", "LOGNAME=visiox-edge",
-            "-e", "YOLO_CONFIG_DIR=/tmp",
-            "-e", "MPLCONFIGDIR=/tmp",
+            "-e", "HOME=/tmp", "-e", "USER=visiox-edge", "-e", "LOGNAME=visiox-edge",
+            "-e", "YOLO_CONFIG_DIR=/tmp", "-e", "MPLCONFIGDIR=/tmp",
             "-e", "TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor",
-            "-e", f"VISIOX_DISTRIBUTED_RUN_ID={request['run_id']}",
-            "-e", f"VISIOX_DISTRIBUTED_ATTEMPT={request['attempt']}",
+            request["runtime_image_digest"],
+            "/usr/local/bin/visiox-train",
         ]
-        if request["engine"] == "yolo26":
-            command.extend(["--mount", f"type=bind,src={request['paths']['model']},dst=/workspace/model/base.pt,readonly"])
-            if "checkpoint" in request["paths"]:
-                command.extend(["--mount", f"type=bind,src={request['paths']['checkpoint']},dst=/workspace/checkpoint/last.pt,readonly"])
-            command.extend([
-                request["image_digest"],
-                "torchrun",
-                f"--nnodes={request['nnodes']}",
-                f"--nproc-per-node={request['nproc_per_node']}",
-                f"--node-rank={request['node_rank']}",
-                f"--master-addr={request['master_addr']}",
-                f"--master-port={request['master_port']}",
-                "-m", "visiox_training_worker.train_entrypoint",
-                *request["training_arguments"],
-            ])
-        else:
-            cache_root = Path.home() / ".cache" / "visiox" / "models"
-            cache_root.mkdir(mode=0o750, parents=True, exist_ok=True)
-            command.extend([
-                "--mount", f"type=bind,src={cache_root},dst=/workspace/model-cache",
-                "-e", "HF_HOME=/workspace/model-cache/huggingface",
-                "-e", "MODELSCOPE_CACHE=/workspace/model-cache/modelscope",
-            ])
-            if request["model_source"] == "modelscope":
-                command.extend(["-e", "USE_MODELSCOPE_HUB=1"])
-            command.extend([
-                request["image_digest"],
-                "python", "-m", "visiox_llm_training_worker.entrypoint",
-                "/workspace/dataset/train.yaml",
-            ])
         stage = "container-launch"
         result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
         container_id = result.stdout.strip()
@@ -265,10 +305,7 @@ def main():
         return 0
     except Exception as error:
         detail = f":{error.code}" if isinstance(error, RequestValidationError) else ""
-        print(
-            f"distributed rank operation failed at stage={stage}{detail} ({type(error).__name__})",
-            file=sys.stderr,
-        )
+        print(f"distributed rank operation failed at stage={stage}{detail} ({type(error).__name__})", file=sys.stderr)
         return 1
 
 
