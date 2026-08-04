@@ -215,6 +215,34 @@ describe("DataPreparationView", () => {
     expect(wrapper.text()).toContain("已转换数据集");
   });
 
+  it("keeps published assets visible in data preparation and the dataset library", async () => {
+    apiMock.listDatasets.mockResolvedValue({
+      items: [
+        {
+          id: "published-huajiao",
+          name: "huajiao",
+          task: "detect",
+          status: "validated",
+          asset_role: "published",
+          source: "label_studio",
+          sample_count: 135,
+          annotation_count: 540,
+        },
+      ],
+      total: 1,
+      limit: 50,
+      offset: 0,
+    });
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listDatasets).toHaveBeenCalledTimes(1));
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("huajiao");
+
+    await wrapper.get('[data-testid="dataset-tab"]').trigger("click");
+    expect(wrapper.text()).toContain("huajiao");
+  });
+
   it("validates a prepared dataset from the dataset card", async () => {
     apiMock.listDatasets.mockResolvedValue({
       items: [{ id: "dataset-1", name: "huajiao", task: "detect", status: "created", sample_count: 135, annotation_count: 135 }],

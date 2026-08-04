@@ -600,7 +600,7 @@ const filteredDatasets = computed(() => {
 });
 
 function isPreparationRecord(dataset: DatasetRow) {
-  if (dataset.asset_role) return dataset.asset_role === "working";
+  if (dataset.asset_role) return dataset.asset_role === "working" || dataset.asset_role === "published";
   if (dataset.status === "preparing") return true;
   const storageUri = dataset.storage_uri || "";
   if (storageUri.startsWith("preparation://")) return false;
