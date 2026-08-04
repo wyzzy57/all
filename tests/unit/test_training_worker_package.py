@@ -5,6 +5,10 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
+import visiox_training.runtime as runtime
+from visiox_training.runtime import ArtifactManifestRefresher, run_worker_command
 from visiox_training_worker.fixed_entrypoint import build_worker_command
 
 
@@ -111,3 +115,133 @@ def test_fixed_entrypoint_preserves_ultralytics_torchrun_semantics() -> None:
         "epochs=2",
         "workers=4",
     )
+
+
+def test_manifest_refresher_tracks_replaced_and_deleted_files(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    weight = output / "best.pt"
+    weight.write_bytes(b"first")
+    refresher = ArtifactManifestRefresher(
+        output,
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        minimum_interval_seconds=0,
+    )
+
+    first = refresher.refresh(force=True, strict=True)
+    replacement = output / "best.pt.replacement"
+    replacement.write_bytes(b"second")
+    replacement.replace(weight)
+    second = refresher.refresh(force=True, strict=True)
+    weight.unlink()
+    third = refresher.refresh(force=True, strict=True)
+
+    assert first is not None and second is not None and third is not None
+    assert first.artifacts[0].checksum_sha256 != second.artifacts[0].checksum_sha256
+    assert third.artifacts == ()
+
+
+def test_periodic_manifest_refresh_isolates_file_replacement_but_final_is_strict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    weight = output / "best.pt"
+    weight.write_bytes(b"first")
+    refresher = ArtifactManifestRefresher(
+        output,
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        minimum_interval_seconds=0,
+    )
+    refresher.refresh(force=True, strict=True)
+    weight.write_bytes(b"changed-before-refresh")
+    original = runtime._stream_file_digest
+
+    def replace_during_hash(path: Path) -> str:
+        digest = original(path)
+        path.write_bytes(b"changed-during-hash")
+        return digest
+
+    monkeypatch.setattr(runtime, "_stream_file_digest", replace_during_hash)
+
+    assert refresher.refresh(force=True, strict=False) is None
+    with pytest.raises(RuntimeError, match="changed while hashing"):
+        refresher.refresh(force=True, strict=True)
+
+
+def test_manifest_refresher_throttles_and_reuses_unchanged_checksums(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "large.pt").write_bytes(b"x" * (2 * 1024 * 1024))
+    calls = 0
+    original = runtime._stream_file_digest
+
+    def count_digest(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(runtime, "_stream_file_digest", count_digest)
+    refresher = ArtifactManifestRefresher(
+        output,
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        minimum_interval_seconds=60,
+    )
+
+    first = refresher.refresh(force=True, strict=False)
+    throttled = refresher.refresh(strict=False)
+    unchanged = refresher.refresh(force=True, strict=False)
+
+    assert first is not None
+    assert throttled is first
+    assert unchanged is not None
+    assert calls == 1
+
+
+def test_worker_poll_callback_exception_is_logged_without_killing_training(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Process:
+        calls = 0
+
+        def wait(self, timeout):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired("train", timeout)
+            return 0
+
+        def poll(self):
+            return None
+
+        def send_signal(self, _signum):
+            return None
+
+    monkeypatch.setattr(
+        runtime.subprocess, "Popen", lambda *_args, **_kwargs: Process()
+    )
+    monkeypatch.setattr(runtime.signal, "signal", lambda *_args: runtime.signal.SIG_DFL)
+
+    def fail_refresh() -> None:
+        raise RuntimeError("transient manifest race")
+
+    assert (
+        run_worker_command(
+            ("train",),
+            environment={},
+            on_poll=fail_refresh,
+            poll_interval_seconds=0.01,
+        )
+        == 0
+    )
+    assert "periodic artifact manifest refresh failed" in caplog.text

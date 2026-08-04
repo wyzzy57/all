@@ -9,11 +9,11 @@ import yaml
 
 from visiox_training.contracts import LaunchSpec
 from visiox_training.runtime import (
+    ArtifactManifestRefresher,
     load_fixed_launch_spec,
     load_runtime_inputs,
     require_string_env,
     run_worker_command,
-    write_artifact_manifest,
 )
 
 
@@ -114,22 +114,21 @@ def main() -> int:
     command, environment = build_worker_command(spec.model_dump(mode="json"))
     output_dir = Path(require_string_env(spec, "VISIOX_OUTPUT_DIR"))
 
-    def refresh_manifest() -> None:
-        write_artifact_manifest(
-            output_dir,
-            task_id=require_string_env(spec, "VISIOX_TRAINING_JOB_ID"),
-            adapter_key=ADAPTER_KEY,
-            adapter_version=ADAPTER_VERSION,
-        )
+    manifest_refresher = ArtifactManifestRefresher(
+        output_dir,
+        task_id=require_string_env(spec, "VISIOX_TRAINING_JOB_ID"),
+        adapter_key=ADAPTER_KEY,
+        adapter_version=ADAPTER_VERSION,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    refresh_manifest()
+    manifest_refresher.refresh(force=True, strict=False)
     return_code = run_worker_command(
         command,
         environment=environment,
-        on_poll=refresh_manifest,
+        on_poll=manifest_refresher.refresh,
     )
-    refresh_manifest()
+    manifest_refresher.refresh(force=True, strict=True)
     return return_code
 
 

@@ -693,7 +693,10 @@ def test_remote_rank_failure_reports_safe_stage_only(
     assert "must-not-appear" not in stderr
 
 
-def test_remote_rank_collect_uploads_last_checkpoint(tmp_path: Path) -> None:
+def test_remote_rank_collect_streams_last_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     output = tmp_path / "output"
     checkpoint = output / "runs" / "job-1" / "weights" / "last.pt"
     checkpoint.parent.mkdir(parents=True)
@@ -703,6 +706,7 @@ def test_remote_rank_collect_uploads_last_checkpoint(tmp_path: Path) -> None:
     namespace: dict[str, object] = {"__name__": "visiox_script_test"}
     exec(compile(embedded, "launch_rank.sh", "exec"), namespace)
     uploaded: list[bytes] = []
+    bodies: list[object] = []
 
     class Response:
         status = 200
@@ -715,7 +719,8 @@ def test_remote_rank_collect_uploads_last_checkpoint(tmp_path: Path) -> None:
 
     def urlopen(request, timeout):
         assert timeout == 600
-        uploaded.append(request.data)
+        bodies.append(request.data)
+        uploaded.append(request.data.read())
         return Response()
 
     namespace["urlopen"] = urlopen
@@ -725,6 +730,11 @@ def test_remote_rank_collect_uploads_last_checkpoint(tmp_path: Path) -> None:
         adapter_key="ultralytics.object_detection.v1",
         adapter_version="1.0.0",
     ).model_dump(mode="json")
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _path: (_ for _ in ()).throw(AssertionError("whole-file read")),
+    )
     relative = "runs/job-1/weights/last.pt"
     result = namespace["collect_artifacts"](  # type: ignore[operator]
         str(output),
@@ -733,6 +743,7 @@ def test_remote_rank_collect_uploads_last_checkpoint(tmp_path: Path) -> None:
     )
 
     assert uploaded == [b"checkpoint"]
+    assert all(hasattr(body, "read") for body in bodies)
     assert result[relative]["size_bytes"] == 10
 
 
@@ -765,7 +776,8 @@ def test_remote_rank_collect_uploads_ultralytics_visualizations(tmp_path: Path) 
 
     def urlopen(request, timeout):
         assert timeout == 600
-        uploaded.append(request.data)
+        assert hasattr(request.data, "read")
+        uploaded.append(request.data.read())
         return Response()
 
     namespace["urlopen"] = urlopen
@@ -786,6 +798,58 @@ def test_remote_rank_collect_uploads_ultralytics_visualizations(tmp_path: Path) 
 
     assert uploaded == list(expected.values())
     assert set(result) == set(uploads)
+
+
+def test_remote_rank_large_artifact_never_uses_whole_file_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    artifact = output / "weights" / "large.pt"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"x" * (3 * 1024 * 1024 + 17))
+    script = load_packaged_script("launch_rank.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "launch_rank.sh", "exec"), namespace)
+    manifest = write_artifact_manifest(
+        output,
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+    ).model_dump(mode="json")
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _path: (_ for _ in ()).throw(AssertionError("whole-file read")),
+    )
+    chunks: list[int] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def urlopen(request, timeout):
+        assert timeout == 600
+        while chunk := request.data.read(1024 * 1024):
+            chunks.append(len(chunk))
+        return Response()
+
+    namespace["urlopen"] = urlopen
+    result = namespace["collect_artifacts"](  # type: ignore[operator]
+        str(output),
+        {"weights/large.pt": "https://minio.internal/large.pt"},
+        manifest,
+    )
+
+    assert len(chunks) == 4
+    assert max(chunks) <= 1024 * 1024
+    assert result["weights/large.pt"]["size_bytes"] == artifact.stat().st_size
 
 
 def test_llm_launch_spec_carries_unified_runtime_inputs_without_edge_translation() -> (

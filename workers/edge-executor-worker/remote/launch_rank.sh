@@ -131,10 +131,10 @@ def validate(request):
 
 def load_launch_spec(request):
     path = Path(request["paths"]["launch_spec"])
-    payload = path.read_bytes()
-    if hashlib.sha256(payload).hexdigest() != request["launch_spec_checksum"]:
+    if stream_sha256(path) != request["launch_spec_checksum"]:
         invalid("launch-spec-file-checksum")
-    spec = json.loads(payload)
+    with path.open("r", encoding="utf-8") as source:
+        spec = json.load(source)
     expected = {"schema_version", "adapter_key", "adapter_version", "argv", "env", "working_directory"}
     if not isinstance(spec, dict) or set(spec) != expected or spec.get("schema_version") != "1.0" or spec.get("argv") != [FIXED_ENTRYPOINT] or spec.get("working_directory") != "workspace":
         invalid("launch-spec")
@@ -169,6 +169,14 @@ def inspect_container(container_id):
 def collect_logs(container_id):
     result = subprocess.run(["docker", "logs", "--timestamps", container_id], check=False, capture_output=True, text=True, timeout=60)
     return {"stdout": result.stdout, "stderr": result.stderr}
+
+
+def stream_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def validate_artifact_manifest(manifest, output_path, expected_identity=None):
@@ -206,7 +214,7 @@ def validate_artifact_manifest(manifest, output_path, expected_identity=None):
         total += size
         if total > MAX_ARTIFACT_TOTAL_BYTES:
             raise ValueError("artifact manifest exceeds total size limit")
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = stream_sha256(path)
         if artifact.get("checksum_sha256") != digest:
             raise ValueError("artifact checksum mismatch")
         seen.add(relative)
@@ -225,11 +233,20 @@ def collect_artifacts(output_path, uploads, artifact_manifest):
     for relative, url in uploads.items():
         if relative not in entries:
             raise ValueError("requested artifact is not in trusted manifest")
-        payload = (Path(output_path).resolve() / relative).read_bytes()
-        request = Request(url, data=payload, method="PUT", headers={"Content-Type": "application/octet-stream"})
-        with urlopen(request, timeout=600) as response:
-            if not 200 <= int(response.status) < 300:
-                raise ValueError("training artifact upload failed")
+        path = Path(output_path).resolve() / relative
+        with path.open("rb") as source:
+            request = Request(
+                url,
+                data=source,
+                method="PUT",
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(entries[relative]["size_bytes"]),
+                },
+            )
+            with urlopen(request, timeout=600) as response:
+                if not 200 <= int(response.status) < 300:
+                    raise ValueError("training artifact upload failed")
         results[relative] = {"checksum": entries[relative]["checksum_sha256"], "size_bytes": entries[relative]["size_bytes"]}
     return results
 

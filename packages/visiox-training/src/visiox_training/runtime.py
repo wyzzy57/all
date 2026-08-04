@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 import re
 import signal
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable
 
@@ -20,6 +22,10 @@ MANAGED_ARTIFACT_PATHS = {
     "checkpoint": "/workspace/checkpoint/last.pt",
 }
 _HOST_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|//)")
+_MANIFEST_NAME = "artifact-manifest.json"
+_MANIFEST_TEMP_NAME = ".artifact-manifest.json.tmp"
+_HASH_CHUNK_SIZE = 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 def load_fixed_launch_spec(
@@ -148,43 +154,137 @@ def write_artifact_manifest(
     adapter_key: str,
     adapter_version: str,
 ) -> ArtifactManifest:
-    output_dir = output_dir.resolve()
-    entries: list[ArtifactEntry] = []
-    for path in sorted(output_dir.rglob("*")):
-        if not path.is_file() or path.name == "artifact-manifest.json":
-            continue
-        digest = hashlib.sha256()
-        with path.open("rb") as source:
-            while chunk := source.read(1024 * 1024):
-                digest.update(chunk)
-        entries.append(
-            ArtifactEntry(
-                path=path.relative_to(output_dir).as_posix(),
-                size_bytes=path.stat().st_size,
-                checksum_sha256=digest.hexdigest(),
-                artifact_type=_artifact_type(path),
-            )
-        )
-    unsigned = ArtifactManifest(
+    manifest = ArtifactManifestRefresher(
+        output_dir,
         task_id=task_id,
         adapter_key=adapter_key,
         adapter_version=adapter_version,
-        artifacts=tuple(entries),
-    )
-    manifest = unsigned.model_copy(
-        update={"checksum_sha256": unsigned.canonical_checksum_sha256()}
-    )
-    (output_dir / "artifact-manifest.json").write_text(
-        json.dumps(
-            manifest.model_dump(mode="json"),
-            ensure_ascii=True,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
+    ).refresh(force=True, strict=True)
+    assert manifest is not None
     return manifest
+
+
+class ArtifactManifestRefresher:
+    def __init__(
+        self,
+        output_dir: Path,
+        *,
+        task_id: str,
+        adapter_key: str,
+        adapter_version: str,
+        minimum_interval_seconds: float = 60.0,
+    ) -> None:
+        if minimum_interval_seconds < 0:
+            raise ValueError("manifest refresh interval cannot be negative")
+        self.output_dir = output_dir.resolve()
+        self.task_id = task_id
+        self.adapter_key = adapter_key
+        self.adapter_version = adapter_version
+        self.minimum_interval_seconds = minimum_interval_seconds
+        self._last_attempt = float("-inf")
+        self._manifest: ArtifactManifest | None = None
+        self._cache: dict[str, tuple[tuple[int, int, int, int], ArtifactEntry]] = {}
+
+    def refresh(
+        self,
+        *,
+        force: bool = False,
+        strict: bool = False,
+    ) -> ArtifactManifest | None:
+        now = time.monotonic()
+        if not force and now - self._last_attempt < self.minimum_interval_seconds:
+            return self._manifest
+        self._last_attempt = now
+        try:
+            manifest, cache = self._build_manifest(rehash_all=strict)
+            self._write_manifest(manifest)
+        except Exception:
+            if strict:
+                raise
+            logger.exception("periodic artifact manifest refresh failed")
+            return None
+        self._manifest = manifest
+        self._cache = cache
+        return manifest
+
+    def _build_manifest(
+        self,
+        *,
+        rehash_all: bool,
+    ) -> tuple[
+        ArtifactManifest,
+        dict[str, tuple[tuple[int, int, int, int], ArtifactEntry]],
+    ]:
+        entries: list[ArtifactEntry] = []
+        cache: dict[str, tuple[tuple[int, int, int, int], ArtifactEntry]] = {}
+        for path in sorted(self.output_dir.rglob("*")):
+            if not path.is_file() or path.name in {
+                _MANIFEST_NAME,
+                _MANIFEST_TEMP_NAME,
+            }:
+                continue
+            relative = path.relative_to(self.output_dir).as_posix()
+            before = _file_fingerprint(path)
+            cached = self._cache.get(relative)
+            if not rehash_all and cached is not None and cached[0] == before:
+                entry = cached[1]
+            else:
+                digest = _stream_file_digest(path)
+                try:
+                    after = _file_fingerprint(path)
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        f"artifact changed while hashing: {relative}"
+                    ) from exc
+                if before != after:
+                    raise RuntimeError(f"artifact changed while hashing: {relative}")
+                entry = ArtifactEntry(
+                    path=relative,
+                    size_bytes=after[2],
+                    checksum_sha256=digest,
+                    artifact_type=_artifact_type(path),
+                )
+                before = after
+            entries.append(entry)
+            cache[relative] = (before, entry)
+        unsigned = ArtifactManifest(
+            task_id=self.task_id,
+            adapter_key=self.adapter_key,
+            adapter_version=self.adapter_version,
+            artifacts=tuple(entries),
+        )
+        manifest = unsigned.model_copy(
+            update={"checksum_sha256": unsigned.canonical_checksum_sha256()}
+        )
+        return manifest, cache
+
+    def _write_manifest(self, manifest: ArtifactManifest) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.output_dir / _MANIFEST_TEMP_NAME
+        temporary.write_text(
+            json.dumps(
+                manifest.model_dump(mode="json"),
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(self.output_dir / _MANIFEST_NAME)
+
+
+def _file_fingerprint(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _stream_file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(_HASH_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _artifact_type(path: Path) -> str:
@@ -233,7 +333,10 @@ def run_worker_command(
                 return int(process.wait(timeout=poll_interval_seconds))
             except subprocess.TimeoutExpired:
                 if on_poll is not None:
-                    on_poll()
+                    try:
+                        on_poll()
+                    except Exception:
+                        logger.exception("periodic artifact manifest refresh failed")
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
