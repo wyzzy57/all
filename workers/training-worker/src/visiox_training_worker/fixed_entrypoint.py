@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from visiox_training.contracts import LaunchSpec
 from visiox_training.runtime import (
     load_fixed_launch_spec,
+    load_runtime_inputs,
     require_string_env,
     run_worker_command,
     write_artifact_manifest,
 )
+from visiox_yolo26.training.commands import build_train_command
 
 
 ADAPTER_KEY = "ultralytics.object_detection.v1"
@@ -24,14 +25,31 @@ def build_worker_command(payload: dict[str, object]) -> tuple[str, ...]:
         raise ValueError("launch spec adapter does not match Ultralytics")
     if tuple(spec.argv) != ("/usr/local/bin/visiox-train",):
         raise ValueError("Ultralytics runtime only accepts the fixed entrypoint")
-    arguments = json.loads(require_string_env(spec, "VISIOX_TRAINING_ARGUMENTS_JSON"))
-    if not isinstance(arguments, list) or any(
-        not isinstance(item, str)
-        or not item
-        or any(character in item for character in "\x00\r\n")
-        for item in arguments
+    inputs = load_runtime_inputs(spec)
+    artifacts = {item["role"]: item["path"] for item in inputs["artifacts"]}
+    if artifacts.get("model") != "/workspace/model/base.pt":
+        raise ValueError("Ultralytics model artifact is unavailable")
+    if artifacts.get("dataset") != "/workspace/dataset":
+        raise ValueError("Ultralytics dataset artifact is unavailable")
+    dataset = inputs["dataset"]
+    if dataset.get("format") not in {"yolo", "coco"}:
+        raise ValueError("Ultralytics dataset format is unsupported")
+    parameters = dict(inputs["parameters"])
+    parameters.pop("device", None)
+    if any(
+        key in parameters for key in {"model", "data", "project", "name", "exist_ok"}
     ):
-        raise ValueError("Ultralytics training arguments are invalid")
+        raise ValueError("Ultralytics managed arguments cannot be overridden")
+    translated = build_train_command(
+        base_model_path=PurePosixPath(artifacts["model"]),  # type: ignore[arg-type]
+        data_yaml_path=PurePosixPath(f"{artifacts['dataset']}/data.yaml"),  # type: ignore[arg-type]
+        params=parameters,
+        project_dir=PurePosixPath("/workspace/output/runs"),  # type: ignore[arg-type]
+        run_name=f"job-{require_string_env(spec, 'VISIOX_TRAINING_JOB_ID')}",
+    )
+    arguments = translated.argv[2:]
+    if any(any(character in item for character in "\x00\r\n") for item in arguments):
+        raise ValueError("Ultralytics translated arguments are invalid")
     return (
         "torchrun",
         f"--nnodes={int(require_string_env(spec, 'VISIOX_NNODES'))}",

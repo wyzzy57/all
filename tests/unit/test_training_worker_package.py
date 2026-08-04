@@ -8,6 +8,23 @@ import sys
 from visiox_training_worker.fixed_entrypoint import build_worker_command
 
 
+def _runtime_inputs() -> str:
+    return (
+        '{"artifacts":[{"path":"/workspace/dataset","role":"dataset"},'
+        '{"path":"/workspace/model/base.pt","role":"model"}],'
+        '"dataset":{"format":"yolo","id":"dataset-1","manifest_checksum":"'
+        + "b"
+        * 64
+        + '","uri":"minio://datasets/1","version":1,"version_id":"version-1"},'
+        '"model":{"checksum":"'
+        + "a"
+        * 64
+        + '","family":"yolo26","id":"model-1","revision":null,'
+        '"runtime_id":"yolo26n.pt","source":"base_model"},'
+        '"parameters":{"device":"0,1","epochs":2,"workers":4}}'
+    )
+
+
 def test_train_entrypoint_import_does_not_load_control_plane_dependencies() -> None:
     source_root = Path(__file__).parents[2] / "workers" / "training-worker" / "src"
     script = """
@@ -61,7 +78,8 @@ def test_fixed_entrypoint_preserves_ultralytics_torchrun_semantics() -> None:
             "adapter_version": "1.0.0",
             "argv": ["/usr/local/bin/visiox-train"],
             "env": {
-                "VISIOX_TRAINING_ARGUMENTS_JSON": '["model=/workspace/model/base.pt","epochs=2"]',
+                "VISIOX_RUNTIME_INPUTS_JSON": _runtime_inputs(),
+                "VISIOX_TRAINING_JOB_ID": "job-1",
                 "VISIOX_NNODES": "2",
                 "VISIOX_NPROC_PER_NODE": "2",
                 "VISIOX_NODE_RANK": "1",
@@ -82,5 +100,10 @@ def test_fixed_entrypoint_preserves_ultralytics_torchrun_semantics() -> None:
         "-m",
         "visiox_training_worker.train_entrypoint",
         "model=/workspace/model/base.pt",
+        "data=/workspace/dataset/data.yaml",
+        "project=/workspace/output/runs",
+        "name=job-job-1",
+        "exist_ok=True",
         "epochs=2",
+        "workers=4",
     )

@@ -4,7 +4,43 @@ import json
 from pathlib import Path
 
 import visiox_llm_training_worker.entrypoint as worker
-from visiox_llm_training_worker.fixed_entrypoint import build_worker_command
+from visiox_llm_training_worker.fixed_entrypoint import (
+    build_runtime_config,
+    build_worker_command,
+)
+
+
+def _runtime_inputs() -> str:
+    return json.dumps(
+        {
+            "parameters": {
+                "finetuning_type": "lora",
+                "learning_rate": 0.0001,
+                "model_source": "modelscope",
+                "num_train_epochs": 2,
+                "stage": "sft",
+            },
+            "model": {
+                "source": "modelscope",
+                "id": "Qwen/Qwen3-0.6B",
+                "family": "qwen3",
+                "runtime_id": "Qwen/Qwen3-0.6B",
+                "checksum": None,
+                "revision": "c" * 40,
+            },
+            "dataset": {
+                "id": "dataset-1",
+                "version_id": "version-1",
+                "version": 1,
+                "format": "alpaca",
+                "uri": "minio://datasets/1",
+                "manifest_checksum": "b" * 64,
+            },
+            "artifacts": [{"role": "dataset", "path": "/workspace/dataset"}],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def test_edge_image_installs_tensorboard_for_training_observability() -> None:
@@ -32,10 +68,9 @@ def test_fixed_entrypoint_preserves_llamafactory_worker_call() -> None:
             "adapter_version": "1.0.0",
             "argv": ["/usr/local/bin/visiox-train"],
             "env": {
-                "VISIOX_LLM_CONFIG_PATH": "/workspace/dataset/train.yaml",
+                "VISIOX_RUNTIME_INPUTS_JSON": _runtime_inputs(),
                 "HF_HOME": "/workspace/model-cache/huggingface",
                 "MODELSCOPE_CACHE": "/workspace/model-cache/modelscope",
-                "USE_MODELSCOPE_HUB": "1",
             },
             "working_directory": "workspace",
         },
@@ -45,11 +80,32 @@ def test_fixed_entrypoint_preserves_llamafactory_worker_call() -> None:
     assert command[-3:] == (
         "-m",
         "visiox_llm_training_worker.entrypoint",
-        "/workspace/dataset/train.yaml",
+        "/workspace/output/.visiox-runtime/train.yaml",
     )
     assert environment["HF_HOME"] == "/workspace/model-cache/huggingface"
     assert environment["MODELSCOPE_CACHE"] == "/workspace/model-cache/modelscope"
     assert environment["USE_MODELSCOPE_HUB"] == "1"
+
+
+def test_fixed_entrypoint_builds_llamafactory_config_from_unified_inputs() -> None:
+    config = build_runtime_config(
+        {
+            "schema_version": "1.0",
+            "adapter_key": "llamafactory.llm_sft.v1",
+            "adapter_version": "1.0.0",
+            "argv": ["/usr/local/bin/visiox-train"],
+            "env": {"VISIOX_RUNTIME_INPUTS_JSON": _runtime_inputs()},
+            "working_directory": "workspace",
+        }
+    )
+
+    assert config["model_name_or_path"] == "Qwen/Qwen3-0.6B"
+    assert config["model_revision"] == "c" * 40
+    assert config["dataset"] == "visiox_train"
+    assert config["dataset_dir"] == "/workspace/dataset"
+    assert config["num_train_epochs"] == 2
+    assert config["learning_rate"] == 0.0001
+    assert "model_source" not in config
 
 
 def test_latest_trainer_log_skips_malformed_tail(tmp_path: Path) -> None:

@@ -19,12 +19,18 @@ IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}\Z")
 IMAGE_DIGEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,430}@sha256:[a-f0-9]{64}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 ARTIFACT_ROLES = {"dataset", "model", "checkpoint"}
+MANAGED_ARTIFACT_PATHS = {
+    "dataset": "/workspace/dataset",
+    "model": "/workspace/model/base.pt",
+    "checkpoint": "/workspace/checkpoint/last.pt",
+}
 FIXED_ENTRYPOINT = "/usr/local/bin/visiox-train"
 REQUIRED_SIGNED_ENV = {
     "VISIOX_TRAINING_JOB_ID", "VISIOX_TRAINING_RUN_ID", "VISIOX_TRAINING_ATTEMPT",
     "VISIOX_FRAMEWORK", "VISIOX_NODE_ID", "VISIOX_NODE_RANK", "VISIOX_NNODES",
     "VISIOX_NPROC_PER_NODE", "VISIOX_GPU_UUIDS_JSON", "VISIOX_MASTER_ADDR",
     "VISIOX_MASTER_PORT", "VISIOX_OUTPUT_DIR", "VISIOX_DATASET_DIR",
+    "VISIOX_RUNTIME_INPUTS_JSON",
 }
 
 
@@ -49,6 +55,47 @@ def valid_url(value):
     return bool(parsed and parsed.scheme in {"http", "https"} and parsed.hostname and not parsed.username and not parsed.password and not parsed.fragment)
 
 
+def validate_snapshot_value(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or any(char in key for char in "\x00\r\n"):
+                invalid()
+            validate_snapshot_value(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            validate_snapshot_value(item)
+        return
+    if isinstance(value, str):
+        if any(char in value for char in "\x00\r\n") or value.startswith("/") or value.casefold().startswith("file:") or re.match(r"^(?:[A-Za-z]:[\\/]|\\\\|//)", value):
+            invalid()
+        return
+    if value is None or isinstance(value, (bool, int, float)):
+        return
+    invalid()
+
+
+def validate_runtime_inputs(value):
+    if not isinstance(value, dict) or set(value) != {"parameters", "model", "dataset", "artifacts"}:
+        invalid()
+    for field in ("parameters", "model", "dataset"):
+        if not isinstance(value[field], dict):
+            invalid()
+        validate_snapshot_value(value[field])
+    artifacts = value["artifacts"]
+    if not isinstance(artifacts, list) or len(artifacts) > len(MANAGED_ARTIFACT_PATHS):
+        invalid()
+    roles = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != {"role", "path"}:
+            invalid()
+        role = artifact["role"]
+        if role in roles or artifact["path"] != MANAGED_ARTIFACT_PATHS.get(role):
+            invalid()
+        roles.add(role)
+    return value
+
+
 def validate_launch_spec(spec):
     expected = {"schema_version", "adapter_key", "adapter_version", "argv", "env", "working_directory"}
     if not isinstance(spec, dict) or set(spec) != expected or spec.get("schema_version") != "1.0":
@@ -69,17 +116,13 @@ def validate_launch_spec(spec):
             invalid()
     if environment["VISIOX_OUTPUT_DIR"] != "/workspace/output" or environment["VISIOX_DATASET_DIR"] != "/workspace/dataset":
         invalid()
-    for key in ("VISIOX_TRAINING_ARGUMENTS_JSON", "VISIOX_FRAMEWORK_PARAMETERS_JSON", "VISIOX_GPU_UUIDS_JSON"):
-        try:
-            value = json.loads(environment.get(key, "[]" if key != "VISIOX_FRAMEWORK_PARAMETERS_JSON" else "{}"))
-        except json.JSONDecodeError:
-            invalid()
-        if key == "VISIOX_FRAMEWORK_PARAMETERS_JSON" and not isinstance(value, dict):
-            invalid()
-        if key != "VISIOX_FRAMEWORK_PARAMETERS_JSON" and not isinstance(value, list):
-            invalid()
-        if key == "VISIOX_TRAINING_ARGUMENTS_JSON" and any(not isinstance(item, str) or not item or any(char in item for char in "\x00\r\n") for item in value):
-            invalid()
+    try:
+        runtime_inputs = validate_runtime_inputs(json.loads(environment["VISIOX_RUNTIME_INPUTS_JSON"]))
+        gpu_uuids = json.loads(environment["VISIOX_GPU_UUIDS_JSON"])
+    except json.JSONDecodeError:
+        invalid()
+    if not isinstance(gpu_uuids, list) or not all(isinstance(item, str) and item for item in gpu_uuids):
+        invalid()
     return spec
 
 
@@ -122,6 +165,9 @@ def validate(request):
             invalid()
         roles.add(role)
         targets.add(target)
+    runtime_inputs = json.loads(env["VISIOX_RUNTIME_INPUTS_JSON"])
+    if roles != {item["role"] for item in runtime_inputs["artifacts"]}:
+        invalid()
     return request
 
 

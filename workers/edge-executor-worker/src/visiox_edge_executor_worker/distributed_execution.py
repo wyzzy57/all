@@ -30,8 +30,8 @@ from visiox_db.models import (
 from visiox_common.settings import get_settings
 from visiox_storage.client import ObjectStorageClient
 from visiox_training.contracts import ArtifactManifest, LaunchSpec
+from visiox_training.runtime import build_runtime_inputs, encode_runtime_inputs
 from visiox_yolo26.converters import export_yolo26_dataset
-from visiox_yolo26.training.commands import build_train_command
 
 from .deployment import _DeploymentHandlerBase, validate_image_digest
 from .log_capture import DurableLogCapture
@@ -129,24 +129,13 @@ class _CollectResult(BaseModel):
 @dataclass(frozen=True)
 class _RemoteAdapterContract:
     framework: str
-    engine: str
     adapter_key: str
     adapter_version: str
 
 
-_REMOTE_ADAPTERS = {
-    "ultralytics.object_detection.v1": _RemoteAdapterContract(
-        framework="ultralytics",
-        engine="yolo26",
-        adapter_key="ultralytics.object_detection.v1",
-        adapter_version="1.0.0",
-    ),
-    "llamafactory.llm_sft.v1": _RemoteAdapterContract(
-        framework="llamafactory",
-        engine="llamafactory",
-        adapter_key="llamafactory.llm_sft.v1",
-        adapter_version="1.0.0",
-    ),
+_TRUSTED_ARTIFACT_PREPARERS = {
+    ("ultralytics.object_detection.v1", "1.0.0"): "_prepare_ultralytics_artifacts",
+    ("llamafactory.llm_sft.v1", "1.0.0"): "_prepare_llm_artifacts",
 }
 
 _MAX_ARTIFACT_COUNT = 256
@@ -215,10 +204,11 @@ class DistributedTrainingHandler:
                 run, job, task, adapter, base_model, dataset
             )
             staged: dict[str, _StageResult] = {}
-            arguments = _training_arguments(job, task, adapter.adapter_key)
-            framework_parameters: dict[str, Any] = {}
-            if adapter.adapter_key == "llamafactory.llm_sft.v1":
-                framework_parameters["model_source"] = _llm_model_source(task)
+            runtime_inputs = _resolved_runtime_inputs(
+                job,
+                base_launch_spec,
+                artifacts,
+            )
             staged_requests: dict[str, dict[str, Any]] = {}
             for rank in ranks:
                 staging_request = _staging_request(
@@ -229,8 +219,7 @@ class DistributedTrainingHandler:
                     adapter.framework,
                     base_launch_spec.adapter_key,
                     base_launch_spec.adapter_version,
-                    arguments,
-                    framework_parameters,
+                    runtime_inputs,
                     artifacts,
                     environment=dict(base_launch_spec.env),
                 )
@@ -410,12 +399,24 @@ class DistributedTrainingHandler:
         base_model: StoredBaseModel | None,
         dataset: Dataset,
     ) -> list[dict[str, Any]]:
-        if adapter.adapter_key == "llamafactory.llm_sft.v1":
-            return self._prepare_llm_artifacts(run, job, task, dataset)
-        if adapter.adapter_key != "ultralytics.object_detection.v1":
+        preparer_name = _TRUSTED_ARTIFACT_PREPARERS.get(
+            (adapter.adapter_key, adapter.adapter_version)
+        )
+        if preparer_name is None:
             raise ValueError(
                 f"remote training adapter {adapter.adapter_key!r} is not implemented"
             )
+        preparer = getattr(self, preparer_name)
+        return preparer(run, job, task, base_model, dataset)
+
+    def _prepare_ultralytics_artifacts(
+        self,
+        run: DistributedTrainingRun,
+        _job: TrainingJob,
+        _task: Task,
+        base_model: StoredBaseModel | None,
+        dataset: Dataset,
+    ) -> list[dict[str, Any]]:
         if base_model is None:
             raise ValueError("base model is unavailable")
         checksum = (base_model.checksum or "").lower()
@@ -480,11 +481,14 @@ class DistributedTrainingHandler:
         self,
         run: DistributedTrainingRun,
         job: TrainingJob,
-        task: Task,
+        _task: Task,
+        _base_model: StoredBaseModel | None,
         dataset: Dataset,
     ) -> list[dict[str, Any]]:
-        payload = task.payload if isinstance(task.payload, dict) else {}
-        manifest_checksum = str(payload.get("dataset_manifest_checksum") or "").lower()
+        snapshot = _snapshot_mapping(job)
+        model_snapshot = _required_snapshot_section(snapshot, "model")
+        dataset_snapshot = _required_snapshot_section(snapshot, "dataset")
+        manifest_checksum = str(dataset_snapshot.get("manifest_checksum") or "").lower()
         if len(manifest_checksum) != 64 or any(
             char not in "0123456789abcdef" for char in manifest_checksum
         ):
@@ -499,11 +503,6 @@ class DistributedTrainingHandler:
             self._download_storage_uri(dataset.storage_uri, train_path)
             if _sha256(train_path) != manifest_checksum:
                 raise ValueError("LLM dataset manifest checksum did not match")
-            config = _llamafactory_config(job, task, dataset)
-            (dataset_dir / "train.yaml").write_text(
-                yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
-                encoding="utf-8",
-            )
             (dataset_dir / "dataset_info.json").write_text(
                 json.dumps(
                     {"visiox_train": _llamafactory_dataset_info(dataset)},
@@ -512,9 +511,6 @@ class DistributedTrainingHandler:
                 ),
                 encoding="utf-8",
             )
-            model_reference = payload.get("model_reference")
-            if not isinstance(model_reference, Mapping):
-                raise ValueError("LLM model reference is unavailable")
             (dataset_dir / "visiox-run.json").write_text(
                 json.dumps(
                     {
@@ -525,8 +521,8 @@ class DistributedTrainingHandler:
                         "owner_user_id": job.owner_user_id,
                         "pipeline_id": job.pipeline_id,
                         "node_ids": list(run.node_ids),
-                        "model_revision": model_reference.get("revision"),
-                        "dataset_version_id": payload.get("dataset_version_id"),
+                        "model_revision": model_snapshot.get("revision"),
+                        "dataset_version_id": dataset_snapshot.get("version_id"),
                         "dataset_checksum": manifest_checksum,
                         "training_image_digest": run.training_image_digest,
                         "mlflow_tracking_uri": get_settings().mlflow_public_url,
@@ -1286,24 +1282,46 @@ def build_distributed_handlers(
     }
 
 
-def _training_arguments(job: TrainingJob, task: Task, engine: str) -> list[str]:
-    if engine in {"llamafactory", "llamafactory.llm_sft.v1"}:
-        return []
-    if engine not in {"yolo26", "ultralytics.object_detection.v1"}:
-        raise ValueError(f"remote training adapter {engine!r} is not implemented")
-    params: dict[str, Any] = dict(job.params or {})
-    environment = (task.payload or {}).get("environment")
-    if isinstance(environment, Mapping):
-        params.update(environment)
-    params.pop("device", None)
-    command = build_train_command(
-        base_model_path=PurePosixPath("/workspace/model/base.pt"),
-        data_yaml_path=PurePosixPath("/workspace/dataset/data.yaml"),
-        params=params,
-        project_dir=PurePosixPath("/workspace/output/runs"),
-        run_name=f"job-{job.id}",
+def _snapshot_mapping(job: TrainingJob) -> Mapping[str, Any]:
+    snapshot = job.resolved_snapshot
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("immutable training snapshot is unavailable")
+    return snapshot
+
+
+def _required_snapshot_section(
+    snapshot: Mapping[str, Any],
+    field: str,
+) -> Mapping[str, Any]:
+    value = snapshot.get(field)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"immutable training snapshot {field} is unavailable")
+    return value
+
+
+def _resolved_runtime_inputs(
+    job: TrainingJob,
+    launch_spec: LaunchSpec,
+    artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    snapshot = _snapshot_mapping(job)
+    if (
+        snapshot.get("adapter_key") != launch_spec.adapter_key
+        or snapshot.get("adapter_version") != launch_spec.adapter_version
+    ):
+        raise ValueError("immutable snapshot adapter identity did not match")
+    roles: list[str] = []
+    for artifact in artifacts:
+        role = artifact.get("role")
+        if not isinstance(role, str):
+            raise ValueError("prepared artifact role is invalid")
+        roles.append(role)
+    return build_runtime_inputs(
+        parameters=_required_snapshot_section(snapshot, "parameters"),
+        model=_required_snapshot_section(snapshot, "model"),
+        dataset=_required_snapshot_section(snapshot, "dataset"),
+        artifact_roles=roles,
     )
-    return command.argv[2:]
 
 
 def _staging_request(
@@ -1314,26 +1332,11 @@ def _staging_request(
     framework: str,
     adapter_key: str,
     adapter_version: str,
-    arguments: list[str],
-    parameters: Mapping[str, Any],
+    runtime_inputs: Mapping[str, Any],
     artifacts: list[dict[str, Any]],
     *,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    if any(
-        not isinstance(argument, str)
-        or not argument
-        or any(character in argument for character in "\x00\r\n")
-        for argument in arguments
-    ):
-        raise ValueError("training arguments contain unsafe control characters")
-    framework_parameters = json.dumps(
-        dict(parameters),
-        ensure_ascii=True,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
     signed_environment = {
         **dict(environment or {}),
         "VISIOX_TRAINING_JOB_ID": job.id,
@@ -1351,18 +1354,10 @@ def _staging_request(
         "VISIOX_MASTER_PORT": str(run.master_port),
         "VISIOX_OUTPUT_DIR": "/workspace/output",
         "VISIOX_DATASET_DIR": "/workspace/dataset",
-        "VISIOX_MODEL_PATH": "/workspace/model/base.pt",
-        "VISIOX_CHECKPOINT_PATH": "/workspace/checkpoint/last.pt",
-        "VISIOX_LLM_CONFIG_PATH": "/workspace/dataset/train.yaml",
-        "VISIOX_TRAINING_ARGUMENTS_JSON": json.dumps(
-            list(arguments), separators=(",", ":")
-        ),
-        "VISIOX_FRAMEWORK_PARAMETERS_JSON": framework_parameters,
+        "VISIOX_RUNTIME_INPUTS_JSON": encode_runtime_inputs(runtime_inputs),
         "HF_HOME": "/workspace/model-cache/huggingface",
         "MODELSCOPE_CACHE": "/workspace/model-cache/modelscope",
     }
-    if parameters.get("model_source") == "modelscope":
-        signed_environment["USE_MODELSCOPE_HUB"] = "1"
     launch_spec_model = LaunchSpec(
         adapter_key=adapter_key,
         adapter_version=adapter_version,
@@ -1425,21 +1420,19 @@ def _require_remote_adapter(
     pipeline: TrainingPipeline,
     launch_spec: LaunchSpec,
 ) -> _RemoteAdapterContract:
-    adapter = _REMOTE_ADAPTERS.get(launch_spec.adapter_key)
-    if adapter is None:
-        raise ValueError(
-            f"remote training adapter {launch_spec.adapter_key!r} is not implemented"
-        )
-    if launch_spec.adapter_version != adapter.adapter_version:
-        raise ValueError("remote training adapter version is not implemented")
     if (
-        pipeline.framework != adapter.framework
-        or pipeline.adapter_key != adapter.adapter_key
-        or pipeline.adapter_version != adapter.adapter_version
-        or pipeline.engine != adapter.engine
+        not isinstance(pipeline.framework, str)
+        or not pipeline.framework
+        or pipeline.adapter_key != launch_spec.adapter_key
+        or pipeline.adapter_version != launch_spec.adapter_version
+        or tuple(launch_spec.argv) != ("/usr/local/bin/visiox-train",)
     ):
-        raise ValueError("persisted pipeline does not match the trusted remote adapter")
-    return adapter
+        raise ValueError("persisted pipeline does not match the signed remote adapter")
+    return _RemoteAdapterContract(
+        framework=pipeline.framework,
+        adapter_key=launch_spec.adapter_key,
+        adapter_version=launch_spec.adapter_version,
+    )
 
 
 def _artifact_uri(job_id: str, path: str) -> str:
@@ -1498,63 +1491,6 @@ def _artifact_mounts(paths: Any) -> list[dict[str, Any]]:
         for role, source in paths.items()
         if role in targets
     ]
-
-
-def _llm_model_source(task: Task) -> str:
-    payload = task.payload if isinstance(task.payload, dict) else {}
-    model_reference = payload.get("model_reference")
-    if not isinstance(model_reference, Mapping):
-        raise ValueError("LLM model reference is unavailable")
-    source = model_reference.get("source")
-    if source not in {"huggingface", "modelscope"}:
-        raise ValueError("LLM model source is unavailable")
-    return str(source)
-
-
-def _llamafactory_config(
-    job: TrainingJob,
-    task: Task,
-    dataset: Dataset,
-) -> dict[str, Any]:
-    payload = task.payload if isinstance(task.payload, dict) else {}
-    model_reference = payload.get("model_reference")
-    if not isinstance(model_reference, Mapping):
-        raise ValueError("LLM model reference is unavailable")
-    model_id = model_reference.get("model_id")
-    revision = model_reference.get("revision")
-    if not isinstance(model_id, str) or not model_id:
-        raise ValueError("LLM model id is unavailable")
-    if not isinstance(revision, str) or not revision:
-        raise ValueError("LLM model revision is unavailable")
-    internal_fields = {
-        "model_source",
-        "model_id",
-        "model_revision",
-        "resolved_revision",
-        "auto_optimize",
-    }
-    config = {
-        key: value
-        for key, value in dict(job.params or {}).items()
-        if key not in internal_fields and value is not None
-    }
-    config.update(
-        {
-            "model_name_or_path": model_id,
-            "model_revision": revision,
-            "dataset": "visiox_train",
-            "dataset_dir": "/workspace/dataset",
-            "output_dir": f"/workspace/output/job-{job.id}",
-            "logging_dir": f"/workspace/output/job-{job.id}/runs",
-            "report_to": "tensorboard",
-            "overwrite_output_dir": True,
-            "do_train": True,
-            "plot_loss": True,
-        }
-    )
-    if dataset.format not in {"alpaca", "sharegpt", "openai_messages"}:
-        raise ValueError("LLM dataset format is unsupported")
-    return config
 
 
 def _llamafactory_dataset_info(dataset: Dataset) -> dict[str, Any]:

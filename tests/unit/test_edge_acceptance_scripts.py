@@ -56,12 +56,17 @@ def test_acceptance_scripts_never_take_password_as_cli_argument(script: Path) ->
     assert "-AsSecureString" in text
     assert "SecureStringToBSTR" in text
     assert "ZeroFreeBSTR" in text
-    assert "password" not in re.sub(
-        r'"password"\s*=\s*\$PlaintextPassword',
-        "",
-        text,
-        flags=re.IGNORECASE,
-    ).split("ConvertTo-Json")[-1].lower()
+    assert (
+        "password"
+        not in re.sub(
+            r'"password"\s*=\s*\$PlaintextPassword',
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        .split("ConvertTo-Json")[-1]
+        .lower()
+    )
 
 
 @pytest.mark.parametrize("script", SCRIPTS.values(), ids=SCRIPTS.keys())
@@ -153,6 +158,18 @@ def test_framework_neutral_training_scripts_are_packaged_as_one_contract() -> No
         script = load_packaged_script(name).decode("utf-8")
         assert "json.load" in script
         assert "ENGINES" not in script
+
+
+def test_remote_scripts_keep_paddlex_on_the_generic_fixed_entrypoint_protocol() -> None:
+    stage = load_packaged_script("stage_training.sh").decode("utf-8")
+    launch = load_packaged_script("launch_rank.sh").decode("utf-8")
+
+    assert "VISIOX_RUNTIME_INPUTS_JSON" in stage
+    assert "VISIOX_TRAINING_ARGUMENTS_JSON" not in stage
+    assert "VISIOX_FRAMEWORK_PARAMETERS_JSON" not in stage
+    assert "/usr/local/bin/visiox-train" in launch
+    for framework in ("ultralytics", "llamafactory", "paddlex"):
+        assert framework not in launch.casefold()
 
 
 def test_stop_training_uses_versioned_run_labels_without_framework_branch() -> None:

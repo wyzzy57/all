@@ -31,11 +31,11 @@ from visiox_edge_executor_worker.distributed_execution import (
     _require_remote_adapter,
     _llamafactory_dataset_info,
     _launch_request,
+    _resolved_runtime_inputs,
     _set_container_dataset_root,
     _staging_request,
     _validate_remote_artifact_manifest,
     build_distributed_handlers,
-    _training_arguments,
 )
 from visiox_edge_executor_worker.scripts import load_packaged_script
 from visiox_training.contracts import ArtifactEntry, ArtifactManifest, LaunchSpec
@@ -69,8 +69,7 @@ def _generic_staging_request() -> dict[str, object]:
         "paddlex",
         "paddlex.object_detection.v1",
         "1.0.0",
-        ["epochs=1"],
-        {},
+        _runtime_inputs("paddlex"),
         [
             {
                 "role": "dataset",
@@ -95,6 +94,42 @@ def _generic_staging_request() -> dict[str, object]:
             },
         ],
     )
+
+
+def _runtime_inputs(
+    framework: str = "ultralytics",
+    artifact_roles: tuple[str, ...] = ("dataset", "model", "checkpoint"),
+) -> dict[str, object]:
+    return {
+        "parameters": {"epochs": 1},
+        "model": {
+            "source": framework,
+            "id": "model-1",
+            "family": "model-family",
+            "runtime_id": "runtime-model",
+            "checksum": "a" * 64,
+            "revision": None,
+        },
+        "dataset": {
+            "id": "dataset-1",
+            "version_id": "dataset-version-1",
+            "version": 1,
+            "format": "yolo" if framework != "llamafactory" else "alpaca",
+            "uri": "minio://datasets/dataset-1/version-1",
+            "manifest_checksum": "b" * 64,
+        },
+        "artifacts": [
+            {
+                "role": role,
+                "path": {
+                    "dataset": "/workspace/dataset",
+                    "model": "/workspace/model/base.pt",
+                    "checkpoint": "/workspace/checkpoint/last.pt",
+                }[role],
+            }
+            for role in artifact_roles
+        ],
+    }
 
 
 def _node(
@@ -401,21 +436,33 @@ def test_completed_distributed_job_converges_without_relaunching() -> None:
         assert session.get(TrainingPipeline, "pipeline-1").status == "success"  # type: ignore[union-attr]
 
 
-def test_distributed_training_arguments_remove_global_device_selection() -> None:
-    arguments = _training_arguments(  # type: ignore[arg-type]
-        SimpleNamespace(id="job-1", params={"epochs": 2, "device": "0,1"}),
-        SimpleNamespace(payload={"environment": {"workers": 4}}),
-        "yolo26",
+def test_edge_extracts_framework_neutral_inputs_from_immutable_snapshot() -> None:
+    snapshot = {
+        **_runtime_inputs(),
+        "framework": "ultralytics",
+        "adapter_key": "ultralytics.object_detection.v1",
+        "adapter_version": "1.0.0",
+    }
+    inputs = _resolved_runtime_inputs(  # type: ignore[arg-type]
+        SimpleNamespace(resolved_snapshot=snapshot),
+        LaunchSpec(
+            adapter_key="ultralytics.object_detection.v1",
+            adapter_version="1.0.0",
+            argv=("/usr/local/bin/visiox-train",),
+        ),
+        [{"role": "dataset"}, {"role": "model"}],
     )
 
-    assert "model=/workspace/model/base.pt" in arguments
-    assert "data=/workspace/dataset/data.yaml" in arguments
-    assert "epochs=2" in arguments
-    assert "workers=4" in arguments
-    assert not any(argument.startswith("device=") for argument in arguments)
+    assert inputs["parameters"] == {"epochs": 1}
+    assert inputs["model"]["runtime_id"] == "runtime-model"
+    assert inputs["dataset"]["format"] == "yolo"
+    assert inputs["artifacts"] == [
+        {"role": "dataset", "path": "/workspace/dataset"},
+        {"role": "model", "path": "/workspace/model/base.pt"},
+    ]
 
 
-def test_unimplemented_remote_adapter_is_rejected_instead_of_using_yolo() -> None:
+def test_remote_adapter_identity_is_validated_without_execution_allowlist() -> None:
     pipeline = SimpleNamespace(
         framework="paddlex",
         adapter_key="paddlex.object_detection.v1",
@@ -428,8 +475,10 @@ def test_unimplemented_remote_adapter_is_rejected_instead_of_using_yolo() -> Non
         argv=("/usr/local/bin/visiox-train",),
     )
 
-    with pytest.raises(ValueError, match="not implemented"):
-        _require_remote_adapter(pipeline, launch_spec)  # type: ignore[arg-type]
+    adapter = _require_remote_adapter(pipeline, launch_spec)  # type: ignore[arg-type]
+
+    assert adapter.framework == "paddlex"
+    assert adapter.adapter_key == "paddlex.object_detection.v1"
 
 
 def test_staging_request_matches_remote_script_contract() -> None:
@@ -457,8 +506,7 @@ def test_staging_request_matches_remote_script_contract() -> None:
         "paddlex",
         "paddlex.object_detection.v1",
         "1.0.0",
-        ["epochs=1"],
-        {},
+        _runtime_inputs("paddlex", ("dataset",)),
         artifacts,
     )
 
@@ -474,6 +522,13 @@ def test_staging_request_matches_remote_script_contract() -> None:
     assert spec.env["VISIOX_MASTER_ADDR"] == "10.10.40.10"
     assert spec.env["VISIOX_MASTER_PORT"] == "29500"
     assert spec.env["VISIOX_OUTPUT_DIR"] == "/workspace/output"
+    runtime_inputs = json.loads(spec.env["VISIOX_RUNTIME_INPUTS_JSON"])
+    assert runtime_inputs["parameters"] == {"epochs": 1}
+    assert runtime_inputs["artifacts"] == [
+        {"path": "/workspace/dataset", "role": "dataset"}
+    ]
+    assert "VISIOX_TRAINING_ARGUMENTS_JSON" not in spec.env
+    assert "VISIOX_FRAMEWORK_PARAMETERS_JSON" not in spec.env
     assert len(request["launch_spec_checksum"]) == 64
     assert "action" not in request
     assert "engine" not in request
@@ -504,8 +559,7 @@ def test_launch_request_matches_remote_script_contract() -> None:
         "ultralytics",
         "ultralytics.object_detection.v1",
         "1.0.0",
-        ["epochs=1"],
-        {},
+        _runtime_inputs(artifact_roles=()),
         [],
     )
     stage.paths = {
@@ -555,8 +609,16 @@ def test_remote_rank_script_rejects_control_characters() -> None:
     namespace["Path"] = PurePosixPath
     validate = namespace["validate"]
     request = _generic_staging_request()
-    request["launch_spec"]["env"]["VISIOX_TRAINING_ARGUMENTS_JSON"] = (
-        '["epochs=2\\nwhoami"]'
+    request["launch_spec"]["env"]["VISIOX_RUNTIME_INPUTS_JSON"] = json.dumps(
+        {
+            **_runtime_inputs("paddlex"),
+            "parameters": {"custom": "epochs=2\nwhoami"},
+            "artifacts": [
+                {"role": "dataset", "path": "/workspace/dataset"},
+                {"role": "model", "path": "/workspace/model/base.pt"},
+                {"role": "checkpoint", "path": "/workspace/checkpoint/last.pt"},
+            ],
+        }
     )
     request["launch_spec_checksum"] = _canonical_checksum(request["launch_spec"])
 
@@ -726,7 +788,9 @@ def test_remote_rank_collect_uploads_ultralytics_visualizations(tmp_path: Path) 
     assert set(result) == set(uploads)
 
 
-def test_llm_launch_spec_preserves_model_source_without_shell_branch() -> None:
+def test_llm_launch_spec_carries_unified_runtime_inputs_without_edge_translation() -> (
+    None
+):
     run = SimpleNamespace(
         id="run-llm",
         attempt=1,
@@ -743,8 +807,17 @@ def test_llm_launch_spec_preserves_model_source_without_shell_branch() -> None:
         "llamafactory",
         "llamafactory.llm_sft.v1",
         "1.0.0",
-        [],
-        {"model_source": "modelscope"},
+        {
+            **_runtime_inputs("llamafactory", ()),
+            "parameters": {"num_train_epochs": 2},
+            "model": {
+                **_runtime_inputs("llamafactory", ())["model"],
+                "source": "modelscope",
+                "id": "Qwen/Qwen3-0.6B",
+                "runtime_id": "Qwen/Qwen3-0.6B",
+                "revision": "c" * 40,
+            },
+        },
         [],
     )
 
@@ -753,10 +826,10 @@ def test_llm_launch_spec_preserves_model_source_without_shell_branch() -> None:
     assert parsed.adapter_key == "llamafactory.llm_sft.v1"
     assert parsed.argv == ("/usr/local/bin/visiox-train",)
     assert parsed.env["VISIOX_FRAMEWORK"] == "llamafactory"
-    assert parsed.env["VISIOX_FRAMEWORK_PARAMETERS_JSON"] == (
-        '{"model_source":"modelscope"}'
-    )
-    assert parsed.env["USE_MODELSCOPE_HUB"] == "1"
+    runtime_inputs = json.loads(parsed.env["VISIOX_RUNTIME_INPUTS_JSON"])
+    assert runtime_inputs["model"]["source"] == "modelscope"
+    assert runtime_inputs["parameters"] == {"num_train_epochs": 2}
+    assert "USE_MODELSCOPE_HUB" not in parsed.env
     assert parsed.env["HF_HOME"] == "/workspace/model-cache/huggingface"
     assert parsed.env["MODELSCOPE_CACHE"] == "/workspace/model-cache/modelscope"
 
@@ -818,8 +891,7 @@ def test_remote_staging_accepts_generic_framework_without_engine_allowlist() -> 
         "paddlex",
         "paddlex.object_detection.v1",
         "1.0.0",
-        ["epochs=1"],
-        {},
+        _runtime_inputs("paddlex", ("dataset",)),
         [
             {
                 "role": "dataset",
@@ -875,9 +947,44 @@ def test_remote_staging_accepts_generic_framework_without_engine_allowlist() -> 
             True,
         ),
         (
-            "newline argument",
+            "newline framework parameter",
             lambda request: request["launch_spec"]["env"].__setitem__(
-                "VISIOX_TRAINING_ARGUMENTS_JSON", '["epochs=1\\nwhoami"]'
+                "VISIOX_RUNTIME_INPUTS_JSON",
+                json.dumps(
+                    {
+                        **_runtime_inputs("paddlex"),
+                        "parameters": {"custom": "epochs=1\nwhoami"},
+                        "artifacts": [
+                            {"role": "dataset", "path": "/workspace/dataset"},
+                            {"role": "model", "path": "/workspace/model/base.pt"},
+                            {
+                                "role": "checkpoint",
+                                "path": "/workspace/checkpoint/last.pt",
+                            },
+                        ],
+                    }
+                ),
+            ),
+            True,
+        ),
+        (
+            "host path framework parameter",
+            lambda request: request["launch_spec"]["env"].__setitem__(
+                "VISIOX_RUNTIME_INPUTS_JSON",
+                json.dumps(
+                    {
+                        **_runtime_inputs("paddlex"),
+                        "parameters": {"resume": "C:/host/checkpoint.pt"},
+                        "artifacts": [
+                            {"role": "dataset", "path": "/workspace/dataset"},
+                            {"role": "model", "path": "/workspace/model/base.pt"},
+                            {
+                                "role": "checkpoint",
+                                "path": "/workspace/checkpoint/last.pt",
+                            },
+                        ],
+                    }
+                ),
             ),
             True,
         ),
