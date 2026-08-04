@@ -326,7 +326,7 @@ onBeforeUnmount(() => {
 
   container: workbench / inline-size;
   display: grid;
-  grid-template-rows: minmax(0, 52px) 58px minmax(0, 310px) minmax(0, 240px) auto;
+  grid-template-rows: auto 58px minmax(310px, 1fr) 240px;
   gap: 6px;
   width: 100%;
   max-width: 100%;
@@ -386,17 +386,20 @@ onBeforeUnmount(() => {
 .command-grid {
   grid-template-columns: minmax(0, 1.7fr) minmax(280px, .8fr);
   gap: 10px;
+  height: 100%;
   align-items: stretch;
 }
 
 .command-primary {
-  grid-template-rows: minmax(0, 208px) minmax(0, 94px);
+  grid-template-rows: minmax(0, 1fr) minmax(0, 94px);
   gap: 8px;
+  height: 100%;
 }
 
 .overview-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
+  height: 100%;
   align-items: stretch;
 }
 
@@ -445,10 +448,15 @@ onBeforeUnmount(() => {
   padding: 2px 14px;
 }
 
+.trend-panel :deep(.asset-trend-chart) {
+  height: 100%;
+  min-height: 0;
+}
+
 .trend-panel :deep(.asset-trend-canvas),
 .trend-panel :deep(.asset-trend-empty) {
   box-sizing: border-box;
-  height: 168px;
+  height: 100%;
   aspect-ratio: auto !important;
 }
 
@@ -546,6 +554,8 @@ onBeforeUnmount(() => {
 }
 
 .trend-panel {
+  grid-template-rows: auto minmax(0, 1fr);
+  align-content: stretch;
   gap: 4px;
   min-height: 0;
   padding: 10px;
@@ -581,13 +591,11 @@ onBeforeUnmount(() => {
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 1350px) {
+@container workbench (max-width: 760px) {
   .workbench-view {
     grid-template-rows: none;
   }
-}
 
-@container workbench (max-width: 1060px) {
   .command-grid,
   .command-primary,
   .overview-grid {

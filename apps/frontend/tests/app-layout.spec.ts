@@ -133,8 +133,8 @@ describe("global application header", () => {
     expect(appSource).toContain('class="app-content-shell"');
     expect(stylesSource).toMatch(/\.app-content-shell\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden/s);
     expect(stylesSource).toMatch(/\.app-main\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*auto/s);
-    expect(workbenchSource).toContain("@container workbench (max-width: 1060px)");
-    expect(workbenchSource).toMatch(/@media \(max-width:\s*1350px\)\s*\{\s*\.workbench-view\s*\{[^}]*grid-template-rows:\s*none/s);
+    expect(workbenchSource).toContain("@container workbench (max-width: 760px)");
+    expect(workbenchSource).not.toMatch(/@media \(max-width:\s*1350px\)/);
     for (const ruleBody of workbenchRootRules) {
       expect(ruleBody).not.toMatch(/transform\s*:[^;{}]*scale\s*\(/);
     }

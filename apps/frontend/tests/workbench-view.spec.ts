@@ -339,10 +339,7 @@ describe("WorkbenchView", () => {
   });
 
   it("keeps the desktop command grid dense and flattens only the intended child surfaces", () => {
-    const naturalFlowBreakpoint = 1060;
-    const naturalFlowViewportBreakpoint = 1350;
-    const expandedSidebarContentWidth = 1366 - 224 - (22 * 2);
-    const reservedScrollbarGutter = 17;
+    const naturalFlowBreakpoint = 760;
     const stylesheet = workbenchSource.match(/<style(?:\s[^>]*)?>([\s\S]*?)<\/style>/)?.[1] ?? "";
     const desktopWorkbenchRule = collectTopLevelCssRuleBodies(stylesheet, ".workbench-view").join("\n");
     const desktopResourceGridRule = collectTopLevelCssRuleBodies(
@@ -353,40 +350,33 @@ describe("WorkbenchView", () => {
       stylesheet,
       new RegExp(`@container\\s+workbench\\s*\\(\\s*max-width:\\s*${naturalFlowBreakpoint}px\\s*\\)`, "g"),
     ).join("\n");
-    const naturalFlowViewport = collectCssAtRuleBodies(
-      stylesheet,
-      new RegExp(`@media\\s*\\(\\s*max-width:\\s*${naturalFlowViewportBreakpoint}px\\s*\\)(?=\\s*\\{)`, "g"),
-    ).join("\n");
 
-    expect(expandedSidebarContentWidth).toBe(1098);
-    expect(expandedSidebarContentWidth - reservedScrollbarGutter).toBeGreaterThan(naturalFlowBreakpoint);
-    expect(1024).toBeLessThanOrEqual(naturalFlowViewportBreakpoint);
-    expect(375).toBeLessThanOrEqual(naturalFlowViewportBreakpoint);
-    expect(1350).toBeLessThanOrEqual(naturalFlowViewportBreakpoint);
-    expect(1366).toBeGreaterThan(naturalFlowViewportBreakpoint);
     expect(stylesheet).not.toBe("");
     expect(desktopWorkbenchRule).not.toBe("");
     expect(desktopResourceGridRule).not.toBe("");
+    expect(workbenchSource).not.toContain("@container workbench (max-width: 1060px)");
     expect(workbenchSource).not.toContain("@container workbench (max-width: 1100px)");
     expect.soft(desktopWorkbenchRule).toMatch(
-      /grid-template-rows:\s*minmax\(0,\s*52px\)\s+58px\s+minmax\(0,\s*310px\)\s+minmax\(0,\s*240px\)(?:\s|;)/s,
+      /grid-template-rows:\s*auto\s+58px\s+minmax\(310px,\s*1fr\)\s+240px\s*;/s,
     );
     expect.soft(desktopWorkbenchRule).toMatch(
       /gap:\s*6px\s*;/s,
     );
     expect(workbenchSource).toMatch(
-      /\.command-primary\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*208px\)\s+minmax\(0,\s*94px\)[^}]*gap:\s*8px/s,
+      /\.command-primary\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)\s+minmax\(0,\s*94px\)[^}]*gap:\s*8px/s,
     );
     expect(workbenchSource).toContain("grid-template-columns: minmax(0, 1.7fr) minmax(280px, .8fr)");
     expect(workbenchSource).toMatch(/\.overview-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/s);
-    expect(workbenchSource).toMatch(/\.asset-trend-canvas\)[^{]*\{[^}]*height:\s*168px;[^}]*aspect-ratio:\s*auto/s);
+    expect(workbenchSource).toMatch(/\.trend-panel\s*\{[^}]*grid-template-rows:\s*auto\s+minmax\(0,\s*1fr\)/s);
+    expect(workbenchSource).toMatch(/\.asset-trend-chart\)[^{]*\{[^}]*height:\s*100%/s);
+    expect(workbenchSource).toMatch(/\.asset-trend-canvas\)[^{]*\{[^}]*height:\s*100%;[^}]*aspect-ratio:\s*auto/s);
     expect(workbenchSource).not.toMatch(/\.command-panel\s*\{[^}]*overflow:\s*hidden/s);
     expect(workbenchSource).toMatch(/\.resource-panel\s*\{[^}]*overflow-y:\s*auto;[^}]*scrollbar-gutter:\s*stable/s);
     expect.soft(desktopResourceGridRule).toMatch(
       /grid-template-columns:\s*minmax\(0,\s*1fr\)\s*;/s,
     );
-    expect(compactBreakpoint).not.toMatch(/\.workbench-view\s*\{/s);
-    expect(naturalFlowViewport).toMatch(/\.workbench-view\s*\{[^}]*grid-template-rows:\s*none/s);
+    expect(compactBreakpoint).toMatch(/\.workbench-view\s*\{[^}]*grid-template-rows:\s*none/s);
+    expect(workbenchSource).not.toMatch(/@media\s*\(\s*max-width:\s*1350px\s*\)/s);
     expect(compactBreakpoint).toMatch(
       /(?=[^{]*\.command-grid)(?=[^{]*\.command-primary)(?=[^{]*\.overview-grid)[^{]*\{[^}]*min-height:\s*0/s,
     );
@@ -402,7 +392,7 @@ describe("WorkbenchView", () => {
   it("fits KPI and service-health content inside their desktop tracks", () => {
     const naturalFlowBreakpoint = collectCssAtRuleBodies(
       workbenchSource,
-      /@container\s+workbench\s*\(\s*max-width:\s*1060px\s*\)/g,
+      /@container\s+workbench\s*\(\s*max-width:\s*760px\s*\)/g,
     ).join("\n");
 
     expect(workbenchSource).toMatch(
