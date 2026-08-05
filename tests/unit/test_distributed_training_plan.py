@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine
 
+import visiox_edge_executor_worker.distributed_execution as distributed_execution
 from visiox_api.services.resource_scheduler import freeze_distributed_allocation
 from visiox_db.base import Base
 from visiox_db.models import (
@@ -16,6 +17,7 @@ from visiox_db.models import (
     RemoteExecution,
     Task,
     TrainingJob,
+    TrainingJobAttempt,
     TrainingPipeline,
 )
 from visiox_db.session import create_session_factory
@@ -34,6 +36,7 @@ from visiox_edge_executor_worker.distributed_execution import (
     _resolved_runtime_inputs,
     _set_container_dataset_root,
     _staging_request,
+    _artifact_uri,
     _validate_remote_artifact_manifest,
     build_distributed_handlers,
 )
@@ -434,6 +437,72 @@ def test_completed_distributed_job_converges_without_relaunching() -> None:
         assert current_task.progress == 100
         assert current_task.error_code is None
         assert session.get(TrainingPipeline, "pipeline-1").status == "success"  # type: ignore[union-attr]
+
+
+def test_completed_job_convergence_derives_pipeline_from_active_job() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    finished_at = datetime.now(UTC)
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            id="pipeline-converge", name="pipeline-converge", task="detect", scale="n"
+        )
+        task = Task(id="task-converge", task_type="EDGE_TRAIN", status="RUNNING")
+        completed = TrainingJob(
+            id="job-completed",
+            pipeline_id=pipeline.id,
+            task_id=task.id,
+            trained_model_id="legacy-model",
+            status="running",
+            metrics={
+                "weights": {
+                    "best.pt": "minio://models/best.pt",
+                    "last.pt": "minio://models/last.pt",
+                }
+            },
+            finished_at=finished_at,
+        )
+        active = TrainingJob(
+            id="job-active", pipeline_id=pipeline.id, status="running"
+        )
+        active_attempt = TrainingJobAttempt(
+            training_job_id=active.id,
+            attempt_number=1,
+            status="training",
+            launch_spec={},
+            launch_spec_checksum="a" * 64,
+        )
+        run = DistributedTrainingRun(
+            id="run-converge",
+            training_job_id=completed.id,
+            resource_pool_id="pool-1",
+            node_ids=["node-1"],
+            ranks=[],
+            master_addr="10.0.0.1",
+            master_port=29500,
+        )
+        execution = RemoteExecution(
+            id="execution-converge",
+            node_id="node-1",
+            task_id=task.id,
+            training_job_id=completed.id,
+            resource_type="distributed_training_run",
+            resource_id=run.id,
+            operation="train",
+            status="running",
+            idempotency_key="converge-active",
+        )
+        session.add_all(
+            [pipeline, task, completed, active, active_attempt, run, execution]
+        )
+        session.commit()
+
+    handler = DistributedTrainingHandler(session_factory, object(), object())  # type: ignore[arg-type]
+
+    assert handler._converge_existing_success("execution-converge") is True
+    with session_factory() as session:
+        assert session.get(TrainingPipeline, "pipeline-converge").status == "running"  # type: ignore[union-attr]
 
 
 def test_edge_extracts_framework_neutral_inputs_from_immutable_snapshot() -> None:
@@ -1177,3 +1246,799 @@ def test_control_plane_rejects_artifact_manifest_identity_and_checksum_mismatch(
             task_id="job-1",
             launch_spec=spec,
         )
+
+
+def test_control_plane_reads_roles_from_train_result_sidecar() -> None:
+    payload = json.dumps(
+        {
+            "schema_version": "1.0",
+            "framework": "ultralytics",
+            "status": "success",
+            "exit_code": 0,
+            "artifacts": [
+                {
+                    "role": "best_weights",
+                    "path": "runs/job/weights/champion.ckpt",
+                }
+            ],
+        }
+    ).encode()
+
+    class Storage:
+        def get_file(self, bucket, object_name, destination):
+            assert (bucket, object_name) == (
+                "training",
+                "jobs/job-1/attempt-2/artifacts/train_result.json",
+            )
+            destination.write_bytes(payload)
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    handler = DistributedTrainingHandler(
+        create_session_factory(engine), object(), Storage()  # type: ignore[arg-type]
+    )
+    manifest = ArtifactManifest(
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        artifacts=(
+            ArtifactEntry(
+                path="runs/job/weights/champion.ckpt",
+                size_bytes=4,
+                checksum_sha256="a" * 64,
+                artifact_type="model_weight",
+            ),
+            ArtifactEntry(
+                path="train_result.json",
+                size_bytes=len(payload),
+                checksum_sha256=hashlib.sha256(payload).hexdigest(),
+                artifact_type="metrics",
+            ),
+        ),
+    )
+
+    roles = handler._load_artifact_roles(
+        "job-1",
+        SimpleNamespace(
+            framework="ultralytics",
+            adapter_key="ultralytics.object_detection.v1",
+        ),
+        manifest,
+        {
+            "runs/job/weights/champion.ckpt": "minio://models/champion.ckpt",
+            "train_result.json": (
+                "minio://training/jobs/job-1/attempt-2/artifacts/train_result.json"
+            ),
+        },
+    )
+
+    assert roles == {"runs/job/weights/champion.ckpt": "best_weights"}
+
+
+def test_control_plane_reads_real_paddlex_sidecar_contract() -> None:
+    sidecar_artifacts = [
+        {"role": "config", "path": "config.yaml"},
+        {"role": "train_log", "path": "train.log"},
+        {"role": "best_dynamic_weights", "path": "best_model/best_model.pdparams"},
+        {
+            "role": "best_static_inference",
+            "path": "best_model/inference/inference.json",
+        },
+        {
+            "role": "best_static_inference",
+            "path": "best_model/inference/inference.pdiparams",
+        },
+        {"role": "last_weights", "path": "last_model/model.pdparams"},
+        {"role": "evaluation_report", "path": "evaluation_metrics.json"},
+        {"role": "visualization", "path": "results.png"},
+        {"role": "visualdl", "path": "visualdl/events.vdlrecords.1"},
+    ]
+    payload = json.dumps(
+        {
+            "schema_version": "1.0",
+            "framework": "paddlex",
+            "status": "completed",
+            "exit_code": 0,
+            "artifacts": sidecar_artifacts,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+    class Storage:
+        def get_file(self, _bucket, _object_name, destination):
+            destination.write_bytes(payload)
+
+    artifact_types = {
+        "config.yaml": "training_output",
+        "train.log": "training_output",
+        "best_model/best_model.pdparams": "model_weight",
+        "best_model/inference/inference.json": "metrics",
+        "best_model/inference/inference.pdiparams": "training_output",
+        "last_model/model.pdparams": "model_weight",
+        "evaluation_metrics.json": "metrics",
+        "results.png": "visualization",
+        "visualdl/events.vdlrecords.1": "training_output",
+    }
+    entries = [
+        ArtifactEntry(
+            path=path,
+            size_bytes=4,
+            checksum_sha256="a" * 64,
+            artifact_type=artifact_type,
+        )
+        for path, artifact_type in artifact_types.items()
+    ]
+    entries.append(
+        ArtifactEntry(
+            path="train_result.json",
+            size_bytes=len(payload),
+            checksum_sha256=hashlib.sha256(payload).hexdigest(),
+            artifact_type="metrics",
+        )
+    )
+    manifest = ArtifactManifest(
+        task_id="job-paddlex",
+        adapter_key="paddlex.object_detection.v1",
+        adapter_version="1.0.0",
+        artifacts=tuple(entries),
+    )
+    handler = DistributedTrainingHandler(
+        create_session_factory(create_engine("sqlite://")), object(), Storage()  # type: ignore[arg-type]
+    )
+    artifact_uris = {
+        entry.path: f"minio://training/{entry.path}" for entry in manifest.artifacts
+    }
+
+    roles = handler._load_artifact_roles(
+        "job-paddlex",
+        SimpleNamespace(
+            framework="paddlex", adapter_key="paddlex.object_detection.v1"
+        ),
+        manifest,
+        artifact_uris,
+    )
+
+    assert roles == {
+        "best_model/best_model.pdparams": "best_dynamic_weights",
+        "best_model/inference/inference.json": "best_static_inference",
+        "best_model/inference/inference.pdiparams": "best_static_inference",
+        "last_model/model.pdparams": "last_weights",
+    }
+
+
+@pytest.mark.parametrize(
+    ("role", "artifact_type"),
+    [
+        ("invented_report", "metrics"),
+        ("best_dynamic_weights", "visualization"),
+    ],
+)
+def test_control_plane_rejects_invalid_paddlex_sidecar_roles(
+    role: str, artifact_type: str
+) -> None:
+    payload = json.dumps(
+        {
+            "schema_version": "1.0",
+            "framework": "paddlex",
+            "status": "success",
+            "exit_code": 0,
+            "artifacts": [{"role": role, "path": "reported-artifact"}],
+        }
+    ).encode()
+
+    class Storage:
+        def get_file(self, _bucket, _object_name, destination):
+            destination.write_bytes(payload)
+
+    manifest = ArtifactManifest(
+        task_id="job-paddlex",
+        adapter_key="paddlex.object_detection.v1",
+        adapter_version="1.0.0",
+        artifacts=(
+            ArtifactEntry(
+                path="reported-artifact",
+                size_bytes=4,
+                checksum_sha256="a" * 64,
+                artifact_type=artifact_type,
+            ),
+            ArtifactEntry(
+                path="train_result.json",
+                size_bytes=len(payload),
+                checksum_sha256=hashlib.sha256(payload).hexdigest(),
+                artifact_type="metrics",
+            ),
+        ),
+    )
+    handler = DistributedTrainingHandler(
+        create_session_factory(create_engine("sqlite://")), object(), Storage()  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(distributed_execution.ArtifactCollectionError):
+        handler._load_artifact_roles(
+            "job-paddlex",
+            SimpleNamespace(
+                framework="paddlex", adapter_key="paddlex.object_detection.v1"
+            ),
+            manifest,
+            {
+                entry.path: f"minio://training/{entry.path}"
+                for entry in manifest.artifacts
+            },
+        )
+
+
+def test_control_plane_ignores_nested_train_result_sidecar() -> None:
+    class Storage:
+        def get_file(self, *_args):
+            raise AssertionError("nested sidecar must not be trusted")
+
+    handler = DistributedTrainingHandler(
+        create_session_factory(create_engine("sqlite://")), object(), Storage()  # type: ignore[arg-type]
+    )
+    manifest = ArtifactManifest(
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        artifacts=(
+            ArtifactEntry(
+                path="forged/train_result.json",
+                size_bytes=2,
+                checksum_sha256=hashlib.sha256(b"{}").hexdigest(),
+                artifact_type="metrics",
+            ),
+        ),
+    )
+
+    assert handler._load_artifact_roles(
+        "job-1",
+        SimpleNamespace(
+            framework="ultralytics",
+            adapter_key="ultralytics.object_detection.v1",
+        ),
+        manifest,
+        {
+            "forged/train_result.json": (
+                "minio://training/jobs/job-1/attempt-1/artifacts/forged/train_result.json"
+            )
+        },
+    ) == {}
+
+
+@pytest.mark.parametrize(
+    ("payload_update", "role", "weight_type"),
+    [
+        ({"status": "failed"}, "best_weights", "model_weight"),
+        ({"exit_code": 1}, "best_weights", "model_weight"),
+        ({"schema_version": "2.0"}, "best_weights", "model_weight"),
+        ({"framework": "paddlex"}, "best_weights", "model_weight"),
+        ({}, "best_weights", "visualization"),
+        ({}, "adapter_weights", "model_weight"),
+    ],
+)
+def test_control_plane_rejects_untrusted_train_result_roles(
+    payload_update: dict[str, object], role: str, weight_type: str
+) -> None:
+    payload_data = {
+        "schema_version": "1.0",
+        "framework": "ultralytics",
+        "status": "success",
+        "exit_code": 0,
+        "artifacts": [{"role": role, "path": "output/model.bin"}],
+        **payload_update,
+    }
+    payload = json.dumps(payload_data).encode()
+
+    class Storage:
+        def get_file(self, _bucket, _object_name, destination):
+            destination.write_bytes(payload)
+
+    handler = DistributedTrainingHandler(
+        create_session_factory(create_engine("sqlite://")), object(), Storage()  # type: ignore[arg-type]
+    )
+    manifest = ArtifactManifest(
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        artifacts=(
+            ArtifactEntry(
+                path="output/model.bin",
+                size_bytes=4,
+                checksum_sha256="a" * 64,
+                artifact_type=weight_type,
+            ),
+            ArtifactEntry(
+                path="train_result.json",
+                size_bytes=len(payload),
+                checksum_sha256=hashlib.sha256(payload).hexdigest(),
+                artifact_type="metrics",
+            ),
+        ),
+    )
+
+    with pytest.raises(distributed_execution.ArtifactCollectionError):
+        handler._load_artifact_roles(
+            "job-1",
+            SimpleNamespace(
+                framework="ultralytics",
+                adapter_key="ultralytics.object_detection.v1",
+            ),
+            manifest,
+            {
+                "output/model.bin": "minio://models/output/model.bin",
+                "train_result.json": "minio://training/train_result.json",
+            },
+        )
+
+
+@pytest.mark.parametrize(("size_delta", "checksum"), [(1, None), (0, "0" * 64)])
+def test_control_plane_verifies_downloaded_train_result(
+    size_delta: int, checksum: str | None
+) -> None:
+    payload = json.dumps(
+        {
+            "schema_version": "1.0",
+            "framework": "ultralytics",
+            "status": "success",
+            "exit_code": 0,
+            "artifacts": [],
+        }
+    ).encode()
+
+    class Storage:
+        def get_file(self, _bucket, _object_name, destination):
+            destination.write_bytes(payload)
+
+    handler = DistributedTrainingHandler(
+        create_session_factory(create_engine("sqlite://")), object(), Storage()  # type: ignore[arg-type]
+    )
+    manifest = ArtifactManifest(
+        task_id="job-1",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        artifacts=(
+            ArtifactEntry(
+                path="train_result.json",
+                size_bytes=len(payload) + size_delta,
+                checksum_sha256=checksum or hashlib.sha256(payload).hexdigest(),
+                artifact_type="metrics",
+            ),
+        ),
+    )
+
+    with pytest.raises(distributed_execution.ArtifactCollectionError, match="integrity"):
+        handler._load_artifact_roles(
+            "job-1",
+            SimpleNamespace(
+                framework="ultralytics",
+                adapter_key="ultralytics.object_detection.v1",
+            ),
+            manifest,
+            {"train_result.json": "minio://training/train_result.json"},
+        )
+
+
+def test_artifact_uri_preserves_framework_native_path_per_attempt() -> None:
+    path = "output/best_model/inference/model.json"
+
+    assert _artifact_uri("job-1", 2, path) == (
+        "minio://models/trained/job-1/attempt-2/"
+        "output/best_model/inference/model.json"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (
+            "runs/job/results.png",
+            "minio://training/jobs/job-1/attempt-2/visualizations/results.png",
+        ),
+        (
+            "train_result.json",
+            "minio://training/jobs/job-1/attempt-2/artifacts/train_result.json",
+        ),
+        (
+            "observability/visiox-progress.json",
+            "minio://training/jobs/job-1/attempt-2/artifacts/observability/visiox-progress.json",
+        ),
+    ],
+)
+def test_non_model_artifact_uris_are_attempt_scoped(path: str, expected: str) -> None:
+    assert _artifact_uri("job-1", 2, path) == expected
+
+
+def test_final_observability_cache_reads_attempt_scoped_artifact_uris(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    downloads: list[tuple[str, str, str]] = []
+
+    class Storage:
+        def get_file(self, bucket, object_name, destination):
+            downloads.append(
+                (bucket, object_name, destination.relative_to(tmp_path).as_posix())
+            )
+            destination.write_bytes(b"cached")
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    handler = DistributedTrainingHandler(
+        create_session_factory(engine), object(), Storage()  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(
+        distributed_execution,
+        "get_settings",
+        lambda: SimpleNamespace(training_runs_root=tmp_path),
+    )
+    collected = SimpleNamespace(
+        artifacts={
+            "observability/visiox-progress.json": object(),
+        }
+    )
+
+    handler._cache_final_observability("job-1", 2, collected)  # type: ignore[arg-type]
+
+    assert set(downloads) == {
+        (
+            "training",
+            "jobs/job-1/attempt-2/artifacts/observability/visiox-progress.json",
+            "runs/job-job-1/attempt-2/visiox-progress.json",
+        ),
+    }
+
+
+def test_periodic_observability_sync_uploads_to_attempt_scoped_uri(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uploads: list[str] = []
+    downloads: list[str] = []
+
+    class Storage:
+        def presigned_put_url(self, uri, *, expires):
+            del expires
+            uploads.append(uri)
+            return "https://storage.invalid/upload"
+
+        def get_file(self, bucket, object_name, destination):
+            assert bucket == "training"
+            assert object_name == (
+                "jobs/job-sync/attempt-2/artifacts/visiox-progress.json"
+            )
+            downloads.append(destination.relative_to(tmp_path).as_posix())
+            destination.write_text('{"progress":{"percent":50}}', encoding="utf-8")
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            id="pipeline-sync", name="pipeline-sync", task="detect", scale="n"
+        )
+        task = Task(id="task-sync", task_type="EDGE_TRAIN", status="RUNNING")
+        job = TrainingJob(
+            id="job-sync", pipeline_id=pipeline.id, task_id=task.id, status="training"
+        )
+        run = DistributedTrainingRun(
+            id="run-sync",
+            training_job_id=job.id,
+            resource_pool_id="pool-1",
+            node_ids=["node-1"],
+            ranks=[],
+            master_addr="10.0.0.1",
+            master_port=29500,
+            attempt=2,
+        )
+        execution = RemoteExecution(
+            id="execution-sync",
+            node_id="node-1",
+            task_id=task.id,
+            training_job_id=job.id,
+            resource_type="distributed_training_run",
+            resource_id=run.id,
+            operation="train",
+            status="running",
+            idempotency_key="sync-test",
+        )
+        session.add_all([pipeline, task, job, run, execution])
+        session.commit()
+
+    handler = DistributedTrainingHandler(
+        session_factory, object(), Storage()  # type: ignore[arg-type]
+    )
+    manifest = ArtifactManifest(
+        task_id="job-sync",
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        artifacts=(
+            ArtifactEntry(
+                path="visiox-progress.json",
+                size_bytes=1,
+                checksum_sha256="a" * 64,
+                artifact_type="metrics",
+            ),
+        ),
+    )
+    handler._remote_artifact_manifest = lambda *_args, **_kwargs: manifest  # type: ignore[method-assign]
+    handler._launch._load_target = lambda _node_id: object()  # type: ignore[method-assign]
+    handler._launch._run_script = lambda _target, _payload: {  # type: ignore[method-assign]
+        "artifacts": {
+            "visiox-progress.json": {"checksum": "a" * 64, "size_bytes": 1}
+        }
+    }
+    handler._persist_observability_snapshot = lambda *_args: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        distributed_execution,
+        "get_settings",
+        lambda: SimpleNamespace(training_runs_root=tmp_path),
+    )
+
+    handler._sync_observability(
+        "execution-sync",
+        SimpleNamespace(node_id="node-1"),  # type: ignore[arg-type]
+        SimpleNamespace(paths={"output": "/workspace/output"}),  # type: ignore[arg-type]
+        task_id="job-sync",
+        launch_spec=LaunchSpec(
+            adapter_key="ultralytics.object_detection.v1",
+            adapter_version="1.0.0",
+            argv=("/usr/local/bin/visiox-train",),
+        ),
+    )
+
+    assert uploads == [
+        "minio://training/jobs/job-sync/attempt-2/artifacts/visiox-progress.json"
+    ]
+    assert downloads == ["runs/job-job-sync/attempt-2/visiox-progress.json"]
+
+
+def test_post_training_phases_are_persisted_on_active_attempt_and_pipeline() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            id="pipeline-phases", name="pipeline-phases", task="detect", scale="n"
+        )
+        task = Task(id="task-phases", task_type="EDGE_TRAIN", status="RUNNING")
+        job = TrainingJob(
+            id="job-phases",
+            pipeline_id=pipeline.id,
+            task_id=task.id,
+            status="training",
+        )
+        attempt = TrainingJobAttempt(
+            id="attempt-phases",
+            training_job_id=job.id,
+            attempt_number=1,
+            status="training",
+            launch_spec={},
+            launch_spec_checksum="a" * 64,
+        )
+        run = DistributedTrainingRun(
+            id="run-phases",
+            training_job_id=job.id,
+            resource_pool_id="pool-1",
+            node_ids=["node-1"],
+            ranks=[],
+            master_addr="10.0.0.1",
+            master_port=29500,
+            attempt=1,
+            status="training",
+        )
+        execution = RemoteExecution(
+            id="execution-phases",
+            node_id="node-1",
+            task_id=task.id,
+            training_job_id=job.id,
+            resource_type="distributed_training_run",
+            resource_id=run.id,
+            operation="train",
+            status="running",
+            idempotency_key="phase-test",
+        )
+        session.add_all([pipeline, task, job, attempt, run, execution])
+        session.commit()
+
+    handler = DistributedTrainingHandler(session_factory, object(), object())  # type: ignore[arg-type]
+    handler._transition("execution-phases", "evaluating", 90)
+    handler._transition("execution-phases", "artifact_collecting", 95)
+
+    with session_factory() as session:
+        assert session.get(TrainingJob, "job-phases").status == "artifact_collecting"  # type: ignore[union-attr]
+        assert session.get(TrainingJobAttempt, "attempt-phases").status == "artifact_collecting"  # type: ignore[union-attr]
+        assert session.get(TrainingPipeline, "pipeline-phases").status == "artifact_collecting"  # type: ignore[union-attr]
+
+
+def test_artifact_collection_failure_uses_durable_error_code() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            id="pipeline-failure", name="pipeline-failure", task="detect", scale="n"
+        )
+        task = Task(id="task-failure", task_type="EDGE_TRAIN", status="RUNNING")
+        job = TrainingJob(
+            id="job-failure",
+            pipeline_id=pipeline.id,
+            task_id=task.id,
+            status="artifact_collecting",
+        )
+        attempt = TrainingJobAttempt(
+            id="attempt-failure",
+            training_job_id=job.id,
+            attempt_number=1,
+            status="artifact_collecting",
+            launch_spec={},
+            launch_spec_checksum="a" * 64,
+        )
+        run = DistributedTrainingRun(
+            id="run-failure",
+            training_job_id=job.id,
+            resource_pool_id="pool-1",
+            node_ids=["node-1"],
+            ranks=[],
+            master_addr="10.0.0.1",
+            master_port=29500,
+            attempt=1,
+            status="artifact_collecting",
+        )
+        execution = RemoteExecution(
+            id="execution-failure",
+            node_id="node-1",
+            task_id=task.id,
+            training_job_id=job.id,
+            resource_type="distributed_training_run",
+            resource_id=run.id,
+            operation="train",
+            status="running",
+            idempotency_key="failure-test",
+        )
+        session.add_all([pipeline, task, job, attempt, run, execution])
+        session.commit()
+
+    handler = DistributedTrainingHandler(session_factory, object(), object())  # type: ignore[arg-type]
+    handler._mark_failed(
+        "execution-failure",
+        error_code="ARTIFACT_COLLECTION_FAILED",
+        error_message="Required best artifact was not collected",
+    )
+
+    with session_factory() as session:
+        execution = session.get(RemoteExecution, "execution-failure")
+        task = session.get(Task, "task-failure")
+        attempt = session.get(TrainingJobAttempt, "attempt-failure")
+        assert execution.error_code == "ARTIFACT_COLLECTION_FAILED"  # type: ignore[union-attr]
+        assert task.error_code == "ARTIFACT_COLLECTION_FAILED"  # type: ignore[union-attr]
+        assert attempt.status == "failed"  # type: ignore[union-attr]
+
+
+def test_late_failure_does_not_downgrade_completed_artifact_ingestion() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            id="pipeline-race", name="pipeline-race", task="detect", scale="n", status="success"
+        )
+        task = Task(id="task-race", task_type="EDGE_TRAIN", status="SUCCESS")
+        job = TrainingJob(
+            id="job-race", pipeline_id=pipeline.id, task_id=task.id, status="success"
+        )
+        attempt = TrainingJobAttempt(
+            id="attempt-race",
+            training_job_id=job.id,
+            attempt_number=1,
+            status="succeeded",
+            launch_spec={},
+            launch_spec_checksum="a" * 64,
+        )
+        run = DistributedTrainingRun(
+            id="run-race",
+            training_job_id=job.id,
+            resource_pool_id="pool-1",
+            node_ids=["node-1"],
+            ranks=[],
+            master_addr="10.0.0.1",
+            master_port=29500,
+            attempt=1,
+            status="succeeded",
+        )
+        execution = RemoteExecution(
+            id="execution-race",
+            node_id="node-1",
+            task_id=task.id,
+            training_job_id=job.id,
+            resource_type="distributed_training_run",
+            resource_id=run.id,
+            operation="train",
+            status="running",
+            idempotency_key="race-test",
+        )
+        session.add_all([pipeline, task, job, attempt, run, execution])
+        session.commit()
+
+    handler = DistributedTrainingHandler(session_factory, object(), object())  # type: ignore[arg-type]
+    handler._mark_failed("execution-race", error_message="late unique conflict")
+
+    with session_factory() as session:
+        assert session.get(TrainingJob, "job-race").status == "success"  # type: ignore[union-attr]
+        assert session.get(TrainingJobAttempt, "attempt-race").status == "succeeded"  # type: ignore[union-attr]
+        assert session.get(TrainingPipeline, "pipeline-race").status == "success"  # type: ignore[union-attr]
+        assert session.get(Task, "task-race").status == "SUCCESS"  # type: ignore[union-attr]
+
+
+def test_stop_distributed_training_cancels_active_attempt_and_derives_pipeline() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    spec = LaunchSpec(
+        adapter_key="ultralytics.object_detection.v1",
+        adapter_version="1.0.0",
+        argv=("/usr/local/bin/visiox-train",),
+    )
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            id="pipeline-stop", name="pipeline-stop", task="detect", scale="n"
+        )
+        task = Task(id="task-stop", task_type="EDGE_STOP_TRAINING", status="RUNNING")
+        job = TrainingJob(
+            id="job-stop", pipeline_id=pipeline.id, task_id=task.id, status="stopping"
+        )
+        attempt = TrainingJobAttempt(
+            id="attempt-stop",
+            training_job_id=job.id,
+            attempt_number=1,
+            status="stopping",
+            launch_spec=spec.model_dump(mode="json"),
+            launch_spec_checksum=spec.canonical_checksum_sha256(),
+        )
+        run = DistributedTrainingRun(
+            id="run-stop",
+            training_job_id=job.id,
+            resource_pool_id="pool-1",
+            node_ids=["node-1"],
+            ranks=[
+                {
+                    "node_id": "node-1",
+                    "node_rank": 0,
+                    "lan_address": "10.0.0.1",
+                    "gpu_uuids": ["GPU-1"],
+                }
+            ],
+            master_addr="10.0.0.1",
+            master_port=29500,
+            attempt=1,
+            status="stopping",
+        )
+        execution = RemoteExecution(
+            id="execution-stop",
+            node_id="node-1",
+            task_id=task.id,
+            training_job_id=job.id,
+            resource_type="distributed_training_run",
+            resource_id=run.id,
+            operation="stop_training",
+            status="running",
+            idempotency_key="stop-test",
+        )
+        session.add_all([pipeline, task, job, attempt, run, execution])
+        session.commit()
+
+    handler = StopDistributedTrainingHandler(session_factory, object(), object())  # type: ignore[arg-type]
+    handler._stop._load_target = lambda _node_id: object()  # type: ignore[method-assign]
+    handler._stop._run_script = lambda _target, _payload: {  # type: ignore[method-assign]
+        "stopped_container_ids": []
+    }
+    handler._try_collect_checkpoint = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    with session_factory() as session:
+        execution = session.get(RemoteExecution, "execution-stop")
+        assert execution is not None
+        result = handler.execute(execution)
+
+    assert result.status == "succeeded"
+    with session_factory() as session:
+        assert session.get(TrainingJobAttempt, "attempt-stop").status == "canceled"  # type: ignore[union-attr]
+        assert session.get(TrainingPipeline, "pipeline-stop").status == "canceled"  # type: ignore[union-attr]

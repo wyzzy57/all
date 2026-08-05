@@ -29,6 +29,7 @@ from visiox_api.services.training_submission import (
     TrainingSubmissionError,
     TrainingSubmissionService,
 )
+from visiox_api.services.training_artifacts import sync_pipeline_status
 from visiox_api.services.resource_scheduler import freeze_distributed_allocation
 from visiox_common.settings import Settings, get_settings
 from visiox_db.base import new_id
@@ -405,8 +406,8 @@ async def create_training_job(
             "params": params,
             "environment": environment,
         }
-        pipeline.status = "running"
         lock_pipeline_to_first_job(pipeline, job.id)
+        sync_pipeline_status(session, pipeline)
         session.add(pipeline)
         session.commit()
     except Exception:
@@ -428,7 +429,7 @@ async def create_training_job(
         now = _utc_now()
         job.status = "failed"
         job.finished_at = now
-        pipeline.status = "failed"
+        sync_pipeline_status(session, pipeline)
         task.status = TaskStatus.FAILED.value
         task.error_code = "ENQUEUE_FAILED"
         task.error_message = str(exc)
@@ -642,12 +643,12 @@ async def _create_distributed_training_job(
         launch_spec_checksum=submission.launch_spec_checksum,
     )
     try:
-        pipeline.status = "running"
         session.add(task)
         session.flush()
         session.add_all([job, pipeline, attempt_record])
         session.flush()
         lock_pipeline_to_first_job(pipeline, job_id)
+        sync_pipeline_status(session, pipeline)
         session.add(pipeline)
         session.flush()
         session.add(run)
@@ -926,7 +927,7 @@ async def resume_distributed_training_job(
         job.status = "queued"
         job.finished_at = None
         if pipeline is not None:
-            pipeline.status = "running"
+            sync_pipeline_status(session, pipeline)
         session.add_all([job, run])
         if pipeline is not None:
             session.add(pipeline)
@@ -1186,7 +1187,7 @@ def _mark_distributed_enqueue_failed(
     execution.error_message = str(error)
     execution.finished_at = now
     if pipeline is not None:
-        pipeline.status = "failed"
+        sync_pipeline_status(session, pipeline)
         session.add(pipeline)
     session.add_all([job, run, task, execution])
     session.commit()
@@ -1320,16 +1321,33 @@ def delete_training_job(
         )
     ).all():
         session.delete(run)
-    for model in session.scalars(
-        select(TrainedModel).where(TrainedModel.training_job_id == job.id)
-    ).all():
-        model.training_job_id = None
-        session.add(model)
-    for attempt in session.scalars(
+    attempts = session.scalars(
         select(TrainingJobAttempt).where(TrainingJobAttempt.training_job_id == job.id)
-    ).all():
+    ).all()
+    attempt_ids = [attempt.id for attempt in attempts]
+    model_filter = TrainedModel.training_job_id == job.id
+    if attempt_ids:
+        model_filter |= TrainedModel.training_job_attempt_id.in_(attempt_ids)
+    for model in session.scalars(select(TrainedModel).where(model_filter)).all():
+        model.training_job_id = None
+        model.training_job_attempt_id = None
+        session.add(model)
+    session.flush()
+    for attempt in attempts:
         session.delete(attempt)
     session.flush()
+    pipeline = session.get(TrainingPipeline, job.pipeline_id)
+    if pipeline is not None and pipeline.first_submitted_job_id == job.id:
+        pipeline.first_submitted_job_id = session.scalar(
+            select(TrainingJob.id)
+            .where(
+                TrainingJob.pipeline_id == pipeline.id,
+                TrainingJob.id != job.id,
+            )
+            .order_by(TrainingJob.created_at, TrainingJob.id)
+        )
+        session.add(pipeline)
+        session.flush()
     session.delete(job)
     session.flush()
     if task is not None:

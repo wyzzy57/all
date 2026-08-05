@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import visiox_llm_training_worker.entrypoint as worker
+import visiox_llm_training_worker.fixed_entrypoint as fixed_entrypoint
 from visiox_llm_training_worker.fixed_entrypoint import (
     build_runtime_config,
     build_worker_command,
@@ -106,6 +107,30 @@ def test_fixed_entrypoint_builds_llamafactory_config_from_unified_inputs() -> No
     assert config["num_train_epochs"] == 2
     assert config["learning_rate"] == 0.0001
     assert "model_source" not in config
+
+
+def test_fixed_entrypoint_writes_llamafactory_artifact_roles(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    runtime = output / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "adapter_model.safetensors").write_bytes(b"adapter")
+
+    result_path = fixed_entrypoint.write_train_result(
+        output, status="success", exit_code=0
+    )
+
+    assert json.loads(result_path.read_text(encoding="utf-8")) == {
+        "schema_version": "1.0",
+        "framework": "llamafactory",
+        "status": "success",
+        "exit_code": 0,
+        "artifacts": [
+            {
+                "role": "adapter_weights",
+                "path": "runtime/adapter_model.safetensors",
+            }
+        ],
+    }
 
 
 def test_latest_trainer_log_skips_malformed_tail(tmp_path: Path) -> None:

@@ -88,9 +88,17 @@ def test_trained_model_deployment_name_can_be_marked_without_renaming_weight(tmp
         model = TrainedModel(
             id="model-1",
             name="best.pt",
+            display_name="Best weights",
             version="best.pt",
             task="detect",
+            framework="ultralytics",
+            adapter_key="ultralytics.object_detection.v1",
+            model_family="yolo26n",
+            model_format="pt",
+            artifact_role="best_weights",
             artifact_uri="memory://models/trained/detect/best.pt",
+            checksum="a" * 64,
+            size_bytes=42,
             metrics={"mAP50": 0.9},
             status="ready",
         )
@@ -116,3 +124,12 @@ def test_trained_model_deployment_name_can_be_marked_without_renaming_weight(tmp
     assert body["metrics"]["mAP50"] == 0.9
     assert body["metrics"]["deployment_name"] == "best_model"
     assert invalid.status_code == 422
+
+    with session_factory() as session:
+        persisted = session.get(TrainedModel, "model-1")
+
+    assert persisted is not None
+    assert persisted.name == "best.pt"
+    assert persisted.display_name == "Best weights"
+    assert persisted.artifact_uri == "memory://models/trained/detect/best.pt"
+    assert persisted.checksum == "a" * 64

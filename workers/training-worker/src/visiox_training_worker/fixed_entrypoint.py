@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path, PurePosixPath
 
@@ -17,6 +18,41 @@ from visiox_yolo26.training.commands import build_train_command
 ADAPTER_KEY = "ultralytics.object_detection.v1"
 ADAPTER_VERSION = "1.0.0"
 LAUNCH_SPEC_PATH = Path("/workspace/input/launch-spec.json")
+
+
+def write_train_result(
+    output_dir: Path,
+    *,
+    status: str,
+    exit_code: int,
+) -> Path:
+    artifacts = []
+    roles = {"best.pt": "best_weights", "last.pt": "last_weights"}
+    for path in sorted(output_dir.rglob("*.pt")):
+        role = roles.get(path.name)
+        if path.is_file() and role is not None:
+            artifacts.append(
+                {"role": role, "path": path.relative_to(output_dir).as_posix()}
+            )
+    result_path = output_dir / "train_result.json"
+    temporary = result_path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "framework": "ultralytics",
+                "status": status,
+                "exit_code": exit_code,
+                "artifacts": artifacts,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(result_path)
+    return result_path
 
 
 def build_worker_command(payload: dict[str, object]) -> tuple[str, ...]:
@@ -86,6 +122,11 @@ def main() -> int:
         command,
         environment=environment,
         on_poll=manifest_refresher.refresh,
+    )
+    write_train_result(
+        output_dir,
+        status="success" if return_code == 0 else "failed",
+        exit_code=return_code,
     )
     manifest_refresher.refresh(force=True, strict=True)
     return return_code

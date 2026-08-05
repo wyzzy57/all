@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import json
 import subprocess
 import sys
 
 import pytest
 
 import visiox_training.runtime as runtime
+import visiox_training_worker.fixed_entrypoint as fixed_entrypoint
 from visiox_training.runtime import ArtifactManifestRefresher, run_worker_command
 from visiox_training_worker.fixed_entrypoint import build_worker_command
 
@@ -115,6 +117,29 @@ def test_fixed_entrypoint_preserves_ultralytics_torchrun_semantics() -> None:
         "epochs=2",
         "workers=4",
     )
+
+
+def test_fixed_entrypoint_writes_ultralytics_artifact_roles(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    weights = output / "runs" / "job-1" / "weights"
+    weights.mkdir(parents=True)
+    (weights / "best.pt").write_bytes(b"best")
+    (weights / "last.pt").write_bytes(b"last")
+
+    result_path = fixed_entrypoint.write_train_result(
+        output, status="success", exit_code=0
+    )
+
+    assert json.loads(result_path.read_text(encoding="utf-8")) == {
+        "schema_version": "1.0",
+        "framework": "ultralytics",
+        "status": "success",
+        "exit_code": 0,
+        "artifacts": [
+            {"role": "best_weights", "path": "runs/job-1/weights/best.pt"},
+            {"role": "last_weights", "path": "runs/job-1/weights/last.pt"},
+        ],
+    }
 
 
 def test_manifest_refresher_tracks_replaced_and_deleted_files(tmp_path: Path) -> None:

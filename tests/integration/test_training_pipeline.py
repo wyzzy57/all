@@ -1714,14 +1714,22 @@ def test_delete_training_record_preserves_trained_model_and_removes_task_depende
     with session_factory() as session:
         job = session.get(TrainingJob, created["id"])
         task = session.get(Task, created["task_id"])
+        attempt = session.scalar(
+            select(TrainingJobAttempt).where(
+                TrainingJobAttempt.training_job_id == job.id
+            )
+        )
+        assert attempt is not None
         job.status = "success"
         task.status = "SUCCESS"
         model = TrainedModel(
             pipeline_id=pipeline_id,
             training_job_id=job.id,
+            training_job_attempt_id=attempt.id,
             name="preserved-model",
             version="1",
             task="detect",
+            artifact_role="best_weights",
             artifact_uri="memory://models/trained/best.pt",
             status="ready",
         )
@@ -1742,6 +1750,42 @@ def test_delete_training_record_preserves_trained_model_and_removes_task_depende
         preserved = session.get(TrainedModel, model_id)
         assert preserved is not None
         assert preserved.training_job_id is None
+        assert preserved.training_job_attempt_id is None
+
+
+def test_delete_first_training_record_repoints_pipeline_to_earliest_remaining_job(
+    client: TestClient,
+    session_factory,
+) -> None:
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    created = client.post(f"/pipelines/{pipeline_id}/jobs", json={}).json()
+    with session_factory() as session:
+        pipeline = session.get(TrainingPipeline, pipeline_id)
+        first = session.get(TrainingJob, created["id"])
+        task = session.get(Task, created["task_id"])
+        assert pipeline is not None and first is not None and task is not None
+        locked_at = pipeline.framework_locked_at
+        first.status = "success"
+        task.status = "SUCCESS"
+        remaining = TrainingJob(
+            pipeline_id=pipeline_id,
+            status="failed",
+            organization_id=first.organization_id,
+            owner_user_id=first.owner_user_id,
+        )
+        session.add(remaining)
+        session.commit()
+        remaining_id = remaining.id
+
+    response = client.delete(f"/training-jobs/{created['id']}")
+
+    assert response.status_code == 204
+    with session_factory() as session:
+        pipeline = session.get(TrainingPipeline, pipeline_id)
+        assert pipeline is not None
+        assert pipeline.first_submitted_job_id == remaining_id
+        assert pipeline.framework_locked_at == locked_at
 
 
 def test_delete_training_record_rejects_active_job(
@@ -2234,6 +2278,24 @@ def test_cancel_training_task_marks_job_and_pipeline_canceled(
     assert saved_task.error_code == "TRAINING_CANCELED"
 
 
+def test_cancel_training_task_keeps_pipeline_running_for_active_peer_job(
+    client: TestClient,
+    session_factory,
+):
+    base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    job = client.post(f"/pipelines/{pipeline_id}/jobs", json={}).json()
+    with session_factory() as session:
+        session.add(TrainingJob(pipeline_id=pipeline_id, status="running"))
+        session.commit()
+
+    response = client.post(f"/tasks/{job['task_id']}/cancel")
+
+    assert response.status_code == 200
+    with session_factory() as session:
+        assert session.get(TrainingPipeline, pipeline_id).status == "running"  # type: ignore[union-attr]
+
+
 def test_create_training_job_revalidates_pipeline_resources(
     client: TestClient, session_factory
 ):
@@ -2578,6 +2640,24 @@ run = Path(project) / name
     }
 
 
+def test_worker_success_keeps_pipeline_running_for_active_peer_job(
+    session_factory, tmp_path
+):
+    storage = InMemoryObjectStorageClient()
+    task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
+    with session_factory() as session:
+        job = session.get(TrainingJob, job_id)
+        session.add(TrainingJob(pipeline_id=job.pipeline_id, status="running"))
+        session.commit()
+
+    with session_factory() as session:
+        run_training_job(session, storage, FakeRunner(), task_id, job_id, tmp_path / "work")
+
+    with session_factory() as session:
+        job = session.get(TrainingJob, job_id)
+        assert session.get(TrainingPipeline, job.pipeline_id).status == "running"
+
+
 def test_worker_falls_back_to_cpu_when_cuda_device_requested_without_cuda(
     session_factory, tmp_path, monkeypatch
 ):
@@ -2633,6 +2713,27 @@ def test_worker_marks_task_and_job_failed_when_runner_fails(session_factory, tmp
         bucket == "models" and object_name.startswith("trained/")
         for bucket, object_name in storage.objects
     )
+
+
+def test_worker_failure_keeps_pipeline_running_for_active_peer_job(
+    session_factory, tmp_path
+):
+    storage = InMemoryObjectStorageClient()
+    task_id, job_id = _create_job_for_worker(session_factory, tmp_path, storage)
+    with session_factory() as session:
+        job = session.get(TrainingJob, job_id)
+        session.add(TrainingJob(pipeline_id=job.pipeline_id, status="running"))
+        session.commit()
+
+    with session_factory() as session:
+        with pytest.raises(RuntimeError, match="cuda out of memory"):
+            run_training_job(
+                session, storage, FailingRunner(), task_id, job_id, tmp_path / "work"
+            )
+
+    with session_factory() as session:
+        job = session.get(TrainingJob, job_id)
+        assert session.get(TrainingPipeline, job.pipeline_id).status == "running"
 
 
 def test_worker_marks_pipeline_canceled_when_training_is_canceled(
@@ -2881,3 +2982,371 @@ def test_trained_model_training_job_id_is_unique(session_factory, tmp_path):
         session.add(duplicate)
         with pytest.raises(IntegrityError):
             session.commit()
+
+
+@pytest.mark.parametrize(
+    ("framework", "adapter_key", "task", "role", "path", "display_name"),
+    [
+        (
+            "ultralytics",
+            "ultralytics.object_detection.v1",
+            "detect",
+            "best_weights",
+            "runs/exp/weights/champion.ckpt",
+            "Best weights",
+        ),
+        (
+            "paddlex",
+            "paddlex.object_detection.v1",
+            "detect",
+            "best_dynamic_weights",
+            "output/best_model/model.pdparams",
+            "Best dynamic weights",
+        ),
+        (
+            "llamafactory",
+            "llamafactory.llm_sft.v1",
+            "llm_sft",
+            "adapter_weights",
+            "adapter/final-adapter.safetensors",
+            "Adapter weights",
+        ),
+    ],
+)
+def test_framework_artifact_manifests_create_typed_trained_models(
+    session_factory,
+    framework,
+    adapter_key,
+    task,
+    role,
+    path,
+    display_name,
+):
+    from visiox_api.services.training_artifacts import ingest_training_artifacts
+
+    checksum = sha256(f"{framework}-artifact".encode()).hexdigest()
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            name=f"{framework}-artifact-pipeline",
+            task=task,
+            scale="n",
+            framework=framework,
+            adapter_key=adapter_key,
+            adapter_version="1.0.0",
+            model_family=f"{framework}-family",
+            status="running",
+        )
+        session.add(pipeline)
+        session.flush()
+        job = TrainingJob(pipeline_id=pipeline.id, status="artifact_collecting")
+        session.add(job)
+        session.flush()
+        attempt = TrainingJobAttempt(
+            training_job_id=job.id,
+            attempt_number=1,
+            status="artifact_collecting",
+            launch_spec={"adapter_key": adapter_key},
+            launch_spec_checksum="a" * 64,
+        )
+        session.add(attempt)
+        session.flush()
+        result = ingest_training_artifacts(
+            session,
+            job=job,
+            pipeline=pipeline,
+            attempt=attempt,
+            manifest={
+                "schema_version": "1.0",
+                "task_id": job.id,
+                "adapter_key": adapter_key,
+                "adapter_version": "1.0.0",
+                "checksum_sha256": "b" * 64,
+                "artifacts": [
+                    {
+                        "path": path,
+                        "size_bytes": 17,
+                        "checksum_sha256": checksum,
+                        "artifact_type": "model_weight",
+                    }
+                ],
+            },
+            artifact_uris={
+                path: f"minio://models/trained/{job.id}/attempt-1/{path}"
+            },
+            artifact_roles={path: role},
+        )
+        session.commit()
+
+        model = session.get(TrainedModel, result.best_model_id)
+
+    assert model is not None
+    assert model.name == Path(path).name
+    assert model.display_name == display_name
+    assert model.framework == framework
+    assert model.adapter_key == adapter_key
+    assert model.model_family == f"{framework}-family"
+    assert model.artifact_role == role
+    assert model.checksum == checksum
+    assert model.size_bytes == 17
+    assert model.artifact_uri.endswith(path)
+
+
+def test_generic_model_weight_requires_explicit_artifact_role(session_factory):
+    from visiox_api.services.training_artifacts import (
+        ArtifactCollectionError,
+        ingest_training_artifacts,
+    )
+
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            name="explicit-role-pipeline",
+            task="detect",
+            scale="n",
+            framework="ultralytics",
+            adapter_key="ultralytics.object_detection.v1",
+            adapter_version="1.0.0",
+        )
+        session.add(pipeline)
+        session.flush()
+        job = TrainingJob(pipeline_id=pipeline.id, status="artifact_collecting")
+        session.add(job)
+        session.flush()
+        attempt = TrainingJobAttempt(
+            training_job_id=job.id,
+            attempt_number=1,
+            status="artifact_collecting",
+            launch_spec={},
+            launch_spec_checksum="a" * 64,
+        )
+        session.add(attempt)
+        session.flush()
+        path = "runs/job/weights/best.pt"
+
+        with pytest.raises(ArtifactCollectionError, match="deployable best artifact"):
+            ingest_training_artifacts(
+                session,
+                job=job,
+                pipeline=pipeline,
+                attempt=attempt,
+                manifest={
+                    "task_id": job.id,
+                    "adapter_key": pipeline.adapter_key,
+                    "adapter_version": pipeline.adapter_version,
+                    "artifacts": [
+                        {
+                            "path": path,
+                            "size_bytes": 4,
+                            "checksum_sha256": "b" * 64,
+                            "artifact_type": "model_weight",
+                        }
+                    ],
+                },
+                artifact_uris={path: f"minio://models/{path}"},
+            )
+
+
+def test_artifact_manifest_reconciliation_is_idempotent_and_attempt_scoped(
+    session_factory,
+):
+    from visiox_api.services.training_artifacts import ingest_training_artifacts
+
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            name="attempt-artifact-pipeline",
+            task="detect",
+            scale="n",
+            framework="paddlex",
+            adapter_key="paddlex.object_detection.v1",
+            adapter_version="1.0.0",
+            model_family="PP-YOLOE-S",
+            status="running",
+        )
+        session.add(pipeline)
+        session.flush()
+        job = TrainingJob(pipeline_id=pipeline.id, status="artifact_collecting")
+        session.add(job)
+        session.flush()
+        attempts = [
+            TrainingJobAttempt(
+                training_job_id=job.id,
+                attempt_number=number,
+                status="artifact_collecting",
+                launch_spec={"adapter_key": pipeline.adapter_key},
+                launch_spec_checksum=str(number) * 64,
+            )
+            for number in (1, 2)
+        ]
+        session.add_all(attempts)
+        session.flush()
+        path = "best_model/model.pdparams"
+        manifest = {
+            "schema_version": "1.0",
+            "task_id": job.id,
+            "adapter_key": pipeline.adapter_key,
+            "adapter_version": pipeline.adapter_version,
+            "checksum_sha256": "c" * 64,
+            "artifacts": [
+                {
+                    "path": path,
+                    "size_bytes": 9,
+                    "checksum_sha256": "d" * 64,
+                    "artifact_type": "best_dynamic_weights",
+                }
+            ],
+        }
+        first = ingest_training_artifacts(
+            session,
+            job=job,
+            pipeline=pipeline,
+            attempt=attempts[0],
+            manifest=manifest,
+            artifact_uris={path: f"minio://models/trained/{job.id}/attempt-1/{path}"},
+        )
+        repeated = ingest_training_artifacts(
+            session,
+            job=job,
+            pipeline=pipeline,
+            attempt=attempts[0],
+            manifest=manifest,
+            artifact_uris={path: f"minio://models/trained/{job.id}/attempt-1/{path}"},
+        )
+        second = ingest_training_artifacts(
+            session,
+            job=job,
+            pipeline=pipeline,
+            attempt=attempts[1],
+            manifest=manifest,
+            artifact_uris={path: f"minio://models/trained/{job.id}/attempt-2/{path}"},
+        )
+        session.commit()
+        models = session.scalars(
+            select(TrainedModel).order_by(TrainedModel.training_job_attempt_id)
+        ).all()
+
+    assert first.best_model_id == repeated.best_model_id
+    assert second.best_model_id != first.best_model_id
+    assert len(models) == 2
+    assert {model.training_job_attempt_id for model in models} == {
+        attempts[0].id,
+        attempts[1].id,
+    }
+    assert {model.artifact_uri for model in models} == {
+        f"minio://models/trained/{job.id}/attempt-1/{path}",
+        f"minio://models/trained/{job.id}/attempt-2/{path}",
+    }
+
+
+def test_artifact_ingestion_rechecks_winner_after_unique_insert_conflict():
+    from visiox_api.services.training_artifacts import ingest_training_artifacts
+
+    path = "best_model/model.pdparams"
+    artifact_uri = f"minio://models/trained/job-race/attempt-1/{path}"
+    winner = SimpleNamespace(
+        id="model-winner",
+        artifact_role="best_dynamic_weights",
+        artifact_uri=artifact_uri,
+        checksum="d" * 64,
+        size_bytes=9,
+    )
+
+    class Savepoint:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class RacingSession:
+        def __init__(self):
+            self.scalar_calls = 0
+
+        def scalar(self, _statement):
+            self.scalar_calls += 1
+            return None if self.scalar_calls == 1 else winner
+
+        def begin_nested(self):
+            return Savepoint()
+
+        def add(self, _value):
+            return None
+
+        def flush(self):
+            raise IntegrityError("insert", {}, RuntimeError("unique conflict"))
+
+    session = RacingSession()
+    pipeline = SimpleNamespace(
+        id="pipeline-race",
+        organization_id=None,
+        owner_user_id=None,
+        task="detect",
+        framework="paddlex",
+        adapter_key="paddlex.object_detection.v1",
+        adapter_version="1.0.0",
+        model_family="PP-YOLOE-S",
+    )
+    job = SimpleNamespace(
+        id="job-race",
+        pipeline_id=pipeline.id,
+        organization_id=None,
+        owner_user_id=None,
+    )
+    attempt = SimpleNamespace(id="attempt-race", attempt_number=1)
+    manifest = {
+        "task_id": job.id,
+        "adapter_key": pipeline.adapter_key,
+        "adapter_version": pipeline.adapter_version,
+        "artifacts": [
+            {
+                "path": path,
+                "size_bytes": 9,
+                "checksum_sha256": "d" * 64,
+                "artifact_type": "best_dynamic_weights",
+            }
+        ],
+    }
+
+    result = ingest_training_artifacts(
+        session,  # type: ignore[arg-type]
+        job=job,  # type: ignore[arg-type]
+        pipeline=pipeline,  # type: ignore[arg-type]
+        attempt=attempt,  # type: ignore[arg-type]
+        manifest=manifest,
+        artifact_uris={path: artifact_uri},
+    )
+
+    assert result.model_ids == (winner.id,)
+    assert result.best_model_id == winner.id
+    assert session.scalar_calls == 2
+
+
+def test_pipeline_status_is_derived_from_active_job_attempt(session_factory):
+    from visiox_api.services.training_artifacts import sync_pipeline_status
+
+    with session_factory() as session:
+        pipeline = TrainingPipeline(
+            name="derived-status-pipeline", task="detect", scale="n", status="failed"
+        )
+        session.add(pipeline)
+        session.flush()
+        old_job = TrainingJob(pipeline_id=pipeline.id, status="failed")
+        active_job = TrainingJob(pipeline_id=pipeline.id, status="running")
+        session.add_all([old_job, active_job])
+        session.flush()
+        active_attempt = TrainingJobAttempt(
+            training_job_id=active_job.id,
+            attempt_number=2,
+            status="evaluating",
+            launch_spec={},
+            launch_spec_checksum="a" * 64,
+        )
+        session.add(active_attempt)
+        session.flush()
+
+        assert sync_pipeline_status(session, pipeline) == "evaluating"
+        active_attempt.status = "artifact_collecting"
+        session.flush()
+        assert sync_pipeline_status(session, pipeline) == "artifact_collecting"
+        active_attempt.status = "succeeded"
+        active_job.status = "success"
+        session.flush()
+        assert sync_pipeline_status(session, pipeline) == "success"

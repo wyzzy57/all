@@ -28,6 +28,12 @@ from visiox_db.models import (
     TrainedModel,
 )
 from visiox_common.settings import get_settings
+from visiox_api.services.training_artifacts import (
+    ARTIFACT_COLLECTION_FAILED,
+    ArtifactCollectionError,
+    ingest_training_artifacts,
+    sync_pipeline_status,
+)
 from visiox_storage.client import ObjectStorageClient
 from visiox_training.contracts import ArtifactManifest, LaunchSpec
 from visiox_training.runtime import build_runtime_inputs, encode_runtime_inputs
@@ -60,6 +66,24 @@ _VISUALIZATION_ARTIFACTS = (
     "val_batch2_labels.jpg",
     "val_batch2_pred.jpg",
 )
+_SIDECAR_MODEL_ROLES = {
+    "ultralytics": {"best_weights", "last_weights", "checkpoint_weights"},
+    "paddlex": {
+        "best_dynamic_weights",
+        "best_static_inference",
+        "last_weights",
+        "checkpoint_weights",
+    },
+    "llamafactory": {"adapter_weights"},
+}
+_SIDECAR_NON_MODEL_ROLES = {
+    "config",
+    "train_log",
+    "evaluation_report",
+    "visualization",
+    "visualdl",
+}
+_PADDLEX_STATIC_ARTIFACT_TYPES = {"metrics", "training_output"}
 
 
 class _Rank(BaseModel):
@@ -124,6 +148,7 @@ class _CollectResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     artifacts: dict[str, _CollectedArtifact]
+    artifact_manifest: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +207,8 @@ class DistributedTrainingHandler:
         launched: list[tuple[str, int]] = []
         log_stream_id: str | None = None
         log_job_id: str | None = None
+        failure_code = "EDGE_TRAIN_FAILED"
+        failure_message = "Distributed edge training failed"
         try:
             if self._converge_existing_success(execution.id):
                 return ExecutionResult.succeeded(phase="succeeded")
@@ -278,6 +305,10 @@ class DistributedTrainingHandler:
                     error_message="Distributed edge training failed",
                     phase="failed",
                 )
+            self._transition(execution.id, "evaluating", 90)
+            self._transition(execution.id, "artifact_collecting", 95)
+            failure_code = ARTIFACT_COLLECTION_FAILED
+            failure_message = "Distributed training artifacts could not be collected"
             collected = self._collect_rank_zero(
                 run,
                 job,
@@ -286,17 +317,23 @@ class DistributedTrainingHandler:
                 staged[ranks[0].node_id],
                 launch_spec=base_launch_spec,
             )
-            self._cache_final_observability(job.id, collected)
+            self._cache_final_observability(job.id, run.attempt, collected)
             self._mark_succeeded(execution.id, collected)
             self._close_log_stream(log_stream_id, "completed", log_job_id)
             return ExecutionResult.succeeded(phase="succeeded")
-        except Exception:
+        except Exception as exc:
             self._stop_peers(execution, launched)
-            self._mark_failed(execution.id)
+            if isinstance(exc, ArtifactCollectionError):
+                failure_message = str(exc)
+            self._mark_failed(
+                execution.id,
+                error_code=failure_code,
+                error_message=failure_message,
+            )
             self._close_log_stream(log_stream_id, "failed", log_job_id)
             return ExecutionResult.failed(
-                error_code="EDGE_TRAIN_FAILED",
-                error_message="Distributed edge training failed",
+                error_code=failure_code,
+                error_message=failure_message,
                 phase="failed",
             )
 
@@ -312,16 +349,23 @@ class DistributedTrainingHandler:
             )
             task = session.get(Task, execution.task_id if execution else None)
             pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
-            metrics = (
-                job.metrics if job is not None and isinstance(job.metrics, dict) else {}
+            typed_artifact_exists = (
+                session.get(TrainedModel, job.trained_model_id) is not None
+                if job is not None and job.trained_model_id
+                else False
             )
-            weights = metrics.get("weights") if isinstance(metrics, dict) else None
-            engine_artifacts_ok = (
+            metrics = job.metrics if job is not None and isinstance(job.metrics, dict) else {}
+            weights = metrics.get("weights")
+            legacy_artifacts_exist = (
                 bool(metrics.get("adapter"))
                 if pipeline is not None and pipeline.engine == "llamafactory"
                 else isinstance(weights, dict)
-                and {"best.pt", "last.pt"}.issubset(weights)
+                and all(
+                    isinstance(weights.get(name), str) and weights[name]
+                    for name in ("best.pt", "last.pt")
+                )
             )
+            engine_artifacts_ok = typed_artifact_exists or legacy_artifacts_exist
             completed = bool(
                 execution
                 and run
@@ -346,7 +390,7 @@ class DistributedTrainingHandler:
             task.error_code = None
             task.error_message = None
             task.finished_at = task.finished_at or finished_at
-            pipeline.status = "success"
+            sync_pipeline_status(session, pipeline)
             execution.phase = "succeeded"
             execution.error_code = None
             execution.error_message = None
@@ -573,11 +617,23 @@ class DistributedTrainingHandler:
                 TrainingJob, execution.training_job_id if execution else None
             )
             task = session.get(Task, execution.task_id if execution else None)
-            if not all((execution, run, job, task)):
+            pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
+            attempt = (
+                session.scalar(
+                    select(TrainingJobAttempt).where(
+                        TrainingJobAttempt.training_job_id == job.id,
+                        TrainingJobAttempt.attempt_number == run.attempt,
+                    )
+                )
+                if job is not None and run is not None
+                else None
+            )
+            if not all((execution, run, job, task, pipeline, attempt)):
                 raise ValueError("distributed training state is incomplete")
             execution.phase = phase
             run.status = phase
-            job.status = "running"
+            job.status = phase
+            attempt.status = phase
             task.status = "RUNNING"
             task.stage = phase
             task.progress = progress
@@ -585,7 +641,8 @@ class DistributedTrainingHandler:
             run.started_at = run.started_at or now
             job.started_at = job.started_at or now
             task.started_at = task.started_at or now
-            session.add_all([execution, run, job, task])
+            sync_pipeline_status(session, pipeline)
+            session.add_all([execution, run, job, attempt, task, pipeline])
             session.commit()
 
     def _persist_container(self, run_id: str, container_id: str) -> None:
@@ -756,22 +813,14 @@ class DistributedTrainingHandler:
                 job = session.get(
                     TrainingJob, execution.training_job_id if execution else None
                 )
-                if job is None:
+                run = session.get(
+                    DistributedTrainingRun,
+                    execution.resource_id if execution else None,
+                )
+                if job is None or run is None:
                     return
                 job_id = job.id
-            object_names = {
-                "visiox-progress.json": f"jobs/{job_id}/observability/visiox-progress.json",
-                "events.out.tfevents.remote": f"jobs/{job_id}/observability/events.out.tfevents.remote",
-                "visiox-metrics.jsonl": f"jobs/{job_id}/observability/visiox-metrics.jsonl",
-                "resource_metrics.jsonl": f"jobs/{job_id}/observability/resource_metrics.jsonl",
-            }
-            uploads = {
-                name: self._storage.presigned_put_url(
-                    f"minio://training/{object_name}",
-                    expires=_PRESIGNED_URL_TTL,
-                )
-                for name, object_name in object_names.items()
-            }
+                attempt = run.attempt
             target = self._launch._load_target(rank.node_id)
             manifest = self._remote_artifact_manifest(
                 target,
@@ -780,13 +829,26 @@ class DistributedTrainingHandler:
                 launch_spec=launch_spec,
             )
             manifest_paths = _manifest_paths_by_name(manifest)
-            selected_uploads = {
-                manifest_paths[name]: url
-                for name, url in uploads.items()
-                if name in manifest_paths
+            cache_names = {
+                "visiox-progress.json",
+                "events.out.tfevents.remote",
+                "visiox-metrics.jsonl",
+                "resource_metrics.jsonl",
             }
-            if not selected_uploads:
+            object_uris = {
+                name: _artifact_uri(job_id, attempt, path)
+                for name, path in manifest_paths.items()
+                if name in cache_names
+            }
+            if not object_uris:
                 return
+            selected_uploads = {
+                manifest_paths[name]: self._storage.presigned_put_url(
+                    uri,
+                    expires=_PRESIGNED_URL_TTL,
+                )
+                for name, uri in object_uris.items()
+            }
             result = _CollectResult.model_validate(
                 self._launch._run_script(
                     target,
@@ -798,14 +860,20 @@ class DistributedTrainingHandler:
                     },
                 )
             )
-            run_path = get_settings().training_runs_root / "runs" / f"job-{job_id}"
+            run_path = (
+                get_settings().training_runs_root
+                / "runs"
+                / f"job-{job_id}"
+                / f"attempt-{attempt}"
+            )
             run_path.mkdir(parents=True, exist_ok=True)
-            for name, object_name in object_names.items():
+            for name, uri in object_uris.items():
                 path = manifest_paths.get(name)
                 if path is None or path not in result.artifacts:
                     continue
                 destination = run_path / name
-                self._storage.get_file("training", object_name, destination)
+                bucket, object_name = uri.removeprefix("minio://").split("/", 1)
+                self._storage.get_file(bucket, object_name, destination)
             progress_path = run_path / "visiox-progress.json"
             if progress_path.is_file():
                 snapshot = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -902,9 +970,8 @@ class DistributedTrainingHandler:
             task_id=job.id,
             launch_spec=launch_spec,
         )
-        paths_by_name = _manifest_paths_by_name(manifest)
         uris = {
-            entry.path: _artifact_uri(job.id, entry.path)
+            entry.path: _artifact_uri(job.id, run.attempt, entry.path)
             for entry in manifest.artifacts
         }
         uploads = {
@@ -922,19 +989,13 @@ class DistributedTrainingHandler:
                 },
             )
         )
-        required = (
-            {"adapter_model.safetensors", "adapter_config.json"}
-            if launch_spec.adapter_key == "llamafactory.llm_sft.v1"
-            else {"best.pt", "last.pt"}
-        )
-        if not required.issubset(paths_by_name):
-            raise ValueError("rank zero did not upload required training artifacts")
         return _CollectResult(
             artifacts={
-                PurePosixPath(path).name: artifact
+                path: artifact
                 for path, artifact in raw_result.artifacts.items()
                 if path in {entry.path for entry in manifest.artifacts}
-            }
+            },
+            artifact_manifest=manifest.model_dump(mode="json"),
         )
 
     def _try_collect_checkpoint(
@@ -999,99 +1060,48 @@ class DistributedTrainingHandler:
             )
             task = session.get(Task, execution.task_id if execution else None)
             pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
-            if not all((execution, run, job, task, pipeline)):
+            attempt = (
+                session.scalar(
+                    select(TrainingJobAttempt).where(
+                        TrainingJobAttempt.training_job_id == job.id,
+                        TrainingJobAttempt.attempt_number == run.attempt,
+                    )
+                )
+                if job is not None and run is not None
+                else None
+            )
+            if not all((execution, run, job, task, pipeline, attempt)):
                 raise ValueError("distributed completion state is incomplete")
-            if pipeline.engine == "llamafactory":
-                adapter_uri = (
-                    f"minio://models/trained/{job.id}/adapter_model.safetensors"
-                )
-                adapter = TrainedModel(
-                    pipeline_id=pipeline.id,
-                    organization_id=job.organization_id or pipeline.organization_id,
-                    owner_user_id=job.owner_user_id or pipeline.owner_user_id,
-                    visibility="private",
-                    training_job_id=job.id,
-                    name="adapter_model.safetensors",
-                    version="adapter",
-                    task=pipeline.task,
-                    artifact_uri=adapter_uri,
-                    metrics={},
-                    status="ready",
-                )
-                session.add(adapter)
-                session.flush()
-                job.trained_model_id = adapter.id
-                job.status = "success"
-                job.metrics = {
-                    **(job.metrics or {}),
-                    "adapter": adapter_uri,
-                    "artifacts": {
-                        name: (
-                            f"minio://models/trained/{job.id}/{name}"
-                            if name == "adapter_config.json"
-                            else f"minio://training/jobs/{job.id}/artifacts/{name}"
-                        )
-                        for name in collected.artifacts
-                        if name
-                        not in {
-                            "adapter_model.safetensors",
-                            "visiox-progress.json",
-                            "events.out.tfevents.remote",
-                            "visiox-metrics.jsonl",
-                            "resource_metrics.jsonl",
-                        }
-                    },
-                }
-                job.finished_at = now
-                run.status = "succeeded"
-                run.finished_at = now
-                task.status = "SUCCESS"
-                task.stage = "completed"
-                task.progress = 100
-                task.finished_at = now
-                pipeline.status = "success"
-                execution.phase = "succeeded"
-                session.add_all([execution, run, job, task, pipeline])
-                session.commit()
-                return
+            if collected.artifact_manifest is None:
+                raise ArtifactCollectionError("artifact manifest was not retained")
+            manifest = ArtifactManifest.model_validate(collected.artifact_manifest)
+            artifact_uris = {
+                entry.path: _artifact_uri(job.id, run.attempt, entry.path)
+                for entry in manifest.artifacts
+            }
+            ingestion = ingest_training_artifacts(
+                session,
+                job=job,
+                pipeline=pipeline,
+                attempt=attempt,
+                manifest=collected.artifact_manifest,
+                artifact_uris=artifact_uris,
+                artifact_roles=self._load_artifact_roles(
+                    job.id, pipeline, manifest, artifact_uris
+                ),
+            )
+            if ingestion.best_model_id is None:
+                raise ArtifactCollectionError("deployable best artifact was not ingested")
+            models = [session.get(TrainedModel, model_id) for model_id in ingestion.model_ids]
             weights = {
-                name: f"minio://models/trained/{job.id}/{name}"
-                for name in ("best.pt", "last.pt")
+                model.name: model.artifact_uri for model in models if model is not None
             }
             visualizations = {
-                name: f"minio://training/jobs/{job.id}/visualizations/{name}"
-                for name in _VISUALIZATION_ARTIFACTS
-                if name in collected.artifacts
+                PurePosixPath(entry.path).name: artifact_uris[entry.path]
+                for entry in manifest.artifacts
+                if entry.artifact_type == "visualization"
             }
-            best = TrainedModel(
-                pipeline_id=pipeline.id,
-                organization_id=job.organization_id or pipeline.organization_id,
-                owner_user_id=job.owner_user_id or pipeline.owner_user_id,
-                visibility="private",
-                training_job_id=job.id,
-                name="best.pt",
-                version="best.pt",
-                task=pipeline.task,
-                artifact_uri=weights["best.pt"],
-                metrics={},
-                status="ready",
-            )
-            last = TrainedModel(
-                pipeline_id=pipeline.id,
-                organization_id=job.organization_id or pipeline.organization_id,
-                owner_user_id=job.owner_user_id or pipeline.owner_user_id,
-                visibility="private",
-                training_job_id=None,
-                name="last.pt",
-                version="last.pt",
-                task=pipeline.task,
-                artifact_uri=weights["last.pt"],
-                metrics={},
-                status="ready",
-            )
-            session.add_all([best, last])
-            session.flush()
-            job.trained_model_id = best.id
+            job.trained_model_id = ingestion.best_model_id
             job.status = "success"
             job.metrics = {
                 **(job.metrics or {}),
@@ -1101,32 +1111,123 @@ class DistributedTrainingHandler:
             job.finished_at = now
             run.status = "succeeded"
             run.finished_at = now
+            attempt.status = "succeeded"
+            attempt.finished_at = now
             task.status = "SUCCESS"
             task.stage = "completed"
             task.progress = 100
             task.finished_at = now
-            pipeline.status = "success"
             execution.phase = "succeeded"
-            session.add_all([execution, run, job, task, pipeline])
+            sync_pipeline_status(session, pipeline)
+            session.add_all([execution, run, job, attempt, task, pipeline])
             session.commit()
 
+    def _load_artifact_roles(
+        self,
+        job_id: str,
+        pipeline: TrainingPipeline,
+        manifest: ArtifactManifest,
+        artifact_uris: Mapping[str, str],
+    ) -> dict[str, str]:
+        entry = next(
+            (
+                item
+                for item in manifest.artifacts
+                if item.path == "train_result.json"
+            ),
+            None,
+        )
+        if entry is None:
+            return {}
+        uri = artifact_uris[entry.path]
+        remainder = uri.removeprefix("minio://")
+        if remainder == uri or "/" not in remainder:
+            raise ArtifactCollectionError("training result URI is invalid")
+        bucket, object_name = remainder.split("/", 1)
+        with TemporaryDirectory(prefix=f"visiox-artifacts-{job_id}-") as directory:
+            path = Path(directory) / "train_result.json"
+            self._storage.get_file(bucket, object_name, path)
+            if (
+                path.stat().st_size != entry.size_bytes
+                or hashlib.sha256(path.read_bytes()).hexdigest()
+                != entry.checksum_sha256
+            ):
+                raise ArtifactCollectionError(
+                    "training result integrity did not match the manifest"
+                )
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ArtifactCollectionError("training result is invalid") from exc
+        successful_statuses = (
+            {"success", "completed"}
+            if pipeline.framework == "paddlex"
+            else {"success"}
+        )
+        if not isinstance(payload, dict) or (
+            payload.get("schema_version") != "1.0"
+            or payload.get("framework") != pipeline.framework
+            or payload.get("status") not in successful_statuses
+            or type(payload.get("exit_code")) is not int
+            or payload.get("exit_code") != 0
+        ):
+            raise ArtifactCollectionError("training result status is not trusted")
+        artifacts = payload.get("artifacts") if isinstance(payload, dict) else None
+        if not isinstance(artifacts, list):
+            raise ArtifactCollectionError("training result artifacts are invalid")
+        manifest_entries = {item.path: item for item in manifest.artifacts}
+        allowed_roles = _SIDECAR_MODEL_ROLES.get(pipeline.framework, set())
+        roles: dict[str, str] = {}
+        for item in artifacts:
+            if not isinstance(item, dict):
+                raise ArtifactCollectionError("training result artifact is invalid")
+            path = item.get("path")
+            role = item.get("role")
+            manifest_entry = manifest_entries.get(path) if isinstance(path, str) else None
+            if manifest_entry is None or not isinstance(role, str):
+                raise ArtifactCollectionError("training result artifact identity is invalid")
+            if role in _SIDECAR_NON_MODEL_ROLES:
+                continue
+            if role not in allowed_roles:
+                raise ArtifactCollectionError("training result artifact role is invalid")
+            allowed_types = (
+                _PADDLEX_STATIC_ARTIFACT_TYPES
+                if pipeline.framework == "paddlex"
+                and role == "best_static_inference"
+                else {"model_weight"}
+            )
+            if manifest_entry.artifact_type not in allowed_types:
+                raise ArtifactCollectionError("training result artifact type is invalid")
+            if path in roles:
+                raise ArtifactCollectionError("training result artifact path is duplicated")
+            roles[path] = role
+        return roles
+
     def _cache_final_observability(
-        self, job_id: str, collected: _CollectResult
+        self, job_id: str, attempt: int, collected: _CollectResult
     ) -> None:
-        run_path = get_settings().training_runs_root / "runs" / f"job-{job_id}"
+        run_path = (
+            get_settings().training_runs_root
+            / "runs"
+            / f"job-{job_id}"
+            / f"attempt-{attempt}"
+        )
         run_path.mkdir(parents=True, exist_ok=True)
-        object_names = {
-            "artifact-manifest.json": f"jobs/{job_id}/artifacts/artifact-manifest.json",
-            "visiox-metrics.jsonl": f"jobs/{job_id}/observability/visiox-metrics.jsonl",
-            "resource_metrics.jsonl": f"jobs/{job_id}/observability/resource_metrics.jsonl",
-            "visiox-progress.json": f"jobs/{job_id}/observability/visiox-progress.json",
-            "events.out.tfevents.remote": f"jobs/{job_id}/observability/events.out.tfevents.remote",
+        cache_names = {
+            "artifact-manifest.json",
+            "visiox-metrics.jsonl",
+            "resource_metrics.jsonl",
+            "visiox-progress.json",
+            "events.out.tfevents.remote",
         }
-        for name, object_name in object_names.items():
-            if name not in collected.artifacts:
+        for path in collected.artifacts:
+            name = PurePosixPath(path).name
+            if name not in cache_names:
                 continue
             try:
-                self._storage.get_file("training", object_name, run_path / name)
+                uri = _artifact_uri(job_id, attempt, path)
+                bucket, object_name = uri.removeprefix("minio://").split("/", 1)
+                self._storage.get_file(bucket, object_name, run_path / name)
             except Exception:
                 continue
 
@@ -1149,7 +1250,13 @@ class DistributedTrainingHandler:
             except Exception:
                 continue
 
-    def _mark_failed(self, execution_id: str) -> None:
+    def _mark_failed(
+        self,
+        execution_id: str,
+        *,
+        error_code: str = "EDGE_TRAIN_FAILED",
+        error_message: str = "Distributed edge training failed",
+    ) -> None:
         now = datetime.now(UTC)
         with self._session_factory() as session:
             execution = session.get(RemoteExecution, execution_id)
@@ -1159,23 +1266,43 @@ class DistributedTrainingHandler:
             job = session.get(TrainingJob, execution.training_job_id)
             task = session.get(Task, execution.task_id)
             pipeline = session.get(TrainingPipeline, job.pipeline_id if job else None)
+            attempt = (
+                session.scalar(
+                    select(TrainingJobAttempt).where(
+                        TrainingJobAttempt.training_job_id == job.id,
+                        TrainingJobAttempt.attempt_number == run.attempt,
+                    )
+                )
+                if job is not None and run is not None
+                else None
+            )
+            if (
+                (job is not None and job.status == "success")
+                or (attempt is not None and attempt.status == "succeeded")
+                or (run is not None and run.status == "succeeded")
+                or (task is not None and task.status == "SUCCESS")
+            ):
+                return
             execution.phase = "failed"
-            execution.error_code = "EDGE_TRAIN_FAILED"
-            execution.error_message = "Distributed edge training failed"
+            execution.error_code = error_code
+            execution.error_message = error_message
             if run:
                 run.status = "failed"
                 run.finished_at = now
             if job:
                 job.status = "failed"
                 job.finished_at = now
+            if attempt:
+                attempt.status = "failed"
+                attempt.finished_at = now
             if task:
                 task.status = "FAILED"
                 task.stage = "failed"
-                task.error_code = "EDGE_TRAIN_FAILED"
-                task.error_message = "Distributed edge training failed"
+                task.error_code = error_code
+                task.error_message = error_message
                 task.finished_at = now
             if pipeline:
-                pipeline.status = "failed"
+                sync_pipeline_status(session, pipeline)
             session.commit()
 
 
@@ -1244,18 +1371,31 @@ class StopDistributedTrainingHandler(DistributedTrainingHandler):
                 pipeline = session.get(
                     TrainingPipeline, job.pipeline_id if job else None
                 )
+                attempt_record = (
+                    session.scalar(
+                        select(TrainingJobAttempt).where(
+                            TrainingJobAttempt.training_job_id == job.id,
+                            TrainingJobAttempt.attempt_number == run.attempt,
+                        )
+                    )
+                    if job is not None and run is not None
+                    else None
+                )
                 if run:
                     run.status = "canceled"
                     run.finished_at = now
                 if job:
                     job.status = "canceled"
                     job.finished_at = now
+                if attempt_record:
+                    attempt_record.status = "canceled"
+                    attempt_record.finished_at = now
                 if task:
                     task.status = "CANCELED"
                     task.stage = "canceled"
                     task.finished_at = now
                 if pipeline:
-                    pipeline.status = "canceled"
+                    sync_pipeline_status(session, pipeline)
                 session.commit()
             return ExecutionResult.succeeded(phase="canceled")
         except Exception:
@@ -1435,18 +1575,25 @@ def _require_remote_adapter(
     )
 
 
-def _artifact_uri(job_id: str, path: str) -> str:
+def _artifact_uri(job_id: str, attempt: int, path: str) -> str:
     name = PurePosixPath(path).name
-    if name in {
-        "best.pt",
-        "last.pt",
-        "adapter_model.safetensors",
-        "adapter_config.json",
-    }:
-        return f"minio://models/trained/{job_id}/{name}"
     if name in _VISUALIZATION_ARTIFACTS:
-        return f"minio://training/jobs/{job_id}/visualizations/{name}"
-    return f"minio://training/jobs/{job_id}/artifacts/{path}"
+        return (
+            f"minio://training/jobs/{job_id}/attempt-{attempt}/"
+            f"visualizations/{name}"
+        )
+    if name in {
+        "artifact-manifest.json",
+        "visiox-progress.json",
+        "events.out.tfevents.remote",
+        "visiox-metrics.jsonl",
+        "resource_metrics.jsonl",
+        "train_result.json",
+    }:
+        return (
+            f"minio://training/jobs/{job_id}/attempt-{attempt}/artifacts/{path}"
+        )
+    return f"minio://models/trained/{job_id}/attempt-{attempt}/{path}"
 
 
 def _launch_request(

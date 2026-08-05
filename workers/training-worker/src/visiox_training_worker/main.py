@@ -20,6 +20,7 @@ from visiox_api.services.log_streams import (
     close_stream,
     open_stream,
 )
+from visiox_api.services.training_artifacts import sync_pipeline_status
 from visiox_db.models import (
     BaseModel,
     Dataset,
@@ -130,7 +131,7 @@ def run_training_job(
     job.status = "running"
     job.started_at = job.started_at or now
     if pipeline is not None:
-        pipeline.status = "running"
+        sync_pipeline_status(session, pipeline)
         session.add(pipeline)
     session.add(job)
     session.commit()
@@ -311,7 +312,7 @@ def run_training_job(
         job.metrics = metrics
         job.log_uri = log_uri
         job.finished_at = _utc_now()
-        pipeline.status = "success"
+        sync_pipeline_status(session, pipeline)
         task.status = TaskStatus.SUCCESS.value
         task.progress = 100
         task.stage = "completed"
@@ -366,7 +367,7 @@ def run_training_job(
             session.add(job)
             pipeline = session.get(TrainingPipeline, job.pipeline_id)
             if pipeline is not None:
-                pipeline.status = "canceled" if canceled else "failed"
+                sync_pipeline_status(session, pipeline)
                 session.add(pipeline)
         if log_stream_id is not None:
             try:

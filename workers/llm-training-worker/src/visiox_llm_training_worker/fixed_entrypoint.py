@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -21,6 +22,41 @@ ADAPTER_KEY = "llamafactory.llm_sft.v1"
 ADAPTER_VERSION = "1.0.0"
 LAUNCH_SPEC_PATH = Path("/workspace/input/launch-spec.json")
 RUNTIME_CONFIG_PATH = "/workspace/output/.visiox-runtime/train.yaml"
+
+
+def write_train_result(
+    output_dir: Path,
+    *,
+    status: str,
+    exit_code: int,
+) -> Path:
+    artifacts = [
+        {
+            "role": "adapter_weights",
+            "path": path.relative_to(output_dir).as_posix(),
+        }
+        for path in sorted(output_dir.rglob("adapter_model.safetensors"))
+        if path.is_file()
+    ]
+    result_path = output_dir / "train_result.json"
+    temporary = result_path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "framework": "llamafactory",
+                "status": status,
+                "exit_code": exit_code,
+                "artifacts": artifacts,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(result_path)
+    return result_path
 
 
 def build_runtime_config(payload: dict[str, object]) -> dict[str, object]:
@@ -127,6 +163,11 @@ def main() -> int:
         command,
         environment=environment,
         on_poll=manifest_refresher.refresh,
+    )
+    write_train_result(
+        output_dir,
+        status="success" if return_code == 0 else "failed",
+        exit_code=return_code,
     )
     manifest_refresher.refresh(force=True, strict=True)
     return return_code

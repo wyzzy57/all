@@ -13,6 +13,7 @@ from visiox_db.base import new_id
 from visiox_db.models import RemoteExecution, Task, TrainingJob, TrainingPipeline
 from visiox_db.session import get_session
 from visiox_messaging.streams import RedisStreamProducer
+from visiox_api.services.training_artifacts import sync_pipeline_status
 
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -190,7 +191,7 @@ def cancel_task(task_id: str, session: Session = Depends(get_task_session)) -> T
             session.add(job)
             pipeline = session.get(TrainingPipeline, job.pipeline_id)
             if pipeline is not None:
-                pipeline.status = "canceled"
+                sync_pipeline_status(session, pipeline)
                 session.add(pipeline)
     session.commit()
     session.refresh(task)
