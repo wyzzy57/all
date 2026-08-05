@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     mlflow_tracking_uri: str = "http://mlflow:5000"
     mlflow_public_url: str = "http://127.0.0.1:5001"
     tensorboard_public_url: str = "http://127.0.0.1:6006"
+    visualdl_public_url: str = "http://127.0.0.1:8040"
     tensorboard_histogram_interval: int = 5
     training_runs_root: Path = Path("/workspace/training-runs")
     ultralytics_training_image_digest: str = ""

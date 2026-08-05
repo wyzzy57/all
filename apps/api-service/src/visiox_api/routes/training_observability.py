@@ -4,7 +4,7 @@ from collections.abc import Generator
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
@@ -33,9 +33,15 @@ AvailabilityResponse = dict[str, SourceAvailabilityResponse]
 
 
 class ScalarPointResponse(BaseModel):
+    canonical_name: str = ""
+    raw_name: str = ""
+    unit: str = "scalar"
+    split: str | None = None
     step: float
+    epoch: float | None = None
     value: float
     timestamp: float
+    source: str = "unknown"
 
 
 class ScalarsResponse(BaseModel):
@@ -48,36 +54,9 @@ class ResourcesResponse(BaseModel):
     availability: AvailabilityResponse
 
 
-class GraphNodeResponse(BaseModel):
-    id: str
-    label: str
-    op: str
-    attributes: dict[str, Any]
-
-
-class GraphEdgeResponse(BaseModel):
+class SecondaryActionResponse(BaseModel):
     source: str
-    target: str
-
-
-class GraphResponse(BaseModel):
-    nodes: list[GraphNodeResponse]
-    edges: list[GraphEdgeResponse]
-    availability: AvailabilityResponse
-
-
-class HistogramBucketResponse(BaseModel):
-    lower: float
-    upper: float
-    count: float
-
-
-class HistogramResponse(BaseModel):
-    kind: Literal["weight", "gradient"]
-    tag: str
-    step: int
-    buckets: list[HistogramBucketResponse]
-    availability: AvailabilityResponse
+    url: str
 
 
 class SummaryResponse(BaseModel):
@@ -91,9 +70,7 @@ class SummaryResponse(BaseModel):
     environment: dict[str, Any] = Field(default_factory=dict)
     latest_metrics: dict[str, float] = Field(default_factory=dict)
     available_scalar_keys: list[str] = Field(default_factory=list)
-    available_histograms: dict[Literal["weight", "gradient"], list[str]] = Field(
-        default_factory=lambda: {"weight": [], "gradient": []}
-    )
+    secondary_actions: list[SecondaryActionResponse] = Field(default_factory=list)
     availability: AvailabilityResponse
 
 
@@ -159,6 +136,18 @@ def _get_training_job(session: Session, actor: User, training_job_id: str) -> Tr
     return job
 
 
+def _observability_adapter(
+    service: TrainingObservabilityService, pipeline: TrainingPipeline
+) -> Any:
+    try:
+        return service.for_pipeline(pipeline)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+
 def _parse_scalar_keys(values: list[str]) -> list[str]:
     return [key for value in values for item in value.split(",") if (key := item.strip())]
 
@@ -203,7 +192,7 @@ def get_training_observability_summary(
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
     task = session.get(Task, job.task_id) if job.task_id else None
-    summary = service.for_engine(pipeline.engine).summary(job, pipeline, task)
+    summary = _observability_adapter(service, pipeline).summary(job, pipeline, task)
     pipeline_data = summary.get("pipeline") if isinstance(summary.get("pipeline"), dict) else {}
     summary_timing = summary.get("timing") if isinstance(summary.get("timing"), dict) else {}
     timing = {**_default_timing(job), **summary_timing}
@@ -222,9 +211,9 @@ def get_training_observability_summary(
         available_scalar_keys=summary.get("available_scalar_keys")
         if isinstance(summary.get("available_scalar_keys"), list)
         else [],
-        available_histograms=summary.get("available_histograms")
-        if isinstance(summary.get("available_histograms"), dict)
-        else {"weight": [], "gradient": []},
+        secondary_actions=summary.get("secondary_actions")
+        if isinstance(summary.get("secondary_actions"), list)
+        else [],
         availability=summary["availability"],
     )
 
@@ -248,7 +237,7 @@ def get_training_observability_scalars(
     if not scalar_keys:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="At least one scalar key is required")
     return ScalarsResponse.model_validate(
-        service.for_engine(pipeline.engine).scalars(job, scalar_keys, start_step, end_step, max_points)
+        _observability_adapter(service, pipeline).scalars(job, scalar_keys, start_step, end_step, max_points)
     )
 
 
@@ -267,33 +256,8 @@ def get_training_observability_resources(
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
     return ResourcesResponse.model_validate(
-        service.for_engine(pipeline.engine).resources(job, start_step, end_step, max_points)
+        _observability_adapter(service, pipeline).resources(job, start_step, end_step, max_points)
     )
-
-
-@router.get("/graph", response_model=GraphResponse)
-def get_training_observability_graph(
-    training_job_id: str,
-    session: Session = Depends(get_training_observability_session),
-    actor: User = Depends(get_current_user),
-    service: TrainingObservabilityService = Depends(get_training_observability_service),
-) -> GraphResponse:
-    job = _get_training_job(session, actor, training_job_id)
-    return GraphResponse.model_validate(service.get_graph(job))
-
-
-@router.get("/histograms", response_model=HistogramResponse)
-def get_training_observability_histogram(
-    training_job_id: str,
-    kind: Literal["weight", "gradient"],
-    tag: str = Query(min_length=1),
-    step: int = Query(ge=0),
-    session: Session = Depends(get_training_observability_session),
-    actor: User = Depends(get_current_user),
-    service: TrainingObservabilityService = Depends(get_training_observability_service),
-) -> HistogramResponse:
-    job = _get_training_job(session, actor, training_job_id)
-    return HistogramResponse.model_validate(service.get_histogram(job, kind, tag, step))
 
 
 @router.get("/analysis", response_model=AnalysisResponse)
@@ -307,7 +271,7 @@ def get_training_observability_analysis(
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
-    return AnalysisResponse.model_validate(service.for_engine(pipeline.engine).analysis(job))
+    return AnalysisResponse.model_validate(_observability_adapter(service, pipeline).analysis(job))
 
 
 @router.get("/artifacts", response_model=ObservabilityArtifactsResponse)
@@ -321,7 +285,7 @@ def get_training_observability_artifacts(
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
-    return ObservabilityArtifactsResponse.model_validate(service.for_engine(pipeline.engine).artifacts(job))
+    return ObservabilityArtifactsResponse.model_validate(_observability_adapter(service, pipeline).artifacts(job))
 
 
 @router.get("/artifacts/{artifact_path:path}")
@@ -337,7 +301,7 @@ def download_training_observability_artifact(
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
-    listed = service.for_engine(pipeline.engine).artifacts(job)
+    listed = _observability_adapter(service, pipeline).artifacts(job)
     if artifact_path not in {item.get("path") for item in listed.get("items", [])}:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found")
     name = Path(artifact_path).name

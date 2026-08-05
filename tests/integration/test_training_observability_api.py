@@ -54,12 +54,18 @@ class FakeObservabilityService:
 
         return Adapter()
 
+    def for_pipeline(self, pipeline: TrainingPipeline):
+        return self.for_engine(pipeline.framework or pipeline.engine)
+
     @property
     def availability(self) -> dict[str, dict[str, bool | str | None]]:
         return {
             "mlflow": {"available": not self.source_failed, "reason": "offline" if self.source_failed else None},
             "tensorboard": {"available": True, "reason": None},
+            "visualdl": {"available": False, "reason": "not configured"},
             "progress": {"available": True, "reason": None},
+            "resources": {"available": True, "reason": None},
+            "logs": {"available": True, "reason": None},
             "artifacts": {"available": True, "reason": None},
         }
 
@@ -75,7 +81,9 @@ class FakeObservabilityService:
             "environment": {"device": "cpu"},
             "latest_metrics": {"metrics.map50": 0.51},
             "available_scalar_keys": ["train.box_loss", "metrics.map50"],
-            "available_histograms": {"weight": ["weights/model.0.conv.weight"], "gradient": []},
+            "secondary_actions": [
+                {"source": "tensorboard", "url": "http://tensorboard.test"}
+            ],
             "availability": self.availability,
         }
 
@@ -104,14 +112,6 @@ class FakeObservabilityService:
     ) -> dict[str, Any]:
         del job, start_step, end_step, max_points, engine
         return {"series": {"system.cpu_percent": []}, "availability": self.availability}
-
-    def get_graph(self, job: TrainingJob) -> dict[str, Any]:
-        del job
-        return {"nodes": [], "edges": [], "availability": self.availability}
-
-    def get_histogram(self, job: TrainingJob, kind: str, tag: str, step: int) -> dict[str, Any]:
-        del job
-        return {"kind": kind, "tag": tag, "step": step, "buckets": [], "availability": self.availability}
 
     def get_analysis(self, job: TrainingJob, *, engine: str = "yolo26") -> dict[str, Any]:
         del job, engine
@@ -294,11 +294,16 @@ def test_observability_summary_returns_pipeline_job_and_availability(client, see
         "environment": {"device": "cpu"},
         "latest_metrics": {"metrics.map50": 0.51},
         "available_scalar_keys": ["train.box_loss", "metrics.map50"],
-        "available_histograms": {"weight": ["weights/model.0.conv.weight"], "gradient": []},
+        "secondary_actions": [
+            {"source": "tensorboard", "url": "http://tensorboard.test"}
+        ],
         "availability": {
             "mlflow": {"available": True, "reason": None},
             "tensorboard": {"available": True, "reason": None},
+            "visualdl": {"available": False, "reason": "not configured"},
             "progress": {"available": True, "reason": None},
+            "resources": {"available": True, "reason": None},
+            "logs": {"available": True, "reason": None},
             "artifacts": {"available": True, "reason": None},
         },
     }
@@ -328,16 +333,27 @@ def test_real_service_summary_flows_through_route_and_reuses_event_cache_across_
         "metrics/mAP50(B)": 0.55,
     }
     assert summary_response.json()["available_scalar_keys"] == ["metrics.map50", "train.box_loss", "val.box_loss"]
-    assert summary_response.json()["available_histograms"] == {
-        "weight": ["weights/model.0.conv.weight"],
-        "gradient": [],
-    }
-    assert graph_response.status_code == 200
+    assert "available_histograms" not in summary_response.json()
+    assert graph_response.status_code == 404
     assert resources_response.status_code == 200
     assert resources_response.json()["series"]["system.cpu_percent"] == [
-        {"step": 2.0, "value": 35.0, "timestamp": 2.0},
+        {
+            "canonical_name": "system.cpu.utilization",
+            "raw_name": "system.cpu_percent",
+            "unit": "percent",
+            "split": None,
+            "step": 2.0,
+            "epoch": None,
+            "value": 35.0,
+            "timestamp": 2.0,
+            "source": "progress",
+        },
     ]
     assert scalar_response.status_code == 200
+    train_point = scalar_response.json()["series"]["train.box_loss"][0]
+    assert train_point["canonical_name"] == "loss.box"
+    assert train_point["raw_name"] == "train/box_loss"
+    assert train_point["source"] == "mlflow"
     assert len(accumulators) == 1
     assert accumulators[0].reload_count == 1
 
@@ -412,7 +428,7 @@ def test_observability_graph_returns_404_for_missing_job(client) -> None:
     response = client.get("/training-jobs/missing/observability/graph")
 
     assert response.status_code == 404
-    assert response.json()["detail"] == "Training job not found"
+    assert response.json()["detail"] == "Not Found"
 
 
 def test_observability_summary_returns_404_for_missing_pipeline(client, session_factory) -> None:
@@ -433,12 +449,51 @@ def test_observability_summary_returns_404_for_missing_pipeline(client, session_
     assert response.json()["detail"] == "Pipeline not found"
 
 
-def test_observability_histogram_requires_weight_or_gradient_kind(client, seeded_training_job) -> None:
+def test_observability_unknown_framework_returns_explicit_422(
+    real_service_client, seeded_training_job, session_factory
+) -> None:
+    client, _, _ = real_service_client
+    with session_factory() as session:
+        pipeline = session.get(TrainingPipeline, seeded_training_job.pipeline_id)
+        assert pipeline is not None
+        pipeline.framework = "mystery"
+        pipeline.adapter_key = "mystery.object_detection.v1"
+        session.commit()
+
+    response = client.get(
+        f"/training-jobs/{seeded_training_job.id}/observability/summary"
+    )
+
+    assert response.status_code == 422
+    assert "Unknown adapter" in response.json()["detail"]
+
+
+def test_observability_unknown_adapter_version_returns_explicit_422(
+    real_service_client, seeded_training_job, session_factory
+) -> None:
+    client, _, _ = real_service_client
+    with session_factory() as session:
+        pipeline = session.get(TrainingPipeline, seeded_training_job.pipeline_id)
+        assert pipeline is not None
+        pipeline.framework = "ultralytics"
+        pipeline.adapter_key = "ultralytics.object_detection.v1"
+        pipeline.adapter_version = "9.9.9"
+        session.commit()
+
+    response = client.get(
+        f"/training-jobs/{seeded_training_job.id}/observability/summary"
+    )
+
+    assert response.status_code == 422
+    assert "Unknown version" in response.json()["detail"]
+
+
+def test_observability_histogram_is_not_part_of_native_contract(client, seeded_training_job) -> None:
     response = client.get(
         f"/training-jobs/{seeded_training_job.id}/observability/histograms?kind=activation&tag=weights.layer&step=1"
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 404
 
 
 def test_observability_source_failure_remains_http_200(client, seeded_training_job) -> None:

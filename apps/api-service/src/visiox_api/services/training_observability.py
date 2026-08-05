@@ -15,6 +15,8 @@ from visiox_api.services.llm_training_analysis import analyze_llm_training
 
 
 _DEFAULT_MAX_POINTS = 2_000
+_OBSERVABILITY_MAX_FILE_BYTES = 8 * 1024 * 1024
+_OBSERVABILITY_MAX_LINES = 10_000
 _RESOURCE_SCALAR_KEYS = frozenset(
     {
         "system.cpu_percent",
@@ -27,6 +29,7 @@ _RESOURCE_SCALAR_KEYS = frozenset(
     }
 )
 _SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9-]+$")
+_OBSERVABILITY_ADAPTERS: dict[str, type[Any]] | None = None
 
 
 class ObservabilitySourceError(RuntimeError):
@@ -87,22 +90,80 @@ class TrainingObservabilityService:
         *,
         mlflow_client_factory: Callable[[str], Any] | None = None,
         event_accumulator_factory: Callable[[str], Any] | None = None,
+        visualdl_reader_factory: Callable[[str], Any] | None = None,
     ) -> None:
         self.settings = settings
         self._mlflow_client_factory = mlflow_client_factory or self._default_mlflow_client
         self._event_accumulator_factory = event_accumulator_factory or self._default_event_accumulator
+        self._visualdl_reader_factory = (
+            visualdl_reader_factory or self._default_visualdl_reader
+        )
         self._event_accumulators: OrderedDict[tuple[Path, int], Any] = OrderedDict()
         self._event_accumulator_lock = Lock()
 
     def for_engine(self, engine: str) -> Any:
-        from visiox_api.services.observability import (
+        global _OBSERVABILITY_ADAPTERS
+        from visiox_api.services.observability.llamafactory import (
             LlamaFactoryObservabilityAdapter,
+        )
+        from visiox_api.services.observability.paddlex import (
+            PaddleXObservabilityAdapter,
+        )
+        from visiox_api.services.observability.ultralytics import (
             UltralyticsObservabilityAdapter,
         )
 
-        if engine == "llamafactory":
-            return LlamaFactoryObservabilityAdapter(self)
-        return UltralyticsObservabilityAdapter(self)
+        if _OBSERVABILITY_ADAPTERS is None:
+            _OBSERVABILITY_ADAPTERS = {
+                "yolo26": UltralyticsObservabilityAdapter,
+                "ultralytics": UltralyticsObservabilityAdapter,
+                "llamafactory": LlamaFactoryObservabilityAdapter,
+                "paddlex": PaddleXObservabilityAdapter,
+            }
+        adapter_type = _OBSERVABILITY_ADAPTERS.get(engine)
+        if adapter_type is None:
+            raise ValueError(f"Unknown observability framework {engine!r}")
+        return adapter_type(self)
+
+    def for_pipeline(self, pipeline: Any) -> Any:
+        from visiox_api.services.framework_adapters import FrameworkAdapterCatalog
+        from visiox_training.errors import FrameworkAdapterError
+        from visiox_training.registry import AdapterRegistry
+
+        framework = getattr(pipeline, "framework", None)
+        adapter_key = getattr(pipeline, "adapter_key", None)
+        adapter_version = getattr(pipeline, "adapter_version", None)
+        if adapter_key:
+            catalog = FrameworkAdapterCatalog(self.settings)
+            try:
+                registered = (
+                    catalog.registry.get(adapter_key, str(adapter_version))
+                    if adapter_version
+                    else next(
+                        (
+                            adapter
+                            for adapter in catalog.registry.list()
+                            if adapter.adapter_key == adapter_key
+                        ),
+                        None,
+                    )
+                )
+            except FrameworkAdapterError as exc:
+                raise ValueError(str(exc)) from exc
+            if registered is None:
+                raise ValueError(f"Unknown observability adapter {adapter_key!r}")
+            if framework and registered.framework != framework:
+                raise ValueError(
+                    f"Adapter {adapter_key!r} does not belong to framework {framework!r}"
+                )
+            framework = framework or registered.framework
+        if not framework:
+            engine = str(getattr(pipeline, "engine", ""))
+            try:
+                framework = AdapterRegistry.legacy_engine_mapping(engine).framework
+            except Exception:
+                framework = engine
+        return self.for_engine(str(framework))
 
     def get_summary(self, job: Any, pipeline: Any, task: Any) -> dict[str, Any]:
         snapshot: dict[str, Any] = {}
@@ -128,7 +189,6 @@ class TrainingObservabilityService:
                         latest_metrics[str(name)] = float(value)
                         scalar_keys.add(_normalize_metric_name(str(name)))
 
-        available_histograms: dict[str, list[str]] = {"weight": [], "gradient": []}
         try:
             tags = self._event_accumulator(job).Tags()
             if not isinstance(tags, dict):
@@ -142,12 +202,6 @@ class TrainingObservabilityService:
             tensorboard_availability = (False, str(exc))
         for tag in tags.get("scalars", []):
             scalar_keys.add(_normalize_metric_name(str(tag)))
-        for tag in tags.get("histograms", []):
-            tag_name = str(tag)
-            if tag_name.startswith("weights/"):
-                available_histograms["weight"].append(tag_name)
-            elif tag_name.startswith("gradients/"):
-                available_histograms["gradient"].append(tag_name)
 
         snapshot_metrics = snapshot.get("latest_metrics")
         if isinstance(snapshot_metrics, dict):
@@ -166,9 +220,27 @@ class TrainingObservabilityService:
                     for name, value in sample.items():
                         if name not in {"step", "timestamp"} and isinstance(value, int | float):
                             scalar_keys.add(_normalize_metric_name(str(name)))
+        if getattr(pipeline, "engine", "yolo26") == "paddlex":
+            metric_samples = self._jsonl_samples(job, "visiox-metrics.jsonl")
+            for sample in metric_samples:
+                metrics = sample.get("metrics")
+                if not isinstance(metrics, dict):
+                    continue
+                for name, value in metrics.items():
+                    if not isinstance(value, int | float) or isinstance(value, bool):
+                        continue
+                    latest_metrics[str(name)] = float(value)
+                    scalar_keys.add(
+                        self.for_engine("paddlex")
+                        .metric_identity(str(name))
+                        .canonical_name
+                    )
         return {
             "job_id": str(job.id),
-            "engine": str(getattr(pipeline, "engine", "yolo26")),
+            "engine": str(
+                getattr(pipeline, "framework", None)
+                or getattr(pipeline, "engine", "yolo26")
+            ),
             "status": getattr(job, "status", None),
             "pipeline": {
                 "id": getattr(pipeline, "id", None),
@@ -186,13 +258,15 @@ class TrainingObservabilityService:
             "available_scalar_keys": sorted(
                 key for key in scalar_keys if key and key not in _RESOURCE_SCALAR_KEYS
             ),
-            "available_histograms": {
-                kind: sorted(set(values)) for kind, values in available_histograms.items()
-            },
+            "secondary_actions": self._secondary_actions(),
             "availability": self._availability(
                 mlflow=mlflow_availability,
                 tensorboard=tensorboard_availability,
                 progress=progress_availability,
+                visualdl=self._visualdl_availability(job, snapshot),
+                resources=self._resources_availability(job, snapshot),
+                logs=self._logs_availability(job),
+                artifacts=self._artifacts_availability(job),
             ),
         }
 
@@ -211,7 +285,9 @@ class TrainingObservabilityService:
         mlflow_available = True
         mlflow_reason: str | None = None
         try:
-            for key, points in self._mlflow_scalars(job, normalized_keys).items():
+            for key, points in self._mlflow_scalars(
+                job, normalized_keys, engine=engine
+            ).items():
                 series[key] = points
         except ObservabilitySourceError as exc:
             mlflow_available = False
@@ -224,9 +300,25 @@ class TrainingObservabilityService:
             tags = accumulator.Tags().get("scalars", [])
             for tag in tags:
                 normalized_tag = _normalize_metric_name(tag)
-                if normalized_tag not in series or series[normalized_tag]:
+                identity = self.for_engine(engine).metric_identity(str(tag))
+                result_key = next(
+                    (
+                        key
+                        for key in (identity.canonical_name, normalized_tag)
+                        if key in series
+                    ),
+                    None,
+                )
+                if result_key is None or series[result_key]:
                     continue
-                series[normalized_tag] = self._scalar_points(accumulator.Scalars(tag), start_step, end_step)
+                series[result_key] = self._scalar_points(
+                    accumulator.Scalars(tag),
+                    start_step,
+                    end_step,
+                    raw_name=str(tag),
+                    engine=engine,
+                    source="tensorboard",
+                )
         except ObservabilitySourceError as exc:
             tensorboard_available = False
             tensorboard_reason = exc.message
@@ -243,10 +335,30 @@ class TrainingObservabilityService:
                     continue
                 for name, value in sample.items():
                     normalized = _normalize_metric_name(str(name))
-                    if normalized in jsonl_keys and isinstance(value, int | float):
-                        series[normalized].append(
-                            {"step": float(step), "value": float(value), "timestamp": float(timestamp)}
+                    identity = self.for_engine(engine).metric_identity(str(name))
+                    result_key = next(
+                        (
+                            key
+                            for key in (identity.canonical_name, normalized)
+                            if key in jsonl_keys
+                        ),
+                        None,
+                    )
+                    if result_key is not None and isinstance(value, int | float):
+                        series[result_key].append(
+                            self._scalar_point(
+                                identity,
+                                step=step,
+                                epoch=sample.get("epoch"),
+                                value=value,
+                                timestamp=timestamp,
+                                source="jsonl",
+                            )
                         )
+
+        visualdl_availability: tuple[bool, str | None] | None = None
+        if engine == "paddlex":
+            visualdl_availability = self._fill_paddlex_fallbacks(job, series)
 
         progress_keys = {key for key, points in series.items() if not points}
         if progress_keys:
@@ -262,9 +374,25 @@ class TrainingObservabilityService:
                             continue
                         for name, value in sample.items():
                             normalized = _normalize_metric_name(str(name))
-                            if normalized in progress_keys and isinstance(value, int | float):
-                                series[normalized].append(
-                                    {"step": float(step), "value": float(value), "timestamp": float(timestamp)}
+                            identity = self.for_engine(engine).metric_identity(str(name))
+                            result_key = next(
+                                (
+                                    key
+                                    for key in (identity.canonical_name, normalized)
+                                    if key in progress_keys
+                                ),
+                                None,
+                            )
+                            if result_key is not None and isinstance(value, int | float):
+                                series[result_key].append(
+                                    self._scalar_point(
+                                        identity,
+                                        step=step,
+                                        epoch=sample.get("epoch"),
+                                        value=value,
+                                        timestamp=timestamp,
+                                        source="progress",
+                                    )
                                 )
             except ObservabilitySourceError:
                 pass
@@ -276,9 +404,11 @@ class TrainingObservabilityService:
         return {
             "series": series,
             "availability": self._availability(
+                job=job,
                 mlflow=(mlflow_available, mlflow_reason),
                 tensorboard=(tensorboard_available, tensorboard_reason),
                 progress=self._progress_availability(job),
+                visualdl=visualdl_availability,
             ),
         }
 
@@ -311,8 +441,16 @@ class TrainingObservabilityService:
                 for name, value in sample.items():
                     if name in {"step", "timestamp"} or not isinstance(value, (int, float)):
                         continue
+                    identity = self._resource_metric_identity(str(name))
                     series.setdefault(name, []).append(
-                        {"step": float(step), "value": float(value), "timestamp": float(timestamp)}
+                        self._scalar_point(
+                            identity,
+                            step=step,
+                            epoch=sample.get("epoch"),
+                            value=value,
+                            timestamp=timestamp,
+                            source="progress",
+                        )
                     )
         except ObservabilitySourceError as exc:
             progress_available = False
@@ -332,6 +470,7 @@ class TrainingObservabilityService:
         return {
             "series": series,
             "availability": self._availability(
+                job=job,
                 mlflow=self._mlflow_availability(job),
                 tensorboard=self._event_availability(job),
                 progress=(progress_available, progress_reason),
@@ -340,11 +479,15 @@ class TrainingObservabilityService:
 
     def get_analysis(self, job: Any, *, engine: str = "yolo26") -> dict[str, Any]:
         if engine != "llamafactory":
-            return {"findings": [], "availability": self._availability(
-                mlflow=self._mlflow_availability(job),
-                tensorboard=self._event_availability(job),
-                progress=self._progress_availability(job),
-            )}
+            return {
+                "findings": [],
+                "availability": self._availability(
+                    job=job,
+                    mlflow=self._mlflow_availability(job),
+                    tensorboard=self._event_availability(job),
+                    progress=self._progress_availability(job),
+                ),
+            }
         metric_samples = self._jsonl_samples(job, "visiox-metrics.jsonl")
         resource_samples = self._jsonl_samples(job, "resource_metrics.jsonl")
         scalar_names = {
@@ -361,6 +504,7 @@ class TrainingObservabilityService:
         return {
             "findings": analyze_llm_training(scalar_series, resource_series),
             "availability": self._availability(
+                job=job,
                 mlflow=self._mlflow_availability(job),
                 tensorboard=self._event_availability(job),
                 progress=self._progress_availability(job),
@@ -400,93 +544,25 @@ class TrainingObservabilityService:
             reason = str(exc)
         return {
             "items": artifacts,
-            "availability": {
-                "artifacts": {"available": reason is None, "reason": reason},
-            },
-        }
-
-    def get_graph(self, job: Any) -> dict[str, Any]:
-        tensorboard_available = True
-        tensorboard_reason: str | None = None
-        nodes: list[dict[str, Any]] = []
-        edges: list[dict[str, str]] = []
-        try:
-            graph = self._event_accumulator(job).Graph()
-        except ObservabilitySourceError as exc:
-            tensorboard_available = False
-            tensorboard_reason = exc.message
-        except Exception as exc:
-            tensorboard_available = False
-            tensorboard_reason = str(exc)
-        else:
-            for node in getattr(graph, "node", []):
-                if getattr(node, "op", "") == "Placeholder":
-                    continue
-                node_id = str(getattr(node, "name", ""))
-                label = self._graph_label(node)
-                nodes.append(
-                    {
-                        "id": node_id,
-                        "label": label,
-                        "op": str(getattr(node, "op", "")),
-                        "attributes": {},
-                    }
-                )
-                for input_name in getattr(node, "input", []):
-                    source = str(input_name).lstrip("^").split(":", 1)[0]
-                    if source:
-                        edges.append({"source": source, "target": node_id})
-        return {
-            "nodes": nodes,
-            "edges": edges,
             "availability": self._availability(
+                job=job,
                 mlflow=self._mlflow_availability(job),
-                tensorboard=(tensorboard_available, tensorboard_reason),
+                tensorboard=self._event_availability(job),
                 progress=self._progress_availability(job),
+                artifacts=(reason is None, reason),
             ),
         }
 
-    def get_histogram(self, job: Any, kind: str, tag: str, step: int) -> dict[str, Any]:
-        buckets: list[dict[str, float]] = []
-        tensorboard_available = True
-        tensorboard_reason: str | None = None
-        try:
-            accumulator = self._event_accumulator(job)
-            events = accumulator.Histograms(tag)
-            event = next((candidate for candidate in events if int(candidate.step) == step), None)
-            if event is None:
-                raise ObservabilitySourceError("tensorboard", "histogram step not found")
-            value = event.histogram_value
-            lower = float(getattr(value, "min", -1.0))
-            for upper, count in zip(getattr(value, "bucket_limit", []), getattr(value, "bucket", []), strict=True):
-                buckets.append({"lower": lower, "upper": float(upper), "count": float(count)})
-                lower = float(upper)
-        except ObservabilitySourceError as exc:
-            tensorboard_available = False
-            tensorboard_reason = exc.message
-        except Exception as exc:
-            tensorboard_available = False
-            tensorboard_reason = str(exc)
-        return {
-            "kind": kind,
-            "tag": tag,
-            "step": step,
-            "buckets": buckets,
-            "availability": self._availability(
-                mlflow=self._mlflow_availability(job),
-                tensorboard=(tensorboard_available, tensorboard_reason),
-                progress=self._progress_availability(job),
-            ),
-        }
-
-    def _mlflow_scalars(self, job: Any, keys: list[str]) -> dict[str, list[dict[str, float]]]:
+    def _mlflow_scalars(
+        self, job: Any, keys: list[str], *, engine: str
+    ) -> dict[str, list[dict[str, Any]]]:
         client, runs = self._mlflow_client_and_runs(job)
         if not runs:
             return {key: [] for key in keys}
 
         run = runs[0]
         run_id = str(run.info.run_id)
-        metric_names = self._mlflow_metric_names(run, keys)
+        metric_names = self._mlflow_metric_names(run, keys, engine=engine)
         result = {key: [] for key in keys}
         for normalized_key, names in metric_names.items():
             for name in names:
@@ -494,8 +570,19 @@ class TrainingObservabilityService:
                     history = client.get_metric_history(run_id, name)
                 except Exception as exc:
                     raise ObservabilitySourceError("mlflow", str(exc)) from exc
+                identity = self.for_engine(engine).metric_identity(name)
                 points = [
-                    {"step": float(item.step), "value": float(item.value), "timestamp": float(item.timestamp) / 1_000}
+                    {
+                        "canonical_name": identity.canonical_name,
+                        "raw_name": identity.raw_name,
+                        "unit": identity.unit,
+                        "split": identity.split,
+                        "step": float(item.step),
+                        "epoch": None,
+                        "value": float(item.value),
+                        "timestamp": float(item.timestamp) / 1_000,
+                        "source": "mlflow",
+                    }
                     for item in history
                 ]
                 if points:
@@ -531,16 +618,18 @@ class TrainingObservabilityService:
 
     def _event_accumulator(self, job: Any) -> Any:
         run_path = self._run_path(job)
-        event_files = list(run_path.glob("events.out.tfevents.*"))
+        event_files = list(run_path.rglob("events.out.tfevents.*"))
         if not event_files:
             raise ObservabilitySourceError("tensorboard", "event file not found")
-        newest_mtime = max(path.stat().st_mtime_ns for path in event_files)
-        key = (run_path, newest_mtime)
+        newest = max(event_files, key=lambda path: path.stat().st_mtime_ns)
+        event_path = newest.parent
+        newest_mtime = newest.stat().st_mtime_ns
+        key = (event_path, newest_mtime)
         with self._event_accumulator_lock:
             accumulator = self._event_accumulators.get(key)
             if accumulator is None:
                 try:
-                    accumulator = self._event_accumulator_factory(str(run_path))
+                    accumulator = self._event_accumulator_factory(str(event_path))
                     accumulator.Reload()
                 except Exception as exc:
                     raise ObservabilitySourceError("tensorboard", str(exc)) from exc
@@ -577,7 +666,7 @@ class TrainingObservabilityService:
             return []
         samples: list[dict[str, Any]] = []
         try:
-            for line in path.read_text(encoding="utf-8").splitlines():
+            for line in self._bounded_text_lines(path):
                 try:
                     payload = json.loads(line)
                 except ValueError:
@@ -587,6 +676,20 @@ class TrainingObservabilityService:
         except OSError:
             return []
         return samples
+
+    @staticmethod
+    def _bounded_text_lines(path: Path) -> list[str]:
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            length = min(size, _OBSERVABILITY_MAX_FILE_BYTES)
+            stream.seek(-length, 2)
+            payload = stream.read(length)
+        if size > length:
+            _, _, payload = payload.partition(b"\n")
+        return payload.decode("utf-8", errors="replace").splitlines()[
+            -_OBSERVABILITY_MAX_LINES:
+        ]
 
     @staticmethod
     def _series_from_samples(samples: list[dict[str, Any]], name: str) -> list[dict[str, float]]:
@@ -600,8 +703,10 @@ class TrainingObservabilityService:
         return points
 
     @classmethod
-    def _resource_series_from_samples(cls, samples: list[dict[str, Any]]) -> dict[str, list[dict[str, float]]]:
-        series: dict[str, list[dict[str, float]]] = {}
+    def _resource_series_from_samples(
+        cls, samples: list[dict[str, Any]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        series: dict[str, list[dict[str, Any]]] = {}
         for sample in samples:
             step = sample.get("step")
             timestamp = sample.get("timestamp")
@@ -611,7 +716,14 @@ class TrainingObservabilityService:
                 if name in {"step", "timestamp", "gpus"} or not isinstance(value, int | float):
                     continue
                 series.setdefault(str(name), []).append(
-                    {"step": float(step), "timestamp": float(timestamp), "value": float(value)}
+                    cls._scalar_point(
+                        cls._resource_metric_identity(str(name)),
+                        step=step,
+                        epoch=sample.get("epoch"),
+                        timestamp=timestamp,
+                        value=value,
+                        source="resources",
+                    )
                 )
             gpus = sample.get("gpus")
             if not isinstance(gpus, list):
@@ -627,7 +739,14 @@ class TrainingObservabilityService:
                         continue
                     key = f"gpu.{identifier}.{name}"
                     series.setdefault(key, []).append(
-                        {"step": float(step), "timestamp": float(timestamp), "value": float(value)}
+                        cls._scalar_point(
+                            cls._resource_metric_identity(key),
+                            step=step,
+                            epoch=sample.get("epoch"),
+                            timestamp=timestamp,
+                            value=value,
+                            source="resources",
+                        )
                     )
         return series
 
@@ -648,10 +767,16 @@ class TrainingObservabilityService:
         return MlflowClient(tracking_uri=tracking_uri)
 
     @staticmethod
+    def _default_visualdl_reader(file_path: str) -> Any:
+        from visualdl import LogReader
+
+        return LogReader(file_path=file_path)
+
+    @staticmethod
     def _default_event_accumulator(run_path: str) -> Any:
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-        return EventAccumulator(run_path, size_guidance={"histograms": 0})
+        return EventAccumulator(run_path, size_guidance={"scalars": 0})
 
     def _point_limit(self, max_points: int | None) -> int:
         limit = getattr(self.settings, "observability_max_points", _DEFAULT_MAX_POINTS)
@@ -675,10 +800,29 @@ class TrainingObservabilityService:
             key=lambda point: (point["step"], point["timestamp"]),
         )
 
-    @staticmethod
-    def _scalar_points(events: Iterable[Any], start_step: int | None, end_step: int | None) -> list[dict[str, float]]:
+    def _scalar_points(
+        self,
+        events: Iterable[Any],
+        start_step: int | None,
+        end_step: int | None,
+        *,
+        raw_name: str,
+        engine: str,
+        source: str,
+    ) -> list[dict[str, Any]]:
+        identity = self.for_engine(engine).metric_identity(raw_name)
         points = [
-            {"step": float(event.step), "value": float(event.value), "timestamp": float(event.wall_time)}
+            {
+                "canonical_name": identity.canonical_name,
+                "raw_name": identity.raw_name,
+                "unit": identity.unit,
+                "split": identity.split,
+                "step": float(event.step),
+                "epoch": None,
+                "value": float(event.value),
+                "timestamp": float(event.wall_time),
+                "source": source,
+            }
             for event in events
         ]
         return TrainingObservabilityService._filter_points(points, start_step, end_step)
@@ -692,26 +836,243 @@ class TrainingObservabilityService:
                 return observability["mlflow_run_name"]
         return f"job-{job.id}"
 
-    @staticmethod
-    def _mlflow_metric_names(run: Any, keys: list[str]) -> dict[str, list[str]]:
+    def _mlflow_metric_names(
+        self, run: Any, keys: list[str], *, engine: str
+    ) -> dict[str, list[str]]:
         names = {key: [key, key.replace(".", "/", 1)] for key in keys}
         metrics = getattr(getattr(run, "data", None), "metrics", {})
         if not isinstance(metrics, dict):
             return names
         for name in metrics:
             normalized = _normalize_metric_name(str(name))
-            if normalized in names and name not in names[normalized]:
-                names[normalized].insert(0, str(name))
+            identity = self.for_engine(engine).metric_identity(str(name))
+            result_key = next(
+                (
+                    key
+                    for key in (identity.canonical_name, normalized)
+                    if key in names
+                ),
+                None,
+            )
+            if result_key is not None and name not in names[result_key]:
+                names[result_key].insert(0, str(name))
         return names
 
+    def _fill_paddlex_fallbacks(
+        self, job: Any, series: dict[str, list[dict[str, Any]]]
+    ) -> tuple[bool, str | None]:
+        visualdl_availability = self._fill_visualdl_scalars(job, series)
+        samples = self._jsonl_samples(job, "visiox-metrics.jsonl")
+        self._fill_metric_samples(series, samples, source="jsonl")
+        if all(series.values()):
+            return visualdl_availability
+        from visiox_api.services.observability.paddlex import parse_log_line
+
+        path = self._run_path(job) / "stdout.log"
+        if not path.is_file():
+            return visualdl_availability
+        try:
+            log_samples: list[dict[str, Any]] = []
+            current_step = 0
+            current_epoch: float | None = None
+            for index, line in enumerate(self._bounded_text_lines(path), start=1):
+                sample = parse_log_line(line)
+                if not sample.get("metrics"):
+                    continue
+                if isinstance(sample.get("step"), int | float):
+                    current_step = int(sample["step"])
+                elif current_step == 0:
+                    current_step = index
+                if isinstance(sample.get("epoch"), int | float):
+                    current_epoch = float(sample["epoch"])
+                sample.setdefault("step", current_step)
+                if current_epoch is not None:
+                    sample.setdefault("epoch", current_epoch)
+                log_samples.append(sample)
+        except OSError:
+            return visualdl_availability
+        timestamp = path.stat().st_mtime
+        for sample in log_samples:
+            sample.setdefault("timestamp", timestamp)
+        self._fill_metric_samples(series, log_samples, source="logs")
+        return visualdl_availability
+
+    def _fill_visualdl_scalars(
+        self, job: Any, series: dict[str, list[dict[str, Any]]]
+    ) -> tuple[bool, str | None]:
+        try:
+            record_paths = sorted(
+                path
+                for path in self._run_path(job).rglob("*")
+                if path.is_file() and "vdlrecords" in path.name.lower()
+            )
+        except OSError as exc:
+            return False, str(exc)
+        if not record_paths:
+            return False, "VisualDL output not found"
+
+        errors: list[str] = []
+        points_read = 0
+        for record_path in record_paths:
+            try:
+                reader = self._visualdl_reader_factory(str(record_path))
+                tags = reader.get_tags()
+                if not isinstance(tags, dict):
+                    raise ValueError("VisualDL tags are invalid")
+                scalar_tags = tags.get("scalar", [])
+                if not isinstance(scalar_tags, list | tuple):
+                    raise ValueError("VisualDL scalar tags are invalid")
+                count, read_errors = self._fill_visualdl_record(
+                    reader, scalar_tags, series
+                )
+                points_read += count
+                errors.extend(read_errors)
+            except Exception as exc:
+                errors.append(str(exc))
+        if points_read:
+            return True, None
+        return False, errors[0] if errors else "VisualDL output could not be read"
+
+    def _fill_visualdl_record(
+        self,
+        reader: Any,
+        scalar_tags: list[Any] | tuple[Any, ...],
+        series: dict[str, list[dict[str, Any]]],
+    ) -> tuple[int, list[str]]:
+        missing = {key for key, points in series.items() if not points}
+        points_read = 0
+        errors: list[str] = []
+        for tag in scalar_tags:
+            raw_name = tag.decode("utf-8") if isinstance(tag, bytes) else str(tag)
+            identity = self.for_engine("paddlex").metric_identity(raw_name)
+            if identity.unit not in {"loss", "rate", "ratio"}:
+                continue
+            key = next(
+                (
+                    candidate
+                    for candidate in (
+                        identity.canonical_name,
+                        _normalize_metric_name(raw_name),
+                    )
+                    if candidate in missing
+                ),
+                None,
+            )
+            try:
+                values = reader.get_data("scalar", tag)
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            for value in values:
+                step = getattr(value, "id", None)
+                timestamp = getattr(value, "timestamp", None)
+                scalar = getattr(value, "value", None)
+                if not all(
+                    isinstance(item, int | float) and not isinstance(item, bool)
+                    for item in (step, timestamp, scalar)
+                ):
+                    continue
+                points_read += 1
+                if key is None:
+                    continue
+                series[key].append(
+                    self._scalar_point(
+                        identity,
+                        step=step,
+                        epoch=None,
+                        value=scalar,
+                        timestamp=timestamp,
+                        source="visualdl",
+                    )
+                )
+        return points_read, errors
+
+    def _fill_metric_samples(
+        self,
+        series: dict[str, list[dict[str, Any]]],
+        samples: list[dict[str, Any]],
+        *,
+        source: str,
+    ) -> None:
+        missing = {key for key, points in series.items() if not points}
+        for sample in samples:
+            metrics = sample.get("metrics")
+            if not isinstance(metrics, dict):
+                continue
+            step = sample.get("step")
+            timestamp = sample.get("timestamp")
+            if not isinstance(step, int | float) or not isinstance(
+                timestamp, int | float
+            ):
+                continue
+            for raw_name, value in metrics.items():
+                if not isinstance(value, int | float) or isinstance(value, bool):
+                    continue
+                identity = self.for_engine("paddlex").metric_identity(str(raw_name))
+                key = next(
+                    (
+                        candidate
+                        for candidate in (
+                            identity.canonical_name,
+                            _normalize_metric_name(str(raw_name)),
+                        )
+                        if candidate in missing
+                    ),
+                    None,
+                )
+                if key is None:
+                    continue
+                series[key].append(
+                    self._scalar_point(
+                        identity,
+                        step=step,
+                        epoch=sample.get("epoch"),
+                        value=value,
+                        timestamp=timestamp,
+                        source=source,
+                    )
+                )
+
     @staticmethod
-    def _graph_label(node: Any) -> str:
-        label = getattr(node, "name", "")
-        attribute = getattr(node, "attr", {}).get("label") if hasattr(getattr(node, "attr", {}), "get") else None
-        encoded = getattr(attribute, "s", None)
-        if isinstance(encoded, bytes):
-            return encoded.decode("utf-8", errors="replace")
-        return str(label)
+    def _scalar_point(
+        identity: Any,
+        *,
+        step: Any,
+        epoch: Any,
+        value: Any,
+        timestamp: Any,
+        source: str,
+    ) -> dict[str, Any]:
+        return {
+            "canonical_name": identity.canonical_name,
+            "raw_name": identity.raw_name,
+            "unit": identity.unit,
+            "split": identity.split,
+            "step": float(step),
+            "epoch": float(epoch) if isinstance(epoch, int | float) else None,
+            "value": float(value),
+            "timestamp": float(timestamp),
+            "source": source,
+        }
+
+    @staticmethod
+    def _resource_metric_identity(raw_name: str) -> Any:
+        from visiox_api.services.observability.base import MetricIdentity
+
+        canonical_name, unit = {
+            "system.cpu_percent": ("system.cpu.utilization", "percent"),
+            "cpu_percent": ("system.cpu.utilization", "percent"),
+            "system.memory_percent": ("system.memory.utilization", "percent"),
+            "system.memory_used_gb": ("system.memory.used", "gigabyte"),
+        }.get(raw_name, (raw_name, "scalar"))
+        if raw_name.startswith("gpu.") and raw_name.endswith(
+            "utilization_percent"
+        ):
+            canonical_name, unit = "system.gpu.utilization", "percent"
+        elif raw_name.startswith("gpu.") and "memory_used" in raw_name:
+            canonical_name = "system.gpu.memory_used"
+            unit = "megabyte" if raw_name.endswith("_mb") else "gigabyte"
+        return MetricIdentity(canonical_name, raw_name, unit, None)
 
     def _event_availability(self, job: Any) -> tuple[bool, str | None]:
         try:
@@ -727,16 +1088,112 @@ class TrainingObservabilityService:
             return False, exc.message
         return True, None
 
-    @staticmethod
+    def _visualdl_availability(
+        self, job: Any, snapshot: dict[str, Any] | None = None
+    ) -> tuple[bool, str | None]:
+        snapshot = snapshot or {}
+        availability = snapshot.get("availability")
+        visualdl = (
+            availability.get("visualdl") if isinstance(availability, dict) else None
+        )
+        if isinstance(visualdl, dict) and isinstance(
+            visualdl.get("available"), bool
+        ):
+            reason = visualdl.get("reason")
+            return visualdl["available"], str(reason) if reason is not None else None
+        try:
+            available = any(
+                "vdlrecords" in path.name.lower()
+                for path in self._run_path(job).rglob("*")
+                if path.is_file()
+            )
+        except OSError as exc:
+            return False, str(exc)
+        return available, None if available else "VisualDL output not found"
+
+    def _resources_availability(
+        self, job: Any, snapshot: dict[str, Any] | None = None
+    ) -> tuple[bool, str | None]:
+        snapshot = snapshot or {}
+        if "resources" in snapshot or "resource_metrics" in snapshot:
+            return True, None
+        if (self._run_path(job) / "resource_metrics.jsonl").is_file():
+            return True, None
+        return False, "resource metrics not found"
+
+    def _logs_availability(self, job: Any) -> tuple[bool, str | None]:
+        run_path = self._run_path(job)
+        available = any(
+            (run_path / name).is_file()
+            for name in ("stdout.log", "stderr.log", "train.log", "training.log")
+        )
+        return available, None if available else "training logs not found"
+
+    def _artifacts_availability(self, job: Any) -> tuple[bool, str | None]:
+        available = (self._run_path(job) / "artifact-manifest.json").is_file()
+        if not available:
+            metrics = getattr(job, "metrics", {})
+            available = isinstance(metrics, dict) and any(
+                key in metrics for key in ("artifacts", "weights", "adapter")
+            )
+        return available, None if available else "artifact manifest not found"
+
+    def _secondary_actions(self) -> list[dict[str, str]]:
+        actions: list[dict[str, str]] = []
+        for source, setting in (
+            ("mlflow", "mlflow_public_url"),
+            ("tensorboard", "tensorboard_public_url"),
+            ("visualdl", "visualdl_public_url"),
+        ):
+            url = getattr(self.settings, setting, None)
+            if isinstance(url, str) and url:
+                actions.append({"source": source, "url": url})
+        return actions
+
     def _availability(
+        self,
         *,
+        job: Any | None = None,
         mlflow: tuple[bool, str | None],
         tensorboard: tuple[bool, str | None],
         progress: tuple[bool, str | None],
+        visualdl: tuple[bool, str | None] | None = None,
+        resources: tuple[bool, str | None] | None = None,
+        logs: tuple[bool, str | None] | None = None,
+        artifacts: tuple[bool, str | None] | None = None,
     ) -> dict[str, dict[str, bool | str | None]]:
+        snapshot: dict[str, Any] = {}
+        if job is not None and (visualdl is None or resources is None):
+            try:
+                snapshot = self._progress_snapshot(job)
+            except ObservabilitySourceError:
+                pass
+        visualdl = visualdl or (
+            self._visualdl_availability(job, snapshot)
+            if job is not None
+            else (False, "not reported")
+        )
+        resources = resources or (
+            self._resources_availability(job, snapshot)
+            if job is not None
+            else (False, "not reported")
+        )
+        logs = logs or (
+            self._logs_availability(job)
+            if job is not None
+            else (False, "not reported")
+        )
+        artifacts = artifacts or (
+            self._artifacts_availability(job)
+            if job is not None
+            else (False, "not reported")
+        )
         return {
             "mlflow": {"available": mlflow[0], "reason": mlflow[1]},
             "tensorboard": {"available": tensorboard[0], "reason": tensorboard[1]},
+            "visualdl": {"available": visualdl[0], "reason": visualdl[1]},
             "progress": {"available": progress[0], "reason": progress[1]},
-            "artifacts": {"available": True, "reason": None},
+            "resources": {"available": resources[0], "reason": resources[1]},
+            "logs": {"available": logs[0], "reason": logs[1]},
+            "artifacts": {"available": artifacts[0], "reason": artifacts[1]},
         }

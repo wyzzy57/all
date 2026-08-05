@@ -23,13 +23,16 @@
             <el-icon><MoreFilled /></el-icon>
           </button>
           <div v-if="advancedMenuOpen" class="advanced-menu">
-            <button v-if="mlflowUrl" type="button" data-testid="open-mlflow" @click="openExternalTool(mlflowUrl)">
-              MLflow
+            <button
+              v-for="action in secondaryActions"
+              :key="action.source"
+              type="button"
+              :data-testid="`open-${action.source}`"
+              @click="openExternalTool(action.url)"
+            >
+              {{ externalActionLabel(action.source) }}
             </button>
-            <button v-if="tensorboardUrl" type="button" data-testid="open-tensorboard" @click="openExternalTool(tensorboardUrl)">
-              TensorBoard
-            </button>
-            <span v-if="!mlflowUrl && !tensorboardUrl">未配置外部工具</span>
+            <span v-if="secondaryActions.length === 0">未配置外部工具</span>
           </div>
         </div>
       </div>
@@ -322,8 +325,6 @@ type MetricsMode = "single" | "compare";
 const POLL_INTERVAL_MS = 5000;
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
 const route = useRoute();
-const mlflowUrl = import.meta.env.VITE_MLFLOW_URL as string | undefined;
-const tensorboardUrl = import.meta.env.VITE_TENSORBOARD_URL as string | undefined;
 const tabs: Array<{ id: DashboardTab; label: string }> = [
   { id: "overview", label: "概览" },
   { id: "metrics", label: "指标" },
@@ -362,6 +363,9 @@ let generation = 0;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
 const currentStatus = computed(() => summaryData.value?.status || selectedJob.value?.status || "queued");
+const secondaryActions = computed(() => summaryData.value?.secondary_actions ?? []);
+const mlflowUrl = computed(() => secondaryActions.value.find((action) => action.source === "mlflow")?.url);
+const tensorboardUrl = computed(() => secondaryActions.value.find((action) => action.source === "tensorboard")?.url);
 const selectedPipeline = computed(() => pipelines.value.find((pipeline) => pipeline.id === selectedJob.value?.pipeline_id));
 const isLlmRun = computed(() => summaryData.value?.engine === "llamafactory" || selectedPipeline.value?.engine === "llamafactory");
 const llmMetricResponse = computed(() => ({ series: scalarSeries.value, availability: scalarAvailability.value }));
@@ -565,6 +569,10 @@ function resetSelectedData() {
   metricsLoadedJobId = null;
   resourcesLoadedJobId = null;
   analysisLoadedJobId = null;
+}
+
+function externalActionLabel(source: string) {
+  return ({ mlflow: "MLflow", tensorboard: "TensorBoard", visualdl: "VisualDL" } as Record<string, string>)[source] || source;
 }
 
 function isActiveStatus(status: string) {

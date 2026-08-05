@@ -84,10 +84,11 @@ function summary(overrides: Record<string, unknown> = {}) {
       "metrics/mAP50-95(B)": 0.5234,
     },
     available_scalar_keys: ["train.box_loss", "metrics.map50"],
-    available_histograms: {
-      weight: ["weights/head.bias", "weights/stem.weight"],
-      gradient: ["gradients/head.bias"],
-    },
+    secondary_actions: [
+      { source: "mlflow", url: "https://mlflow.example.test" },
+      { source: "tensorboard", url: "https://tensorboard.example.test" },
+      { source: "visualdl", url: "https://visualdl.example.test" },
+    ],
     availability: {
       mlflow: { available: false, reason: "offline" },
       tensorboard: { available: true, reason: null },
@@ -181,7 +182,6 @@ describe("TrainingVisualizationView", () => {
   });
 
   it("delegates graph and histogram inspection to the existing TensorBoard action", async () => {
-    vi.stubEnv("VITE_TENSORBOARD_URL", "https://tensorboard.example.test");
     const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
     const wrapper = mountView();
     await flushPromises();
@@ -190,6 +190,7 @@ describe("TrainingVisualizationView", () => {
     expect(wrapper.find('[data-testid="tab-histograms"]').exists()).toBe(false);
 
     await wrapper.get('[data-testid="advanced-menu-toggle"]').trigger("click");
+    expect(wrapper.get('[data-testid="open-visualdl"]').text()).toBe("VisualDL");
     await wrapper.get('[data-testid="open-tensorboard"]').trigger("click");
     expect(openSpy).toHaveBeenCalledWith(
       "https://tensorboard.example.test",
@@ -199,7 +200,6 @@ describe("TrainingVisualizationView", () => {
 
     wrapper.unmount();
     openSpy.mockRestore();
-    vi.unstubAllEnvs();
   });
 
   it("renders the real run list and complete native overview without an iframe", async () => {
@@ -447,8 +447,6 @@ describe("TrainingVisualizationView", () => {
   });
 
   it("opens configured advanced tools only after an explicit menu action", async () => {
-    vi.stubEnv("VITE_MLFLOW_URL", "https://mlflow.example.test");
-    vi.stubEnv("VITE_TENSORBOARD_URL", "https://tensorboard.example.test");
     const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
     const wrapper = mountView();
     await flushPromises();
@@ -461,7 +459,6 @@ describe("TrainingVisualizationView", () => {
 
     wrapper.unmount();
     openSpy.mockRestore();
-    vi.unstubAllEnvs();
   });
 
   it("mounts the metric chart only after data is visible and keeps that instance through polling", async () => {

@@ -3,8 +3,6 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "v
 
 import {
   api,
-  type TrainingObservabilityGraph,
-  type TrainingObservabilityHistogram,
   type TrainingObservabilitySummary
 } from "@/api/client";
 import MetricLineChart from "@/components/training/MetricLineChart.vue";
@@ -209,21 +207,13 @@ describe("training observability API client", () => {
     );
   });
 
-  it("calls the summary, resources, graph, and histogram endpoints", async () => {
+  it("calls the native summary and resources endpoints", async () => {
     await api.getTrainingObservabilitySummary("job-1");
     await api.getTrainingObservabilityResources("job-1", { max_points: 100 });
-    await api.getTrainingObservabilityGraph("job-1");
-    await api.getTrainingObservabilityHistogram("job-1", {
-      kind: "gradient",
-      tag: "gradients/head.bias",
-      step: 12
-    });
 
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
       "/training-jobs/job-1/observability/summary",
-      "/training-jobs/job-1/observability/resources?max_points=100",
-      "/training-jobs/job-1/observability/graph",
-      "/training-jobs/job-1/observability/histograms?kind=gradient&tag=gradients%2Fhead.bias&step=12"
+      "/training-jobs/job-1/observability/resources?max_points=100"
     ]);
   });
 
@@ -232,13 +222,7 @@ describe("training observability API client", () => {
     type SummaryHasNoCollectionUrl = Extract<keyof TrainingObservabilitySummary, ForbiddenUrl> extends never
       ? true
       : false;
-    type GraphHasNoCollectionUrl = Extract<keyof TrainingObservabilityGraph, ForbiddenUrl> extends never ? true : false;
-    type HistogramHasNoCollectionUrl = Extract<keyof TrainingObservabilityHistogram, ForbiddenUrl> extends never
-      ? true
-      : false;
 
     expectTypeOf<SummaryHasNoCollectionUrl>().toEqualTypeOf<true>();
-    expectTypeOf<GraphHasNoCollectionUrl>().toEqualTypeOf<true>();
-    expectTypeOf<HistogramHasNoCollectionUrl>().toEqualTypeOf<true>();
   });
 });

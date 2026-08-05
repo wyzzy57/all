@@ -383,9 +383,15 @@ export type TrainingObservabilitySourceAvailability = {
 export type TrainingObservabilityAvailability = Record<string, TrainingObservabilitySourceAvailability>;
 
 export type TrainingObservabilityScalarPoint = {
+  canonical_name?: string;
+  raw_name?: string;
+  unit?: string;
+  split?: string | null;
   step: number;
+  epoch?: number | null;
   value: number;
   timestamp: number;
+  source?: string;
 };
 
 export type TrainingObservabilityScalars = {
@@ -398,41 +404,14 @@ export type TrainingObservabilityResources = {
   availability: TrainingObservabilityAvailability;
 };
 
-export type TrainingObservabilityGraphNode = {
-  id: string;
-  label: string;
-  op: string;
-  attributes: Record<string, unknown>;
-};
-
-export type TrainingObservabilityGraphEdge = {
+export type TrainingObservabilitySecondaryAction = {
   source: string;
-  target: string;
-};
-
-export type TrainingObservabilityGraph = {
-  nodes: TrainingObservabilityGraphNode[];
-  edges: TrainingObservabilityGraphEdge[];
-  availability: TrainingObservabilityAvailability;
-};
-
-export type TrainingObservabilityHistogramBucket = {
-  lower: number;
-  upper: number;
-  count: number;
-};
-
-export type TrainingObservabilityHistogram = {
-  kind: "weight" | "gradient";
-  tag: string;
-  step: number;
-  buckets: TrainingObservabilityHistogramBucket[];
-  availability: TrainingObservabilityAvailability;
+  url: string;
 };
 
 export type TrainingObservabilitySummary = {
   job_id: string;
-  engine: "yolo26" | "llamafactory";
+  engine: "yolo26" | "ultralytics" | "paddlex" | "llamafactory";
   pipeline_id: string;
   pipeline_name: string;
   status: string;
@@ -441,7 +420,7 @@ export type TrainingObservabilitySummary = {
   environment: Record<string, unknown>;
   latest_metrics: Record<string, number>;
   available_scalar_keys: string[];
-  available_histograms: Record<"weight" | "gradient", string[]>;
+  secondary_actions: TrainingObservabilitySecondaryAction[];
   availability: TrainingObservabilityAvailability;
 };
 
@@ -480,12 +459,6 @@ export type TrainingObservabilityRangeParams = {
 
 export type TrainingObservabilityScalarsParams = TrainingObservabilityRangeParams & {
   keys: string[];
-};
-
-export type TrainingObservabilityHistogramParams = {
-  kind: "weight" | "gradient";
-  tag: string;
-  step: number;
 };
 
 export type TrainedModelRecord = {
@@ -1144,12 +1117,6 @@ export const api = {
   ) =>
     request<TrainingObservabilityResources>(
       `/training-jobs/${trainingJobId}/observability/resources${query(params)}`
-    ),
-  getTrainingObservabilityGraph: (trainingJobId: string) =>
-    request<TrainingObservabilityGraph>(`/training-jobs/${trainingJobId}/observability/graph`),
-  getTrainingObservabilityHistogram: (trainingJobId: string, params: TrainingObservabilityHistogramParams) =>
-    request<TrainingObservabilityHistogram>(
-      `/training-jobs/${trainingJobId}/observability/histograms${query(params)}`
     ),
   getTrainingObservabilityAnalysis: (trainingJobId: string) =>
     request<TrainingObservabilityAnalysis>(`/training-jobs/${trainingJobId}/observability/analysis`),

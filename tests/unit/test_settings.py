@@ -4,6 +4,16 @@ from pydantic import ValidationError
 from visiox_common.settings import Settings
 
 
+def test_visualdl_public_url_is_configurable_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VISIOX_VISUALDL_PUBLIC_URL", "https://visualdl.example")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.visualdl_public_url == "https://visualdl.example"
+
+
 @pytest.mark.parametrize("heartbeat_seconds", [4, 301])
 def test_agent_heartbeat_interval_matches_agent_protocol_bounds(heartbeat_seconds: int) -> None:
     with pytest.raises(ValidationError, match="agent_heartbeat_interval_seconds"):
