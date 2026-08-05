@@ -1,0 +1,60 @@
+{
+  "categories": [
+    {
+      "id": 1,
+      "name": "正常",
+      "supercategory": ""
+    },
+    {
+      "id": 2,
+      "name": "瑕疵",
+      "supercategory": ""
+    }
+  ],
+  "samples": [
+    {
+      "image_path": "images/train/sample-train-empty.jpg",
+      "sample_id": "sample-train-empty",
+      "source_checksum_sha256": "e4bfb03e204b14ad34ded976d2203416f2d988ede59621f0d16c24a375529e21",
+      "split": "train"
+    },
+    {
+      "image_path": "images/train/sample-train-multi.jpg",
+      "sample_id": "sample-train-multi",
+      "source_checksum_sha256": "a7256ed5a15bbd875b27de0786e62ab9d487316f54a2a26b6216ec77b7c0b9c4",
+      "split": "train"
+    },
+    {
+      "image_path": "images/val/sample-val.jpg",
+      "sample_id": "sample-val",
+      "source_checksum_sha256": "96c1226e0a989b4eb62bda846dec087fa68be278b7eb652be95180bdec18590a",
+      "split": "val"
+    },
+    {
+      "image_path": "images/test/sample-test.jpg",
+      "sample_id": "sample-test",
+      "source_checksum_sha256": "9febe01bd41bfb69683e29d711d8adffc9ae38de17a6873464b416f3b67398b6",
+      "split": "test"
+    }
+  ],
+  "splits": {
+    "test": {
+      "annotation_count": 1,
+      "annotation_path": "annotations/instance_test.json",
+      "image_dir": "images/test",
+      "sample_count": 1
+    },
+    "train": {
+      "annotation_count": 2,
+      "annotation_path": "annotations/instance_train.json",
+      "image_dir": "images/train",
+      "sample_count": 2
+    },
+    "val": {
+      "annotation_count": 1,
+      "annotation_path": "annotations/instance_val.json",
+      "image_dir": "images/val",
+      "sample_count": 1
+    }
+  }
+}
