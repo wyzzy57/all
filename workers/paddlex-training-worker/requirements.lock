@@ -1,0 +1,5 @@
+mlflow-skinny==3.1.1
+paddlex[cv]==3.0.3
+psutil==7.0.0
+tensorboard==2.19.0
+tensorboardX==2.6.4

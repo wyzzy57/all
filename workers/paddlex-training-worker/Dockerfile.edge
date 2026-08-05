@@ -1,0 +1,17 @@
+FROM paddlepaddle/paddle:3.0.0-gpu-cuda11.8-cudnn8.9-trt8.6@sha256:2bd8830dafd258501e7313b320fa1bcc946c70318b3081647b90bc70182e7360
+
+WORKDIR /app
+COPY workers/paddlex-training-worker/requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock
+RUN paddlex --install PaddleDetection
+COPY workers/paddlex-training-worker/src/visiox_paddlex_training_worker /app/visiox_paddlex_training_worker
+COPY packages/visiox-training/src/visiox_training /app/visiox_training
+RUN mkdir -p /opt/paddlex-runtime \
+    && ln -s "$(python -c 'import pathlib,paddlex; print(pathlib.Path(paddlex.__file__).parent)')" /opt/paddlex-runtime/paddlex \
+    && cp /app/visiox_paddlex_training_worker/paddlex_main.py /opt/paddlex-runtime/paddlex_main.py
+RUN printf '#!/bin/sh\nexec python -m visiox_paddlex_training_worker.entrypoint "$@"\n' > /usr/local/bin/visiox-train \
+    && chmod 0755 /usr/local/bin/visiox-train
+ENV PYTHONPATH=/app
+
+HEALTHCHECK NONE
+WORKDIR /opt/paddlex-runtime

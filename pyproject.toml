@@ -59,6 +59,7 @@ packages = [
   "workers/edge-executor-worker/src/visiox_edge_executor_worker",
   "workers/training-worker/src/visiox_training_worker",
   "workers/llm-training-worker/src/visiox_llm_training_worker",
+  "workers/paddlex-training-worker/src/visiox_paddlex_training_worker",
 ]
 
 [tool.hatch.build.targets.wheel.force-include]
@@ -87,5 +88,6 @@ pythonpath = [
   "workers/edge-executor-worker/src",
   "workers/training-worker/src",
   "workers/llm-training-worker/src",
+  "workers/paddlex-training-worker/src",
 ]
 testpaths = ["tests"]
