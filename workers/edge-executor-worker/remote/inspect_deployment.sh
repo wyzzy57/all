@@ -19,6 +19,13 @@ OBSERVED_LABELS = (
     "com.visiox.engine",
     "com.visiox.engine-digest",
     "com.visiox.port",
+    "com.visiox.framework",
+    "com.visiox.adapter-key",
+    "com.visiox.adapter-version",
+    "com.visiox.model-format",
+    "com.visiox.resolved-backend",
+    "com.visiox.runtime-digest",
+    "com.visiox.runtime-config-checksum",
 )
 
 

@@ -36,8 +36,8 @@ from .startup import EdgeExecutorSecurityContext
 from .state import ExecutionResult
 
 
-ModelFormat = Literal["pt", "onnx", "engine"]
-RequestedFormat = Literal["auto", "pt", "onnx", "engine"]
+ModelFormat = Literal["pt", "onnx", "engine", "paddle_inference_bundle"]
+RequestedFormat = Literal["auto", "pt", "onnx", "engine", "paddle_inference_bundle"]
 Precision = Literal["auto", "fp32", "fp16", "int8"]
 
 _IMAGE_DIGEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,430}@sha256:[a-f0-9]{64}\Z")
@@ -63,6 +63,13 @@ class DeploymentLabels:
     RESTART_POLICY = "com.visiox.restart-policy"
     HEALTH_PATH = "com.visiox.health-path"
     WARMUP_PATH = "com.visiox.warmup-path"
+    FRAMEWORK = "com.visiox.framework"
+    ADAPTER_KEY = "com.visiox.adapter-key"
+    ADAPTER_VERSION = "com.visiox.adapter-version"
+    MODEL_FORMAT = "com.visiox.model-format"
+    RESOLVED_BACKEND = "com.visiox.resolved-backend"
+    RUNTIME_DIGEST = "com.visiox.runtime-digest"
+    RUNTIME_CONFIG_CHECKSUM = "com.visiox.runtime-config-checksum"
 
 
 class ModelArtifact(BaseModel):
@@ -233,6 +240,15 @@ class _PersistedDeployment(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     image_digest: str
+    runtime_image_digest: str | None = None
+    runtime_config_checksum: str | None = None
+    framework: Literal["ultralytics", "paddlex"] = "ultralytics"
+    adapter_key: str = "ultralytics.yolo26.detect.v1"
+    adapter_version: str = "1.0.0"
+    resolved_backend: str = "tensorrt"
+    optimization: str = "auto"
+    device: str = "gpu:0"
+    artifact_uri: str | None = None
     model_checksum: str
     model_format: ModelFormat
     format: ModelFormat
@@ -242,6 +258,13 @@ class _PersistedDeployment(BaseModel):
     engine_cache_key: str | None
     calibration_dataset_uri: str | None
     port: int = Field(ge=1024, le=65535)
+
+    @field_validator("runtime_config_checksum")
+    @classmethod
+    def _validate_runtime_config_checksum(cls, value: str | None) -> str | None:
+        if value is not None and not _SHA256.fullmatch(value):
+            raise ValueError("runtime configuration checksum is invalid")
+        return value
 
 
 class _DeploymentResult(BaseModel):
@@ -254,6 +277,13 @@ class _DeploymentResult(BaseModel):
     engine_digest: str
     port: int = Field(ge=1024, le=65535)
     health_status: Literal["healthy"]
+    framework: str | None = None
+    adapter_key: str | None = None
+    adapter_version: str | None = None
+    model_format: str | None = None
+    resolved_backend: str | None = None
+    runtime_image_digest: str | None = None
+    runtime_config_checksum: str | None = None
 
     @field_validator("container_id")
     @classmethod
@@ -267,6 +297,13 @@ class _DeploymentResult(BaseModel):
     def _validate_engine_digest(cls, value: str) -> str:
         if not _SHA256.fullmatch(value):
             raise ValueError("engine digest is invalid")
+        return value
+
+    @field_validator("runtime_config_checksum")
+    @classmethod
+    def _validate_runtime_config_checksum(cls, value: str | None) -> str | None:
+        if value is not None and not _SHA256.fullmatch(value):
+            raise ValueError("runtime configuration checksum is invalid")
         return value
 
 
@@ -328,9 +365,17 @@ def _deployment_model(
         trained_model = session.get(TrainedModel, service.trained_model_id)
         if trained_model is None or trained_model.status != "ready":
             return None
+        deployment = service.config.get("deployment")
+        artifact_uri = (
+            deployment.get("artifact_uri")
+            if isinstance(deployment, dict)
+            else None
+        )
         return _DeploymentModel(
             task=trained_model.task,
-            artifact_uri=trained_model.artifact_uri,
+            artifact_uri=(
+                artifact_uri if isinstance(artifact_uri, str) else trained_model.artifact_uri
+            ),
         )
     base_model_id = service.config.get("base_model_id")
     if not isinstance(base_model_id, str):
@@ -600,19 +645,30 @@ class _DeploymentHandlerBase:
             service = session.get(DeploymentService, execution.deployment_service_id)
             instance = session.get(DeploymentInstance, execution.resource_id)
             task = session.get(Task, execution.task_id)
+            restored_upgrade = bool(
+                restore_healthy
+                and service is not None
+                and instance is not None
+                and _restore_upgrade_snapshot(service, instance)
+            )
             execution.phase = "failed"
             execution.error_code = self.failure_code
             execution.error_message = self.failure_message
             if service is not None:
-                service.status = "running" if restore_healthy else "failed"
-                if restore_healthy:
+                if not restored_upgrade:
+                    service.status = "running" if restore_healthy else "failed"
+                if restore_healthy and not restored_upgrade:
                     service.desired_state = "running"
                 session.add(service)
             if instance is not None:
-                instance.status = "running" if restore_healthy else "failed"
-                instance.health_status = "healthy" if restore_healthy else "unhealthy"
+                if not restored_upgrade:
+                    instance.status = "running" if restore_healthy else "failed"
+                    instance.health_status = (
+                        "healthy" if restore_healthy else "unhealthy"
+                    )
                 if (
                     restore_healthy
+                    and not restored_upgrade
                     and service is not None
                     and service.active_revision is not None
                 ):
@@ -654,14 +710,19 @@ class DeployInferenceHandler(_DeploymentHandlerBase):
         prior: dict[str, Any] | None = None
         try:
             context = self._load_context(execution)
-            prior = _healthy_tuple(context.instance)
+            prior = (
+                _validate_rollback_tuple(context.instance.rollback_metadata)
+                if context.instance.rollback_metadata
+                else _healthy_tuple(context)
+            )
             self._transition(context, "connecting")
             target = self._load_target(context.node_id)
             self._transition(context, "probing")
             desired, plan = _validated_desired_state(context)
             self._transition(context, "preparing")
+            artifact_uri = _require_minio_artifact_uri(desired.artifact_uri)
             model_url = self._storage.presigned_get_url(
-                context.model.artifact_uri,
+                artifact_uri,
                 expires=_PRESIGNED_URL_TTL,
             )
             calibration_url = None
@@ -728,7 +789,7 @@ class StopDeploymentHandler(_DeploymentHandlerBase):
             return self._fail(
                 execution.id,
                 restore_healthy=(
-                    context is not None and _healthy_tuple(context.instance) is not None
+                    context is not None and _healthy_tuple(context) is not None
                 ),
             )
 
@@ -811,7 +872,7 @@ class RollbackDeploymentHandler(_DeploymentHandlerBase):
         current: dict[str, Any] | None = None
         try:
             context = self._load_context(execution)
-            current = _healthy_tuple(context.instance)
+            current = _healthy_tuple(context)
             target_tuple = _validate_rollback_tuple(context.instance.rollback_metadata)
             self._transition(context, "connecting")
             target = self._load_target(context.node_id)
@@ -867,32 +928,98 @@ def _validated_desired_state(
     try:
         desired = _PersistedDeployment.model_validate(deployment)
         validate_image_digest(desired.image_digest)
+        _require_minio_artifact_uri(desired.artifact_uri)
         artifact = ModelArtifact(
             task=context.model.task,
-            artifact_uri=context.model.artifact_uri,
+            artifact_uri=desired.artifact_uri,
             checksum=desired.model_checksum,
             format=desired.model_format,
         )
         inventory = InventorySnapshot.model_validate(
             context.node.fingerprint.get("inventory_snapshot")
         )
-        plan = build_deployment_plan(
-            artifact,
-            inventory,
-            DeploymentOptions(
-                format=desired.format,
+        if desired.runtime_image_digest not in {None, desired.image_digest}:
+            raise ValueError("runtime image identity is invalid")
+        expected_runtime_checksum = _runtime_config_checksum(desired)
+        if desired.runtime_config_checksum not in {None, expected_runtime_checksum}:
+            raise ValueError("runtime configuration identity is invalid")
+        if desired.framework == "paddlex":
+            if (
+                desired.model_format != "paddle_inference_bundle"
+                or desired.format != "paddle_inference_bundle"
+                or desired.resolved_backend
+                not in {"paddle_inference", "paddlex_hpi_tensorrt"}
+                or desired.engine_cache_key is not None
+                or desired.calibration_dataset_uri is not None
+                or desired.runtime_config_checksum is None
+            ):
+                raise ValueError("PaddleX deployment configuration is invalid")
+            plan = DeploymentPlan(
+                source_format="paddle_inference_bundle",
+                export_format="paddle_inference_bundle",
                 precision=desired.precision,
                 input_shape=desired.input_shape,
                 gpu_uuids=desired.gpu_uuids,
-                calibration_dataset_uri=desired.calibration_dataset_uri,
-                runtime_image_digest=desired.image_digest,
-            ),
-        )
+                engine_cache_key=None,
+            )
+        else:
+            plan = build_deployment_plan(
+                artifact,
+                inventory,
+                DeploymentOptions(
+                    format=desired.format,
+                    precision=desired.precision,
+                    input_shape=desired.input_shape,
+                    gpu_uuids=desired.gpu_uuids,
+                    calibration_dataset_uri=desired.calibration_dataset_uri,
+                    runtime_image_digest=desired.image_digest,
+                ),
+            )
     except (ValueError, ValidationError):
         raise ValueError("persisted deployment configuration is invalid") from None
     if desired.engine_cache_key != plan.engine_cache_key:
         raise ValueError("persisted engine cache identity is invalid")
     return desired, plan
+
+
+def _require_minio_artifact_uri(value: str | None) -> str:
+    if not isinstance(value, str) or not value.startswith("minio://"):
+        raise ValueError("deployment artifact URI is invalid")
+    remainder = value.removeprefix("minio://")
+    if (
+        not remainder
+        or "/" not in remainder
+        or remainder.startswith("/")
+        or remainder.endswith("/")
+        or "?" in remainder
+        or "#" in remainder
+        or ".." in PurePosixPath(remainder).parts
+    ):
+        raise ValueError("deployment artifact URI is invalid")
+    return value
+
+
+def _runtime_config_checksum(desired: _PersistedDeployment) -> str:
+    identity = {
+        "framework": desired.framework,
+        "adapter_key": desired.adapter_key,
+        "adapter_version": desired.adapter_version,
+        "model_format": desired.model_format,
+        "resolved_backend": desired.resolved_backend,
+        "device": desired.device,
+        "precision": desired.precision,
+        "input_shape": list(desired.input_shape),
+        "gpu_uuids": list(desired.gpu_uuids),
+        "optimization": desired.optimization,
+        "runtime_image_digest": desired.runtime_image_digest or desired.image_digest,
+    }
+    payload = json.dumps(
+        identity,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _deployment_labels(context: _DeploymentContext) -> dict[str, str]:
@@ -903,13 +1030,33 @@ def _deployment_labels(context: _DeploymentContext) -> dict[str, str]:
     }
     if any(not _LABEL_VALUE.fullmatch(value) for value in dynamic_labels.values()):
         raise ValueError("deployment label value is invalid")
-    return {
+    deployment = context.service.config.get("deployment")
+    identity = deployment if isinstance(deployment, dict) else {}
+    labels = {
         DeploymentLabels.MANAGED: "true",
         **dynamic_labels,
         DeploymentLabels.RESTART_POLICY: "unless-stopped",
         DeploymentLabels.HEALTH_PATH: "/health",
         DeploymentLabels.WARMUP_PATH: "/predict/image",
+        DeploymentLabels.FRAMEWORK: str(identity.get("framework", "ultralytics")),
+        DeploymentLabels.ADAPTER_KEY: str(
+            identity.get("adapter_key", "ultralytics.yolo26.detect.v1")
+        ),
+        DeploymentLabels.ADAPTER_VERSION: str(identity.get("adapter_version", "1.0.0")),
+        DeploymentLabels.MODEL_FORMAT: str(
+            identity.get("model_format", identity.get("format", "pt"))
+        ),
+        DeploymentLabels.RESOLVED_BACKEND: str(
+            identity.get("resolved_backend", "tensorrt")
+        ),
+        DeploymentLabels.RUNTIME_DIGEST: str(
+            identity.get("runtime_image_digest", identity.get("image_digest", ""))
+        ),
     }
+    runtime_checksum = identity.get("runtime_config_checksum")
+    if isinstance(runtime_checksum, str):
+        labels[DeploymentLabels.RUNTIME_CONFIG_CHECKSUM] = runtime_checksum
+    return labels
 
 
 def _deploy_request(
@@ -921,6 +1068,29 @@ def _deploy_request(
     calibration_url: str | None,
     previous_container_id: str | None,
 ) -> dict[str, Any]:
+    runtime = {
+        "framework": desired.framework,
+        "adapter_key": desired.adapter_key,
+        "adapter_version": desired.adapter_version,
+        "model_format": desired.model_format,
+        "resolved_backend": desired.resolved_backend,
+        "runtime_image_digest": desired.image_digest,
+        "optimization": desired.optimization,
+        "device": desired.device,
+        "format": plan.export_format,
+        "precision": plan.precision,
+        "input_shape": list(plan.input_shape),
+        "gpu_uuids": list(plan.gpu_uuids),
+        "engine_cache_key": plan.engine_cache_key,
+        "calibration_download_url": calibration_url,
+        "port": desired.port,
+        "shm_size": _SHM_SIZE,
+        "restart_policy": "unless-stopped",
+        "model_mount_read_only": True,
+        "privileged": False,
+    }
+    if desired.runtime_config_checksum is not None:
+        runtime["runtime_config_checksum"] = desired.runtime_config_checksum
     return {
         "action": "deploy",
         "image_digest": desired.image_digest,
@@ -929,25 +1099,15 @@ def _deploy_request(
             "download_url": model_url,
             "checksum": desired.model_checksum,
             "source_format": desired.model_format,
+            "archive_format": "tar" if desired.model_format == "paddle_inference_bundle" else None,
         },
-        "runtime": {
-            "format": plan.export_format,
-            "precision": plan.precision,
-            "input_shape": list(plan.input_shape),
-            "gpu_uuids": list(plan.gpu_uuids),
-            "engine_cache_key": plan.engine_cache_key,
-            "calibration_download_url": calibration_url,
-            "port": desired.port,
-            "shm_size": _SHM_SIZE,
-            "restart_policy": "unless-stopped",
-            "model_mount_read_only": True,
-            "privileged": False,
-        },
+        "runtime": runtime,
         "previous_container_id": previous_container_id,
     }
 
 
-def _healthy_tuple(instance: DeploymentInstance) -> dict[str, Any] | None:
+def _healthy_tuple(context: _DeploymentContext) -> dict[str, Any] | None:
+    instance = context.instance
     if (
         instance.container_id is None
         or instance.image_digest is None
@@ -957,7 +1117,9 @@ def _healthy_tuple(instance: DeploymentInstance) -> dict[str, Any] | None:
         or instance.health_status != "healthy"
     ):
         return None
-    return {
+    deployment = context.service.config.get("deployment")
+    identity = deployment if isinstance(deployment, dict) else {}
+    result = {
         "container_id": instance.container_id,
         "image_digest": instance.image_digest,
         "model_checksum": instance.model_checksum,
@@ -965,16 +1127,41 @@ def _healthy_tuple(instance: DeploymentInstance) -> dict[str, Any] | None:
         "engine_digest": instance.engine_digest,
         "port": instance.port,
     }
+    identity_fields = {
+        "framework",
+        "adapter_key",
+        "adapter_version",
+        "model_format",
+        "resolved_backend",
+        "runtime_image_digest",
+        "runtime_config_checksum",
+    }
+    if identity_fields.issubset(identity):
+        result.update({field: str(identity[field]) for field in identity_fields})
+    return result
 
 
 def _validate_rollback_tuple(value: Mapping[str, Any]) -> dict[str, Any]:
-    if set(value) != {
+    legacy_fields = {
         "container_id",
         "image_digest",
         "model_checksum",
         "engine",
         "engine_digest",
         "port",
+    }
+    identity_fields = {
+        "framework",
+        "adapter_key",
+        "adapter_version",
+        "model_format",
+        "resolved_backend",
+        "runtime_image_digest",
+        "runtime_config_checksum",
+    }
+    if frozenset(value) not in {
+        frozenset(legacy_fields),
+        frozenset(legacy_fields | identity_fields),
     }:
         raise ValueError("rollback tuple is invalid")
     try:
@@ -998,6 +1185,14 @@ def _require_deployment_matches(
         or deployed.model_checksum != desired.model_checksum
         or deployed.engine != plan.export_format
         or deployed.port != desired.port
+        or deployed.framework not in {None, desired.framework}
+        or deployed.adapter_key not in {None, desired.adapter_key}
+        or deployed.adapter_version not in {None, desired.adapter_version}
+        or deployed.model_format not in {None, desired.model_format}
+        or deployed.resolved_backend not in {None, desired.resolved_backend}
+        or deployed.runtime_image_digest not in {None, desired.image_digest}
+        or deployed.runtime_config_checksum
+        not in {None, desired.runtime_config_checksum}
     ):
         raise ValueError("remote deployment result did not match the desired tuple")
 
@@ -1037,6 +1232,37 @@ def _persist_running(
         service.desired_state = "running"
         service.active_revision = instance.deployment_revision
         service.endpoint = endpoint
+        deployment = service.config.get("deployment")
+        if isinstance(deployment, dict):
+            identity_fields = (
+                "framework",
+                "adapter_key",
+                "adapter_version",
+                "model_format",
+                "resolved_backend",
+                "runtime_image_digest",
+                "runtime_config_checksum",
+            )
+            observed_identity = {
+                field: getattr(deployed, field) for field in identity_fields
+            }
+            if all(value is not None for value in observed_identity.values()):
+                service.config = {
+                    **service.config,
+                    "deployment": {
+                        **deployment,
+                        **observed_identity,
+                        "image_digest": deployed.image_digest,
+                        "model_checksum": deployed.model_checksum,
+                        "format": deployed.engine,
+                    },
+                }
+        if "upgrade_snapshot" in service.config:
+            service.config = {
+                key: value
+                for key, value in service.config.items()
+                if key != "upgrade_snapshot"
+            }
         instance.container_id = deployed.container_id
         instance.image_digest = deployed.image_digest
         instance.model_checksum = deployed.model_checksum
@@ -1056,6 +1282,34 @@ def _persist_running(
         task.finished_at = now
         session.add_all([execution, service, instance, task])
         session.commit()
+
+
+def _restore_upgrade_snapshot(
+    service: DeploymentService,
+    instance: DeploymentInstance,
+) -> bool:
+    snapshot = service.config.get("upgrade_snapshot")
+    if not isinstance(snapshot, dict) or not isinstance(
+        snapshot.get("service_config"), dict
+    ):
+        return False
+    service.config = dict(snapshot["service_config"])
+    service.trained_model_id = snapshot.get("trained_model_id")
+    service.status = str(snapshot.get("service_status", "running"))
+    service.desired_state = str(snapshot.get("desired_state", "running"))
+    service.active_revision = snapshot.get("active_revision")
+    instance.status = str(snapshot.get("instance_status", "running"))
+    instance.health_status = str(
+        snapshot.get("instance_health_status", "healthy")
+    )
+    instance.deployment_revision = int(
+        snapshot.get("instance_deployment_revision", instance.deployment_revision)
+    )
+    rollback_metadata = snapshot.get("rollback_metadata")
+    instance.rollback_metadata = (
+        dict(rollback_metadata) if isinstance(rollback_metadata, dict) else {}
+    )
+    return True
 
 
 def _persist_stopped(

@@ -1,0 +1,7 @@
+# PaddleDetection is intentionally absent: this runtime consumes an exported
+# static inference bundle and does not install training plugins.
+fastapi==0.115.14
+paddlex[cv]==3.0.3
+pillow==11.2.1
+python-multipart==0.0.20
+uvicorn[standard]==0.34.3

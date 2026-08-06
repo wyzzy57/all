@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from io import BytesIO
 import inspect
 from pathlib import Path, PurePosixPath
+import tarfile
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
@@ -29,6 +30,10 @@ from visiox_api.dependencies.auth import get_current_user
 from visiox_api.dependencies.authorization import require_resource_permission
 from visiox_api.dependencies.database import get_db_session
 from visiox_api.services.authorization import authorized_resource_predicate
+from visiox_api.services.deployment_adapters import (
+    resolve_deployment_adapter,
+    runtime_config_checksum,
+)
 from visiox_api.routes.pipeline_inference import (
     PipelinePredictResponse,
     get_pipeline_inference_storage,
@@ -73,6 +78,10 @@ from visiox_storage.checksum import sha256_file
 
 router = APIRouter(prefix="/services", tags=["services"])
 
+_PADDLEX_BUNDLE_MAX_BYTES = 8 * 1024 * 1024 * 1024
+_PADDLEX_BUNDLE_MAX_MEMBER_BYTES = 4 * 1024 * 1024 * 1024
+_PADDLEX_BUNDLE_MAX_MEMBERS = 64
+
 _DEPLOY_OPERATION = "deploy"
 _STOP_OPERATION = "stop_deployment"
 _START_OPERATION = "start_deployment"
@@ -85,6 +94,19 @@ _ROLLBACK_FIELDS = {
     "engine",
     "engine_digest",
     "port",
+}
+_ROLLBACK_IDENTITY_FIELDS = {
+    "framework",
+    "adapter_key",
+    "adapter_version",
+    "model_format",
+    "resolved_backend",
+    "runtime_image_digest",
+    "runtime_config_checksum",
+}
+_ROLLBACK_FIELD_SETS = {
+    frozenset(_ROLLBACK_FIELDS),
+    frozenset(_ROLLBACK_FIELDS | _ROLLBACK_IDENTITY_FIELDS),
 }
 
 
@@ -236,24 +258,9 @@ async def create_service(
 
     node, inventory = _deployment_node(session, request.node_id)
     try:
-        image_digest = validate_image_digest(
-            request.image_digest or get_settings().deployment_image_digest
+        deployment_config, instance_engine = _build_deployment_config(
+            pipeline, trained_model, artifact, inventory, request
         )
-        options = DeploymentOptions(
-            format=request.format,
-            precision=request.precision,
-            input_shape=request.input_shape,
-            gpu_uuids=request.gpu_uuids,
-            calibration_dataset_uri=request.calibration_dataset_uri,
-            runtime_image_digest=image_digest,
-        )
-        plan = build_deployment_plan(artifact, inventory, options)
-        _require_minio_uri(artifact.artifact_uri, "Model artifact")
-        if request.calibration_dataset_uri is not None:
-            _require_minio_uri(
-                request.calibration_dataset_uri,
-                "Calibration dataset",
-            )
     except ValueError as error:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -268,18 +275,8 @@ async def create_service(
     normalized_config["current_remote_execution_id"] = execution_id
     if base_model is not None:
         normalized_config["base_model_id"] = base_model.id
-    normalized_config["deployment"] = {
-        "image_digest": image_digest,
-        "model_checksum": artifact.checksum,
-        "model_format": artifact.format,
-        "format": plan.export_format,
-        "precision": plan.precision,
-        "input_shape": list(plan.input_shape),
-        "gpu_uuids": list(plan.gpu_uuids),
-        "engine_cache_key": plan.engine_cache_key,
-        "calibration_dataset_uri": request.calibration_dataset_uri,
-        "port": request.port,
-    }
+    normalized_config["deployment"] = deployment_config
+    image_digest = deployment_config["image_digest"]
     service = DeploymentService(
         id=service_id,
         name=request.name.strip(),
@@ -312,7 +309,7 @@ async def create_service(
         instance_name=service.instance_name,
         image_digest=image_digest,
         model_checksum=artifact.checksum,
-        engine=plan.export_format,
+        engine=instance_engine,
         engine_digest=None,
         port=request.port,
         status="queued",
@@ -429,6 +426,7 @@ async def upgrade_service(
     actor: User = Depends(get_current_user),
     session: Session = Depends(get_service_session),
     producer: Any = Depends(get_service_stream_producer),
+    storage: ObjectStorageClient = Depends(get_pipeline_inference_storage),
 ) -> ServiceResponse:
     require_resource_permission(session, actor, "service", service_id, PERMISSION_EDIT)
     service = session.get(DeploymentService, service_id)
@@ -466,28 +464,10 @@ async def upgrade_service(
 
     _node, inventory = _deployment_node(session, instance.node_id)
     try:
-        image_digest = validate_image_digest(request.image_digest)
-        artifact = ModelArtifact(
-            task=trained_model.task,
-            artifact_uri=trained_model.artifact_uri,
-            checksum=request.model_checksum,
-            format=_artifact_format(trained_model.artifact_uri),
+        artifact = _trained_deployment_artifact(storage, pipeline, trained_model)
+        deployment_config, _instance_engine = _build_deployment_config(
+            pipeline, trained_model, artifact, inventory, request
         )
-        plan = build_deployment_plan(
-            artifact,
-            inventory,
-            DeploymentOptions(
-                format=request.format,
-                precision=request.precision,
-                input_shape=request.input_shape,
-                gpu_uuids=request.gpu_uuids,
-                calibration_dataset_uri=request.calibration_dataset_uri,
-                runtime_image_digest=image_digest,
-            ),
-        )
-        _require_minio_uri(trained_model.artifact_uri, "Trained model artifact")
-        if request.calibration_dataset_uri is not None:
-            _require_minio_uri(request.calibration_dataset_uri, "Calibration dataset")
     except ValueError as error:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -497,19 +477,20 @@ async def upgrade_service(
     task_id = new_id()
     execution_id = new_id()
     config = dict(service.config)
-    config["current_remote_execution_id"] = execution_id
-    config["deployment"] = {
-        "image_digest": image_digest,
-        "model_checksum": artifact.checksum,
-        "model_format": artifact.format,
-        "format": plan.export_format,
-        "precision": plan.precision,
-        "input_shape": list(plan.input_shape),
-        "gpu_uuids": list(plan.gpu_uuids),
-        "engine_cache_key": plan.engine_cache_key,
-        "calibration_dataset_uri": request.calibration_dataset_uri,
-        "port": request.port,
+    previous_tuple = _instance_runtime_tuple(service, instance)
+    config["upgrade_snapshot"] = {
+        "service_config": dict(service.config),
+        "trained_model_id": service.trained_model_id,
+        "service_status": service.status,
+        "desired_state": service.desired_state,
+        "active_revision": service.active_revision,
+        "instance_status": instance.status,
+        "instance_health_status": instance.health_status,
+        "instance_deployment_revision": instance.deployment_revision,
+        "rollback_metadata": dict(instance.rollback_metadata),
     }
+    config["current_remote_execution_id"] = execution_id
+    config["deployment"] = deployment_config
     task = Task(
         id=task_id,
         task_type=TaskType.EDGE_DEPLOY.value,
@@ -536,6 +517,7 @@ async def upgrade_service(
     service.status = "upgrade_queued"
     service.desired_state = "running"
     instance.status = "upgrade_queued"
+    instance.rollback_metadata = previous_tuple
     instance.deployment_revision = (
         service.active_revision or instance.deployment_revision
     ) + 1
@@ -994,18 +976,8 @@ def _resolve_deployment_artifact(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Trained model is not ready for this pipeline",
             )
-        checksum = _trained_model_checksum(trained_model)
-        if checksum is None:
-            checksum = _calculate_trained_model_checksum(storage, trained_model)
-            trained_model.metrics = {**trained_model.metrics, "checksum": checksum}
-            session.add(trained_model)
         try:
-            artifact = ModelArtifact(
-                task=trained_model.task,
-                artifact_uri=trained_model.artifact_uri,
-                checksum=checksum,
-                format=_artifact_format(trained_model.artifact_uri),
-            )
+            artifact = _trained_deployment_artifact(storage, pipeline, trained_model)
         except ValueError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1041,6 +1013,121 @@ def _resolve_deployment_artifact(
     return None, base_model, artifact
 
 
+def _trained_deployment_artifact(
+    storage: ObjectStorageClient,
+    pipeline: TrainingPipeline,
+    trained_model: TrainedModel,
+) -> ModelArtifact:
+    if pipeline.framework == "paddlex":
+        bundle_uri, bundle_checksum = _prepare_paddlex_deployment_bundle(
+            storage, trained_model
+        )
+        return ModelArtifact(
+            task=trained_model.task,
+            artifact_uri=bundle_uri,
+            checksum=bundle_checksum,
+            format="paddle_inference_bundle",
+        )
+    checksum = _trained_model_checksum(trained_model)
+    if checksum is None:
+        checksum = _calculate_trained_model_checksum(storage, trained_model)
+        trained_model.metrics = {**trained_model.metrics, "checksum": checksum}
+    return ModelArtifact(
+        task=trained_model.task,
+        artifact_uri=trained_model.artifact_uri,
+        checksum=checksum,
+        format=_artifact_format(trained_model.artifact_uri),
+    )
+
+
+def _build_deployment_config(
+    pipeline: TrainingPipeline,
+    trained_model: TrainedModel | None,
+    artifact: ModelArtifact,
+    inventory: InventorySnapshot,
+    request: ServiceCreateRequest | ServiceUpgradeRequest,
+) -> tuple[dict[str, Any], str]:
+    settings = get_settings()
+    default_digest = (
+        settings.paddlex_inference_image_digest
+        if pipeline.framework == "paddlex"
+        else settings.deployment_image_digest
+    )
+    image_digest = validate_image_digest(request.image_digest or default_digest)
+    _require_minio_uri(artifact.artifact_uri, "Model artifact")
+    if request.calibration_dataset_uri is not None:
+        _require_minio_uri(request.calibration_dataset_uri, "Calibration dataset")
+    if pipeline.framework == "paddlex":
+        if trained_model is None:
+            raise ValueError("PaddleX deployment requires a trained static model")
+        resolution = resolve_deployment_adapter(
+            pipeline,
+            trained_model,
+            inventory,
+            runtime_image_digest=image_digest,
+            precision=request.precision,
+            input_shape=request.input_shape,
+            gpu_uuids=request.gpu_uuids,
+        )
+        return (
+            {
+                **resolution.as_config(),
+                "image_digest": image_digest,
+                "artifact_uri": artifact.artifact_uri,
+                "model_checksum": artifact.checksum,
+                "format": resolution.model_format,
+                "engine_cache_key": None,
+                "calibration_dataset_uri": None,
+                "port": request.port,
+            },
+            resolution.model_format,
+        )
+
+    plan = build_deployment_plan(
+        artifact,
+        inventory,
+        DeploymentOptions(
+            format=request.format,
+            precision=request.precision,
+            input_shape=request.input_shape,
+            gpu_uuids=request.gpu_uuids,
+            calibration_dataset_uri=request.calibration_dataset_uri,
+            runtime_image_digest=image_digest,
+        ),
+    )
+    if request.model_checksum is not None and request.model_checksum != artifact.checksum:
+        raise ValueError("Requested model checksum does not match the selected artifact")
+    identity = {
+        "framework": "ultralytics",
+        "adapter_key": pipeline.adapter_key,
+        "adapter_version": pipeline.adapter_version,
+        "model_format": artifact.format,
+        "resolved_backend": "tensorrt" if plan.export_format == "engine" else "pytorch",
+        "runtime_image_digest": image_digest,
+        "optimization": "auto",
+        "device": "gpu:0" if plan.gpu_uuids else "cpu",
+        "precision": plan.precision,
+        "input_shape": plan.input_shape,
+        "gpu_uuids": plan.gpu_uuids,
+    }
+    return (
+        {
+            **identity,
+            "runtime_config_checksum": runtime_config_checksum(identity),
+            "image_digest": image_digest,
+            "artifact_uri": artifact.artifact_uri,
+            "model_checksum": artifact.checksum,
+            "format": plan.export_format,
+            "input_shape": list(plan.input_shape),
+            "gpu_uuids": list(plan.gpu_uuids),
+            "engine_cache_key": plan.engine_cache_key,
+            "calibration_dataset_uri": request.calibration_dataset_uri,
+            "port": request.port,
+        },
+        plan.export_format,
+    )
+
+
 def _trained_model_checksum(model: TrainedModel) -> str | None:
     for key in ("checksum", "sha256", "artifact_checksum"):
         value = model.metrics.get(key)
@@ -1067,6 +1154,188 @@ def _calculate_trained_model_checksum(
             status_code=status.HTTP_409_CONFLICT,
             detail="Trained model artifact is unavailable for checksum calculation",
         ) from error
+
+
+def _prepare_paddlex_deployment_bundle(
+    storage: ObjectStorageClient,
+    model: TrainedModel,
+) -> tuple[str, str]:
+    runtime_digest = validate_image_digest(get_settings().paddlex_inference_image_digest)
+    _ensure_paddlex_runtime_compatibility(model, runtime_digest)
+    cached = model.deployment_compatibility.get("paddlex_bundle")
+    if isinstance(cached, dict):
+        uri = cached.get("uri")
+        checksum = cached.get("checksum_sha256")
+        size_bytes = cached.get("size_bytes")
+        if (
+            isinstance(uri, str)
+            and isinstance(checksum, str)
+            and isinstance(size_bytes, int)
+            and cached.get("artifact_type") == "paddle_inference_bundle"
+            and cached.get("artifact_role") == "paddle_inference_bundle"
+        ):
+            _require_minio_uri(uri, "PaddleX deployment bundle")
+            bucket, object_name = uri.removeprefix("minio://").split("/", 1)
+            manifest_entries = model.artifact_manifest.get("deployment_artifacts")
+            manifest_match = isinstance(manifest_entries, list) and any(
+                isinstance(item, dict)
+                and item.get("uri") == uri
+                and item.get("checksum_sha256") == checksum
+                and item.get("size_bytes") == size_bytes
+                and item.get("artifact_type") == "paddle_inference_bundle"
+                and item.get("artifact_role") == "paddle_inference_bundle"
+                for item in manifest_entries
+            )
+            if (
+                len(checksum) == 64
+                and all(ch in "0123456789abcdef" for ch in checksum)
+                and size_bytes > 0
+                and manifest_match
+                and storage.object_size(bucket, object_name) == size_bytes
+            ):
+                return uri, checksum
+
+    manifest = model.artifact_manifest
+    entries = manifest.get("role_artifacts") if isinstance(manifest, dict) else None
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("PaddleX inference bundle manifest is unavailable")
+    try:
+        source_bucket, primary_object = model.artifact_uri.removeprefix(
+            "minio://"
+        ).split("/", 1)
+    except ValueError as error:
+        raise ValueError("PaddleX static artifacts must use durable MinIO URIs") from error
+    if model.artifact_uri == f"{source_bucket}/{primary_object}":
+        raise ValueError("PaddleX static artifacts must use durable MinIO URIs")
+    validated: list[tuple[PurePosixPath, str, int]] = []
+    for raw in entries:
+        if not isinstance(raw, dict):
+            raise ValueError("PaddleX inference bundle manifest is invalid")
+        path = raw.get("path")
+        checksum = raw.get("checksum_sha256")
+        size = raw.get("size_bytes")
+        candidate = PurePosixPath(path) if isinstance(path, str) else PurePosixPath(".")
+        if (
+            not isinstance(path, str)
+            or candidate.is_absolute()
+            or ".." in candidate.parts
+            or not isinstance(checksum, str)
+            or len(checksum) != 64
+            or not all(ch in "0123456789abcdef" for ch in checksum)
+            or not isinstance(size, int)
+            or size < 0
+        ):
+            raise ValueError("PaddleX inference bundle manifest is invalid")
+        validated.append((candidate, checksum, size))
+    if (
+        len(validated) > _PADDLEX_BUNDLE_MAX_MEMBERS
+        or any(size > _PADDLEX_BUNDLE_MAX_MEMBER_BYTES for _path, _checksum, size in validated)
+        or sum(size for _path, _checksum, size in validated) > _PADDLEX_BUNDLE_MAX_BYTES
+    ):
+        raise ValueError("PaddleX inference bundle exceeds platform size limits")
+    parents = {item[0].parent for item in validated}
+    names = {item[0].name for item in validated}
+    if len(parents) != 1 or len(names) != len(validated):
+        raise ValueError("PaddleX inference bundle must contain one flat model directory")
+    primary_entry = next(
+        (path for path, _checksum, _size in validated if primary_object.endswith(str(path))),
+        None,
+    )
+    if primary_entry is None:
+        raise ValueError("PaddleX primary artifact does not match its manifest")
+    object_prefix = primary_object[: -len(str(primary_entry))]
+
+    with TemporaryDirectory(prefix="visiox-paddlex-deploy-") as temp_dir:
+        root = Path(temp_dir)
+        archive_path = root / "paddle-inference-bundle.tar"
+        local_files: list[tuple[Path, str]] = []
+        for path, checksum, size in sorted(validated, key=lambda item: str(item[0])):
+            local = root / "files" / path.name
+            storage.get_file(source_bucket, object_prefix + str(path), local)
+            actual_size = local.stat().st_size
+            if (
+                actual_size > _PADDLEX_BUNDLE_MAX_MEMBER_BYTES
+                or actual_size != size
+                or sha256_file(local) != checksum
+            ):
+                raise ValueError("PaddleX static artifact integrity check failed")
+            local_files.append((local, path.name))
+        with tarfile.open(archive_path, mode="w") as archive:
+            for local, name in local_files:
+                info = tarfile.TarInfo(name)
+                info.size = local.stat().st_size
+                info.mode = 0o400
+                info.mtime = 0
+                with local.open("rb") as source:
+                    archive.addfile(info, source)
+        bundle_checksum = sha256_file(archive_path)
+        bundle_size = archive_path.stat().st_size
+        object_name = f"deployments/{model.id}/paddle-inference-{bundle_checksum}.tar"
+        storage.put_file(
+            "models", object_name, archive_path, content_type="application/x-tar"
+        )
+    bundle_uri = f"minio://models/{object_name}"
+    model.deployment_compatibility = {
+        **model.deployment_compatibility,
+        "paddlex_bundle": {
+            "uri": bundle_uri,
+            "checksum_sha256": bundle_checksum,
+            "size_bytes": bundle_size,
+            "format": "tar",
+            "artifact_type": "paddle_inference_bundle",
+            "artifact_role": "paddle_inference_bundle",
+        },
+    }
+    bundle_entry = {
+        "uri": bundle_uri,
+        "checksum_sha256": bundle_checksum,
+        "size_bytes": bundle_size,
+        "format": "tar",
+        "artifact_type": "paddle_inference_bundle",
+        "artifact_role": "paddle_inference_bundle",
+    }
+    model.artifact_manifest = {
+        **model.artifact_manifest,
+        "deployment_artifacts": [bundle_entry],
+    }
+    return bundle_uri, bundle_checksum
+
+
+def _ensure_paddlex_runtime_compatibility(
+    model: TrainedModel,
+    runtime_image_digest: str,
+) -> None:
+    compatibility = dict(model.deployment_compatibility)
+    entries = compatibility.get("runtime_compatibility")
+    normalized = list(entries) if isinstance(entries, list) else []
+    if not any(
+        isinstance(entry, dict)
+        and entry.get("runtime_image_digest") == runtime_image_digest
+        and entry.get("adapter_key") == model.adapter_key
+        and entry.get("model_format") == "paddle_inference_bundle"
+        for entry in normalized
+    ):
+        adapter_version = model.artifact_manifest.get("adapter_version")
+        normalized.append(
+            {
+                "runtime_image_digest": runtime_image_digest,
+                "adapter_key": model.adapter_key,
+                "adapter_version": adapter_version,
+                "model_format": "paddle_inference_bundle",
+                "backends": ["paddle_inference", "paddlex_hpi_tensorrt"],
+                "precisions": ["fp32", "fp16"],
+                "hpi_requirements": {
+                    "cuda_min": "11.8",
+                    "tensorrt_min": "8.6",
+                    "compute_capability_min": "7.0",
+                },
+                "source": "platform_default",
+            }
+        )
+    model.deployment_compatibility = {
+        **compatibility,
+        "runtime_compatibility": normalized,
+    }
 
 
 def _artifact_format(uri: str) -> Literal["pt", "onnx", "engine"]:
@@ -1137,12 +1406,7 @@ async def _queue_service_operation(
             status_code=status.HTTP_409_CONFLICT,
             detail="No successful deployment revision is available",
         )
-    if require_rollback and (
-        set(instance.rollback_metadata) != _ROLLBACK_FIELDS
-        or any(
-            instance.rollback_metadata.get(field) is None for field in _ROLLBACK_FIELDS
-        )
-    ):
+    if require_rollback and not _valid_rollback_metadata(instance.rollback_metadata):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="No prior healthy deployment is available for rollback",
@@ -1223,6 +1487,8 @@ def _mark_enqueue_failed(
     service.status = "running" if restore_healthy else "failed"
     instance.status = "running" if restore_healthy else "failed"
     instance.health_status = "healthy" if restore_healthy else "unhealthy"
+    if restore_healthy:
+        _restore_upgrade_snapshot(service, instance)
     task.status = TaskStatus.FAILED.value
     task.error_code = "ENQUEUE_FAILED"
     task.error_message = "Edge deployment could not be queued"
@@ -1245,6 +1511,62 @@ def _instance_has_healthy_tuple(instance: DeploymentInstance) -> bool:
         and instance.engine is not None
         and instance.engine_digest is not None
         and instance.port is not None
+    )
+
+
+def _restore_upgrade_snapshot(
+    service: DeploymentService,
+    instance: DeploymentInstance,
+) -> bool:
+    snapshot = service.config.get("upgrade_snapshot")
+    if not isinstance(snapshot, dict) or not isinstance(
+        snapshot.get("service_config"), dict
+    ):
+        return False
+    service.config = dict(snapshot["service_config"])
+    service.trained_model_id = snapshot.get("trained_model_id")
+    service.status = str(snapshot.get("service_status", "running"))
+    service.desired_state = str(snapshot.get("desired_state", "running"))
+    service.active_revision = snapshot.get("active_revision")
+    instance.status = str(snapshot.get("instance_status", "running"))
+    instance.health_status = str(
+        snapshot.get("instance_health_status", "healthy")
+    )
+    instance.deployment_revision = int(
+        snapshot.get("instance_deployment_revision", instance.deployment_revision)
+    )
+    rollback_metadata = snapshot.get("rollback_metadata")
+    instance.rollback_metadata = (
+        dict(rollback_metadata) if isinstance(rollback_metadata, dict) else {}
+    )
+    return True
+
+
+def _instance_runtime_tuple(
+    service: DeploymentService,
+    instance: DeploymentInstance,
+) -> dict[str, Any]:
+    if not _instance_has_healthy_tuple(instance):
+        raise ValueError("deployment instance does not have a healthy runtime tuple")
+    result: dict[str, Any] = {
+        "container_id": instance.container_id,
+        "image_digest": instance.image_digest,
+        "model_checksum": instance.model_checksum,
+        "engine": instance.engine,
+        "engine_digest": instance.engine_digest,
+        "port": instance.port,
+    }
+    deployment = service.config.get("deployment")
+    if isinstance(deployment, dict) and _ROLLBACK_IDENTITY_FIELDS.issubset(deployment):
+        result.update(
+            {field: str(deployment[field]) for field in _ROLLBACK_IDENTITY_FIELDS}
+        )
+    return result
+
+
+def _valid_rollback_metadata(value: dict[str, Any]) -> bool:
+    return frozenset(value) in _ROLLBACK_FIELD_SETS and all(
+        value.get(field) is not None for field in value
     )
 
 

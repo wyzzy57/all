@@ -346,6 +346,7 @@ def _deployment_database(*, prior_healthy: bool = False):
     deployment_config = {
         "deployment": {
             "image_digest": IMAGE_DIGEST,
+            "artifact_uri": "minio://models/trained/model-1/best.pt",
             "model_checksum": MODEL_CHECKSUM,
             "model_format": "pt",
             "format": "engine",
@@ -579,6 +580,69 @@ def test_deploy_handler_persists_fixed_failure_without_remote_secrets() -> None:
         assert instance is not None and instance.status == "failed"
         assert task is not None and task.status == "FAILED"
         assert "secret" not in (task.error_message or "").casefold()
+
+
+def test_failed_upgrade_restores_previous_service_config_and_revision() -> None:
+    factory, cipher = _deployment_database(prior_healthy=True)
+    with factory() as database:
+        service = database.get(DeploymentService, "service-1")
+        instance = database.get(DeploymentInstance, "instance-1")
+        assert service is not None and instance is not None
+        old_config = json.loads(json.dumps(service.config))
+        old_rollback = dict(instance.rollback_metadata)
+        service.config = {
+            **service.config,
+            "upgrade_snapshot": {
+                "service_config": old_config,
+                "trained_model_id": None,
+                "service_status": "running",
+                "desired_state": "running",
+                "active_revision": 1,
+                "instance_status": "running",
+                "instance_health_status": "healthy",
+                "instance_deployment_revision": 1,
+                "rollback_metadata": old_rollback,
+            },
+        }
+        service.status = "upgrade_queued"
+        service.active_revision = 1
+        instance.status = "upgrade_queued"
+        instance.deployment_revision = 2
+        instance.rollback_metadata = {
+            "container_id": instance.container_id,
+            "image_digest": instance.image_digest,
+            "model_checksum": instance.model_checksum,
+            "engine": instance.engine,
+            "engine_digest": instance.engine_digest,
+            "port": instance.port,
+        }
+        database.commit()
+    handler = DeployInferenceHandler(
+        factory,
+        EdgeExecutorSecurityContext(
+            cipher,
+            DeploymentSshClient(
+                DeploymentSshSession([_command_result({}, status=23)])
+            ),  # type: ignore[arg-type]
+        ),
+        RecordingStorage(),  # type: ignore[arg-type]
+    )
+
+    result = handler.execute(_load_execution(factory))
+
+    assert result.status == "failed"
+    with factory() as database:
+        service = database.get(DeploymentService, "service-1")
+        instance = database.get(DeploymentInstance, "instance-1")
+        assert service is not None and instance is not None
+        assert service.config == old_config
+        assert service.trained_model_id is None
+        assert service.status == "running"
+        assert service.active_revision == 1
+        assert instance.status == "running"
+        assert instance.health_status == "healthy"
+        assert instance.deployment_revision == 1
+        assert instance.rollback_metadata == old_rollback
 
 
 def test_stop_handler_uses_stable_instance_label_and_persists_stopped() -> None:
@@ -820,6 +884,94 @@ def _remote_deploy_request() -> dict[str, object]:
         },
         "previous_container_id": "a" * 64,
     }
+
+
+def _remote_paddlex_deploy_request() -> dict[str, object]:
+    request = _remote_deploy_request()
+    request["image_digest"] = (
+        "registry.internal/visiox/paddlex-inference@sha256:" + "c" * 64
+    )
+    request["labels"].update(  # type: ignore[union-attr]
+        {
+            "com.visiox.framework": "paddlex",
+            "com.visiox.adapter-key": "paddlex.object_detection.v1",
+            "com.visiox.adapter-version": "1.0.0",
+            "com.visiox.model-format": "paddle_inference_bundle",
+            "com.visiox.resolved-backend": "paddlex_hpi_tensorrt",
+            "com.visiox.runtime-digest": request["image_digest"],
+        }
+    )
+    request["model"] = {
+        "download_url": "https://minio.internal/model.tar?X-Amz-Signature=secret",
+        "checksum": MODEL_CHECKSUM,
+        "source_format": "paddle_inference_bundle",
+        "archive_format": "tar",
+    }
+    request["runtime"] = {
+        "framework": "paddlex",
+        "adapter_key": "paddlex.object_detection.v1",
+        "adapter_version": "1.0.0",
+        "model_format": "paddle_inference_bundle",
+        "resolved_backend": "paddlex_hpi_tensorrt",
+        "runtime_image_digest": request["image_digest"],
+        "format": "paddle_inference_bundle",
+        "precision": "fp16",
+        "input_shape": [1, 3, 640, 640],
+        "gpu_uuids": ["GPU-x86-fixture"],
+        "engine_cache_key": None,
+        "calibration_download_url": None,
+        "port": 18080,
+        "shm_size": "1g",
+        "restart_policy": "unless-stopped",
+        "model_mount_read_only": True,
+        "privileged": False,
+        "optimization": "auto",
+        "device": "gpu:0",
+    }
+    return request
+
+
+def test_paddlex_remote_request_mounts_verified_bundle_directory_read_only() -> None:
+    namespace = _script_namespace("deploy_inference.sh")
+    request = namespace["_validate_request"](_remote_paddlex_deploy_request())  # type: ignore[operator]
+    args = namespace["_container_args"](  # type: ignore[operator]
+        request,
+        artifact_path=Path("/var/lib/visiox/paddlex-bundle"),
+        config_path=Path("/var/lib/visiox/config.json"),
+        engine_digest="f" * 64,
+        name="visiox-paddlex-fixed",
+        host_port=18080,
+        runtime_user="1000:1000",
+    )
+
+    mounts = [args[index + 1] for index, value in enumerate(args) if value == "--mount"]
+    assert any(
+        mount.replace("\\", "/")
+        == "type=bind,src=/var/lib/visiox/paddlex-bundle,dst=/models/model,readonly"
+        for mount in mounts
+    )
+    assert "VISIOX_INFERENCE_CONFIG=/app/config.json" in args
+    assert "com.visiox.framework=paddlex" in args
+    assert "com.visiox.resolved-backend=paddlex_hpi_tensorrt" in args
+
+
+def test_paddlex_bundle_extraction_rejects_traversal_before_writing(
+    tmp_path: Path,
+) -> None:
+    import io
+    import tarfile
+
+    namespace = _script_namespace("deploy_inference.sh")
+    archive = tmp_path / "bundle.tar"
+    with tarfile.open(archive, "w") as handle:
+        payload = b"escape"
+        info = tarfile.TarInfo("../outside.txt")
+        info.size = len(payload)
+        handle.addfile(info, io.BytesIO(payload))
+
+    with pytest.raises(ValueError, match="bundle archive is invalid"):
+        namespace["_extract_bundle"](archive, tmp_path / "bundle")  # type: ignore[operator]
+    assert not (tmp_path / "outside.txt").exists()
 
 
 def test_deploy_script_builds_hardened_docker_arguments_from_validated_json() -> None:

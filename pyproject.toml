@@ -48,6 +48,7 @@ visiox-edge-bootstrap-server = "visiox_edge_executor_worker.bootstrap_server:mai
 [tool.hatch.build.targets.wheel]
 packages = [
   "apps/api-service/src/visiox_api",
+  "apps/paddlex-inference/src/visiox_paddlex_inference",
   "apps/yolo26-inference/src/visiox_yolo26_inference",
   "packages/visiox-common/src/visiox_common",
   "packages/visiox-db/src/visiox_db",
@@ -77,6 +78,7 @@ packages = [
 [tool.pytest.ini_options]
 pythonpath = [
   "apps/api-service/src",
+  "apps/paddlex-inference/src",
   "apps/yolo26-inference/src",
   "packages/visiox-common/src",
   "packages/visiox-db/src",

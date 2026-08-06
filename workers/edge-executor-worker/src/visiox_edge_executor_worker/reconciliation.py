@@ -49,6 +49,13 @@ _DEPLOYMENT_LABELS = frozenset(
         "com.visiox.engine",
         "com.visiox.engine-digest",
         "com.visiox.port",
+        "com.visiox.framework",
+        "com.visiox.adapter-key",
+        "com.visiox.adapter-version",
+        "com.visiox.model-format",
+        "com.visiox.resolved-backend",
+        "com.visiox.runtime-digest",
+        "com.visiox.runtime-config-checksum",
     }
 )
 
@@ -210,6 +217,11 @@ class RemoteRuntimeReconciler:
                 "node_id": instance.node_id,
                 "active_revision": service.active_revision,
                 "deployment_revision": instance.deployment_revision,
+                "deployment_config": (
+                    service.config.get("deployment")
+                    if isinstance(service.config.get("deployment"), dict)
+                    else {}
+                ),
             }
         if (
             expected["active_revision"] is None
@@ -270,6 +282,22 @@ class RemoteRuntimeReconciler:
             "com.visiox.engine-digest": expected["engine_digest"],
             "com.visiox.port": str(expected["port"]),
         }
+        deployment_config = expected["deployment_config"]
+        identity = {
+            "com.visiox.framework": deployment_config.get("framework"),
+            "com.visiox.adapter-key": deployment_config.get("adapter_key"),
+            "com.visiox.adapter-version": deployment_config.get("adapter_version"),
+            "com.visiox.model-format": deployment_config.get("model_format"),
+            "com.visiox.resolved-backend": deployment_config.get("resolved_backend"),
+            "com.visiox.runtime-digest": deployment_config.get(
+                "runtime_image_digest"
+            ),
+        }
+        if all(isinstance(value, str) and value for value in identity.values()):
+            expected_labels.update(identity)  # type: ignore[arg-type]
+        runtime_checksum = deployment_config.get("runtime_config_checksum")
+        if isinstance(runtime_checksum, str) and runtime_checksum:
+            expected_labels["com.visiox.runtime-config-checksum"] = runtime_checksum
         if observed is None or observed["labels"] != expected_labels:
             self._persist_deployment_failure(
                 instance_id,

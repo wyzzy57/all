@@ -483,6 +483,55 @@ def test_reconciler_recovers_running_deployment_from_exact_observed_tuple() -> N
     }
 
 
+def test_reconciler_matches_extended_paddlex_deployment_identity() -> None:
+    image_digest = (
+        "registry.internal/visiox/paddlex-inference@sha256:" + "b" * 64
+    )
+    response = _healthy_deployment_response(image_digest)
+    runtime_checksum = "9" * 64
+    labels = response["containers"][0]["labels"]  # type: ignore[index]
+    labels.update(  # type: ignore[union-attr]
+        {
+            "com.visiox.framework": "paddlex",
+            "com.visiox.adapter-key": "paddlex.object_detection.v1",
+            "com.visiox.adapter-version": "1.0.0",
+            "com.visiox.model-format": "paddle_inference_bundle",
+            "com.visiox.resolved-backend": "paddlex_hpi_tensorrt",
+            "com.visiox.runtime-digest": image_digest,
+            "com.visiox.runtime-config-checksum": runtime_checksum,
+        }
+    )
+    labels["com.visiox.engine"] = "paddle_inference_bundle"  # type: ignore[index]
+    reconciler, factory, _ssh_client, _ = _deployment_runtime(response)
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        assert service is not None and instance is not None
+        service.config = {
+            "deployment": {
+                "framework": "paddlex",
+                "adapter_key": "paddlex.object_detection.v1",
+                "adapter_version": "1.0.0",
+                "model_format": "paddle_inference_bundle",
+                "resolved_backend": "paddlex_hpi_tensorrt",
+                    "runtime_image_digest": image_digest,
+                    "runtime_config_checksum": runtime_checksum,
+            }
+        }
+        instance.image_digest = image_digest
+        instance.engine = "paddle_inference_bundle"
+        session.add_all([service, instance])
+        session.commit()
+
+    assert reconciler.reconcile_startup() == 1
+
+    with factory() as session:
+        service = session.get(DeploymentService, "service-1")
+        instance = session.get(DeploymentInstance, "instance-1")
+        assert service is not None and service.status == "running"
+        assert instance is not None and instance.health_status == "healthy"
+
+
 def test_reconciler_recovers_failed_deployment_when_remote_container_is_healthy() -> (
     None
 ):
