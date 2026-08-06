@@ -68,6 +68,12 @@ def ingest_training_artifacts(
         raise ArtifactCollectionError("artifact manifest entries are invalid")
 
     roles = dict(artifact_roles or {})
+    resolved_snapshot = getattr(job, "resolved_snapshot", None)
+    runtime_model_id = (
+        resolved_snapshot.get("runtime_model_id")
+        if isinstance(resolved_snapshot, Mapping)
+        else None
+    )
     by_role: dict[str, list[Mapping[str, Any]]] = {}
     for raw_entry in entries:
         if not isinstance(raw_entry, Mapping):
@@ -126,6 +132,10 @@ def ingest_training_artifacts(
             size_bytes=size_bytes,
             artifact_manifest={
                 **dict(manifest),
+                "model_identity": {
+                    "model_family": pipeline.model_family,
+                    "runtime_model_id": runtime_model_id,
+                },
                 "role_artifacts": [dict(item) for item in candidates],
             },
             metrics={"checksum": checksum},

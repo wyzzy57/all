@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import re
-from collections.abc import Generator
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Protocol
@@ -15,10 +14,25 @@ from sqlalchemy.orm import Session
 from visiox_api.dependencies.auth import get_current_user
 from visiox_api.dependencies.authorization import require_resource_permission
 from visiox_api.dependencies.database import get_db_session
+from visiox_api.services.framework_adapters import (
+    FrameworkAdapterCatalog,
+    get_framework_adapter_catalog,
+)
+from visiox_api.services.pipeline_inference import (
+    DockerPaddleXInferenceRuntime,
+    PaddleXInferenceRuntime,
+    PaddleXInferenceRuntimeRequest,
+    download_artifact,
+    download_paddlex_static_bundle,
+    paddlex_device,
+    resolve_pipeline_model,
+    safe_image_suffix,
+)
 from visiox_db.models import BaseModel as BaseModelRecord
 from visiox_db.models import TrainedModel, TrainingPipeline
 from visiox_db.models.identity import PERMISSION_USE, User
 from visiox_storage.client import ObjectStorageClient
+from visiox_paddlex.results import PaddleXResultError, read_inference_result
 
 
 router = APIRouter(prefix="/pipelines", tags=["pipeline-inference"])
@@ -80,6 +94,10 @@ def get_pipeline_predictor() -> PipelinePredictor:
     return UltralyticsPipelinePredictor()
 
 
+def get_pipeline_inference_runtime() -> PaddleXInferenceRuntime:
+    return DockerPaddleXInferenceRuntime()
+
+
 @router.post("/{pipeline_id}/predict/image", response_model=PipelinePredictResponse)
 async def predict_pipeline_image(
     pipeline_id: str,
@@ -89,6 +107,8 @@ async def predict_pipeline_image(
     session: Session = Depends(get_pipeline_inference_session),
     storage: ObjectStorageClient = Depends(get_pipeline_inference_storage),
     predictor: PipelinePredictor = Depends(get_pipeline_predictor),
+    runtime: PaddleXInferenceRuntime = Depends(get_pipeline_inference_runtime),
+    catalog: FrameworkAdapterCatalog = Depends(get_framework_adapter_catalog),
     actor: User = Depends(get_current_user),
 ) -> PipelinePredictResponse:
     pipeline = session.get(TrainingPipeline, pipeline_id)
@@ -98,18 +118,70 @@ async def predict_pipeline_image(
     if file.content_type and not file.content_type.startswith("image/"):
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Only image files are supported")
 
-    weight_uri = _resolve_weight_uri(session, pipeline, model_weight)
+    resolved = resolve_pipeline_model(
+        session, catalog, pipeline, model_weight, operation="image_inference"
+    )
+    paddlex_environment = None
+    paddlex_runtime_digest = None
+    if pipeline.framework == "paddlex":
+        paddlex_environment = paddlex_device(environment)
+        paddlex_runtime_digest = _require_inference_digest(
+            resolved.adapter.capabilities.inference_runtime_image_digest
+        )
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Image file is empty")
 
     with TemporaryDirectory(prefix="visiox-infer-") as temp_dir:
         work_dir = Path(temp_dir)
-        model_path = work_dir / "model.pt"
+        model_path = work_dir / "model" / f"model.{resolved.model_format}"
         image_path = work_dir / (Path(file.filename or "image").name or "image.png")
-        _download_storage_uri(storage, weight_uri, model_path)
         image_path.write_bytes(image_bytes)
-        result = predictor.predict(model_path=model_path, image_path=image_path, environment=environment or "cpu")
+        if pipeline.framework == "ultralytics":
+            download_artifact(
+                storage,
+                resolved.artifact_uri,
+                model_path,
+                checksum=resolved.model.checksum if resolved.model else None,
+                size_bytes=resolved.model.size_bytes if resolved.model else None,
+            )
+            result = predictor.predict(
+                model_path=model_path,
+                image_path=image_path,
+                environment=environment or "cpu",
+            )
+        elif pipeline.framework == "paddlex":
+            assert paddlex_environment is not None
+            assert paddlex_runtime_digest is not None
+            model_dir = download_paddlex_static_bundle(storage, resolved, work_dir / "model")
+            output_dir = work_dir / "output"
+            output_dir.mkdir()
+            mounted_input = work_dir / "input" / f"image{safe_image_suffix(file.filename)}"
+            mounted_input.parent.mkdir()
+            mounted_input.write_bytes(image_bytes)
+            request = PaddleXInferenceRuntimeRequest(
+                image_digest=paddlex_runtime_digest,
+                workspace=work_dir,
+                model_dir=model_dir,
+                image_path=mounted_input,
+                output_dir=output_dir,
+                result_path=output_dir / "inference_result.json",
+                environment=paddlex_environment,
+            )
+            try:
+                runtime.run(request)
+                predictions, annotated = read_inference_result(
+                    request.result_path, request.output_dir
+                )
+            except (RuntimeError, PaddleXResultError) as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            result = PipelineInferenceResult(
+                predictions=predictions,
+                annotated_image_bytes=annotated,
+                content_type="image/png",
+            )
+        else:
+            raise HTTPException(status_code=409, detail="Framework inference is not implemented")
 
     encoded = base64.b64encode(result.annotated_image_bytes).decode("ascii")
     return PipelinePredictResponse(
@@ -229,3 +301,9 @@ def _ultralytics_predictions(result: Any) -> list[dict[str, Any]]:
             }
         )
     return predictions
+
+
+def _require_inference_digest(value: str | None) -> str:
+    if not value:
+        raise HTTPException(status_code=409, detail="PaddleX inference runtime is unavailable")
+    return value
