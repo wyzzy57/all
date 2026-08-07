@@ -853,7 +853,7 @@ def test_create_paddlex_service_persists_resolved_runtime_and_checksummed_bundle
     assert deployment["adapter_key"] == "paddlex.object_detection.v1"
     assert deployment["adapter_version"] == "1.0.0"
     assert deployment["model_format"] == "paddle_inference_bundle"
-    assert deployment["resolved_backend"] == "paddlex_hpi_tensorrt"
+    assert deployment["resolved_backend"] == "paddle_inference"
     assert deployment["runtime_image_digest"] == runtime_digest
     assert deployment["image_digest"] == runtime_digest
     assert deployment["artifact_uri"].startswith("minio://models/deployments/")
@@ -872,14 +872,9 @@ def test_create_paddlex_service_persists_resolved_runtime_and_checksummed_bundle
                 "adapter_key": "paddlex.object_detection.v1",
                 "adapter_version": "1.0.0",
                 "model_format": "paddle_inference_bundle",
-                "backends": ["paddle_inference", "paddlex_hpi_tensorrt"],
-                "precisions": ["fp32", "fp16"],
-                "hpi_requirements": {
-                    "cuda_min": "11.8",
-                    "tensorrt_min": "8.6",
-                    "compute_capability_min": "7.0",
-                },
-                "source": "platform_default",
+                "backends": ["paddle_inference"],
+                "precisions": ["fp32"],
+                "source": "runtime_image_default",
             }
         ]
 

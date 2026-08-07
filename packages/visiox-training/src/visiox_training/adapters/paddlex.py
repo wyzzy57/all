@@ -7,6 +7,7 @@ from visiox_training.adapters.base import FrameworkAdapter
 from visiox_training.capabilities import (
     FrameworkCapabilities,
     ModelCapability,
+    OperationName,
     ParameterCapability,
     ResourceCapability,
     RuntimeComponentCapability,
@@ -25,24 +26,31 @@ from visiox_training.errors import UnsupportedAdapterOperationError
 
 
 class PaddleXAdapter(FrameworkAdapter):
-    def __init__(self, training_image_digest: str, inference_image_digest: str) -> None:
+    def __init__(
+        self,
+        training_image_digest: str,
+        inference_image_digest: str,
+        *,
+        implemented_operations: set[OperationName] | None = None,
+    ) -> None:
         training_digest, training_reason = runtime_image_readiness(
             training_image_digest, "VISIOX_PADDLEX_TRAINING_IMAGE_DIGEST"
         )
         inference_digest, inference_reason = runtime_image_readiness(
             inference_image_digest, "VISIOX_PADDLEX_INFERENCE_IMAGE_DIGEST"
         )
+        supported_operations = {
+            "train",
+            "stop",
+            "resume",
+            "evaluate",
+            "image_inference",
+            "export",
+            "deploy",
+        }
         operations = operation_capabilities(
-            supported={
-                "train",
-                "stop",
-                "resume",
-                "evaluate",
-                "image_inference",
-                "export",
-                "deploy",
-            },
-            implemented=set(),
+            supported=supported_operations,
+            implemented=set(implemented_operations or ()),
             training_unavailable_reason=training_reason,
             inference_unavailable_reason=inference_reason,
         )
@@ -54,13 +62,14 @@ class PaddleXAdapter(FrameworkAdapter):
             display_name="PaddleX",
             framework_version="3.0.3",
             base_image_reference=(
-                "paddlepaddle/paddle:3.0.0-gpu-cuda11.8-cudnn8.9-trt8.6"
+                "nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04@sha256:"
+                "f6913f3c02f297877f6859d12ff330043c0be668fdad86868c29a239a5a82151"
             ),
             runtime_components=(
                 RuntimeComponentCapability(key="PaddlePaddle", value="3.0.0"),
-                RuntimeComponentCapability(key="CUDA", value="11.8"),
-                RuntimeComponentCapability(key="cuDNN", value="8.9"),
-                RuntimeComponentCapability(key="TensorRT", value="8.6"),
+                RuntimeComponentCapability(key="Python", value="3.10"),
+                RuntimeComponentCapability(key="CUDA", value="11.8.0"),
+                RuntimeComponentCapability(key="cuDNN", value="8.9.6"),
             ),
             training_runtime_image_digest=training_digest,
             inference_runtime_image_digest=inference_digest,

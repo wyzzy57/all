@@ -313,11 +313,7 @@ def operation_capabilities(
         if not is_supported:
             reason = f"{name} is not supported by this adapter"
         elif not is_implemented:
-            reason = (
-                "Product support is cataloged, but this adapter operation is not "
-                "implemented until Tasks 4-12; legacy execution paths are outside "
-                "this adapter readiness status"
-            )
+            reason = "No runtime implementation is registered for this adapter operation"
             if runtime_reason is not None:
                 reason = f"{reason}; runtime unavailable: {runtime_reason}"
         else:

@@ -3,8 +3,12 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from visiox_api.services.framework_adapters import FrameworkAdapterCatalog
+from visiox_api.services.framework_adapters import (
+    FrameworkAdapterCatalog,
+    paddlex_operation_implementations,
+)
 from visiox_common.settings import Settings
+from visiox_training.adapters.paddlex import PaddleXAdapter
 from visiox_training.contracts import DatasetManifest
 from visiox_training.capabilities import (
     FrameworkCapabilities,
@@ -75,13 +79,14 @@ def test_catalog_publishes_exact_product_model_choices_and_versions() -> None:
     assert paddlex.framework_version == "3.0.3"
     assert paddlex.framework_version_constraint is None
     assert paddlex.base_image_reference == (
-        "paddlepaddle/paddle:3.0.0-gpu-cuda11.8-cudnn8.9-trt8.6"
+        "nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04"
+        "@sha256:f6913f3c02f297877f6859d12ff330043c0be668fdad86868c29a239a5a82151"
     )
     assert {item.key: item.value for item in paddlex.runtime_components} == {
         "PaddlePaddle": "3.0.0",
-        "CUDA": "11.8",
-        "cuDNN": "8.9",
-        "TensorRT": "8.6",
+        "Python": "3.10",
+        "CUDA": "11.8.0",
+        "cuDNN": "8.9.6",
     }
     assert [
         (
@@ -155,11 +160,14 @@ def test_capabilities_cover_dataset_parameters_resources_operations_and_outputs(
             "export",
             "deploy",
         }
-        assert all(operation.implemented is False for operation in task.operations)
+        if adapter.framework == "paddlex":
+            assert all(operation.implemented is True for operation in task.operations)
+        else:
+            assert all(operation.implemented is False for operation in task.operations)
         assert all(operation.available is False for operation in task.operations)
         assert capability.availability_baseline_operation == "train"
         assert capability.available is False
-        assert "Tasks 4-12" in capability.unavailable_reason
+        assert "Tasks 4-12" not in capability.unavailable_reason
         assert task.observable_metrics
         assert task.observable_artifacts
 
@@ -198,7 +206,7 @@ def test_empty_and_invalid_training_digests_are_actionably_unavailable() -> None
             assert env_name in train.unavailable_reason
 
 
-def test_valid_digests_do_not_enable_unwired_operations() -> None:
+def test_paddlex_operation_availability_derives_from_wiring_and_runtime_digests() -> None:
     training_ready = FrameworkAdapterCatalog(
         _settings(
             ultralytics_training_image_digest=VALID_DIGEST,
@@ -210,13 +218,14 @@ def test_valid_digests_do_not_enable_unwired_operations() -> None:
         adapter for adapter in training_ready.list() if adapter.framework == "paddlex"
     )
 
-    assert paddlex.capabilities.available is False
-    assert "Tasks 4-12" in paddlex.capabilities.unavailable_reason
+    assert paddlex.capabilities.available is True
     assert paddlex.capabilities.training_runtime_image_digest == VALID_DIGEST
     assert _operation(paddlex, "train").supported is True
-    assert _operation(paddlex, "train").implemented is False
-    assert _operation(paddlex, "train").available is False
-    assert "Tasks 4-12" in _operation(paddlex, "train").unavailable_reason
+    assert _operation(paddlex, "train").implemented is True
+    assert _operation(paddlex, "train").available is True
+    assert _operation(paddlex, "train").unavailable_reason is None
+    assert _operation(paddlex, "evaluate").available is True
+    assert _operation(paddlex, "export").available is True
     assert _operation(paddlex, "deploy").available is False
     assert (
         "VISIOX_PADDLEX_INFERENCE_IMAGE_DIGEST"
@@ -232,11 +241,41 @@ def test_valid_digests_do_not_enable_unwired_operations() -> None:
     paddlex = next(
         adapter for adapter in fully_ready.list() if adapter.framework == "paddlex"
     )
+    assert paddlex.capabilities.available is True
     assert _operation(paddlex, "deploy").supported is True
-    assert _operation(paddlex, "deploy").implemented is False
-    assert _operation(paddlex, "deploy").available is False
-    assert "Tasks 4-12" in _operation(paddlex, "deploy").unavailable_reason
+    assert _operation(paddlex, "deploy").implemented is True
+    assert _operation(paddlex, "deploy").available is True
+    assert _operation(paddlex, "image_inference").available is True
     assert paddlex.capabilities.inference_runtime_image_digest == VALID_DIGEST
+
+
+def test_paddlex_digests_do_not_enable_unregistered_operations() -> None:
+    adapter = PaddleXAdapter(
+        VALID_DIGEST,
+        VALID_DIGEST,
+        implemented_operations=set(),
+    )
+
+    assert all(
+        operation.implemented is False
+        for operation in adapter.capabilities.tasks[0].operations
+    )
+    assert adapter.capabilities.available is False
+
+
+def test_paddlex_operation_registry_references_real_callables() -> None:
+    implementations = paddlex_operation_implementations()
+
+    assert set(implementations) == {
+        "train",
+        "stop",
+        "resume",
+        "evaluate",
+        "image_inference",
+        "export",
+        "deploy",
+    }
+    assert all(callable(handler) for handler in implementations.values())
 
 
 def test_catalog_adapters_fail_unwired_execution_actionably() -> None:

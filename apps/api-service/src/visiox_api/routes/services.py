@@ -1322,14 +1322,9 @@ def _ensure_paddlex_runtime_compatibility(
                 "adapter_key": model.adapter_key,
                 "adapter_version": adapter_version,
                 "model_format": "paddle_inference_bundle",
-                "backends": ["paddle_inference", "paddlex_hpi_tensorrt"],
-                "precisions": ["fp32", "fp16"],
-                "hpi_requirements": {
-                    "cuda_min": "11.8",
-                    "tensorrt_min": "8.6",
-                    "compute_capability_min": "7.0",
-                },
-                "source": "platform_default",
+                "backends": ["paddle_inference"],
+                "precisions": ["fp32"],
+                "source": "runtime_image_default",
             }
         )
     model.deployment_compatibility = {
