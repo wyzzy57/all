@@ -58,3 +58,10 @@ def test_paddlex_runbook_uses_authenticated_capabilities_endpoint():
 
     assert "/frameworks/capabilities" in runbook
     assert "Authorization = \"Bearer $($login.access_token)\"" in runbook
+
+
+def test_control_plane_image_uses_a_reliable_configurable_package_mirror():
+    dockerfile = Path("apps/api-service/Dockerfile").read_text(encoding="utf-8")
+
+    assert "ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple" in dockerfile
+    assert "PIP_INDEX_URL=${PIP_INDEX_URL}" in dockerfile
