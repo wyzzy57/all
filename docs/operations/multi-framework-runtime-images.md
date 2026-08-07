@@ -87,6 +87,13 @@ Docker stores image layers in its configured data root (normally
 the runtime container cache on first use; keep the cache on the node's managed
 Docker storage and do not seed or download those weights from API startup.
 
+For PP-YOLOE-S and RT-DETR-L, PaddleX publishes fixed pretraining URLs but no
+official weight-file SHA-256. The seed contract therefore carries the PaddleX
+`v3.0.3` immutable Git revision and SHA-256 of the exact official model config,
+not a made-up weight checksum. The edge runtime must record the SHA-256 it
+actually downloads in the artifact manifest before later staging or deployment
+verification.
+
 ## Rollback
 
 Keep the last known-good digest for every runtime. To roll back, replace only

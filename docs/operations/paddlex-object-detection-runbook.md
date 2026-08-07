@@ -4,15 +4,19 @@
 
 The initial PaddleX object-detection catalog contains two official references:
 
-| Product model | Runtime model id | Config path | Weight format | Revision |
+| Product model | Runtime model id | Config path | Weight format | Immutable revision |
 | --- | --- | --- | --- | --- |
-| PP-YOLOE-S | `PP-YOLOE_plus-S` | `paddlex/configs/modules/object_detection/PP-YOLOE_plus-S.yaml` | `pdparams` | `paddlex-model-zoo/3.0.3/PP-YOLOE_plus-S` |
-| RT-DETR-L | `RT-DETR-L` | `paddlex/configs/modules/object_detection/RT-DETR-L.yaml` | `pdparams` | `paddlex-model-zoo/3.0.3/RT-DETR-L` |
+| PP-YOLOE-S | `PP-YOLOE_plus-S` | `paddlex/configs/modules/object_detection/PP-YOLOE_plus-S.yaml` | `pdparams` | PaddleX `v3.0.3` commit `917f10be35f644d01a6bf57cf8c312bdba0a4183` |
+| RT-DETR-L | `RT-DETR-L` | `paddlex/configs/modules/object_detection/RT-DETR-L.yaml` | `pdparams` | PaddleX `v3.0.3` commit `917f10be35f644d01a6bf57cf8c312bdba0a4183` |
 
-The API seeds only these identifiers, configuration paths, format metadata, and
-revisions. It does not download model weights or create fake weight files.
-PaddleX resolves and caches official assets on the authorized edge runtime at
-execution time.
+The API seeds only these identifiers, fixed configuration sources, format
+metadata, and immutable revisions. Each seed also records the SHA-256 of the
+official configuration content at that commit. PaddleX does not publish a
+weight-file SHA-256 for either official pretraining URL, so the seed explicitly
+uses the immutable upstream revision and configuration checksum instead of
+inventing an artifact checksum. It does not download model weights or create
+fake weight files. PaddleX resolves and caches official assets on the
+authorized edge runtime at execution time.
 
 ## Preflight
 
@@ -37,11 +41,23 @@ docker compose -f infra/compose/docker-compose.yml up -d api-service edge-execut
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/health
 ```
 
-Check framework availability through the API. A missing or tag-only runtime
-reference must be fixed before creating a production job:
+Check framework availability through the authenticated API. Set the operator
+credentials in the current shell rather than placing them in this runbook. A
+missing or tag-only runtime reference must be fixed before creating a
+production job:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8000/frameworks | ConvertTo-Json -Depth 8
+$apiBaseUrl = "http://127.0.0.1:8000"
+$loginBody = @{
+  username = $env:VISIOX_OPERATOR_USERNAME
+  password = $env:VISIOX_OPERATOR_PASSWORD
+} | ConvertTo-Json
+$login = Invoke-RestMethod -Method Post -ContentType "application/json" `
+  -Body $loginBody "$apiBaseUrl/auth/login"
+$headers = @{ Authorization = "Bearer $($login.access_token)" }
+Invoke-RestMethod -Headers $headers `
+  "$apiBaseUrl/frameworks/capabilities?task_kind=object_detection" |
+  ConvertTo-Json -Depth 8
 ```
 
 For temporary VisualDL troubleshooting only, configure a protected public URL

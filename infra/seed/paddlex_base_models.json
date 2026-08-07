@@ -10,10 +10,14 @@
     "artifact_format": "pdparams",
     "source_path": "paddlex://official/PP-YOLOE_plus-S",
     "artifact_metadata": {
-      "source_id": "PaddlePaddle/PaddleX:PP-YOLOE_plus-S",
-      "revision": "paddlex-model-zoo/3.0.3/PP-YOLOE_plus-S",
+      "source_id": "PaddlePaddle/PaddleX",
+      "immutable_revision": "917f10be35f644d01a6bf57cf8c312bdba0a4183",
+      "immutable_revision_algorithm": "git-sha1",
       "runtime_model_id": "PP-YOLOE_plus-S",
-      "config_path": "paddlex/configs/modules/object_detection/PP-YOLOE_plus-S.yaml"
+      "config_path": "paddlex/configs/modules/object_detection/PP-YOLOE_plus-S.yaml",
+      "config_source_url": "https://raw.githubusercontent.com/PaddlePaddle/PaddleX/917f10be35f644d01a6bf57cf8c312bdba0a4183/paddlex/configs/modules/object_detection/PP-YOLOE_plus-S.yaml",
+      "config_checksum_sha256": "f372a205ca5485b22ac4b12f0d814e52d8e9d691de59d18f485c214c48f8080a",
+      "pretrained_artifact_url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pretrained_model/PP-YOLOE_plus-S_obj365_pretrained.pdparams"
     },
     "status": "available"
   },
@@ -28,10 +32,14 @@
     "artifact_format": "pdparams",
     "source_path": "paddlex://official/RT-DETR-L",
     "artifact_metadata": {
-      "source_id": "PaddlePaddle/PaddleX:RT-DETR-L",
-      "revision": "paddlex-model-zoo/3.0.3/RT-DETR-L",
+      "source_id": "PaddlePaddle/PaddleX",
+      "immutable_revision": "917f10be35f644d01a6bf57cf8c312bdba0a4183",
+      "immutable_revision_algorithm": "git-sha1",
       "runtime_model_id": "RT-DETR-L",
-      "config_path": "paddlex/configs/modules/object_detection/RT-DETR-L.yaml"
+      "config_path": "paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
+      "config_source_url": "https://raw.githubusercontent.com/PaddlePaddle/PaddleX/917f10be35f644d01a6bf57cf8c312bdba0a4183/paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
+      "config_checksum_sha256": "efdf795471ee4d8b29f24d6408cef458c823d91b78db8aeb975db8855122c91d",
+      "pretrained_artifact_url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pretrained_model/RT-DETR-L_pretrained.pdparams"
     },
     "status": "available"
   }

@@ -2,11 +2,6 @@ services:
   api-service:
     environment:
       PYTHONPATH: /app/apps/api-service/src:/app/packages/visiox-common/src:/app/packages/visiox-paddlex/src
-      VISIOX_DEPLOYMENT_IMAGE_DIGEST: ${VISIOX_DEPLOYMENT_IMAGE_DIGEST:-}
-      VISIOX_ULTRALYTICS_TRAINING_IMAGE_DIGEST: ${VISIOX_ULTRALYTICS_TRAINING_IMAGE_DIGEST:-}
-      VISIOX_PADDLEX_TRAINING_IMAGE_DIGEST: ${VISIOX_PADDLEX_TRAINING_IMAGE_DIGEST:-}
-      VISIOX_PADDLEX_INFERENCE_IMAGE_DIGEST: ${VISIOX_PADDLEX_INFERENCE_IMAGE_DIGEST:-}
-      VISIOX_LLM_TRAINING_IMAGE_DIGEST: ${VISIOX_LLM_TRAINING_IMAGE_DIGEST:-}
     volumes:
       - ../../apps/api-service/src:/app/apps/api-service/src
       - ../../packages/visiox-common/src:/app/packages/visiox-common/src

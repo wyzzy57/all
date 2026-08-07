@@ -78,7 +78,7 @@ def _seed_base_models(
             model = session.get(BaseModel, model_id)
 
             if model is not None and _has_real_artifact(model):
-                _apply_model_metadata(model, record)
+                _apply_model_metadata(model, record, preserve_status=True)
                 session.add(model)
                 prepared_count += 1
                 continue
@@ -114,7 +114,12 @@ def _seed_base_models(
     return prepared_count
 
 
-def _apply_model_metadata(model: BaseModel, record: dict[str, object]) -> None:
+def _apply_model_metadata(
+    model: BaseModel,
+    record: dict[str, object],
+    *,
+    preserve_status: bool = False,
+) -> None:
     model.family = str(record["family"])
     model.task = str(record["task"])
     model.scale = str(record["scale"])
@@ -128,7 +133,8 @@ def _apply_model_metadata(model: BaseModel, record: dict[str, object]) -> None:
     metadata = record.get("artifact_metadata")
     model.artifact_metadata = dict(metadata) if isinstance(metadata, dict) else {}
     model.source_path = str(record["source_path"])
-    model.status = str(record.get("status") or "ready")
+    if not preserve_status:
+        model.status = str(record.get("status") or "ready")
 
 
 def _has_real_artifact(model: BaseModel) -> bool:
