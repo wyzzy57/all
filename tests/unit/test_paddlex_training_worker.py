@@ -338,6 +338,7 @@ def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
     assert config["EvalDataset"]["image_dir"] == ""
     assert config["use_vdl"] is True
     assert config["vdl_log_dir"] == "/workspace/output/visualdl"
+    assert config["output_eval"] == "/workspace/output"
 
 
 def test_resource_sample_preserves_each_gpu(monkeypatch) -> None:

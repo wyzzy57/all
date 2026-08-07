@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -32,6 +32,7 @@ def apply_runtime_config(
             inputs_def["image_shape"] = [3, image_size, image_size]
     config["use_vdl"] = True
     config["vdl_log_dir"] = visualdl_dir
+    config["output_eval"] = str(PurePosixPath(visualdl_dir).parent)
 
 
 def _set_reader_resize(

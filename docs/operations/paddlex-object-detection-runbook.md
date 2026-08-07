@@ -169,3 +169,8 @@ For a bad release, restore the prior known-good pinned digest, run Compose
 configuration validation, recreate the API and edge executor, and submit a new
 validation job. Preserve completed-job records, runtime digests, artifact
 checksums, and model revisions as audit evidence.
+
+PaddleDetection evaluation runs from the bundled repository rather than the
+image `WORKDIR`. Keep the generated `output_eval` config pinned to the writable
+training output root; otherwise COCO evaluation attempts to create a relative
+`bbox.json` in the read-only repository and exits with `PermissionError`.
