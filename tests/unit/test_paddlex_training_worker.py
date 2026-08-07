@@ -137,6 +137,10 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
     assert "tensorrt" not in dockerfile.casefold()
     assert "paddlex[cv]==3.0.3" in requirements
     assert "pip install --no-cache-dir -r /app/requirements.lock" in dockerfile
+    assert (
+        'mkdir -p "$VIRTUAL_ENV/lib/python3.10/site-packages/'
+        'paddlex/repo_manager/repos"'
+    ) in dockerfile
     assert "paddlex --install PaddleDetection" in dockerfile
     assert "paddlex_main.py" in dockerfile
     assert "/usr/local/bin/visiox-train" in dockerfile
