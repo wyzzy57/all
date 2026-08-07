@@ -45,6 +45,31 @@ docker buildx imagetools inspect $pinned
 docker pull $pinned
 ```
 
+### PaddleX 3.0.3 Runtime Contract
+
+Both PaddleX images share this immutable runtime prefix:
+
+- linux/amd64 CUDA base:
+  `nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04@sha256:f6913f3c02f297877f6859d12ff330043c0be668fdad86868c29a239a5a82151`.
+- Python 3.10 virtual environment at `/opt/venv`.
+- Official PaddlePaddle GPU 3.0.0 cu118 wheel:
+  `https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl`.
+- Wheel length: 1,206,592,273 bytes; SHA-256:
+  `6e262ce3a18220a4e066e40656777753fd6dcdd8637c9f397dd449079d12ce9c`.
+- PaddleX `3.0.3`, installed only after the wheel checksum and imported Paddle
+  version are verified.
+
+The training image installs PaddleDetection but omits TensorRT. The inference
+image also omits TensorRT and defaults to Paddle Inference FP32. A deployment
+must not request `paddlex_hpi_tensorrt` unless a different immutable runtime
+explicitly declares TensorRT support and the target-node inventory verifies
+the corresponding CUDA, TensorRT, and compute-capability requirements.
+
+The Dockerfiles default to `https://mirrors.aliyun.com/pypi/simple` for Python
+packages. Operators may override `PIP_INDEX_URL` at build time with another
+verified mirror without changing the pinned CUDA manifest or Paddle wheel
+checksum.
+
 Set the five `VISIOX_*_IMAGE_DIGEST` variables in the deployment `.env` to
 these pinned references. Production mTLS Compose refuses to start when any
 runtime digest is missing. A tag such as `:latest` or `:2026-08-07` is not an

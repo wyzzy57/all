@@ -1,5 +1,7 @@
 # PaddleDetection is intentionally absent: this runtime consumes an exported
 # static inference bundle and does not install training plugins.
+# PaddlePaddle GPU 3.0.0 is installed from the official cu118 wheel and
+# SHA-256 verified in the Dockerfile before PaddleX.
 fastapi==0.115.14
 paddlex[cv]==3.0.3
 pillow==11.2.1

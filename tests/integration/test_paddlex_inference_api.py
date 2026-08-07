@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from io import BytesIO
+import re
 import sys
 from types import SimpleNamespace
 
@@ -338,11 +339,29 @@ def test_paddlex_dockerfile_uses_a_pinned_build_arg_base_image() -> None:
     )
 
     expected_image = (
-        "paddlepaddle/paddle:3.0.0-gpu-cuda11.8-cudnn8.9-trt8.6"
-        "@sha256:2bd8830dafd258501e7313b320fa1bcc946c70318b3081647b90bc70182e7360"
+        "nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04"
+        "@sha256:f6913f3c02f297877f6859d12ff330043c0be668fdad86868c29a239a5a82151"
     )
-    assert f"ARG PADDLEX_BASE_IMAGE={expected_image}" in dockerfile
-    assert "FROM ${PADDLEX_BASE_IMAGE}" in dockerfile
+    paddle_wheel = (
+        "https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/"
+        "paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl"
+    )
+    assert f"ARG CUDA_BASE_IMAGE={expected_image}" in dockerfile
+    assert "FROM ${CUDA_BASE_IMAGE}" in dockerfile
+    assert f"ARG PADDLE_WHEEL_URL={paddle_wheel}" in dockerfile
+    assert "ARG UBUNTU_MIRROR=https://mirrors.aliyun.com/ubuntu" in dockerfile
+    assert "Acquire::Retries=3" in dockerfile
+    assert re.search(
+        r"^ARG PADDLE_WHEEL_SHA256=[a-f0-9]{64}$",
+        dockerfile,
+        re.MULTILINE,
+    )
+    assert "sha256sum -c -" in dockerfile
+    assert "--output /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl" in dockerfile
+    assert "pip install --no-cache-dir /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl" in dockerfile
+    assert "python3.10 -m venv" in dockerfile
+    assert "paddlepaddle/paddle" not in dockerfile
+    assert "tensorrt" not in dockerfile.casefold()
     assert "@sha256:" in dockerfile.splitlines()[0]
     assert "latest" not in dockerfile.casefold()
     assert (

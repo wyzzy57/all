@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from threading import Event
@@ -105,10 +106,30 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
         "workers/paddlex-training-worker/requirements.lock"
     ).read_text(encoding="utf-8")
 
-    assert (
-        "FROM paddlepaddle/paddle:3.0.0-gpu-cuda11.8-cudnn8.9-trt8.6"
-        in dockerfile
+    cuda_base = (
+        "nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04"
+        "@sha256:f6913f3c02f297877f6859d12ff330043c0be668fdad86868c29a239a5a82151"
     )
+    paddle_wheel = (
+        "https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/"
+        "paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl"
+    )
+    assert f"ARG CUDA_BASE_IMAGE={cuda_base}" in dockerfile
+    assert "FROM ${CUDA_BASE_IMAGE}" in dockerfile
+    assert f"ARG PADDLE_WHEEL_URL={paddle_wheel}" in dockerfile
+    assert "ARG UBUNTU_MIRROR=https://mirrors.aliyun.com/ubuntu" in dockerfile
+    assert "Acquire::Retries=3" in dockerfile
+    assert re.search(
+        r"^ARG PADDLE_WHEEL_SHA256=[a-f0-9]{64}$",
+        dockerfile,
+        re.MULTILINE,
+    )
+    assert "sha256sum -c -" in dockerfile
+    assert "--output /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl" in dockerfile
+    assert "pip install --no-cache-dir /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl" in dockerfile
+    assert "python3.10 -m venv" in dockerfile
+    assert "paddlepaddle/paddle" not in dockerfile
+    assert "tensorrt" not in dockerfile.casefold()
     assert "paddlex[cv]==3.0.3" in requirements
     assert "pip install --no-cache-dir -r /app/requirements.lock" in dockerfile
     assert "paddlex --install PaddleDetection" in dockerfile
