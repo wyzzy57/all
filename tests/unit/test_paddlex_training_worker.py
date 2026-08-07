@@ -230,6 +230,8 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
     assert "paddlex_main.py" in dockerfile
     assert "/usr/local/bin/visiox-train" in dockerfile
     assert "visiox_paddlex_training_worker.entrypoint" in dockerfile
+    assert "WORKDIR /workspace/output" in dockerfile
+    assert "WORKDIR /opt/paddlex-runtime" not in dockerfile
 
 
 def test_python_310_training_runtime_does_not_import_typing_self() -> None:

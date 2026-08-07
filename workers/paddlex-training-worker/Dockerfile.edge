@@ -72,4 +72,4 @@ RUN printf '#!/bin/sh\nexec python -m visiox_paddlex_training_worker.entrypoint 
 ENV PYTHONPATH=/app
 
 HEALTHCHECK NONE
-WORKDIR /opt/paddlex-runtime
+WORKDIR /workspace/output
