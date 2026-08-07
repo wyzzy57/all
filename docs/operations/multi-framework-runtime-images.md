@@ -71,6 +71,12 @@ Both PaddleX images share this immutable runtime prefix:
   a GPU-enabled runtime because `libcuda.so.1` is injected by the NVIDIA
   container runtime and is intentionally absent during an ordinary image build.
 
+Both Dockerfiles install `packages/visiox-paddlex/requirements.runtime.lock`
+before any training- or inference-specific dependency. Keep that COPY/RUN
+pair byte-for-byte identical and before the application lock in both files so
+the large PaddleX CV dependency layer is shared on disk when both immutable
+images are pulled to an edge node.
+
 The training image installs PaddleDetection but omits TensorRT. The inference
 image also omits TensorRT and defaults to Paddle Inference FP32. A deployment
 must not request `paddlex_hpi_tensorrt` unless a different immutable runtime

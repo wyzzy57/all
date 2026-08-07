@@ -37,6 +37,9 @@ RUN python3.10 -m venv "$VIRTUAL_ENV" \
     && python -m pip install --no-cache-dir /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl \
     && python -c "from importlib.metadata import version; assert version('paddlepaddle-gpu') == '3.0.0'" \
     && rm -f /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl
+COPY packages/visiox-paddlex/requirements.runtime.lock /tmp/paddlex-runtime-requirements.lock
+RUN pip install --no-cache-dir -r /tmp/paddlex-runtime-requirements.lock \
+    && rm -f /tmp/paddlex-runtime-requirements.lock
 
 ENV VISIOX_INFERENCE_HOST=0.0.0.0 \
     VISIOX_INFERENCE_PORT=8080

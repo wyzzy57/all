@@ -1,7 +1,6 @@
-# PaddlePaddle GPU 3.0.0 is installed from the official cu118 wheel and
-# SHA-256 verified in Dockerfile.edge before these PaddleX dependencies.
+# PaddlePaddle GPU and the shared PaddleX CV runtime are installed and verified
+# before these training-only dependencies.
 mlflow-skinny==3.1.1
-paddlex[cv]==3.0.3
 psutil==7.0.0
 tensorboard==2.19.0
 tensorboardX==2.6.4

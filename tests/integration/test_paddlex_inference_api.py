@@ -403,18 +403,49 @@ def test_paddlex_inference_documents_static_bundle_runtime() -> None:
 
 def test_paddlex_inference_dependency_lock_is_complete_and_pinned() -> None:
     lock_path = __import__("pathlib").Path("apps/paddlex-inference/requirements.lock")
+    shared_lock_path = __import__("pathlib").Path(
+        "packages/visiox-paddlex/requirements.runtime.lock"
+    )
+    assert shared_lock_path.is_file()
     requirements = {
         line.strip()
         for line in lock_path.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.startswith("#")
     }
+    shared_requirements = {
+        line.strip()
+        for line in shared_lock_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    }
 
-    assert "paddlex[cv]==3.0.3" in requirements
+    assert "paddlex[cv]==3.0.3" in shared_requirements
+    assert all(not item.startswith("paddlex") for item in requirements)
     assert any(item.startswith("fastapi==") for item in requirements)
     assert any(item.startswith("pillow==") for item in requirements)
     assert any(item.startswith("python-multipart==") for item in requirements)
     assert any(item.startswith("uvicorn[standard]==") for item in requirements)
     assert all("==" in item for item in requirements)
+
+
+def test_paddlex_inference_installs_shared_runtime_before_app_dependencies() -> None:
+    dockerfile = (
+        __import__("pathlib")
+        .Path("apps/paddlex-inference/Dockerfile")
+        .read_text(encoding="utf-8")
+    )
+    shared_copy = (
+        "COPY packages/visiox-paddlex/requirements.runtime.lock "
+        "/tmp/paddlex-runtime-requirements.lock"
+    )
+    shared_install = (
+        "pip install --no-cache-dir -r /tmp/paddlex-runtime-requirements.lock"
+    )
+
+    assert shared_copy in dockerfile
+    assert shared_install in dockerfile
+    assert dockerfile.index(shared_copy) < dockerfile.index(
+        "COPY apps/paddlex-inference/requirements.lock"
+    )
 
 
 def test_production_model_bundle_path_must_be_absolute(tmp_path, monkeypatch) -> None:

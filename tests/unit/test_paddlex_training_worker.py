@@ -144,6 +144,11 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
     requirements = Path(
         "workers/paddlex-training-worker/requirements.lock"
     ).read_text(encoding="utf-8")
+    shared_requirements_path = Path(
+        "packages/visiox-paddlex/requirements.runtime.lock"
+    )
+    assert shared_requirements_path.is_file()
+    shared_requirements = shared_requirements_path.read_text(encoding="utf-8")
     installer_path = Path(
         "workers/paddlex-training-worker/install_paddledetection.py"
     )
@@ -180,8 +185,19 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
     assert "python3.10 -m venv" in dockerfile
     assert "paddlepaddle/paddle" not in dockerfile
     assert "tensorrt" not in dockerfile.casefold()
-    assert "paddlex[cv]==3.0.3" in requirements
+    assert "paddlex[cv]==3.0.3" in shared_requirements
+    assert "paddlex[cv]" not in requirements
     assert "pip install --no-cache-dir -r /app/requirements.lock" in dockerfile
+    shared_copy = (
+        "COPY packages/visiox-paddlex/requirements.runtime.lock "
+        "/tmp/paddlex-runtime-requirements.lock"
+    )
+    shared_install = (
+        "pip install --no-cache-dir -r /tmp/paddlex-runtime-requirements.lock"
+    )
+    assert shared_copy in dockerfile
+    assert shared_install in dockerfile
+    assert dockerfile.index(shared_copy) < dockerfile.index("WORKDIR /app")
     assert (
         'mkdir -p "$VIRTUAL_ENV/lib/python3.10/site-packages/'
         'paddlex/repo_manager/repos"'

@@ -1,0 +1,3 @@
+# Shared by the PaddleX training and inference images so the large CV runtime
+# is stored as one reusable OCI layer.
+paddlex[cv]==3.0.3
