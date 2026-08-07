@@ -446,7 +446,7 @@ def test_worker_always_writes_durable_outputs_and_manifest(
         "python",
         "/opt/paddlex-runtime/paddlex_main.py",
         "-c",
-        "paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
+        "/opt/paddlex-runtime/paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
     )
     assert popen_calls[0][1].get("shell") is not True
     assert popen_calls[0][1]["env"]["VISIOX_PADDLEX_IMAGE_SIZE"] == "640"

@@ -63,11 +63,11 @@ def _launch_spec(
     [
         (
             "PP-YOLOE-S",
-            "paddlex/configs/modules/object_detection/PP-YOLOE_plus-S.yaml",
+            "/opt/paddlex-runtime/paddlex/configs/modules/object_detection/PP-YOLOE_plus-S.yaml",
         ),
         (
             "RT-DETR-L",
-            "paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
+            "/opt/paddlex-runtime/paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
         ),
     ],
 )
@@ -91,7 +91,7 @@ def test_typed_parameters_build_an_argv_command_with_managed_paths() -> None:
         "python",
         "/opt/paddlex-runtime/paddlex_main.py",
         "-c",
-        "paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
+        "/opt/paddlex-runtime/paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
         "-o",
         "Global.mode=train",
         "-o",
@@ -124,7 +124,7 @@ def test_export_command_uses_trained_best_weights_and_static_bundle_dir() -> Non
         "python",
         "/opt/paddlex-runtime/paddlex_main.py",
         "-c",
-        "paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
+        "/opt/paddlex-runtime/paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
         "-o",
         "Global.mode=export",
         "-o",

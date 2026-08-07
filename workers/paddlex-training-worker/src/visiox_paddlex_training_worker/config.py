@@ -17,14 +17,11 @@ RESUME_PREFIX = "/workspace/output/.resume/last"
 RESUME_WEIGHTS_PATH = f"{RESUME_PREFIX}.pdparams"
 BEST_WEIGHTS_PATH = "/workspace/output/best_model/best_model.pdparams"
 BEST_INFERENCE_DIR = "/workspace/output/best_model/inference"
+PADDLEX_CONFIG_DIR = "/opt/paddlex-runtime/paddlex/configs/modules/object_detection"
 MODEL_CONFIG_PATHS = {
-    "PP-YOLOE-S": (
-        "paddlex/configs/modules/object_detection/PP-YOLOE_plus-S.yaml"
-    ),
-    "PP-YOLOE_plus-S": (
-        "paddlex/configs/modules/object_detection/PP-YOLOE_plus-S.yaml"
-    ),
-    "RT-DETR-L": "paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
+    "PP-YOLOE-S": f"{PADDLEX_CONFIG_DIR}/PP-YOLOE_plus-S.yaml",
+    "PP-YOLOE_plus-S": f"{PADDLEX_CONFIG_DIR}/PP-YOLOE_plus-S.yaml",
+    "RT-DETR-L": f"{PADDLEX_CONFIG_DIR}/RT-DETR-L.yaml",
 }
 
 _ALIASES = {
