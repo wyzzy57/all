@@ -359,6 +359,11 @@ def test_paddlex_dockerfile_uses_a_pinned_build_arg_base_image() -> None:
     assert "sha256sum -c -" in dockerfile
     assert "--output /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl" in dockerfile
     assert "pip install --no-cache-dir /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl" in dockerfile
+    assert (
+        "from importlib.metadata import version; "
+        "assert version('paddlepaddle-gpu') == '3.0.0'"
+    ) in dockerfile
+    assert 'import paddle; assert paddle.__version__' not in dockerfile
     assert "python3.10 -m venv" in dockerfile
     assert "paddlepaddle/paddle" not in dockerfile
     assert "tensorrt" not in dockerfile.casefold()

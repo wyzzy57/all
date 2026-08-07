@@ -56,8 +56,10 @@ Both PaddleX images share this immutable runtime prefix:
   `https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl`.
 - Wheel length: 1,206,592,273 bytes; SHA-256:
   `6e262ce3a18220a4e066e40656777753fd6dcdd8637c9f397dd449079d12ce9c`.
-- PaddleX `3.0.3`, installed only after the wheel checksum and imported Paddle
-  version are verified.
+- PaddleX `3.0.3`, installed only after the wheel checksum and installed
+  `paddlepaddle-gpu` distribution version are verified. Import Paddle only in
+  a GPU-enabled runtime because `libcuda.so.1` is injected by the NVIDIA
+  container runtime and is intentionally absent during an ordinary image build.
 
 The training image installs PaddleDetection but omits TensorRT. The inference
 image also omits TensorRT and defaults to Paddle Inference FP32. A deployment

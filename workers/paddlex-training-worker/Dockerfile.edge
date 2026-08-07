@@ -35,7 +35,7 @@ RUN python3.10 -m venv "$VIRTUAL_ENV" \
         --connect-timeout 30 --output /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl "$PADDLE_WHEEL_URL" \
     && echo "$PADDLE_WHEEL_SHA256  /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl" | sha256sum -c - \
     && python -m pip install --no-cache-dir /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl \
-    && python -c "import paddle; assert paddle.__version__ == '3.0.0'" \
+    && python -c "from importlib.metadata import version; assert version('paddlepaddle-gpu') == '3.0.0'" \
     && rm -f /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl
 
 WORKDIR /app
