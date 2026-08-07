@@ -214,6 +214,21 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
     assert "visiox_paddlex_training_worker.entrypoint" in dockerfile
 
 
+def test_python_310_training_runtime_does_not_import_typing_self() -> None:
+    runtime_package = Path("packages/visiox-training/src/visiox_training")
+    incompatible = [
+        path.as_posix()
+        for path in runtime_package.rglob("*.py")
+        if re.search(
+            r"^from typing import .*\bSelf\b",
+            path.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+    ]
+
+    assert incompatible == []
+
+
 def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
     module = _paddlex_main_module()
 

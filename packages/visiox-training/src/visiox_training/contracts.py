@@ -7,7 +7,9 @@ import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Any, Literal, Self, cast
+from typing import Any, Literal, cast
+
+from typing_extensions import Self
 
 from pydantic import (
     BaseModel,

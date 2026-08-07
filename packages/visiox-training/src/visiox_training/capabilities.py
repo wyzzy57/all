@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import re
-from typing import Any, Literal, Self
+from typing import Any, Literal
+
+from typing_extensions import Self
 
 from pydantic import (
     BaseModel,
