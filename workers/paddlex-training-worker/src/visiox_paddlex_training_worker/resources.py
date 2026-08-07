@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import subprocess
@@ -10,6 +10,7 @@ from typing import Any, Callable
 import psutil
 
 
+UTC = timezone.utc
 _GPU_QUERY = (
     "index,uuid,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw"
 )

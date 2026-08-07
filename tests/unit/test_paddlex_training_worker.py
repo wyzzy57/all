@@ -229,6 +229,28 @@ def test_python_310_training_runtime_does_not_import_typing_self() -> None:
     assert incompatible == []
 
 
+def test_python_310_training_runtime_does_not_import_datetime_utc() -> None:
+    runtime_packages = (
+        Path("packages/visiox-training/src/visiox_training"),
+        Path(
+            "workers/paddlex-training-worker/src/"
+            "visiox_paddlex_training_worker"
+        ),
+    )
+    incompatible = [
+        path.as_posix()
+        for package in runtime_packages
+        for path in package.rglob("*.py")
+        if re.search(
+            r"^from datetime import .*\bUTC\b",
+            path.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+    ]
+
+    assert incompatible == []
+
+
 def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
     module = _paddlex_main_module()
 

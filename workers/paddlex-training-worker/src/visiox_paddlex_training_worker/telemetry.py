@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
 from typing import Any, Callable
 
 
+UTC = timezone.utc
 _POSITION = re.compile(r"Epoch:\s*\[\s*(\d+)\s*]\s*\[\s*(\d+)\s*/\s*(\d+)\s*]")
 _METRIC = re.compile(
     r"(?<![A-Za-z0-9_])"

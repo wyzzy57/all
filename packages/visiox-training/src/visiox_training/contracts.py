@@ -5,7 +5,7 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Literal, cast
 
@@ -22,6 +22,7 @@ from pydantic import (
 )
 
 
+UTC = timezone.utc
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 

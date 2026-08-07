@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -27,6 +27,7 @@ from visiox_paddlex_training_worker.resources import ResourceSampler
 from visiox_paddlex_training_worker.telemetry import TelemetryRecorder
 
 
+UTC = timezone.utc
 LAUNCH_SPEC_PATH = Path("/workspace/input/launch-spec.json")
 OUTPUT_DIR = Path("/workspace/output")
 CHECKPOINT_DIR = Path("/workspace/checkpoint")
