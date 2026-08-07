@@ -18,7 +18,7 @@ export type LlmChartDefinition = {
 };
 
 export type LlmChartGroup = {
-  id: "loss" | "optimization" | "throughput" | "progress";
+  id: "loss" | "optimization" | "throughput" | "runtime" | "progress";
   title: string;
   charts: LlmChartDefinition[];
 };
@@ -124,6 +124,17 @@ const METRIC_GROUPS: GroupTemplate[] = [
         lines: [{ key: "samples_per_second", label: "Samples/s" }],
       },
     ],
+  },
+  {
+    id: "runtime",
+    title: "运行时间",
+    charts: [{
+      id: "runtime",
+      title: "Runtime",
+      unit: "seconds",
+      axisMin: 0,
+      lines: [{ key: "train_runtime", label: "Runtime" }],
+    }],
   },
   {
     id: "progress",

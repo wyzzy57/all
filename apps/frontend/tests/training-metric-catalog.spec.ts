@@ -102,4 +102,25 @@ describe("training metric catalog", () => {
       "metrics.map50": [point(1, 0.7)],
     }, "metrics.map50")).toEqual([point(1, 0.7)]);
   });
+
+  it("keeps runtime and hardware scalars on their own unit-aware charts", () => {
+    const cards = buildMetricCards({
+      "train.box_loss": [point(1, 1.2)],
+      "throughput.samples_per_second": [point(1, 38)],
+      "gpu.GPU-0.utilization_percent": [point(1, 72)],
+      "gpu.GPU-0.memory_used_mb": [point(1, 12288)],
+      "gpu.GPU-0.temperature_celsius": [point(1, 67)],
+      "gpu.GPU-0.power_watts": [point(1, 185)],
+    });
+
+    expect(cards.map((card) => card.id)).toEqual(expect.arrayContaining([
+      "box-loss",
+      "throughput-samples-per-second",
+      "gpu-gpu-0-utilization-percent",
+      "gpu-gpu-0-memory-used-mb",
+      "gpu-gpu-0-temperature-celsius",
+      "gpu-gpu-0-power-watts",
+    ]));
+    expect(cards.find((card) => card.id === "gpu-gpu-0-utilization-percent")?.axis).toEqual({ min: 0, max: 100 });
+  });
 });

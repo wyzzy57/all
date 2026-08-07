@@ -108,6 +108,7 @@ function mountView() {
         LlmTrainingMetrics: { props: ["response"], template: '<div data-testid="llm-metrics-stub">{{ Object.keys(response.series).join(",") }}</div>' },
         LlmTrainingResources: { props: ["response"], template: '<div data-testid="llm-resources-stub">{{ Object.keys(response.series).join(",") }}</div>' },
         LlmTrainingAnalysis: { props: ["analysis", "artifacts"], template: '<div data-testid="llm-analysis-stub">{{ analysis.findings.length }} / {{ artifacts.items.length }}</div>' },
+        PaddleXTrainingAnalysis: { props: ["series", "analysis", "artifacts", "visualdlUrl"], template: '<div data-testid="paddlex-analysis-stub">{{ Object.keys(series).join(",") }} / {{ visualdlUrl }}</div>' },
         "el-dialog": {
           props: ["modelValue", "title"],
           template: '<section v-if="modelValue" class="el-dialog-stub"><h2>{{ title }}</h2><slot /><slot name="footer" /></section>',
@@ -212,7 +213,7 @@ describe("TrainingVisualizationView", () => {
     expect(wrapper.text()).toContain("花椒检测");
     expect(wrapper.text()).toContain("柑橘检测");
 
-    for (const tab of ["overview", "metrics", "resources", "analysis"]) {
+    for (const tab of ["overview", "metrics", "resources", "analysis", "logs", "artifacts"]) {
       expect(wrapper.find(`[data-testid="tab-${tab}"]`).exists()).toBe(true);
     }
 
@@ -274,6 +275,59 @@ describe("TrainingVisualizationView", () => {
     expect(apiMock.getTrainingObservabilityAnalysis).toHaveBeenCalledWith("job-1");
     expect(apiMock.getTrainingObservabilityArtifacts).toHaveBeenCalledWith("job-1");
     expect(wrapper.find('[data-testid="llm-analysis-stub"]').exists()).toBe(true);
+  });
+
+  it("renders framework provenance and a PaddleX analysis in the common native shell", async () => {
+    apiMock.listPipelines.mockResolvedValue({
+      items: [{
+        id: "pipeline-1", name: "PaddleX detection", engine: "paddlex", task: "detect", scale: "s", status: "training",
+        model_family: "PP-YOLOE-S", adapter_key: "paddlex.object_detection.v1", adapter_version: "1.2.0",
+      }],
+      total: 1, limit: 100, offset: 0,
+    });
+    apiMock.listTrainingJobs.mockResolvedValue({ items: [{
+      ...jobs[0],
+      resolved_snapshot: {
+        model: { runtime_id: "PP-YOLOE-S" },
+        dataset: { version: 7 },
+        runtime_image_digest: "registry.example/paddlex@sha256:abc123",
+      },
+      attempts: [{ id: "attempt-1", attempt_number: 1 }, { id: "attempt-2", attempt_number: 2 }],
+    }], total: 1, limit: 200, offset: 0 });
+    apiMock.getTrainingObservabilitySummary.mockResolvedValue(summary({
+      engine: "paddlex", pipeline_name: "PaddleX detection", available_scalar_keys: ["bbox_map", "loss_cls"],
+    }));
+
+    const wrapper = mountView();
+    await flushPromises();
+
+    const overview = wrapper.get('[data-testid="overview-panel"]').text();
+    expect(overview).toContain("PaddleX");
+    expect(overview).toContain("PP-YOLOE-S");
+    expect(overview).toContain("v7");
+    expect(overview).toContain("sha256:abc123");
+    expect(overview).toContain("1.2.0");
+    expect(wrapper.get('[data-testid="attempt-select"]').findAll("option")).toHaveLength(2);
+
+    await wrapper.get('[data-testid="tab-analysis"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.get('[data-testid="paddlex-analysis-stub"]').text()).toContain("https://visualdl.example.test");
+  });
+
+  it("lists every framework artifact in the shared product tab and opens its download URL", async () => {
+    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+    apiMock.getTrainingObservabilityArtifacts.mockResolvedValue({
+      items: [{ path: "best_model.pdparams", size_bytes: 1024, sha256: "abc", download_url: "https://files.example/best_model.pdparams" }],
+      availability: summary().availability,
+    });
+    const wrapper = mountView();
+    await flushPromises();
+
+    await wrapper.get('[data-testid="tab-artifacts"]').trigger("click");
+    await flushPromises();
+    await wrapper.get('[data-testid="observability-artifact-best_model.pdparams"]').trigger("click");
+    expect(openSpy).toHaveBeenCalledWith("https://files.example/best_model.pdparams", "_blank", "noopener,noreferrer");
+    openSpy.mockRestore();
   });
 
   it("renders TensorBoard-style semantic metric cards and switches to run comparison", async () => {

@@ -427,6 +427,15 @@ export type TrainingAttemptRecord = {
   artifact_manifest: Record<string, unknown>;
 };
 
+export type TrainingResolvedSnapshot = {
+  framework?: string;
+  adapter_key?: string;
+  adapter_version?: string;
+  runtime_image_digest?: string;
+  model?: { id?: string; family?: string; runtime_id?: string };
+  dataset?: { id?: string; version_id?: string; version?: number; format?: string };
+};
+
 export type ArtifactManifestRecord = {
   adapter_identity: AdapterIdentityRecord;
   role_artifacts: Array<Record<string, unknown>>;
@@ -456,6 +465,8 @@ export type TrainingJobRecord = {
   trained_model_id?: string | null;
   environment?: Record<string, unknown>;
   params?: Record<string, unknown>;
+  resolved_snapshot?: TrainingResolvedSnapshot;
+  attempts?: Array<Pick<TrainingAttemptRecord, "id" | "attempt_number">>;
   metrics: Record<string, unknown>;
   log_uri?: string | null;
   log_stream_id?: string | null;

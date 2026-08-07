@@ -144,4 +144,22 @@ describe("TrainingRunComparison", () => {
     expect(wrapper.find("[data-testid='comparison-chart']").exists()).toBe(false);
     expect(wrapper.get("[data-testid='comparison-empty']").text()).toContain("暂无可对比数据");
   });
+
+  it("offers only cross-framework canonical metrics and explains why proprietary losses are excluded", async () => {
+    const wrapper = mountComparison();
+    await flushPromises();
+
+    const options = wrapper.findAll("[data-testid='comparison-metric-select'] option").map((option) => option.attributes("value"));
+    expect(options).toEqual(expect.arrayContaining([
+      "detection.ap50",
+      "detection.ap",
+      "detection.precision",
+      "detection.recall",
+      "runtime.throughput",
+      "runtime.elapsed_seconds",
+      "resource.gpu_memory_peak_mb",
+    ]));
+    expect(options.some((key) => key?.includes("loss"))).toBe(false);
+    expect(wrapper.get("[data-testid='comparison-scope-note']").text()).toContain("框架私有损失");
+  });
 });

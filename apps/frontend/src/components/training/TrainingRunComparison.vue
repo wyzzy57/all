@@ -34,17 +34,13 @@ type ComparisonRow = {
 };
 
 const metricOptions: MetricOption[] = [
-  { key: "metrics.map50", label: "mAP50", format: "ratio", direction: "max", axis: { min: 0, max: 1 } },
-  { key: "metrics.map50_95", label: "mAP50-95", format: "ratio", direction: "max", axis: { min: 0, max: 1 } },
-  { key: "metrics.precision", label: "Precision", format: "ratio", direction: "max", axis: { min: 0, max: 1 } },
-  { key: "metrics.recall", label: "Recall", format: "ratio", direction: "max", axis: { min: 0, max: 1 } },
-  { key: "train.box_loss", label: "Train Box Loss", format: "number", direction: "min" },
-  { key: "val.box_loss", label: "Validation Box Loss", format: "number", direction: "min" },
-  { key: "train.cls_loss", label: "Train Classification Loss", format: "number", direction: "min" },
-  { key: "val.cls_loss", label: "Validation Classification Loss", format: "number", direction: "min" },
-  { key: "train.dfl_loss", label: "Train DFL Loss", format: "number", direction: "min" },
-  { key: "val.dfl_loss", label: "Validation DFL Loss", format: "number", direction: "min" },
-  { key: "learning_rate", label: "Learning Rate", format: "scientific", direction: "min" },
+  { key: "detection.ap50", label: "AP50", format: "ratio", direction: "max", axis: { min: 0, max: 1 } },
+  { key: "detection.ap", label: "AP50-95", format: "ratio", direction: "max", axis: { min: 0, max: 1 } },
+  { key: "detection.precision", label: "Precision", format: "ratio", direction: "max", axis: { min: 0, max: 1 } },
+  { key: "detection.recall", label: "Recall", format: "ratio", direction: "max", axis: { min: 0, max: 1 } },
+  { key: "runtime.throughput", label: "Throughput", format: "number", direction: "max" },
+  { key: "runtime.elapsed_seconds", label: "Runtime", format: "number", direction: "min" },
+  { key: "resource.gpu_memory_peak_mb", label: "Peak GPU memory", format: "number", direction: "min" },
 ];
 
 const selectedMetricKey = ref(metricOptions[0].key);
@@ -145,6 +141,7 @@ watch([selectedJobIds, selectedMetricKey, () => props.jobs], loadComparison, { d
         <select v-model="selectedMetricKey" data-testid="comparison-metric-select">
           <option v-for="option in metricOptions" :key="option.key" :value="option.key">{{ option.label }}</option>
         </select>
+        <small data-testid="comparison-scope-note">框架私有损失不具备统一语义，不能跨框架比较。</small>
       </label>
       <fieldset>
         <legend>训练记录 <span>选择 2-5 条</span></legend>

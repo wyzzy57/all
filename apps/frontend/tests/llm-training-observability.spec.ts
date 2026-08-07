@@ -41,6 +41,7 @@ const metricSeries: LlmScalarSeries = {
   grad_norm: [point(1, 1.2), point(2, 0.9)],
   tokens_per_second: [point(1, 820), point(2, 910)],
   samples_per_second: [point(1, 8.2), point(2, 9.1)],
+  train_runtime: [point(1, 600), point(2, 1200)],
   epoch: [point(1, 0.5), point(2, 1)],
   step: [point(1, 1), point(2, 2)],
 };
@@ -49,7 +50,7 @@ describe("LLM metric catalog", () => {
   it("groups loss, optimization, throughput and progress without mixing units", () => {
     const groups = buildLlmMetricCharts(metricSeries);
 
-    expect(groups.map((group) => group.id)).toEqual(["loss", "optimization", "throughput", "progress"]);
+    expect(groups.map((group) => group.id)).toEqual(["loss", "optimization", "throughput", "runtime", "progress"]);
     expect(groups.find((group) => group.id === "loss")?.charts).toEqual([
       expect.objectContaining({ unit: "Loss", series: expect.objectContaining({ "训练 Loss": metricSeries.loss }) }),
     ]);
@@ -60,6 +61,9 @@ describe("LLM metric catalog", () => {
     expect(groups.find((group) => group.id === "throughput")?.charts.map((chart) => chart.unit)).toEqual([
       "tokens/s",
       "samples/s",
+    ]);
+    expect(groups.find((group) => group.id === "runtime")?.charts).toEqual([
+      expect.objectContaining({ unit: "seconds", series: { Runtime: metricSeries.train_runtime } }),
     ]);
     expect(groups.find((group) => group.id === "progress")?.charts.map((chart) => chart.unit)).toEqual([
       "Epoch",
@@ -137,15 +141,15 @@ describe("native LLM observability components", () => {
     });
     await flushPromises();
 
-    expect(wrapper.findAll('[data-testid^="metric-group-"]')).toHaveLength(4);
+    expect(wrapper.findAll('[data-testid^="metric-group-"]')).toHaveLength(5);
     const chartOptions = echartsMocks.setOption.mock.calls
       .filter((call) => call[1] === true)
       .map((call) => call[0]);
-    expect(chartOptions.length).toBeGreaterThanOrEqual(7);
+    expect(chartOptions.length).toBeGreaterThanOrEqual(8);
     expect(chartOptions.every((option) => option.tooltip?.trigger === "axis")).toBe(true);
     expect(chartOptions.every((option) => Array.isArray(option.dataZoom) && option.dataZoom.length === 2)).toBe(true);
     expect(chartOptions.map((option) => option.yAxis?.name)).toEqual(expect.arrayContaining([
-      "Loss", "Learning rate", "Gradient norm", "tokens/s", "samples/s", "Epoch", "Step",
+      "Loss", "Learning rate", "Gradient norm", "tokens/s", "samples/s", "seconds", "Epoch", "Step",
     ]));
 
     const callsBeforeToggle = echartsMocks.setOption.mock.calls.length;

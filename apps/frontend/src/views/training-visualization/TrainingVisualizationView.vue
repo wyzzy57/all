@@ -112,13 +112,25 @@
           <div class="dashboard-panels">
             <section v-show="activeTab === 'overview'" class="dashboard-panel" data-testid="overview-panel">
               <div v-if="summaryLoading && !summaryData" class="panel-loading">正在加载训练概览...</div>
-              <LlmTrainingOverview
-                v-else-if="isLlmRun && summaryData"
-                :summary="summaryData"
-                :mlflow-url="mlflowUrl"
-                :tensorboard-url="tensorboardUrl"
-              />
               <template v-else>
+                <div class="overview-band provenance-band" data-testid="run-provenance">
+                  <div class="provenance-heading"><strong>运行溯源</strong><span>不可变训练快照</span></div>
+                  <div class="provenance-grid">
+                    <div class="provenance-cell"><span>框架</span><strong>{{ frameworkLabel }}</strong></div>
+                    <div class="provenance-cell"><span>模型</span><strong>{{ modelLabel }}</strong></div>
+                    <div class="provenance-cell"><span>数据集版本</span><strong>{{ datasetVersionLabel }}</strong></div>
+                    <div class="provenance-cell"><span>运行镜像</span><code>{{ imageDigestLabel }}</code></div>
+                    <div class="provenance-cell"><span>Adapter</span><strong>{{ adapterVersionLabel }}</strong></div>
+                    <label v-if="attempts.length" class="provenance-cell attempt-cell"><span>训练尝试</span><select v-model="selectedAttemptId" data-testid="attempt-select"><option v-for="attempt in attempts" :key="attempt.id" :value="attempt.id">Attempt {{ attempt.attempt_number }}</option></select></label>
+                  </div>
+                </div>
+                <LlmTrainingOverview
+                  v-if="isLlmRun && summaryData"
+                  :summary="summaryData"
+                  :mlflow-url="mlflowUrl"
+                  :tensorboard-url="tensorboardUrl"
+                />
+                <template v-else>
                 <div class="overview-band progress-band">
                   <div class="status-cell">
                     <span>训练状态</span>
@@ -170,6 +182,7 @@
                     </div>
                   </div>
                 </div>
+                </template>
               </template>
             </section>
 
@@ -260,15 +273,38 @@
                 v-if="isLlmRun"
                 :analysis="llmAnalysis"
                 :artifacts="llmArtifacts"
-                @open-artifact="openLlmArtifact"
+                @open-artifact="openObservabilityArtifact"
+              />
+              <PaddleXTrainingAnalysis
+                v-else-if="isPaddlexRun"
+                :series="scalarSeries"
+                :analysis="llmAnalysis"
+                :artifacts="llmArtifacts"
+                :visualdl-url="visualdlUrl"
+                @open-artifact="openObservabilityArtifact"
               />
               <KeepAlive :max="5">
                 <ArtifactGallery
-                  v-if="!isLlmRun && activeTab === 'analysis'"
+                  v-if="!isLlmRun && !isPaddlexRun && activeTab === 'analysis'"
                   :key="selectedJob.id"
                   :job-id="selectedJob.id"
                 />
               </KeepAlive>
+            </section>
+            <section
+              v-if="artifactsActivated"
+              v-show="activeTab === 'artifacts'"
+              class="dashboard-panel artifact-dashboard-panel"
+              data-testid="artifacts-panel"
+            >
+              <div v-if="artifactsLoading" class="panel-loading">正在加载训练产物...</div>
+              <el-empty v-else-if="llmArtifacts.items.length === 0" description="该训练暂无可下载产物" />
+              <div v-else class="observability-artifact-list">
+                <button v-for="artifact in llmArtifacts.items" :key="artifact.path" type="button" :data-testid="`observability-artifact-${artifact.path}`" @click="openObservabilityArtifact(artifact)">
+                  <span><strong>{{ artifact.path }}</strong><small>{{ artifact.sha256 }}</small></span>
+                  <span>{{ formatArtifactSize(artifact.size_bytes) }}</span>
+                </button>
+              </div>
             </section>
             <section
               v-if="activeTab === 'logs'"
@@ -318,8 +354,9 @@ import LlmTrainingMetrics from "@/features/training-observability/llm/LlmTrainin
 import LlmTrainingOverview from "@/features/training-observability/llm/LlmTrainingOverview.vue";
 import LlmTrainingResources from "@/features/training-observability/llm/LlmTrainingResources.vue";
 import type { LlmArtifact } from "@/features/training-observability/llm/llmMetricCatalog";
+import PaddleXTrainingAnalysis from "@/features/training-observability/paddlex/PaddleXTrainingAnalysis.vue";
 
-type DashboardTab = "overview" | "metrics" | "resources" | "analysis" | "logs";
+type DashboardTab = "overview" | "metrics" | "resources" | "analysis" | "logs" | "artifacts";
 type MetricsMode = "single" | "compare";
 
 const POLL_INTERVAL_MS = 5000;
@@ -331,6 +368,7 @@ const tabs: Array<{ id: DashboardTab; label: string }> = [
   { id: "resources", label: "资源" },
   { id: "analysis", label: "分析" },
   { id: "logs", label: "日志" },
+  { id: "artifacts", label: "产物" },
 ];
 
 const jobs = ref<TrainingJobRecord[]>([]);
@@ -353,12 +391,16 @@ const resourcesLoading = ref(false);
 const metricsActivated = ref(false);
 const resourcesActivated = ref(false);
 const analysisActivated = ref(false);
+const artifactsActivated = ref(false);
 const metricsChartMounted = ref(false);
 const resourcesChartMounted = ref(false);
+const artifactsLoading = ref(false);
 const advancedMenuOpen = ref(false);
+const selectedAttemptId = ref("");
 let metricsLoadedJobId: string | null = null;
 let resourcesLoadedJobId: string | null = null;
 let analysisLoadedJobId: string | null = null;
+let artifactsLoadedJobId: string | null = null;
 let generation = 0;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -368,8 +410,20 @@ const mlflowUrl = computed(() => secondaryActions.value.find((action) => action.
 const tensorboardUrl = computed(() => secondaryActions.value.find((action) => action.source === "tensorboard")?.url);
 const selectedPipeline = computed(() => pipelines.value.find((pipeline) => pipeline.id === selectedJob.value?.pipeline_id));
 const isLlmRun = computed(() => summaryData.value?.engine === "llamafactory" || selectedPipeline.value?.engine === "llamafactory");
+const isPaddlexRun = computed(() => summaryData.value?.engine === "paddlex" || selectedPipeline.value?.engine === "paddlex");
 const llmMetricResponse = computed(() => ({ series: scalarSeries.value, availability: scalarAvailability.value }));
 const llmResourceResponse = computed(() => ({ series: resourceSeries.value, availability: resourceAvailability.value }));
+const visualdlUrl = computed(() => secondaryActions.value.find((action) => action.source === "visualdl")?.url);
+const resolvedSnapshot = computed(() => selectedJob.value?.resolved_snapshot);
+const attempts = computed(() => selectedJob.value?.attempts ?? []);
+const frameworkLabel = computed(() => ({ yolo26: "Ultralytics", ultralytics: "Ultralytics", paddlex: "PaddleX", llamafactory: "LLaMA-Factory" } as Record<string, string>)[summaryData.value?.engine ?? selectedPipeline.value?.engine ?? ""] ?? "-");
+const modelLabel = computed(() => resolvedSnapshot.value?.model?.runtime_id ?? resolvedSnapshot.value?.model?.family ?? selectedPipeline.value?.model_family ?? "-");
+const datasetVersionLabel = computed(() => {
+  const version = resolvedSnapshot.value?.dataset?.version ?? readNumber(selectedJob.value?.metrics?.dataset_snapshot as Record<string, unknown> | undefined, ["dataset_version"]);
+  return version === null || version === undefined ? "-" : `v${version}`;
+});
+const imageDigestLabel = computed(() => formatImageDigest(resolvedSnapshot.value?.runtime_image_digest));
+const adapterVersionLabel = computed(() => resolvedSnapshot.value?.adapter_version ?? selectedPipeline.value?.adapter_version ?? "-");
 const progressPercent = computed(() => clamp(readNumber(summaryData.value?.progress, ["percent"]) ?? 0, 0, 100));
 const currentEpoch = computed(() => readNumber(summaryData.value?.progress, ["current_epoch"]) ?? 0);
 const totalEpochs = computed(() =>
@@ -525,6 +579,19 @@ function formatImageSize(value: unknown) {
   return formatPlainValue(value);
 }
 
+function formatImageDigest(value: string | undefined) {
+  if (!value) return "-";
+  const marker = value.indexOf("sha256:");
+  return marker >= 0 ? value.slice(marker) : value;
+}
+
+function formatArtifactSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+}
+
 function openExternalTool(url: string) {
   advancedMenuOpen.value = false;
   window.open(url, "_blank", "noopener,noreferrer");
@@ -569,6 +636,8 @@ function resetSelectedData() {
   metricsLoadedJobId = null;
   resourcesLoadedJobId = null;
   analysisLoadedJobId = null;
+  artifactsLoadedJobId = null;
+  selectedAttemptId.value = selectedJob.value?.attempts?.[0]?.id ?? "";
 }
 
 function externalActionLabel(source: string) {
@@ -659,7 +728,7 @@ async function loadResources(requestGeneration: number, force = false) {
 
 async function loadAnalysis(requestGeneration: number, force = false) {
   const job = selectedJob.value;
-  if (!job || requestGeneration !== generation || !isLlmRun.value) return;
+  if (!job || requestGeneration !== generation || (!isLlmRun.value && !isPaddlexRun.value)) return;
   if (!force && analysisLoadedJobId === job.id) return;
   try {
     const [analysis, artifacts] = await Promise.all([
@@ -670,6 +739,7 @@ async function loadAnalysis(requestGeneration: number, force = false) {
     llmAnalysis.value = analysis;
     llmArtifacts.value = artifacts;
     analysisLoadedJobId = job.id;
+    artifactsLoadedJobId = job.id;
   } catch (error) {
     if (requestGeneration === generation) {
       ElMessage.error(error instanceof Error ? error.message : "训练分析加载失败");
@@ -677,7 +747,26 @@ async function loadAnalysis(requestGeneration: number, force = false) {
   }
 }
 
-function openLlmArtifact(artifact: LlmArtifact) {
+async function loadObservabilityArtifacts(requestGeneration: number, force = false) {
+  const job = selectedJob.value;
+  if (!job || requestGeneration !== generation) return;
+  if (!force && artifactsLoadedJobId === job.id) return;
+  artifactsLoading.value = true;
+  try {
+    const artifacts = await api.getTrainingObservabilityArtifacts(job.id);
+    if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
+    llmArtifacts.value = artifacts;
+    artifactsLoadedJobId = job.id;
+  } catch (error) {
+    if (requestGeneration === generation) {
+      ElMessage.error(error instanceof Error ? error.message : "训练产物加载失败");
+    }
+  } finally {
+    if (requestGeneration === generation) artifactsLoading.value = false;
+  }
+}
+
+function openObservabilityArtifact(artifact: LlmArtifact) {
   if (!artifact.download_url) {
     ElMessage.warning("该历史制品没有可用的下载地址");
     return;
@@ -688,7 +777,11 @@ function openLlmArtifact(artifact: LlmArtifact) {
 async function loadActiveTabData(requestGeneration: number, force = false) {
   if (activeTab.value === "metrics") await loadScalars(requestGeneration, force);
   if (activeTab.value === "resources") await loadResources(requestGeneration, force);
-  if (activeTab.value === "analysis") await loadAnalysis(requestGeneration, force);
+  if (activeTab.value === "analysis") {
+    if (isPaddlexRun.value) await loadScalars(requestGeneration, force);
+    await loadAnalysis(requestGeneration, force);
+  }
+  if (activeTab.value === "artifacts") await loadObservabilityArtifacts(requestGeneration, force);
 }
 
 async function loadSummary(requestGeneration: number) {
@@ -735,6 +828,7 @@ async function activateTab(tab: DashboardTab) {
     if (hasResourceSeries.value) resourcesChartMounted.value = true;
   }
   if (tab === "analysis") analysisActivated.value = true;
+  if (tab === "artifacts") artifactsActivated.value = true;
   await loadActiveTabData(generation);
 }
 
@@ -843,6 +937,16 @@ onBeforeUnmount(() => {
 .source-item small { grid-column: 2 / -1; overflow: hidden; color: #b42318; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .source-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
 .source-dot.available { background: #16a34a; }
+.provenance-band { border-bottom: 1px solid #e3e8ef; background: #f8fafc; }
+.provenance-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 14px 18px 8px; }
+.provenance-heading span { color: #667085; font-size: 12px; }
+.provenance-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.provenance-cell { display: grid; min-width: 0; gap: 5px; padding: 11px 18px 14px; border-right: 1px solid #e3e8ef; }
+.provenance-cell:last-child { border-right: 0; }
+.provenance-cell span { color: #667085; font-size: 11px; }
+.provenance-cell strong, .provenance-cell code { overflow: hidden; color: #172033; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.provenance-cell code { font-family: Consolas, monospace; }
+.attempt-cell select { width: 100%; height: 28px; border: 1px solid #cfd7e6; border-radius: 4px; background: #fff; color: #344054; font-size: 12px; }
 .chart-panel { padding: 0 18px 20px; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 58px; border-bottom: 1px solid #e3e8ef; }
 .panel-heading > div { display: flex; min-width: 0; align-items: baseline; gap: 10px; }
@@ -855,6 +959,14 @@ onBeforeUnmount(() => {
 .smoothing-control input { width: 120px; accent-color: #1769ff; }
 .smoothing-control output { width: 26px; color: #101828; font-variant-numeric: tabular-nums; }
 .metric-card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.artifact-dashboard-panel { padding: 18px; }
+.observability-artifact-list { border: 1px solid #dfe5ed; background: #fff; }
+.observability-artifact-list button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 14px; border: 0; border-bottom: 1px solid #edf0f4; background: #fff; color: #172033; text-align: left; cursor: pointer; }
+.observability-artifact-list button:last-child { border-bottom: 0; }
+.observability-artifact-list button:hover { background: #f7f9fc; }
+.observability-artifact-list button > span:first-child { display: grid; min-width: 0; gap: 3px; }
+.observability-artifact-list strong, .observability-artifact-list small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.observability-artifact-list small, .observability-artifact-list button > span:last-child { color: #667085; font-size: 11px; }
 .source-warning { color: #b54708 !important; }
 .placeholder-panel { min-height: 420px; padding-top: 80px; }
 @container training-view (max-width: 900px) {
@@ -862,6 +974,7 @@ onBeforeUnmount(() => {
   .detail-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .detail-grid .metric-cell { border-bottom: 1px solid #e3e8ef; }
   .source-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .provenance-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .source-item { border-bottom: 1px solid #e3e8ef; }
 }
 @container training-view (max-width: 760px) {
@@ -872,6 +985,7 @@ onBeforeUnmount(() => {
   .selected-run-band code { grid-column: 1 / -1; }
   .progress-band { grid-template-columns: 1fr; }
   .detail-grid, .latest-grid, .source-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .provenance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metric-cell:nth-child(2n), .source-item:nth-child(2n) { border-right: 0; }
   .metric-card-grid { grid-template-columns: minmax(0, 1fr); }
 }
@@ -882,6 +996,8 @@ onBeforeUnmount(() => {
   .dashboard-tabs button { padding: 0 14px; }
   .band-title { flex-wrap: wrap; }
   .source-list { grid-template-columns: minmax(0, 1fr); }
+  .provenance-grid { grid-template-columns: minmax(0, 1fr); }
+  .provenance-cell { border-right: 0; border-bottom: 1px solid #e3e8ef; }
   .source-item { min-height: 56px; padding: 9px 14px; border-right: 0; }
   .chart-panel { padding-right: 10px; padding-left: 10px; }
   .panel-heading { flex-direction: column; align-items: flex-start; gap: 4px; padding: 10px 0; }

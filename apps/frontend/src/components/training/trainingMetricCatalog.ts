@@ -29,6 +29,27 @@ const ALIASES: Record<string, string> = {
   "metrics.map50_95b": "metrics.map50_95",
 };
 
+const COMPARISON_ALIASES: Record<string, string> = {
+  "metrics.precision": "detection.precision",
+  "metrics.precisionb": "detection.precision",
+  "metrics.recall": "detection.recall",
+  "metrics.recallb": "detection.recall",
+  "metrics.map50": "detection.ap50",
+  "metrics.map50b": "detection.ap50",
+  "metrics.map50_95": "detection.ap",
+  "metrics.map50_95b": "detection.ap",
+  "bbox_map": "detection.ap",
+  "bbox_map50": "detection.ap50",
+  "bbox_map_50": "detection.ap50",
+  "precision": "detection.precision",
+  "recall": "detection.recall",
+  "tokens_per_second": "runtime.throughput",
+  "samples_per_second": "runtime.throughput",
+  "throughput.samples_per_second": "runtime.throughput",
+  "elapsed_seconds": "runtime.elapsed_seconds",
+  "gpu_memory_peak_mb": "resource.gpu_memory_peak_mb",
+};
+
 type CardDefinition = Omit<TrainingMetricCard, "series" | "primarySeries"> & {
   lines: Array<{ key: string; label: string }>;
   primaryKey: string;
@@ -101,6 +122,11 @@ export function canonicalMetricKey(key: string) {
   return ALIASES[normalized] ?? normalized;
 }
 
+function comparisonMetricKey(key: string) {
+  const normalized = normalizeMetricKey(key);
+  return COMPARISON_ALIASES[normalized] ?? normalized;
+}
+
 function canonicalSeries(series: TrainingObservabilityScalars["series"]) {
   const result = new Map<string, TrainingObservabilityScalarPoint[]>();
   const canonicalSources = new Set(Object.keys(series).map(normalizeMetricKey));
@@ -150,8 +176,9 @@ export function buildMetricCards(series: TrainingObservabilityScalars["series"])
     cards.push({
       id: key.replace(/[^a-z0-9]+/g, "-"),
       title,
-      format: "number",
+      format: key.includes("utilization_percent") ? "percent" : "number",
       direction: "max",
+      axis: key.includes("utilization_percent") ? { min: 0, max: 100 } : undefined,
       canonicalKeys: [key],
       series: { [key]: points },
       primarySeries: key,
@@ -190,6 +217,11 @@ export function summarizeMetric(points: TrainingObservabilityScalarPoint[], dire
 }
 
 export function aliasesForCanonicalKey(key: string) {
+  if (key.startsWith("detection.") || key.startsWith("runtime.") || key.startsWith("resource.")) {
+    return [...new Set([key, ...Object.entries(COMPARISON_ALIASES)
+      .filter(([, target]) => target === key)
+      .map(([alias]) => alias)])];
+  }
   const canonical = canonicalMetricKey(key);
   return [canonical, ...Object.entries(ALIASES)
     .filter(([, target]) => target === canonical)
@@ -200,5 +232,11 @@ export function selectCanonicalSeries(
   series: TrainingObservabilityScalars["series"],
   key: string,
 ) {
+  if (key.startsWith("detection.") || key.startsWith("runtime.") || key.startsWith("resource.")) {
+    const matching = Object.entries(series)
+      .filter(([sourceKey]) => comparisonMetricKey(sourceKey) === key)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return matching[0]?.[1] ?? [];
+  }
   return canonicalSeries(series).get(canonicalMetricKey(key)) ?? [];
 }
