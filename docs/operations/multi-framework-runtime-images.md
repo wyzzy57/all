@@ -51,9 +51,12 @@ Both PaddleX images share this immutable runtime prefix:
 
 - linux/amd64 CUDA base:
   `nvidia/cuda:11.8.0-base-ubuntu22.04@sha256:79e5b2cf878ee9006f5b3738caeea34fdc7708a32db53fe3e80db0b48bd286a0`.
-  This NVIDIA base preserves the container entrypoint and driver-injection
-  contract without duplicating the runtime and cuDNN libraries supplied by
-  the official Paddle wheel.
+  This NVIDIA base preserves the `NVIDIA_REQUIRE_CUDA`, device visibility,
+  driver capability, and library-path contract used by NVIDIA Container
+  Runtime without duplicating the runtime and cuDNN libraries supplied by the
+  official Paddle wheel. This exact base manifest has no NVIDIA entrypoint
+  script; driver injection is verified with an actual `--gpus all` runtime
+  probe on the target node.
 - Python 3.10 virtual environment at `/opt/venv`.
 - Official PaddlePaddle GPU 3.0.0 cu118 wheel:
   `https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl`.
