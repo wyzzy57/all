@@ -105,6 +105,11 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
     requirements = Path(
         "workers/paddlex-training-worker/requirements.lock"
     ).read_text(encoding="utf-8")
+    installer_path = Path(
+        "workers/paddlex-training-worker/install_paddledetection.py"
+    )
+    assert installer_path.is_file()
+    installer = installer_path.read_text(encoding="utf-8")
 
     cuda_base = (
         "nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04"
@@ -141,7 +146,13 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
         'mkdir -p "$VIRTUAL_ENV/lib/python3.10/site-packages/'
         'paddlex/repo_manager/repos"'
     ) in dockerfile
-    assert "paddlex --install PaddleDetection" in dockerfile
+    assert "COPY workers/paddlex-training-worker/install_paddledetection.py" in dockerfile
+    assert "python /tmp/install_paddledetection.py" in dockerfile
+    assert "paddlex --install PaddleDetection" not in dockerfile
+    assert "repo.install_external_deps = _defer_driver_bound_custom_ops" in installer
+    assert 'repo_name != "PaddleDetection"' in installer
+    assert 'distribution("paddledet")' in installer
+    assert 'find_spec("ppdet")' in installer
     assert "paddlex_main.py" in dockerfile
     assert "/usr/local/bin/visiox-train" in dockerfile
     assert "visiox_paddlex_training_worker.entrypoint" in dockerfile

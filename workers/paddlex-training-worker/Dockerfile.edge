@@ -41,8 +41,10 @@ RUN python3.10 -m venv "$VIRTUAL_ENV" \
 WORKDIR /app
 COPY workers/paddlex-training-worker/requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir -r /app/requirements.lock
+COPY workers/paddlex-training-worker/install_paddledetection.py /tmp/install_paddledetection.py
 RUN mkdir -p "$VIRTUAL_ENV/lib/python3.10/site-packages/paddlex/repo_manager/repos" \
-    && paddlex --install PaddleDetection
+    && python /tmp/install_paddledetection.py \
+    && rm -f /tmp/install_paddledetection.py
 COPY workers/paddlex-training-worker/src/visiox_paddlex_training_worker /app/visiox_paddlex_training_worker
 COPY packages/visiox-training/src/visiox_training /app/visiox_training
 RUN mkdir -p /opt/paddlex-runtime \

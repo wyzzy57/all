@@ -67,6 +67,11 @@ must not request `paddlex_hpi_tensorrt` unless a different immutable runtime
 explicitly declares TensorRT support and the target-node inventory verifies
 the corresponding CUDA, TensorRT, and compute-capability requirements.
 
+The training build defers PaddleDetection's optional rotated-detection custom
+operator compilation because it requires a runtime-injected NVIDIA driver.
+The standard PP-YOLOE and RT-DETR object-detection paths remain installed;
+rotated detection is not a declared capability of this image.
+
 The Dockerfiles default to `https://mirrors.aliyun.com/pypi/simple` for Python
 packages. Operators may override `PIP_INDEX_URL` at build time with another
 verified mirror without changing the pinned CUDA manifest or Paddle wheel
