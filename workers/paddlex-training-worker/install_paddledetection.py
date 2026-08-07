@@ -12,6 +12,14 @@ def _defer_driver_bound_custom_ops(repo_name: str, repo_root: str) -> None:
         raise RuntimeError("PaddleDetection source is incomplete")
 
 
+def _paddlex_repository_root() -> Path:
+    spec = find_spec("paddlex")
+    if spec is None or spec.submodule_search_locations is None:
+        raise RuntimeError("PaddleX module is unavailable")
+    package_root = Path(next(iter(spec.submodule_search_locations)))
+    return package_root / "repo_manager" / "repos" / "PaddleDetection"
+
+
 def main() -> None:
     from paddlex.repo_manager import core, repo
 
@@ -23,7 +31,7 @@ def main() -> None:
     spec = find_spec("ppdet")
     if spec is None or spec.submodule_search_locations is None:
         raise RuntimeError("PaddleDetection module is unavailable")
-    repo_root = Path(next(iter(spec.submodule_search_locations))).parent
+    repo_root = _paddlex_repository_root()
     if not (repo_root / ".installed").is_file():
         raise RuntimeError("PaddleDetection installation marker is missing")
 

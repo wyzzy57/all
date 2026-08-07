@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,23 @@ def _artifacts_module():
 
 def _paddlex_main_module():
     return importlib.import_module("visiox_paddlex_training_worker.paddlex_main")
+
+
+def _paddledetection_installer_module():
+    path = (
+        Path(__file__).parents[2]
+        / "workers"
+        / "paddlex-training-worker"
+        / "install_paddledetection.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "visiox_install_paddledetection",
+        path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _launch_spec() -> dict[str, object]:
@@ -96,6 +114,27 @@ import visiox_paddlex_training_worker.entrypoint
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_installer_locates_marker_in_paddlex_repository_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    installer = _paddledetection_installer_module()
+    paddlex_root = tmp_path / "paddlex"
+    paddlex_root.mkdir()
+    requested_packages: list[str] = []
+
+    def fake_find_spec(package: str) -> SimpleNamespace:
+        requested_packages.append(package)
+        return SimpleNamespace(submodule_search_locations=[str(paddlex_root)])
+
+    monkeypatch.setattr(installer, "find_spec", fake_find_spec)
+
+    assert installer._paddlex_repository_root() == (
+        paddlex_root / "repo_manager" / "repos" / "PaddleDetection"
+    )
+    assert requested_packages == ["paddlex"]
 
 
 def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
