@@ -3,6 +3,9 @@ FROM ${CUDA_BASE_IMAGE}
 
 ARG PADDLE_WHEEL_URL=https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl
 ARG PADDLE_WHEEL_SHA256=6e262ce3a18220a4e066e40656777753fd6dcdd8637c9f397dd449079d12ce9c
+ARG PADDLEX_CONFIG_BASE_URL=https://raw.githubusercontent.com/PaddlePaddle/PaddleX/v3.0.3/paddlex/repo_apis/PaddleDetection_api/configs
+ARG PPYOLOE_CONFIG_SHA256=20ec1fc27f96943026ebf7306ce850ab784be0dd7975c2fc03341f1a776bd0f8
+ARG RTDETR_CONFIG_SHA256=fa18adf6bc279ac628e6775ac33274913a6ebd3a74df78231620cc859bdf179d
 ARG UBUNTU_MIRROR=https://mirrors.aliyun.com/ubuntu
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 ENV VIRTUAL_ENV=/opt/venv \
@@ -47,7 +50,18 @@ RUN pip install --no-cache-dir -r /app/requirements.lock
 COPY workers/paddlex-training-worker/install_paddledetection.py /tmp/install_paddledetection.py
 RUN mkdir -p "$VIRTUAL_ENV/lib/python3.10/site-packages/paddlex/repo_manager/repos" \
     && python /tmp/install_paddledetection.py \
-    && rm -f /tmp/install_paddledetection.py
+    && rm -f /tmp/install_paddledetection.py \
+    && config_dir="$VIRTUAL_ENV/lib/python3.10/site-packages/paddlex/repo_apis/PaddleDetection_api/configs" \
+    && mkdir -p "$config_dir" \
+    && curl --fail --location --retry 3 --retry-all-errors \
+        --connect-timeout 30 --output "$config_dir/PP-YOLOE_plus-S.yaml" \
+        "$PADDLEX_CONFIG_BASE_URL/PP-YOLOE_plus-S.yaml" \
+    && curl --fail --location --retry 3 --retry-all-errors \
+        --connect-timeout 30 --output "$config_dir/RT-DETR-L.yaml" \
+        "$PADDLEX_CONFIG_BASE_URL/RT-DETR-L.yaml" \
+    && echo "$PPYOLOE_CONFIG_SHA256  $config_dir/PP-YOLOE_plus-S.yaml" | sha256sum -c - \
+    && echo "$RTDETR_CONFIG_SHA256  $config_dir/RT-DETR-L.yaml" | sha256sum -c - \
+    && python -c "from paddlex.repo_apis.PaddleDetection_api.object_det import register; from paddlex.repo_apis.base import Config; Config('PP-YOLOE_plus-S'); Config('RT-DETR-L')"
 COPY workers/paddlex-training-worker/src/visiox_paddlex_training_worker /app/visiox_paddlex_training_worker
 COPY packages/visiox-training/src/visiox_training /app/visiox_training
 RUN mkdir -p /opt/paddlex-runtime \

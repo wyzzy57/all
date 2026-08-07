@@ -18,6 +18,15 @@ inventing an artifact checksum. It does not download model weights or create
 fake weight files. PaddleX resolves and caches official assets on the
 authorized edge runtime at execution time.
 
+The PaddleX 3.0.3 wheel does not package the two registered
+`repo_apis/PaddleDetection_api/configs` YAML files. The training image therefore
+retrieves those files from the immutable upstream `v3.0.3` tag and verifies
+SHA-256 `20ec1fc27f96943026ebf7306ce850ab784be0dd7975c2fc03341f1a776bd0f8`
+for PP-YOLOE-S and
+`fa18adf6bc279ac628e6775ac33274913a6ebd3a74df78231620cc859bdf179d`
+for RT-DETR-L. Its build must instantiate both registered configurations before
+the image can be published.
+
 ## Preflight
 
 1. Publish and pin `VISIOX_PADDLEX_TRAINING_IMAGE_DIGEST` and

@@ -163,6 +163,10 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
         "https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/"
         "paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl"
     )
+    paddlex_config_base = (
+        "https://raw.githubusercontent.com/PaddlePaddle/PaddleX/v3.0.3/"
+        "paddlex/repo_apis/PaddleDetection_api/configs"
+    )
     assert f"ARG CUDA_BASE_IMAGE={cuda_base}" in dockerfile
     assert "FROM ${CUDA_BASE_IMAGE}" in dockerfile
     assert "cudnn8-runtime" not in dockerfile
@@ -205,6 +209,19 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
     assert "COPY workers/paddlex-training-worker/install_paddledetection.py" in dockerfile
     assert "python /tmp/install_paddledetection.py" in dockerfile
     assert "paddlex --install PaddleDetection" not in dockerfile
+    assert f"ARG PADDLEX_CONFIG_BASE_URL={paddlex_config_base}" in dockerfile
+    assert (
+        "ARG PPYOLOE_CONFIG_SHA256="
+        "20ec1fc27f96943026ebf7306ce850ab784be0dd7975c2fc03341f1a776bd0f8"
+    ) in dockerfile
+    assert (
+        "ARG RTDETR_CONFIG_SHA256="
+        "fa18adf6bc279ac628e6775ac33274913a6ebd3a74df78231620cc859bdf179d"
+    ) in dockerfile
+    assert '"$PADDLEX_CONFIG_BASE_URL/PP-YOLOE_plus-S.yaml"' in dockerfile
+    assert '"$PADDLEX_CONFIG_BASE_URL/RT-DETR-L.yaml"' in dockerfile
+    assert "Config('PP-YOLOE_plus-S')" in dockerfile
+    assert "Config('RT-DETR-L')" in dockerfile
     assert "repo.install_external_deps = _defer_driver_bound_custom_ops" in installer
     assert 'repo_name != "PaddleDetection"' in installer
     assert 'distribution("paddledet")' in installer
