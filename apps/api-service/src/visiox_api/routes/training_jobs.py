@@ -113,6 +113,14 @@ class TrainingJobCreateRequest(PydanticBaseModel):
     dataset_version_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
+class TrainingJobAttemptResponse(PydanticBaseModel):
+    id: str
+    attempt_number: int
+    status: str
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
 class TrainingJobResponse(PydanticBaseModel):
     id: str
     pipeline_id: str
@@ -130,6 +138,8 @@ class TrainingJobResponse(PydanticBaseModel):
     updated_at: datetime
     distributed_run_id: str | None = None
     remote_execution_id: str | None = None
+    resolved_snapshot: dict[str, Any] = Field(default_factory=dict)
+    attempts: list[TrainingJobAttemptResponse] = Field(default_factory=list)
 
 
 class TrainingJobListResponse(PydanticBaseModel):
@@ -202,6 +212,7 @@ def _job_response(
     *,
     distributed_run_id: str | None = None,
     remote_execution_id: str | None = None,
+    attempts: list[TrainingJobAttempt] | None = None,
 ) -> TrainingJobResponse:
     if environment is None and task is not None:
         payload = task.payload or {}
@@ -231,7 +242,34 @@ def _job_response(
         updated_at=job.updated_at,
         distributed_run_id=distributed_run_id,
         remote_execution_id=remote_execution_id,
+        resolved_snapshot=job.resolved_snapshot if isinstance(job.resolved_snapshot, dict) else {},
+        attempts=[
+            TrainingJobAttemptResponse(
+                id=attempt.id,
+                attempt_number=attempt.attempt_number,
+                status=attempt.status,
+                started_at=attempt.started_at,
+                finished_at=attempt.finished_at,
+            )
+            for attempt in attempts or []
+        ],
     )
+
+
+def _attempts_by_training_job_id(
+    session: Session, training_job_ids: list[str]
+) -> dict[str, list[TrainingJobAttempt]]:
+    if not training_job_ids:
+        return {}
+    attempts = session.scalars(
+        select(TrainingJobAttempt)
+        .where(TrainingJobAttempt.training_job_id.in_(training_job_ids))
+        .order_by(TrainingJobAttempt.training_job_id, TrainingJobAttempt.attempt_number)
+    ).all()
+    grouped: dict[str, list[TrainingJobAttempt]] = {}
+    for attempt in attempts:
+        grouped.setdefault(attempt.training_job_id, []).append(attempt)
+    return grouped
 
 
 @router.post("/pipelines/{pipeline_id}/jobs", response_model=TrainingJobResponse)
@@ -1125,6 +1163,44 @@ def _distributed_response_refs(
     return run.id, execution.id if execution is not None else None
 
 
+def _distributed_response_refs_by_training_job_id(
+    session: Session, training_job_ids: list[str]
+) -> dict[str, tuple[str | None, str | None]]:
+    if not training_job_ids:
+        return {}
+    runs = session.scalars(
+        select(DistributedTrainingRun)
+        .where(DistributedTrainingRun.training_job_id.in_(training_job_ids))
+        .order_by(
+            DistributedTrainingRun.training_job_id,
+            DistributedTrainingRun.attempt.desc(),
+            DistributedTrainingRun.created_at.desc(),
+            DistributedTrainingRun.id.desc(),
+        )
+    ).all()
+    latest_runs: dict[str, DistributedTrainingRun] = {}
+    for run in runs:
+        latest_runs.setdefault(run.training_job_id, run)
+    if not latest_runs:
+        return {}
+    executions = session.scalars(
+        select(RemoteExecution)
+        .where(
+            RemoteExecution.training_job_id.in_(training_job_ids),
+            RemoteExecution.resource_type == "distributed_training_run",
+            RemoteExecution.resource_id.in_([run.id for run in latest_runs.values()]),
+        )
+        .order_by(RemoteExecution.resource_id, RemoteExecution.created_at.desc(), RemoteExecution.id.desc())
+    ).all()
+    execution_by_run_id: dict[str, RemoteExecution] = {}
+    for execution in executions:
+        execution_by_run_id.setdefault(execution.resource_id, execution)
+    return {
+        job_id: (run.id, execution_by_run_id.get(run.id).id if run.id in execution_by_run_id else None)
+        for job_id, run in latest_runs.items()
+    }
+
+
 def _distributed_training_context(session: Session, job: TrainingJob) -> dict[str, Any]:
     task = session.scalar(
         select(Task)
@@ -1218,15 +1294,26 @@ def list_training_jobs(
         list_query = list_query.where(*filters)
     total = session.scalar(total_query) or 0
     jobs = session.scalars(list_query.limit(limit).offset(offset)).all()
+    attempts_by_job_id = _attempts_by_training_job_id(session, [job.id for job in jobs])
+    tasks_by_id = {
+        task.id: task
+        for task in session.scalars(
+            select(Task).where(Task.id.in_([job.task_id for job in jobs if job.task_id]))
+        ).all()
+    }
+    distributed_refs_by_job_id = _distributed_response_refs_by_training_job_id(
+        session, [job.id for job in jobs]
+    )
     items = []
     for job in jobs:
-        run_id, execution_id = _distributed_response_refs(session, job.id)
+        run_id, execution_id = distributed_refs_by_job_id.get(job.id, (None, None))
         items.append(
             _job_response(
                 job,
-                task=session.get(Task, job.task_id) if job.task_id else None,
+                task=tasks_by_id.get(job.task_id),
                 distributed_run_id=run_id,
                 remote_execution_id=execution_id,
+                attempts=attempts_by_job_id.get(job.id, []),
             )
         )
     return TrainingJobListResponse(items=items, total=total, limit=limit, offset=offset)
@@ -1248,11 +1335,13 @@ def get_training_job(
     )
     task = session.get(Task, job.task_id) if job.task_id else None
     run_id, execution_id = _distributed_response_refs(session, job.id)
+    attempts = _attempts_by_training_job_id(session, [job.id]).get(job.id, [])
     return _job_response(
         job,
         task=task,
         distributed_run_id=run_id,
         remote_execution_id=execution_id,
+        attempts=attempts,
     )
 
 

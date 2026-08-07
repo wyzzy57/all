@@ -1390,6 +1390,23 @@ def test_create_training_job_creates_task_and_enqueues_command(
             "recipe": pipeline.recipe,
             "runtime_model_id": "yolo26n.pt",
         }
+        expected_snapshot = job.resolved_snapshot
+        session.add(
+            TrainingJobAttempt(
+                training_job_id=job.id,
+                attempt_number=2,
+                status="failed",
+                launch_spec={"adapter_key": "ultralytics.object_detection.v1"},
+                launch_spec_checksum="c" * 64,
+            )
+        )
+        session.commit()
+
+    list_item = client.get(f"/training-jobs?pipeline_id={pipeline_id}&status=queued").json()["items"][0]
+    detail_item = client.get(f"/training-jobs/{body['id']}").json()
+    for item in (list_item, detail_item):
+        assert item["resolved_snapshot"] == expected_snapshot
+        assert [attempt["attempt_number"] for attempt in item["attempts"]] == [1, 2]
 
 
 def test_training_snapshot_is_independent_from_request_and_pipeline_mutation(

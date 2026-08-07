@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 
-import { api, type TrainingJobRecord, type TrainingObservabilityScalars } from "@/api/client";
+import {
+  api,
+  type TrainingJobRecord,
+  type TrainingObservabilityResources,
+  type TrainingObservabilityScalars,
+} from "@/api/client";
 import MetricLineChart from "./MetricLineChart.vue";
 import {
   aliasesForCanonicalKey,
@@ -23,6 +28,7 @@ type MetricOption = {
   format: MetricValueFormat;
   direction: MetricDirection;
   axis?: { min?: number; max?: number };
+  source?: "scalars" | "resources";
 };
 
 type ComparisonRow = {
@@ -40,7 +46,7 @@ const metricOptions: MetricOption[] = [
   { key: "detection.recall", label: "Recall", format: "ratio", direction: "max", axis: { min: 0, max: 1 } },
   { key: "runtime.throughput", label: "Throughput", format: "number", direction: "max" },
   { key: "runtime.elapsed_seconds", label: "Runtime", format: "number", direction: "min" },
-  { key: "resource.gpu_memory_peak_mb", label: "Peak GPU memory", format: "number", direction: "min" },
+  { key: "resource.gpu_memory_peak_mb", label: "Peak GPU memory", format: "number", direction: "min", source: "resources" },
 ];
 
 const selectedMetricKey = ref(metricOptions[0].key);
@@ -83,6 +89,19 @@ function formatValue(value: number) {
   return value.toFixed(4);
 }
 
+function peakGpuMemoryPoints(series: TrainingObservabilityResources["series"]) {
+  const peaks = new Map<string, TrainingObservabilityResources["series"][string][number]>();
+  for (const [key, points] of Object.entries(series)) {
+    if (!/^gpu\.[^.]+\.memory_(?:used|peak)_(?:mb|mib)$/i.test(key)) continue;
+    for (const point of points) {
+      const pointKey = `${point.step}:${point.timestamp}`;
+      const existing = peaks.get(pointKey);
+      if (!existing || point.value > existing.value) peaks.set(pointKey, point);
+    }
+  }
+  return [...peaks.values()].sort((left, right) => left.step - right.step || left.timestamp - right.timestamp);
+}
+
 async function loadComparison() {
   const currentGeneration = ++requestGeneration;
   comparisonSeries.value = {};
@@ -99,10 +118,12 @@ async function loadComparison() {
   try {
     const settledResponses = await Promise.allSettled(jobs.map(async (job) => ({
       job,
-      response: await api.getTrainingObservabilityScalars(job.id, {
-        keys: aliasesForCanonicalKey(selectedMetricKey.value),
-        max_points: 1000,
-      }),
+      response: selectedMetric.value.source === "resources"
+        ? await api.getTrainingObservabilityResources(job.id, { max_points: 1000 })
+        : await api.getTrainingObservabilityScalars(job.id, {
+          keys: aliasesForCanonicalKey(selectedMetricKey.value),
+          max_points: 1000,
+        }),
     })));
     if (currentGeneration !== requestGeneration) return;
     const responses = settledResponses.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
@@ -113,7 +134,9 @@ async function loadComparison() {
     const duplicateNameCounts = new Map<string, number>();
     for (const name of baseNames) duplicateNameCounts.set(name, (duplicateNameCounts.get(name) ?? 0) + 1);
     for (const { job, response } of responses) {
-      const points = selectCanonicalSeries(response.series, selectedMetricKey.value);
+      const points = selectedMetric.value.source === "resources"
+        ? peakGpuMemoryPoints(response.series)
+        : selectCanonicalSeries(response.series, selectedMetricKey.value);
       if (!points.length) continue;
       const baseName = pipelineName(job);
       const name = (duplicateNameCounts.get(baseName) ?? 0) > 1

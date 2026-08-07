@@ -330,6 +330,29 @@ describe("TrainingVisualizationView", () => {
     openSpy.mockRestore();
   });
 
+  it("reloads every observability dataset when the selected training attempt changes", async () => {
+    apiMock.listTrainingJobs.mockResolvedValue({ items: [{
+      ...jobs[0],
+      attempts: [{ id: "attempt-1", attempt_number: 1 }, { id: "attempt-2", attempt_number: 2 }],
+    }], total: 1, limit: 200, offset: 0 });
+    apiMock.getTrainingObservabilitySummary.mockImplementation((_jobId: string, params?: { attempt_id?: string }) => Promise.resolve(summary({
+      progress: { current_epoch: params?.attempt_id === "attempt-2" ? 9 : 4, total_epochs: 10, percent: params?.attempt_id === "attempt-2" ? 90 : 40 },
+    })));
+
+    const wrapper = mountView();
+    await flushPromises();
+    await wrapper.get('[data-testid="attempt-select"]').setValue("attempt-2");
+    await flushPromises();
+
+    const attemptParams = { attempt_id: "attempt-2" };
+    expect(apiMock.getTrainingObservabilitySummary).toHaveBeenLastCalledWith("job-1", attemptParams);
+    expect(apiMock.getTrainingObservabilityScalars).toHaveBeenLastCalledWith("job-1", expect.objectContaining(attemptParams));
+    expect(apiMock.getTrainingObservabilityResources).toHaveBeenLastCalledWith("job-1", expect.objectContaining(attemptParams));
+    expect(apiMock.getTrainingObservabilityAnalysis).toHaveBeenLastCalledWith("job-1", attemptParams);
+    expect(apiMock.getTrainingObservabilityArtifacts).toHaveBeenLastCalledWith("job-1", expect.objectContaining(attemptParams));
+    expect(wrapper.get('[data-testid="overview-panel"]').text()).toContain("9 / 10");
+  });
+
   it("renders TensorBoard-style semantic metric cards and switches to run comparison", async () => {
     const wrapper = mountView();
     await flushPromises();

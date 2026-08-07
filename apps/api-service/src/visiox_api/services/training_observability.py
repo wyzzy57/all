@@ -534,6 +534,11 @@ class TrainingObservabilityService:
                     "download_url": (
                         f"/training-jobs/{job.id}/observability/artifacts/"
                         f"{quote(str(item.get('path', '')), safe='')}"
+                        + (
+                            f"?attempt_id={quote(str(getattr(job, 'attempt_id')), safe='')}"
+                            if getattr(job, "attempt_id", None)
+                            else ""
+                        )
                     ),
                 }
                 for item in values
@@ -755,7 +760,13 @@ class TrainingObservabilityService:
         if not _SAFE_JOB_ID.fullmatch(job_id):
             raise ObservabilitySourceError("progress", "invalid training job id")
         root = Path(getattr(self.settings, "training_runs_root", "/workspace/training-runs")).resolve()
-        run_path = (root / "runs" / f"job-{job_id}").resolve()
+        run_path = root / "runs" / f"job-{job_id}"
+        attempt_number = getattr(job, "attempt_number", None)
+        if attempt_number is not None:
+            if not isinstance(attempt_number, int) or isinstance(attempt_number, bool) or attempt_number < 1:
+                raise ObservabilitySourceError("progress", "invalid training attempt number")
+            run_path = run_path / f"attempt-{attempt_number}"
+        run_path = run_path.resolve()
         if root not in run_path.parents:
             raise ObservabilitySourceError("progress", "training run path is outside the configured root")
         return run_path
@@ -829,6 +840,9 @@ class TrainingObservabilityService:
 
     @staticmethod
     def _mlflow_run_name(job: Any) -> str:
+        attempt_number = getattr(job, "attempt_number", None)
+        if isinstance(attempt_number, int) and not isinstance(attempt_number, bool) and attempt_number > 0:
+            return f"visiox-{job.id}-attempt-{attempt_number}"
         metrics = getattr(job, "metrics", {})
         if isinstance(metrics, dict):
             observability = metrics.get("observability")

@@ -24,7 +24,7 @@ from visiox_api.routes.training_observability import (
 from visiox_api.dependencies.auth import get_current_user
 from visiox_common.settings import Settings
 from visiox_api.services.training_observability import TrainingObservabilityService
-from visiox_db.models import Task, TrainingJob, TrainingPipeline
+from visiox_db.models import Task, TrainingJob, TrainingJobAttempt, TrainingPipeline
 from tests.integration.ownership_test_support import install_legacy_ownership
 
 
@@ -32,6 +32,10 @@ class FakeObservabilityService:
     def __init__(self, *, source_failed: bool = False) -> None:
         self.source_failed = source_failed
         self.scalar_keys: list[str] = []
+        self.observed_attempts: dict[str, int | None] = {}
+
+    def _observe_attempt(self, endpoint: str, job: TrainingJob) -> None:
+        self.observed_attempts[endpoint] = getattr(job, "attempt_number", None)
 
     def for_engine(self, engine: str):
         service = self
@@ -70,6 +74,7 @@ class FakeObservabilityService:
         }
 
     def get_summary(self, job: TrainingJob, pipeline: TrainingPipeline, task: Task | None) -> dict[str, Any]:
+        self._observe_attempt("summary", job)
         return {
             "job_id": job.id,
             "engine": pipeline.engine,
@@ -97,7 +102,8 @@ class FakeObservabilityService:
         *,
         engine: str = "yolo26",
     ) -> dict[str, Any]:
-        del job, start_step, end_step, max_points, engine
+        self._observe_attempt("scalars", job)
+        del start_step, end_step, max_points, engine
         self.scalar_keys = list(keys)
         return {"series": {key: [] for key in keys}, "availability": self.availability}
 
@@ -110,15 +116,17 @@ class FakeObservabilityService:
         *,
         engine: str = "yolo26",
     ) -> dict[str, Any]:
-        del job, start_step, end_step, max_points, engine
+        self._observe_attempt("resources", job)
+        del start_step, end_step, max_points, engine
         return {"series": {"system.cpu_percent": []}, "availability": self.availability}
 
     def get_analysis(self, job: TrainingJob, *, engine: str = "yolo26") -> dict[str, Any]:
-        del job, engine
+        self._observe_attempt("analysis", job)
+        del engine
         return {"findings": [], "availability": self.availability}
 
     def get_artifacts(self, job: TrainingJob) -> dict[str, Any]:
-        del job
+        self._observe_attempt("artifacts", job)
         return {"items": [], "availability": {"artifacts": {"available": True, "reason": None}}}
 
 
@@ -516,6 +524,59 @@ def test_llm_analysis_and_artifacts_routes_use_authorized_job_context(client, se
     assert analysis.json()["findings"] == []
     assert artifacts.status_code == 200
     assert artifacts.json()["items"] == []
+
+
+def test_observability_attempt_parameter_scopes_every_endpoint_and_rejects_foreign_attempt(
+    client,
+    session_factory,
+    seeded_training_job: TrainingJob,
+) -> None:
+    service = FakeObservabilityService()
+    client.app.dependency_overrides[get_training_observability_service] = lambda: service
+    with session_factory() as session:
+        selected = TrainingJobAttempt(
+            id="attempt-selected",
+            training_job_id=seeded_training_job.id,
+            attempt_number=2,
+            status="failed",
+            launch_spec={},
+            launch_spec_checksum="a" * 64,
+        )
+        foreign_job = TrainingJob(
+            id="job-foreign-attempt",
+            pipeline_id=seeded_training_job.pipeline_id,
+            status="running",
+            params={},
+            metrics={},
+        )
+        foreign_attempt = TrainingJobAttempt(
+            id="attempt-foreign",
+            training_job_id=foreign_job.id,
+            attempt_number=1,
+            status="running",
+            launch_spec={},
+            launch_spec_checksum="b" * 64,
+        )
+        session.add_all([selected, foreign_job, foreign_attempt])
+        session.commit()
+
+    base = f"/training-jobs/{seeded_training_job.id}/observability"
+    summary_response = client.get(f"{base}/summary?attempt_id=attempt-selected")
+    assert summary_response.status_code == 200
+    assert summary_response.json()["status"] == "failed"
+    assert client.get(f"{base}/scalars?attempt_id=attempt-selected&keys=train.box_loss").status_code == 200
+    assert client.get(f"{base}/resources?attempt_id=attempt-selected").status_code == 200
+    assert client.get(f"{base}/analysis?attempt_id=attempt-selected").status_code == 200
+    assert client.get(f"{base}/artifacts?attempt_id=attempt-selected").status_code == 200
+
+    assert service.observed_attempts == {
+        "summary": 2,
+        "scalars": 2,
+        "resources": 2,
+        "analysis": 2,
+        "artifacts": 2,
+    }
+    assert client.get(f"{base}/summary?attempt_id=attempt-foreign").status_code == 404
 
 
 def test_observability_rejects_same_organization_user_without_view_permission(

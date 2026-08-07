@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import TrainingRunComparison from "@/components/training/TrainingRunComparison.vue";
 
 const apiMock = vi.hoisted(() => ({
+  getTrainingObservabilityResources: vi.fn(),
   getTrainingObservabilityScalars: vi.fn(),
 }));
 
@@ -55,6 +56,13 @@ describe("TrainingRunComparison", () => {
           { step: 1, value: jobId === "job-1" ? 0.6 : 0.5, timestamp: 100 },
           { step: 2, value: jobId === "job-1" ? 0.7 : 0.65, timestamp: 110 },
         ],
+      },
+      availability: {},
+    }));
+    apiMock.getTrainingObservabilityResources.mockImplementation((jobId: string) => Promise.resolve({
+      series: {
+        "gpu.0.memory_used_mb": [{ step: 1, value: jobId === "job-1" ? 9000 : 7000, timestamp: 100 }],
+        "gpu.1.memory_used_mb": [{ step: 1, value: jobId === "job-1" ? 12000 : 11000, timestamp: 100 }],
       },
       availability: {},
     }));
@@ -161,5 +169,35 @@ describe("TrainingRunComparison", () => {
     ]));
     expect(options.some((key) => key?.includes("loss"))).toBe(false);
     expect(wrapper.get("[data-testid='comparison-scope-note']").text()).toContain("框架私有损失");
+  });
+
+  it("reads LLaMA-Factory train_runtime through the canonical Runtime comparison", async () => {
+    apiMock.getTrainingObservabilityScalars.mockResolvedValue({
+      series: { train_runtime: [{ step: 1, value: 600, timestamp: 100 }] },
+      availability: {},
+    });
+    const wrapper = mountComparison();
+    await flushPromises();
+    await wrapper.get("[data-testid='comparison-metric-select']").setValue("runtime.elapsed_seconds");
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilityScalars).toHaveBeenLastCalledWith(
+      "job-2",
+      expect.objectContaining({ keys: expect.arrayContaining(["train_runtime"]) }),
+    );
+    expect(wrapper.find("[data-testid='comparison-chart']").exists()).toBe(true);
+  });
+
+  it("loads peak GPU memory from the resources endpoint instead of scalar metrics", async () => {
+    const wrapper = mountComparison();
+    await flushPromises();
+    apiMock.getTrainingObservabilityScalars.mockClear();
+
+    await wrapper.get("[data-testid='comparison-metric-select']").setValue("resource.gpu_memory_peak_mb");
+    await flushPromises();
+
+    expect(apiMock.getTrainingObservabilityScalars).not.toHaveBeenCalled();
+    expect(apiMock.getTrainingObservabilityResources).toHaveBeenCalledWith("job-1", { max_points: 1000 });
+    expect(wrapper.text()).toContain("12000.0000");
   });
 });

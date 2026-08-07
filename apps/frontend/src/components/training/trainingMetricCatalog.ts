@@ -47,6 +47,7 @@ const COMPARISON_ALIASES: Record<string, string> = {
   "samples_per_second": "runtime.throughput",
   "throughput.samples_per_second": "runtime.throughput",
   "elapsed_seconds": "runtime.elapsed_seconds",
+  "train_runtime": "runtime.elapsed_seconds",
   "gpu_memory_peak_mb": "resource.gpu_memory_peak_mb",
 };
 

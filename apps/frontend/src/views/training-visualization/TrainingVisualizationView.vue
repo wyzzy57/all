@@ -121,7 +121,7 @@
                     <div class="provenance-cell"><span>数据集版本</span><strong>{{ datasetVersionLabel }}</strong></div>
                     <div class="provenance-cell"><span>运行镜像</span><code>{{ imageDigestLabel }}</code></div>
                     <div class="provenance-cell"><span>Adapter</span><strong>{{ adapterVersionLabel }}</strong></div>
-                    <label v-if="attempts.length" class="provenance-cell attempt-cell"><span>训练尝试</span><select v-model="selectedAttemptId" data-testid="attempt-select"><option v-for="attempt in attempts" :key="attempt.id" :value="attempt.id">Attempt {{ attempt.attempt_number }}</option></select></label>
+                    <label v-if="attempts.length" class="provenance-cell attempt-cell"><span>训练尝试</span><select v-model="selectedAttemptId" data-testid="attempt-select" @change="selectAttempt"><option v-for="attempt in attempts" :key="attempt.id" :value="attempt.id">Attempt {{ attempt.attempt_number }}</option></select></label>
                   </div>
                 </div>
                 <LlmTrainingOverview
@@ -579,6 +579,35 @@ function formatImageSize(value: unknown) {
   return formatPlainValue(value);
 }
 
+function observationKey(job: TrainingJobRecord) {
+  return `${job.id}:${selectedAttemptId.value || "current"}`;
+}
+
+function selectedAttemptParams() {
+  return selectedAttemptId.value ? { attempt_id: selectedAttemptId.value } : undefined;
+}
+
+function loadAttemptSummary(jobId: string) {
+  const params = selectedAttemptParams();
+  return params
+    ? api.getTrainingObservabilitySummary(jobId, params)
+    : api.getTrainingObservabilitySummary(jobId);
+}
+
+function loadAttemptAnalysis(jobId: string) {
+  const params = selectedAttemptParams();
+  return params
+    ? api.getTrainingObservabilityAnalysis(jobId, params)
+    : api.getTrainingObservabilityAnalysis(jobId);
+}
+
+function loadAttemptArtifacts(jobId: string) {
+  const params = selectedAttemptParams();
+  return params
+    ? api.getTrainingObservabilityArtifacts(jobId, params)
+    : api.getTrainingObservabilityArtifacts(jobId);
+}
+
 function formatImageDigest(value: string | undefined) {
   if (!value) return "-";
   const marker = value.indexOf("sha256:");
@@ -625,7 +654,7 @@ function schedulePoll(status: string, requestGeneration: number) {
   }, POLL_INTERVAL_MS);
 }
 
-function resetSelectedData() {
+function resetSelectedData(attemptId = selectedJob.value?.attempts?.[0]?.id ?? "") {
   summaryData.value = null;
   scalarSeries.value = {};
   resourceSeries.value = {};
@@ -637,7 +666,7 @@ function resetSelectedData() {
   resourcesLoadedJobId = null;
   analysisLoadedJobId = null;
   artifactsLoadedJobId = null;
-  selectedAttemptId.value = selectedJob.value?.attempts?.[0]?.id ?? "";
+  selectedAttemptId.value = attemptId;
 }
 
 function externalActionLabel(source: string) {
@@ -677,23 +706,28 @@ async function deleteRun(job: TrainingJobRecord) {
 
 async function loadScalars(requestGeneration: number, force = false) {
   const job = selectedJob.value;
+  const key = job ? observationKey(job) : null;
   const advertisedKeys = [...new Set(summaryData.value?.available_scalar_keys.filter((key) => key.trim()) ?? [])];
   if (!job || requestGeneration !== generation) return;
-  if (!force && metricsLoadedJobId === job.id) return;
+  if (!force && metricsLoadedJobId === key) return;
   if (advertisedKeys.length === 0) {
     scalarSeries.value = {};
     scalarAvailability.value = summaryData.value?.availability ?? {};
-    metricsLoadedJobId = job.id;
+    metricsLoadedJobId = key;
     return;
   }
 
   metricsLoading.value = true;
   try {
-    const response = await api.getTrainingObservabilityScalars(job.id, { keys: advertisedKeys, max_points: 1000 });
+    const response = await api.getTrainingObservabilityScalars(job.id, {
+      keys: advertisedKeys,
+      max_points: 1000,
+      ...(selectedAttemptParams() ?? {}),
+    });
     if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
     scalarSeries.value = response.series;
     scalarAvailability.value = response.availability;
-    metricsLoadedJobId = job.id;
+    metricsLoadedJobId = key;
     if (activeTab.value === "metrics" && hasPoints(response.series)) metricsChartMounted.value = true;
   } catch (error) {
     if (requestGeneration === generation) {
@@ -706,16 +740,20 @@ async function loadScalars(requestGeneration: number, force = false) {
 
 async function loadResources(requestGeneration: number, force = false) {
   const job = selectedJob.value;
+  const key = job ? observationKey(job) : null;
   if (!job || requestGeneration !== generation) return;
-  if (!force && resourcesLoadedJobId === job.id) return;
+  if (!force && resourcesLoadedJobId === key) return;
 
   resourcesLoading.value = true;
   try {
-    const response = await api.getTrainingObservabilityResources(job.id, { max_points: 1000 });
+    const response = await api.getTrainingObservabilityResources(job.id, {
+      max_points: 1000,
+      ...(selectedAttemptParams() ?? {}),
+    });
     if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
     resourceSeries.value = response.series;
     resourceAvailability.value = response.availability;
-    resourcesLoadedJobId = job.id;
+    resourcesLoadedJobId = key;
     if (activeTab.value === "resources" && hasPoints(response.series)) resourcesChartMounted.value = true;
   } catch (error) {
     if (requestGeneration === generation) {
@@ -728,18 +766,14 @@ async function loadResources(requestGeneration: number, force = false) {
 
 async function loadAnalysis(requestGeneration: number, force = false) {
   const job = selectedJob.value;
-  if (!job || requestGeneration !== generation || (!isLlmRun.value && !isPaddlexRun.value)) return;
-  if (!force && analysisLoadedJobId === job.id) return;
+  const key = job ? observationKey(job) : null;
+  if (!job || requestGeneration !== generation) return;
+  if (!force && analysisLoadedJobId === key) return;
   try {
-    const [analysis, artifacts] = await Promise.all([
-      api.getTrainingObservabilityAnalysis(job.id),
-      api.getTrainingObservabilityArtifacts(job.id),
-    ]);
+    const analysis = await loadAttemptAnalysis(job.id);
     if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
     llmAnalysis.value = analysis;
-    llmArtifacts.value = artifacts;
-    analysisLoadedJobId = job.id;
-    artifactsLoadedJobId = job.id;
+    analysisLoadedJobId = key;
   } catch (error) {
     if (requestGeneration === generation) {
       ElMessage.error(error instanceof Error ? error.message : "训练分析加载失败");
@@ -749,14 +783,15 @@ async function loadAnalysis(requestGeneration: number, force = false) {
 
 async function loadObservabilityArtifacts(requestGeneration: number, force = false) {
   const job = selectedJob.value;
+  const key = job ? observationKey(job) : null;
   if (!job || requestGeneration !== generation) return;
-  if (!force && artifactsLoadedJobId === job.id) return;
+  if (!force && artifactsLoadedJobId === key) return;
   artifactsLoading.value = true;
   try {
-    const artifacts = await api.getTrainingObservabilityArtifacts(job.id);
+    const artifacts = await loadAttemptArtifacts(job.id);
     if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
     llmArtifacts.value = artifacts;
-    artifactsLoadedJobId = job.id;
+    artifactsLoadedJobId = key;
   } catch (error) {
     if (requestGeneration === generation) {
       ElMessage.error(error instanceof Error ? error.message : "训练产物加载失败");
@@ -779,7 +814,10 @@ async function loadActiveTabData(requestGeneration: number, force = false) {
   if (activeTab.value === "resources") await loadResources(requestGeneration, force);
   if (activeTab.value === "analysis") {
     if (isPaddlexRun.value) await loadScalars(requestGeneration, force);
-    await loadAnalysis(requestGeneration, force);
+    await Promise.all([
+      loadAnalysis(requestGeneration, force),
+      loadObservabilityArtifacts(requestGeneration, force),
+    ]);
   }
   if (activeTab.value === "artifacts") await loadObservabilityArtifacts(requestGeneration, force);
 }
@@ -789,7 +827,7 @@ async function loadSummary(requestGeneration: number) {
   if (!job || requestGeneration !== generation) return;
   summaryLoading.value = true;
   try {
-    const response = await api.getTrainingObservabilitySummary(job.id);
+    const response = await loadAttemptSummary(job.id);
     if (requestGeneration !== generation || selectedJob.value?.id !== job.id) return;
 
     summaryData.value = response;
@@ -815,6 +853,21 @@ async function selectJob(job: TrainingJobRecord) {
   selectedJob.value = job;
   resetSelectedData();
   await loadSummary(requestGeneration);
+}
+
+async function selectAttempt() {
+  const job = selectedJob.value;
+  if (!job) return;
+  const requestGeneration = ++generation;
+  clearPollTimer();
+  resetSelectedData(selectedAttemptId.value);
+  await loadSummary(requestGeneration);
+  await Promise.all([
+    loadScalars(requestGeneration, true),
+    loadResources(requestGeneration, true),
+    loadAnalysis(requestGeneration, true),
+    loadObservabilityArtifacts(requestGeneration, true),
+  ]);
 }
 
 async function activateTab(tab: DashboardTab) {

@@ -560,6 +560,7 @@ export type TrainingObservabilityArtifacts = {
 };
 
 export type TrainingObservabilityRangeParams = {
+  attempt_id?: string;
   start_step?: number;
   end_step?: number;
   max_points?: number;
@@ -1212,12 +1213,13 @@ export const api = {
     request<ListResponse<TrainingJobRecord>>(`/training-jobs${query(params)}`),
   deleteTrainingJob: (trainingJobId: string) =>
     request<void>(`/training-jobs/${trainingJobId}`, { method: "DELETE" }),
-  getTrainingObservabilitySummary: (trainingJobId: string) =>
-    request<TrainingObservabilitySummary>(`/training-jobs/${trainingJobId}/observability/summary`),
+  getTrainingObservabilitySummary: (trainingJobId: string, params: Pick<TrainingObservabilityRangeParams, "attempt_id"> = {}) =>
+    request<TrainingObservabilitySummary>(`/training-jobs/${trainingJobId}/observability/summary${query(params)}`),
   getTrainingObservabilityScalars: (trainingJobId: string, params: TrainingObservabilityScalarsParams) =>
     request<TrainingObservabilityScalars>(
       `/training-jobs/${trainingJobId}/observability/scalars${query({
         keys: params.keys.join(","),
+        attempt_id: params.attempt_id,
         start_step: params.start_step,
         end_step: params.end_step,
         max_points: params.max_points
@@ -1230,10 +1232,10 @@ export const api = {
     request<TrainingObservabilityResources>(
       `/training-jobs/${trainingJobId}/observability/resources${query(params)}`
     ),
-  getTrainingObservabilityAnalysis: (trainingJobId: string) =>
-    request<TrainingObservabilityAnalysis>(`/training-jobs/${trainingJobId}/observability/analysis`),
-  getTrainingObservabilityArtifacts: (trainingJobId: string) =>
-    request<TrainingObservabilityArtifacts>(`/training-jobs/${trainingJobId}/observability/artifacts`),
+  getTrainingObservabilityAnalysis: (trainingJobId: string, params: Pick<TrainingObservabilityRangeParams, "attempt_id"> = {}) =>
+    request<TrainingObservabilityAnalysis>(`/training-jobs/${trainingJobId}/observability/analysis${query(params)}`),
+  getTrainingObservabilityArtifacts: (trainingJobId: string, params: Pick<TrainingObservabilityRangeParams, "attempt_id"> = {}) =>
+    request<TrainingObservabilityArtifacts>(`/training-jobs/${trainingJobId}/observability/artifacts${query(params)}`),
   trainingJobLogUrl: (trainingJobId: string) => `${API_BASE_URL}/training-jobs/${trainingJobId}/log`,
   trainingJobVisualizationUrl: (trainingJobId: string, name: string) =>
     `${API_BASE_URL}/training-jobs/${trainingJobId}/visualizations/${encodeURIComponent(name)}`,

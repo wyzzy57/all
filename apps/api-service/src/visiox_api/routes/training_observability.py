@@ -4,18 +4,20 @@ from collections.abc import Generator
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from visiox_api.services.training_observability import TrainingObservabilityService
 from visiox_api.dependencies.auth import get_current_user
 from visiox_api.dependencies.authorization import require_resource_permission
-from visiox_db.models import Task, TrainingJob, TrainingPipeline, User
+from visiox_db.models import Task, TrainingJob, TrainingJobAttempt, TrainingPipeline, User
 from visiox_db.models.identity import PERMISSION_VIEW
 from visiox_storage.client import ObjectStorageClient
 from visiox_db.session import get_session
@@ -136,6 +138,33 @@ def _get_training_job(session: Session, actor: User, training_job_id: str) -> Tr
     return job
 
 
+def _get_observability_attempt(
+    session: Session, job: TrainingJob, attempt_id: str | None
+) -> TrainingJob | SimpleNamespace:
+    if attempt_id is None:
+        return job
+    attempt = session.scalar(
+        select(TrainingJobAttempt).where(
+            TrainingJobAttempt.id == attempt_id,
+            TrainingJobAttempt.training_job_id == job.id,
+        )
+    )
+    if attempt is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training attempt not found")
+    metrics = dict(job.metrics) if isinstance(job.metrics, dict) else {}
+    if isinstance(attempt.metrics, dict):
+        metrics.update(attempt.metrics)
+    return SimpleNamespace(
+        id=job.id,
+        status=attempt.status,
+        metrics=metrics,
+        started_at=attempt.started_at,
+        finished_at=attempt.finished_at,
+        attempt_id=attempt.id,
+        attempt_number=attempt.attempt_number,
+    )
+
+
 def _observability_adapter(
     service: TrainingObservabilityService, pipeline: TrainingPipeline
 ) -> Any:
@@ -159,7 +188,7 @@ def _job_environment(task: Task | None) -> dict[str, Any]:
     return environment if isinstance(environment, dict) else {}
 
 
-def _latest_metrics(job: TrainingJob) -> dict[str, float]:
+def _latest_metrics(job: Any) -> dict[str, float]:
     return {
         name: float(value)
         for name, value in job.metrics.items()
@@ -167,7 +196,7 @@ def _latest_metrics(job: TrainingJob) -> dict[str, float]:
     }
 
 
-def _default_timing(job: TrainingJob) -> dict[str, Any]:
+def _default_timing(job: Any) -> dict[str, Any]:
     timing: dict[str, Any] = {}
     if job.started_at is not None:
         timing["started_at"] = _serialize_datetime(job.started_at)
@@ -183,19 +212,21 @@ def _serialize_datetime(value: datetime) -> str:
 @router.get("/summary", response_model=SummaryResponse)
 def get_training_observability_summary(
     training_job_id: str,
+    attempt_id: str | None = Query(default=None, min_length=1, max_length=128),
     session: Session = Depends(get_training_observability_session),
     actor: User = Depends(get_current_user),
     service: TrainingObservabilityService = Depends(get_training_observability_service),
 ) -> SummaryResponse:
     job = _get_training_job(session, actor, training_job_id)
+    observability_job = _get_observability_attempt(session, job, attempt_id)
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
     task = session.get(Task, job.task_id) if job.task_id else None
-    summary = _observability_adapter(service, pipeline).summary(job, pipeline, task)
+    summary = _observability_adapter(service, pipeline).summary(observability_job, pipeline, task)
     pipeline_data = summary.get("pipeline") if isinstance(summary.get("pipeline"), dict) else {}
     summary_timing = summary.get("timing") if isinstance(summary.get("timing"), dict) else {}
-    timing = {**_default_timing(job), **summary_timing}
+    timing = {**_default_timing(observability_job), **summary_timing}
     summary_environment = summary.get("environment") if isinstance(summary.get("environment"), dict) else {}
     summary_metrics = summary.get("latest_metrics") if isinstance(summary.get("latest_metrics"), dict) else {}
     return SummaryResponse(
@@ -203,11 +234,11 @@ def get_training_observability_summary(
         engine=str(summary.get("engine", pipeline.engine)),
         pipeline_id=str(pipeline_data.get("id", job.pipeline_id)),
         pipeline_name=str(pipeline_data.get("name", getattr(pipeline, "name", job.pipeline_id))),
-        status=str(summary.get("status", job.status)),
+        status=str(summary.get("status", observability_job.status)),
         progress=summary.get("progress") if isinstance(summary.get("progress"), dict) else {},
         timing=timing,
         environment=summary_environment or _job_environment(task),
-        latest_metrics=summary_metrics or _latest_metrics(job),
+        latest_metrics=summary_metrics or _latest_metrics(observability_job),
         available_scalar_keys=summary.get("available_scalar_keys")
         if isinstance(summary.get("available_scalar_keys"), list)
         else [],
@@ -222,6 +253,7 @@ def get_training_observability_summary(
 def get_training_observability_scalars(
     training_job_id: str,
     keys: list[str] = Query(min_length=1),
+    attempt_id: str | None = Query(default=None, min_length=1, max_length=128),
     start_step: int | None = Query(default=None, ge=0),
     end_step: int | None = Query(default=None, ge=0),
     max_points: int | None = Query(default=None, ge=10, le=10_000),
@@ -230,6 +262,7 @@ def get_training_observability_scalars(
     service: TrainingObservabilityService = Depends(get_training_observability_service),
 ) -> ScalarsResponse:
     job = _get_training_job(session, actor, training_job_id)
+    observability_job = _get_observability_attempt(session, job, attempt_id)
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
@@ -237,13 +270,14 @@ def get_training_observability_scalars(
     if not scalar_keys:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="At least one scalar key is required")
     return ScalarsResponse.model_validate(
-        _observability_adapter(service, pipeline).scalars(job, scalar_keys, start_step, end_step, max_points)
+        _observability_adapter(service, pipeline).scalars(observability_job, scalar_keys, start_step, end_step, max_points)
     )
 
 
 @router.get("/resources", response_model=ResourcesResponse)
 def get_training_observability_resources(
     training_job_id: str,
+    attempt_id: str | None = Query(default=None, min_length=1, max_length=128),
     start_step: int | None = Query(default=None, ge=0),
     end_step: int | None = Query(default=None, ge=0),
     max_points: int | None = Query(default=None, ge=10, le=10_000),
@@ -252,60 +286,67 @@ def get_training_observability_resources(
     service: TrainingObservabilityService = Depends(get_training_observability_service),
 ) -> ResourcesResponse:
     job = _get_training_job(session, actor, training_job_id)
+    observability_job = _get_observability_attempt(session, job, attempt_id)
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
     return ResourcesResponse.model_validate(
-        _observability_adapter(service, pipeline).resources(job, start_step, end_step, max_points)
+        _observability_adapter(service, pipeline).resources(observability_job, start_step, end_step, max_points)
     )
 
 
 @router.get("/analysis", response_model=AnalysisResponse)
 def get_training_observability_analysis(
     training_job_id: str,
+    attempt_id: str | None = Query(default=None, min_length=1, max_length=128),
     session: Session = Depends(get_training_observability_session),
     actor: User = Depends(get_current_user),
     service: TrainingObservabilityService = Depends(get_training_observability_service),
 ) -> AnalysisResponse:
     job = _get_training_job(session, actor, training_job_id)
+    observability_job = _get_observability_attempt(session, job, attempt_id)
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
-    return AnalysisResponse.model_validate(_observability_adapter(service, pipeline).analysis(job))
+    return AnalysisResponse.model_validate(_observability_adapter(service, pipeline).analysis(observability_job))
 
 
 @router.get("/artifacts", response_model=ObservabilityArtifactsResponse)
 def get_training_observability_artifacts(
     training_job_id: str,
+    attempt_id: str | None = Query(default=None, min_length=1, max_length=128),
     session: Session = Depends(get_training_observability_session),
     actor: User = Depends(get_current_user),
     service: TrainingObservabilityService = Depends(get_training_observability_service),
 ) -> ObservabilityArtifactsResponse:
     job = _get_training_job(session, actor, training_job_id)
+    observability_job = _get_observability_attempt(session, job, attempt_id)
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
-    return ObservabilityArtifactsResponse.model_validate(_observability_adapter(service, pipeline).artifacts(job))
+    return ObservabilityArtifactsResponse.model_validate(_observability_adapter(service, pipeline).artifacts(observability_job))
 
 
 @router.get("/artifacts/{artifact_path:path}")
 def download_training_observability_artifact(
     training_job_id: str,
     artifact_path: str,
+    attempt_id: str | None = Query(default=None, min_length=1, max_length=128),
     session: Session = Depends(get_training_observability_session),
     actor: User = Depends(get_current_user),
     service: TrainingObservabilityService = Depends(get_training_observability_service),
     storage: ObjectStorageClient = Depends(get_training_observability_storage),
 ) -> FileResponse:
     job = _get_training_job(session, actor, training_job_id)
+    observability_job = _get_observability_attempt(session, job, attempt_id)
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
-    listed = _observability_adapter(service, pipeline).artifacts(job)
+    listed = _observability_adapter(service, pipeline).artifacts(observability_job)
     if artifact_path not in {item.get("path") for item in listed.get("items", [])}:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found")
     name = Path(artifact_path).name
-    metrics = job.metrics if isinstance(job.metrics, dict) else {}
+    metrics = observability_job.metrics if isinstance(observability_job.metrics, dict) else {}
     artifact_uris = metrics.get("artifacts") if isinstance(metrics.get("artifacts"), dict) else {}
     uri = metrics.get("adapter") if name == "adapter_model.safetensors" else artifact_uris.get(name)
     location = _parse_minio_uri(uri)
