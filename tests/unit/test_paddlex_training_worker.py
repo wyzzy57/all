@@ -151,8 +151,8 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
     installer = installer_path.read_text(encoding="utf-8")
 
     cuda_base = (
-        "nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04"
-        "@sha256:f6913f3c02f297877f6859d12ff330043c0be668fdad86868c29a239a5a82151"
+        "nvidia/cuda:11.8.0-base-ubuntu22.04"
+        "@sha256:79e5b2cf878ee9006f5b3738caeea34fdc7708a32db53fe3e80db0b48bd286a0"
     )
     paddle_wheel = (
         "https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/"
@@ -160,6 +160,7 @@ def test_edge_image_uses_pinned_official_runtime_and_fixed_entrypoint() -> None:
     )
     assert f"ARG CUDA_BASE_IMAGE={cuda_base}" in dockerfile
     assert "FROM ${CUDA_BASE_IMAGE}" in dockerfile
+    assert "cudnn8-runtime" not in dockerfile
     assert f"ARG PADDLE_WHEEL_URL={paddle_wheel}" in dockerfile
     assert "ARG UBUNTU_MIRROR=https://mirrors.aliyun.com/ubuntu" in dockerfile
     assert "Acquire::Retries=3" in dockerfile

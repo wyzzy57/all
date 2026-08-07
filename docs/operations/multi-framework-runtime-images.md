@@ -50,12 +50,19 @@ docker pull $pinned
 Both PaddleX images share this immutable runtime prefix:
 
 - linux/amd64 CUDA base:
-  `nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04@sha256:f6913f3c02f297877f6859d12ff330043c0be668fdad86868c29a239a5a82151`.
+  `nvidia/cuda:11.8.0-base-ubuntu22.04@sha256:79e5b2cf878ee9006f5b3738caeea34fdc7708a32db53fe3e80db0b48bd286a0`.
+  This NVIDIA base preserves the container entrypoint and driver-injection
+  contract without duplicating the runtime and cuDNN libraries supplied by
+  the official Paddle wheel.
 - Python 3.10 virtual environment at `/opt/venv`.
 - Official PaddlePaddle GPU 3.0.0 cu118 wheel:
   `https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl`.
 - Wheel length: 1,206,592,273 bytes; SHA-256:
   `6e262ce3a18220a4e066e40656777753fd6dcdd8637c9f397dd449079d12ce9c`.
+- The wheel installs the matching CUDA 11.8 userspace packages, including
+  `nvidia-cuda-runtime-cu11==11.8.89` and
+  `nvidia-cudnn-cu11==8.9.6.50`; the edge NVIDIA runtime supplies the host
+  driver and `libcuda.so.1`.
 - PaddleX `3.0.3`, installed only after the wheel checksum and installed
   `paddlepaddle-gpu` distribution version are verified. Import Paddle only in
   a GPU-enabled runtime because `libcuda.so.1` is injected by the NVIDIA

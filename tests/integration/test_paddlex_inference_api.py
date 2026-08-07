@@ -339,8 +339,8 @@ def test_paddlex_dockerfile_uses_a_pinned_build_arg_base_image() -> None:
     )
 
     expected_image = (
-        "nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04"
-        "@sha256:f6913f3c02f297877f6859d12ff330043c0be668fdad86868c29a239a5a82151"
+        "nvidia/cuda:11.8.0-base-ubuntu22.04"
+        "@sha256:79e5b2cf878ee9006f5b3738caeea34fdc7708a32db53fe3e80db0b48bd286a0"
     )
     paddle_wheel = (
         "https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/"
@@ -348,6 +348,7 @@ def test_paddlex_dockerfile_uses_a_pinned_build_arg_base_image() -> None:
     )
     assert f"ARG CUDA_BASE_IMAGE={expected_image}" in dockerfile
     assert "FROM ${CUDA_BASE_IMAGE}" in dockerfile
+    assert "cudnn8-runtime" not in dockerfile
     assert f"ARG PADDLE_WHEEL_URL={paddle_wheel}" in dockerfile
     assert "ARG UBUNTU_MIRROR=https://mirrors.aliyun.com/ubuntu" in dockerfile
     assert "Acquire::Retries=3" in dockerfile

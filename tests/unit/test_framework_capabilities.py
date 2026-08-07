@@ -79,8 +79,8 @@ def test_catalog_publishes_exact_product_model_choices_and_versions() -> None:
     assert paddlex.framework_version == "3.0.3"
     assert paddlex.framework_version_constraint is None
     assert paddlex.base_image_reference == (
-        "nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04"
-        "@sha256:f6913f3c02f297877f6859d12ff330043c0be668fdad86868c29a239a5a82151"
+        "nvidia/cuda:11.8.0-base-ubuntu22.04"
+        "@sha256:79e5b2cf878ee9006f5b3738caeea34fdc7708a32db53fe3e80db0b48bd286a0"
     )
     assert {item.key: item.value for item in paddlex.runtime_components} == {
         "PaddlePaddle": "3.0.0",
