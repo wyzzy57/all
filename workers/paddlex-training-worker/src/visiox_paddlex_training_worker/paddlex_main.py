@@ -19,6 +19,9 @@ def apply_runtime_config(
 ) -> None:
     config.update_num_workers(workers)
     config["eval_size"] = [image_size, image_size]
+    for dataset_name in ("TrainDataset", "EvalDataset"):
+        if dataset_name in config and isinstance(config[dataset_name], dict):
+            config[dataset_name]["image_dir"] = ""
     _set_reader_resize(config, "TrainReader", image_size, batch_random=True)
     _set_reader_resize(config, "EvalReader", image_size, batch_random=False)
     _set_reader_resize(config, "TestReader", image_size, batch_random=False)

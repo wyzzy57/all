@@ -277,6 +277,8 @@ def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
             self._data = {
                 "worker_num": 0,
                 "eval_size": [640, 640],
+                "TrainDataset": {"image_dir": "images"},
+                "EvalDataset": {"image_dir": "images"},
                 "TrainReader": {
                     "batch_transforms": [
                         {"BatchRandomResize": {"target_size": [480, 512, 544]}}
@@ -330,6 +332,8 @@ def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
         "target_size"
     ] == [768, 768]
     assert config["TestReader"]["inputs_def"]["image_shape"] == [3, 768, 768]
+    assert config["TrainDataset"]["image_dir"] == ""
+    assert config["EvalDataset"]["image_dir"] == ""
     assert config["use_vdl"] is True
     assert config["vdl_log_dir"] == "/workspace/output/visualdl"
 
