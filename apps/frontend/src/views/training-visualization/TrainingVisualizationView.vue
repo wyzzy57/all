@@ -822,7 +822,7 @@ async function loadActiveTabData(requestGeneration: number, force = false) {
   if (activeTab.value === "artifacts") await loadObservabilityArtifacts(requestGeneration, force);
 }
 
-async function loadSummary(requestGeneration: number) {
+async function loadSummary(requestGeneration: number, loadActiveTab = true) {
   const job = selectedJob.value;
   if (!job || requestGeneration !== generation) return;
   summaryLoading.value = true;
@@ -835,7 +835,7 @@ async function loadSummary(requestGeneration: number) {
     selectedJob.value = updatedJob;
     jobs.value = jobs.value.map((item) => item.id === job.id ? updatedJob : item);
     schedulePoll(response.status, requestGeneration);
-    await loadActiveTabData(requestGeneration, true);
+    if (loadActiveTab) await loadActiveTabData(requestGeneration, true);
   } catch (error) {
     if (requestGeneration === generation) {
       ElMessage.error(error instanceof Error ? error.message : "训练概览加载失败");
@@ -861,7 +861,7 @@ async function selectAttempt() {
   const requestGeneration = ++generation;
   clearPollTimer();
   resetSelectedData(selectedAttemptId.value);
-  await loadSummary(requestGeneration);
+  await loadSummary(requestGeneration, false);
   await Promise.all([
     loadScalars(requestGeneration, true),
     loadResources(requestGeneration, true),

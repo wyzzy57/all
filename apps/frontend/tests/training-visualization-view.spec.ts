@@ -341,15 +341,27 @@ describe("TrainingVisualizationView", () => {
 
     const wrapper = mountView();
     await flushPromises();
+    await wrapper.get('[data-testid="tab-metrics"]').trigger("click");
+    await flushPromises();
+    apiMock.getTrainingObservabilitySummary.mockClear();
+    apiMock.getTrainingObservabilityScalars.mockClear();
+    apiMock.getTrainingObservabilityResources.mockClear();
+    apiMock.getTrainingObservabilityAnalysis.mockClear();
+    apiMock.getTrainingObservabilityArtifacts.mockClear();
     await wrapper.get('[data-testid="attempt-select"]').setValue("attempt-2");
     await flushPromises();
 
     const attemptParams = { attempt_id: "attempt-2" };
-    expect(apiMock.getTrainingObservabilitySummary).toHaveBeenLastCalledWith("job-1", attemptParams);
-    expect(apiMock.getTrainingObservabilityScalars).toHaveBeenLastCalledWith("job-1", expect.objectContaining(attemptParams));
-    expect(apiMock.getTrainingObservabilityResources).toHaveBeenLastCalledWith("job-1", expect.objectContaining(attemptParams));
-    expect(apiMock.getTrainingObservabilityAnalysis).toHaveBeenLastCalledWith("job-1", attemptParams);
-    expect(apiMock.getTrainingObservabilityArtifacts).toHaveBeenLastCalledWith("job-1", expect.objectContaining(attemptParams));
+    expect(apiMock.getTrainingObservabilitySummary).toHaveBeenCalledOnce();
+    expect(apiMock.getTrainingObservabilityScalars).toHaveBeenCalledOnce();
+    expect(apiMock.getTrainingObservabilityResources).toHaveBeenCalledOnce();
+    expect(apiMock.getTrainingObservabilityAnalysis).toHaveBeenCalledOnce();
+    expect(apiMock.getTrainingObservabilityArtifacts).toHaveBeenCalledOnce();
+    expect(apiMock.getTrainingObservabilitySummary).toHaveBeenCalledWith("job-1", attemptParams);
+    expect(apiMock.getTrainingObservabilityScalars).toHaveBeenCalledWith("job-1", expect.objectContaining(attemptParams));
+    expect(apiMock.getTrainingObservabilityResources).toHaveBeenCalledWith("job-1", expect.objectContaining(attemptParams));
+    expect(apiMock.getTrainingObservabilityAnalysis).toHaveBeenCalledWith("job-1", attemptParams);
+    expect(apiMock.getTrainingObservabilityArtifacts).toHaveBeenCalledWith("job-1", expect.objectContaining(attemptParams));
     expect(wrapper.get('[data-testid="overview-panel"]').text()).toContain("9 / 10");
   });
 
