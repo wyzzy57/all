@@ -571,6 +571,37 @@ def test_create_explicit_adapter_drafts_resolves_catalog_models(
     assert body["status"] == "draft"
 
 
+def test_create_paddlex_pipeline_is_ready_with_published_coco_version(
+    client: TestClient,
+    session_factory,
+) -> None:
+    _, dataset_id, _ = seed_training_ready_rows(session_factory)
+    with session_factory() as session:
+        version = session.scalar(
+            select(DatasetVersion).where(DatasetVersion.dataset_id == dataset_id)
+        )
+        assert version is not None
+        version.format = "coco"
+        session.commit()
+
+    response = client.post(
+        "/pipelines",
+        json={
+            "name": "ready-paddlex-pipeline",
+            "task_kind": "object_detection",
+            "framework": "paddlex",
+            "adapter_key": "paddlex.object_detection.v1",
+            "adapter_version": "1.0.0",
+            "recipe": {"model": "PP-YOLOE-S"},
+            "dataset_id": dataset_id,
+            "params_template": {"epochs": 2, "batch_size": 1},
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "ready"
+
+
 def test_create_legacy_pipeline_returns_explicit_identity(client: TestClient) -> None:
     yolo = client.post(
         "/pipelines",

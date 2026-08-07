@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from packaging.version import InvalidVersion, Version
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from visiox_api.services.framework_adapters import FrameworkAdapterCatalog
@@ -13,7 +14,7 @@ from visiox_api.services.llm_training import (
     validate_llm_dataset,
     validate_llm_environment,
 )
-from visiox_db.models import BaseModel, Dataset, TrainingPipeline
+from visiox_db.models import BaseModel, Dataset, DatasetVersion, TrainingPipeline
 from visiox_training.capabilities import (
     ModelCapability,
     ParameterCapability,
@@ -330,7 +331,22 @@ class PipelineConfigurationService:
                     raise PipelineConfigurationError(
                         "PaddleX dataset must be validated"
                     )
-            pipeline_status = "draft"
+            compatible_version_id = None
+            if dataset_id is not None:
+                compatible_version_id = session.scalar(
+                    select(DatasetVersion.id)
+                    .where(
+                        DatasetVersion.dataset_id == dataset_id,
+                        DatasetVersion.status == "published",
+                        DatasetVersion.format.in_(
+                            task_capability.accepted_dataset_formats
+                        ),
+                        DatasetVersion.object_uri != "",
+                        DatasetVersion.manifest_checksum != "",
+                    )
+                    .limit(1)
+                )
+            pipeline_status = "ready" if compatible_version_id else "draft"
         else:  # Registry resolution should make this unreachable.
             raise PipelineConfigurationError(f"Unsupported framework {framework!r}")
 
