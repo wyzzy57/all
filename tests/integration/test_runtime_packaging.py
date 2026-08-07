@@ -65,3 +65,9 @@ def test_control_plane_image_uses_a_reliable_configurable_package_mirror():
 
     assert "ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple" in dockerfile
     assert "PIP_INDEX_URL=${PIP_INDEX_URL}" in dockerfile
+
+
+def test_control_plane_image_includes_paddlex_inference_package_source():
+    dockerfile = Path("apps/api-service/Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY apps/paddlex-inference ./apps/paddlex-inference" in dockerfile
