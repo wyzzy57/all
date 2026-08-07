@@ -1603,3 +1603,48 @@ def test_yolo26_base_model_seed_has_all_tasks_and_scales():
     assert all(
         record["local_uri"].startswith("minio://models/base/") for record in records
     )
+
+
+def test_paddlex_base_model_seed_has_immutable_official_references():
+    seed_path = Path("infra/seed/paddlex_base_models.json")
+
+    records = json.loads(seed_path.read_text(encoding="utf-8"))
+
+    assert records == [
+        {
+            "id": "paddlex-pp-yoloe-s",
+            "framework": "paddlex",
+            "family": "PP-YOLOE",
+            "task": "detect",
+            "scale": "s",
+            "variant": "S",
+            "filename": "PP-YOLOE_plus-S.pdparams",
+            "artifact_format": "pdparams",
+            "source_path": "paddlex://official/PP-YOLOE_plus-S",
+            "artifact_metadata": {
+                "source_id": "PaddlePaddle/PaddleX:PP-YOLOE_plus-S",
+                "revision": "paddlex-model-zoo/3.0.3/PP-YOLOE_plus-S",
+                "runtime_model_id": "PP-YOLOE_plus-S",
+                "config_path": "paddlex/configs/modules/object_detection/PP-YOLOE_plus-S.yaml",
+            },
+            "status": "available",
+        },
+        {
+            "id": "paddlex-rt-detr-l",
+            "framework": "paddlex",
+            "family": "RT-DETR",
+            "task": "detect",
+            "scale": "l",
+            "variant": "L",
+            "filename": "RT-DETR-L.pdparams",
+            "artifact_format": "pdparams",
+            "source_path": "paddlex://official/RT-DETR-L",
+            "artifact_metadata": {
+                "source_id": "PaddlePaddle/PaddleX:RT-DETR-L",
+                "revision": "paddlex-model-zoo/3.0.3/RT-DETR-L",
+                "runtime_model_id": "RT-DETR-L",
+                "config_path": "paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
+            },
+            "status": "available",
+        },
+    ]

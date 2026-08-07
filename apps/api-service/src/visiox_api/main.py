@@ -44,7 +44,7 @@ from visiox_api.services.bootstrap_admin import (
     BootstrapAdminIdentityConflictError,
     bootstrap_default_admin,
 )
-from visiox_api.seed_base_models import seed_yolo26_base_models
+from visiox_api.seed_base_models import seed_paddlex_base_models, seed_yolo26_base_models
 from visiox_api.ws.agents import router as agent_gateway_router
 from visiox_api.ws.tasks import router as task_progress_router
 from visiox_db.session import create_session_factory
@@ -103,8 +103,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             session_factory = create_session_factory()
             with session_factory() as session:
                 seed_yolo26_base_models(session, storage=app.state.object_storage)
+                seed_paddlex_base_models(session)
         except Exception:
-            logger.exception("Failed to seed YOLO26 base models")
+            logger.exception("Failed to seed base models")
     try:
         yield
     finally:

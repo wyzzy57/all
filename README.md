@@ -23,6 +23,14 @@ npm run build --prefix apps/frontend
 
 See [docs/runbooks/local-mvp.md](docs/runbooks/local-mvp.md) for the local MVP runbook.
 
+## Multi-Framework Runtimes
+
+PaddleX, Ultralytics, and LLaMA-Factory training images are immutable,
+on-demand edge runtimes rather than long-running Compose services. Build and
+publish them before enabling a framework, then configure their manifest-digest
+references. See the [runtime image operations guide](docs/operations/multi-framework-runtime-images.md)
+and [PaddleX object-detection runbook](docs/operations/paddlex-object-detection-runbook.md).
+
 ## SSH/Docker Edge Runtime
 
 Visiox can bootstrap trusted Ubuntu NVIDIA x86 and Jetson nodes over strict

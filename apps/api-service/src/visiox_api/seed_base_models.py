@@ -24,7 +24,8 @@ class SeedStorage(Protocol):
     ) -> str: ...
 
 
-DEFAULT_SEED_PATH = Path("infra/seed/yolo26_base_models.json")
+DEFAULT_YOLO26_SEED_PATH = Path("infra/seed/yolo26_base_models.json")
+DEFAULT_PADDLEX_SEED_PATH = Path("infra/seed/paddlex_base_models.json")
 _MIN_REAL_MODEL_SIZE_BYTES = 1024 * 1024
 
 
@@ -32,9 +33,40 @@ def seed_yolo26_base_models(
     session: Session,
     *,
     storage: SeedStorage | None = None,
-    seed_path: Path = DEFAULT_SEED_PATH,
+    seed_path: Path = DEFAULT_YOLO26_SEED_PATH,
 ) -> int:
     records = json.loads(seed_path.read_text(encoding="utf-8"))
+    return _seed_base_models(
+        session,
+        records=records,
+        storage=storage,
+        prepare_placeholders=True,
+    )
+
+
+def seed_paddlex_base_models(
+    session: Session,
+    *,
+    storage: SeedStorage | None = None,
+    seed_path: Path = DEFAULT_PADDLEX_SEED_PATH,
+) -> int:
+    del storage  # PaddleX weights are downloaded and cached by the edge runtime.
+    records = json.loads(seed_path.read_text(encoding="utf-8"))
+    return _seed_base_models(
+        session,
+        records=records,
+        storage=None,
+        prepare_placeholders=False,
+    )
+
+
+def _seed_base_models(
+    session: Session,
+    *,
+    records: list[dict[str, object]],
+    storage: SeedStorage | None,
+    prepare_placeholders: bool,
+) -> int:
     prepared_count = 0
 
     with tempfile.TemporaryDirectory(prefix="visiox-base-model-seed-") as tmp_dir:
@@ -46,46 +78,57 @@ def seed_yolo26_base_models(
             model = session.get(BaseModel, model_id)
 
             if model is not None and _has_real_artifact(model):
-                model.family = str(record["family"])
-                model.task = str(record["task"])
-                model.scale = str(record["scale"])
-                model.filename = filename
-                model.source_path = str(record["source_path"])
+                _apply_model_metadata(model, record)
                 session.add(model)
                 prepared_count += 1
                 continue
 
-            payload = _placeholder_payload(record)
-            checksum = sha256(payload).hexdigest()
-            local_uri = str(record.get("local_uri") or f"minio://models/{object_name}")
-
-            if storage is not None:
-                model_path = tmp_path / filename
-                model_path.write_bytes(payload)
-                local_uri = storage.put_file(
-                    "models",
-                    object_name,
-                    model_path,
-                    content_type="application/octet-stream",
-                )
-
             if model is None:
                 model = BaseModel(id=model_id)
 
-            model.family = str(record["family"])
-            model.task = str(record["task"])
-            model.scale = str(record["scale"])
-            model.filename = filename
-            model.source_path = str(record["source_path"])
-            model.local_uri = local_uri
-            model.checksum = checksum
-            model.size_bytes = len(payload)
-            model.status = "ready"
+            _apply_model_metadata(model, record)
+            if prepare_placeholders:
+                payload = _placeholder_payload(record)
+                model.checksum = sha256(payload).hexdigest()
+                model.size_bytes = len(payload)
+                model.local_uri = str(
+                    record.get("local_uri") or f"minio://models/{object_name}"
+                )
+                if storage is not None:
+                    model_path = tmp_path / filename
+                    model_path.write_bytes(payload)
+                    model.local_uri = storage.put_file(
+                        "models",
+                        object_name,
+                        model_path,
+                        content_type="application/octet-stream",
+                    )
+            else:
+                model.local_uri = None
+                model.checksum = None
+                model.size_bytes = None
             session.add(model)
             prepared_count += 1
 
     session.commit()
     return prepared_count
+
+
+def _apply_model_metadata(model: BaseModel, record: dict[str, object]) -> None:
+    model.family = str(record["family"])
+    model.task = str(record["task"])
+    model.scale = str(record["scale"])
+    model.filename = str(record["filename"])
+    model.framework = str(record.get("framework") or "ultralytics")
+    model.model_family = str(record.get("model_family") or record["family"])
+    model.variant = str(record.get("variant") or record["scale"])
+    model.artifact_format = str(
+        record.get("artifact_format") or Path(model.filename).suffix.removeprefix(".")
+    )
+    metadata = record.get("artifact_metadata")
+    model.artifact_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    model.source_path = str(record["source_path"])
+    model.status = str(record.get("status") or "ready")
 
 
 def _has_real_artifact(model: BaseModel) -> bool:
@@ -101,7 +144,7 @@ def _has_real_artifact(model: BaseModel) -> bool:
 
 def _placeholder_payload(record: dict[str, object]) -> bytes:
     model_id = str(record["id"])
-    return f"visiox prepared yolo26 base model placeholder: {model_id}\n".encode()
+    return f"visiox prepared base model placeholder: {model_id}\n".encode()
 
 
 def seed_yolo26_base_models_from_settings() -> int:

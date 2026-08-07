@@ -2,6 +2,7 @@
   {
     "id": "yolo26-detect-n",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "detect",
     "scale": "n",
     "filename": "yolo26n.pt",
@@ -12,6 +13,7 @@
   {
     "id": "yolo26-detect-s",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "detect",
     "scale": "s",
     "filename": "yolo26s.pt",
@@ -22,6 +24,7 @@
   {
     "id": "yolo26-detect-m",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "detect",
     "scale": "m",
     "filename": "yolo26m.pt",
@@ -32,6 +35,7 @@
   {
     "id": "yolo26-detect-l",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "detect",
     "scale": "l",
     "filename": "yolo26l.pt",
@@ -42,6 +46,7 @@
   {
     "id": "yolo26-detect-x",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "detect",
     "scale": "x",
     "filename": "yolo26x.pt",
@@ -52,6 +57,7 @@
   {
     "id": "yolo26-segment-n",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "segment",
     "scale": "n",
     "filename": "yolo26n-seg.pt",
@@ -62,6 +68,7 @@
   {
     "id": "yolo26-segment-s",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "segment",
     "scale": "s",
     "filename": "yolo26s-seg.pt",
@@ -72,6 +79,7 @@
   {
     "id": "yolo26-segment-m",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "segment",
     "scale": "m",
     "filename": "yolo26m-seg.pt",
@@ -82,6 +90,7 @@
   {
     "id": "yolo26-segment-l",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "segment",
     "scale": "l",
     "filename": "yolo26l-seg.pt",
@@ -92,6 +101,7 @@
   {
     "id": "yolo26-segment-x",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "segment",
     "scale": "x",
     "filename": "yolo26x-seg.pt",
@@ -102,6 +112,7 @@
   {
     "id": "yolo26-semantic-n",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "semantic",
     "scale": "n",
     "filename": "yolo26n-sem.pt",
@@ -112,6 +123,7 @@
   {
     "id": "yolo26-semantic-s",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "semantic",
     "scale": "s",
     "filename": "yolo26s-sem.pt",
@@ -122,6 +134,7 @@
   {
     "id": "yolo26-semantic-m",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "semantic",
     "scale": "m",
     "filename": "yolo26m-sem.pt",
@@ -132,6 +145,7 @@
   {
     "id": "yolo26-semantic-l",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "semantic",
     "scale": "l",
     "filename": "yolo26l-sem.pt",
@@ -142,6 +156,7 @@
   {
     "id": "yolo26-semantic-x",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "semantic",
     "scale": "x",
     "filename": "yolo26x-sem.pt",
@@ -152,6 +167,7 @@
   {
     "id": "yolo26-pose-n",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "pose",
     "scale": "n",
     "filename": "yolo26n-pose.pt",
@@ -162,6 +178,7 @@
   {
     "id": "yolo26-pose-s",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "pose",
     "scale": "s",
     "filename": "yolo26s-pose.pt",
@@ -172,6 +189,7 @@
   {
     "id": "yolo26-pose-m",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "pose",
     "scale": "m",
     "filename": "yolo26m-pose.pt",
@@ -182,6 +200,7 @@
   {
     "id": "yolo26-pose-l",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "pose",
     "scale": "l",
     "filename": "yolo26l-pose.pt",
@@ -192,6 +211,7 @@
   {
     "id": "yolo26-pose-x",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "pose",
     "scale": "x",
     "filename": "yolo26x-pose.pt",
@@ -202,6 +222,7 @@
   {
     "id": "yolo26-obb-n",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "obb",
     "scale": "n",
     "filename": "yolo26n-obb.pt",
@@ -212,6 +233,7 @@
   {
     "id": "yolo26-obb-s",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "obb",
     "scale": "s",
     "filename": "yolo26s-obb.pt",
@@ -222,6 +244,7 @@
   {
     "id": "yolo26-obb-m",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "obb",
     "scale": "m",
     "filename": "yolo26m-obb.pt",
@@ -232,6 +255,7 @@
   {
     "id": "yolo26-obb-l",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "obb",
     "scale": "l",
     "filename": "yolo26l-obb.pt",
@@ -242,6 +266,7 @@
   {
     "id": "yolo26-obb-x",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "obb",
     "scale": "x",
     "filename": "yolo26x-obb.pt",
@@ -252,6 +277,7 @@
   {
     "id": "yolo26-classify-n",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "classify",
     "scale": "n",
     "filename": "yolo26n-cls.pt",
@@ -262,6 +288,7 @@
   {
     "id": "yolo26-classify-s",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "classify",
     "scale": "s",
     "filename": "yolo26s-cls.pt",
@@ -272,6 +299,7 @@
   {
     "id": "yolo26-classify-m",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "classify",
     "scale": "m",
     "filename": "yolo26m-cls.pt",
@@ -282,6 +310,7 @@
   {
     "id": "yolo26-classify-l",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "classify",
     "scale": "l",
     "filename": "yolo26l-cls.pt",
@@ -292,6 +321,7 @@
   {
     "id": "yolo26-classify-x",
     "family": "yolo26",
+    "framework": "ultralytics",
     "task": "classify",
     "scale": "x",
     "filename": "yolo26x-cls.pt",

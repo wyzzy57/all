@@ -4,6 +4,12 @@ from pydantic import ValidationError
 from visiox_common.settings import Settings
 
 
+def test_visualdl_public_url_is_disabled_by_default() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.visualdl_public_url is None
+
+
 def test_visualdl_public_url_is_configurable_from_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
