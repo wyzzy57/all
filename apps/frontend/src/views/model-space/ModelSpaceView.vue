@@ -153,6 +153,12 @@
             </p>
           </div>
           <div class="detail-actions">
+            <el-button
+              v-if="detailPipeline.framework_locked_at || detailPipeline.first_submitted_job_id"
+              plain
+              data-testid="clone-locked-pipeline"
+              @click="clonePipelineForEditing(detailPipeline)"
+            >克隆并更换框架</el-button>
             <el-button plain @click="deletePipeline(detailPipeline)">删除</el-button>
             <el-button plain @click="openPublicDialog(detailPipeline)">公开配置</el-button>
             <el-button plain @click="toggleFavorite(detailPipeline)">{{ detailPipeline.is_favorite ? "取消收藏" : "收藏" }}</el-button>
@@ -496,15 +502,15 @@
         :active-step="activeStep"
         :submitting="submitting"
         :show-direct-deploy="!isLlmWizard"
-        :show-save-draft="isLlmWizard"
-        :draft-saving="llmDraftSaving"
-        :draft-status="isLlmWizard ? llmDraftStatus : ''"
+        :show-save-draft="true"
+        :draft-saving="wizardDraftSaving"
+        :draft-status="wizardDraftStatus"
         @back="backToList"
         @step="goToWizardStep"
         @previous="activeStep -= 1"
         @next="goNext"
         @submit="submitTraining"
-        @save-draft="saveLlmDraftFromAction"
+        @save-draft="saveWizardDraftFromAction"
       >
         <LlmPipelineWizardSteps
           v-if="isLlmWizard"
@@ -523,6 +529,19 @@
         <template v-else>
         <div v-if="activeStep === 0" class="step-panel">
           <h2>选择产线</h2>
+          <FrameworkModelSelector
+            v-if="frameworkCatalog"
+            :catalog="frameworkCatalog"
+            :selection="frameworkSelection"
+            :parameter-values="frameworkParameters"
+            :advanced-yaml="frameworkAdvancedYaml"
+            :locked="Boolean(activeWizardPipeline?.framework_locked_at)"
+            :lock-reason="frameworkLockReason"
+            @update:selection="setFrameworkSelection"
+            @update:parameter-values="frameworkParameters = $event"
+            @update:advanced-yaml="frameworkAdvancedYaml = $event"
+            @clone="cloneWithFrameworkSelection"
+          />
           <button class="scenario-card selected" type="button">
             <strong>{{ form.name || selectedScenario.label }}</strong>
             <span>{{ selectedScenario.description }}</span>
@@ -535,7 +554,7 @@
           <div class="step-main">
             <h2>请选择模型并添加数据集</h2>
             <label class="field-label required">选择模型</label>
-            <el-select v-model="form.base_model_id" class="full-input" placeholder="请选择基础模型" @change="syncScaleFromModel">
+            <el-select v-if="requiresBaseModel" v-model="form.base_model_id" class="full-input" placeholder="请选择基础模型" @change="syncScaleFromModel">
               <el-option
                 v-for="model in selectableBaseModels"
                 :key="model.id"
@@ -543,6 +562,10 @@
                 :value="model.id"
               />
             </el-select>
+            <div v-else class="selected-framework-model" data-testid="selected-framework-model">
+              <strong>{{ selectedFrameworkModel?.display_name || frameworkSelection.modelKey }}</strong>
+              <span>{{ selectedFrameworkAdapter?.display_name || frameworkSelection.framework }} 官方模型</span>
+            </div>
 
             <label class="field-label required">添加数据集</label>
             <div class="dataset-picker">
@@ -960,6 +983,17 @@
             </span>
           </button>
         </div>
+        <FrameworkModelSelector
+          v-if="frameworkCatalog"
+          :catalog="frameworkCatalog"
+          :selection="frameworkSelection"
+          :parameter-values="frameworkParameters"
+          :advanced-yaml="frameworkAdvancedYaml"
+          @update:selection="setFrameworkSelection"
+          @update:parameter-values="frameworkParameters = $event"
+          @update:advanced-yaml="frameworkAdvancedYaml = $event"
+        />
+        <p v-else-if="frameworkCatalogError" class="framework-catalog-error">{{ frameworkCatalogError }}</p>
       </div>
 
       <div v-else class="create-form local-form">
@@ -1047,6 +1081,7 @@ import {
 import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onMounted, onUnmounted, reactive, ref, watch, type Component } from "vue";
 import { useRoute, useRouter } from "vue-router";
+import { parse as parseYaml } from "yaml";
 
 import {
   api,
@@ -1060,13 +1095,24 @@ import {
   type TrainingJobRecord,
   type TrainingPipelineRecord,
   type ComputeNodeRecord,
+  type FrameworkCapabilityCatalogResponse,
   type ResourcePoolRecord,
 } from "@/api/client";
 import type { ExperienceInferenceRequest } from "@/components/ServiceExperiencePanel.vue";
 import ServiceExperiencePanel from "@/components/ServiceExperiencePanel.vue";
 import ResourceSharingDialog from "@/components/sharing/ResourceSharingDialog.vue";
 import PipelineWizardShell from "@/features/pipeline-wizard/PipelineWizardShell.vue";
+import FrameworkModelSelector from "@/features/pipeline-wizard/FrameworkModelSelector.vue";
 import { usePipelineWizardDraft } from "@/features/pipeline-wizard/usePipelineWizardDraft";
+import {
+  compatibleFrameworks,
+  defaultFrameworkModelSelection,
+  legacyEngineForFramework,
+  pipelineTaskForTaskKind,
+  taskForFramework,
+  taskKindForPipelineTask,
+  type FrameworkModelSelection,
+} from "@/features/pipeline-wizard/frameworkCatalog";
 import LlmPipelineWizardSteps from "@/features/pipeline-wizard/llm/LlmPipelineWizardSteps.vue";
 import {
   createDefaultLlmTrainingForm,
@@ -1331,6 +1377,17 @@ const baseModels = ref<BaseModelRecord[]>([]);
 const trainedModels = ref<TrainedModelRecord[]>([]);
 const datasets = ref<DatasetRecord[]>([]);
 const configParams = ref<Record<string, unknown>>({});
+const frameworkCatalog = ref<FrameworkCapabilityCatalogResponse | null>(null);
+const frameworkCatalogError = ref("");
+const frameworkParameters = ref<Record<string, unknown>>({});
+const frameworkAdvancedYaml = ref("");
+const frameworkSelection = ref<FrameworkModelSelection>({
+  taskKind: "object_detection",
+  framework: "",
+  adapterKey: "",
+  adapterVersion: "",
+  modelKey: "",
+});
 let refreshTimer: number | undefined;
 const analysisResult = ref<DatasetAnalysis | null>(null);
 const samplesBySplit = ref<Record<"train" | "val" | "test", DatasetSampleRecord[]>>({
@@ -1420,7 +1477,25 @@ const typeOptions = computed(() => Array.from(new Set(pipelines.value.map((item)
 const selectedScenario = computed(
   () => scenarios.find((scenario) => scenario.key === createForm.scenarioKey) || scenarios[0],
 );
+const activeWizardPipeline = computed(() => pipelines.value.find((pipeline) => pipeline.id === wizardPipelineId.value));
+const frameworkLockReason = computed(() => activeWizardPipeline.value?.framework_locked_at ? "Framework and model are locked because this pipeline has already been submitted for training." : "");
 const isLlmWizard = computed(() => form.task === "llm");
+const selectedFrameworkAdapter = computed(() => compatibleFrameworks(frameworkCatalog.value, frameworkSelection.value.taskKind)
+  .find((adapter) => adapter.framework === frameworkSelection.value.framework));
+const selectedFrameworkTask = computed(() => taskForFramework(selectedFrameworkAdapter.value, frameworkSelection.value.taskKind));
+const selectedFrameworkModel = computed(() => selectedFrameworkTask.value?.models
+  .find((model) => model.model_key === frameworkSelection.value.modelKey));
+const requiresBaseModel = computed(() => frameworkSelection.value.framework === "ultralytics");
+const frameworkDraft = computed(() => ({
+  selection: frameworkSelection.value,
+  parameters: frameworkParameters.value,
+  advancedYaml: frameworkAdvancedYaml.value,
+}));
+const frameworkDraftController = usePipelineWizardDraft(
+  frameworkDraft,
+  computed(() => viewMode.value === "wizard" && !isLlmWizard.value && Boolean(wizardPipelineId.value) && !activeWizardPipeline.value?.framework_locked_at),
+  saveFrameworkDraft,
+);
 const llmDraftController = usePipelineWizardDraft(
   llmForm,
   computed(() => viewMode.value === "wizard" && isLlmWizard.value && Boolean(wizardPipelineId.value)),
@@ -1436,6 +1511,16 @@ const llmDraftStatus = computed(() => {
     ? `草稿已保存 ${savedAt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`
     : "草稿已保存";
 });
+const frameworkDraftSaving = computed(() => frameworkDraftController.status.value === "saving");
+const frameworkDraftStatus = computed(() => {
+  if (frameworkDraftController.status.value === "dirty") return "有未保存更改";
+  if (frameworkDraftController.status.value === "saving") return "正在校验并保存框架配置";
+  if (frameworkDraftController.status.value === "error") return frameworkDraftController.error.value || "框架配置校验失败";
+  const savedAt = frameworkDraftController.lastSavedAt.value;
+  return savedAt ? `框架配置已保存 ${savedAt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}` : "框架配置已保存";
+});
+const wizardDraftSaving = computed(() => isLlmWizard.value ? llmDraftSaving.value : frameworkDraftSaving.value);
+const wizardDraftStatus = computed(() => isLlmWizard.value ? llmDraftStatus.value : frameworkDraftStatus.value);
 
 const filteredPipelines = computed(() => {
   const normalizedKeyword = keyword.value.trim().toLowerCase();
@@ -1782,10 +1867,20 @@ function openCreateDialog() {
   createForm.name = nextPipelineName();
   createForm.localTask = "detect";
   createForm.localScale = "n";
+  frameworkParameters.value = {};
+  frameworkAdvancedYaml.value = "";
+  frameworkSelection.value = {
+    taskKind: "object_detection",
+    framework: "",
+    adapterKey: "",
+    adapterVersion: "",
+    modelKey: "",
+  };
   localModelFile.value = null;
   if (modelFileInput.value) modelFileInput.value.value = "";
   createDialogVisible.value = true;
   createTab.value = "zero";
+  void loadFrameworkCapabilities("object_detection");
 }
 
 function nextPipelineName() {
@@ -1799,6 +1894,90 @@ function nextPipelineName() {
 
 function selectScenario(key: string) {
   createForm.scenarioKey = key;
+  const scenario = scenarios.find((item) => item.key === key);
+  if (scenario) void loadFrameworkCapabilities(taskKindForPipelineTask(scenario.task));
+}
+
+let frameworkCatalogRequestSequence = 0;
+
+async function loadFrameworkCapabilities(taskKind: string) {
+  const requestId = ++frameworkCatalogRequestSequence;
+  frameworkCatalogError.value = "";
+  try {
+    const catalog = await api.getFrameworkCapabilities(taskKind);
+    if (requestId !== frameworkCatalogRequestSequence) return;
+    frameworkCatalog.value = catalog ?? { task_kind: taskKind, adapters: [] };
+    const current = frameworkSelection.value;
+    const currentAdapter = compatibleFrameworks(frameworkCatalog.value, taskKind)
+      .find((adapter) => adapter.framework === current.framework);
+    const currentModel = taskForFramework(currentAdapter, taskKind)?.models
+      .find((model) => model.model_key === current.modelKey);
+    if (currentAdapter && currentModel) {
+      frameworkSelection.value = {
+        taskKind,
+        framework: currentAdapter.framework,
+        adapterKey: currentAdapter.adapter_key,
+        adapterVersion: currentAdapter.adapter_version,
+        modelKey: currentModel.model_key,
+      };
+    } else {
+      const selection = defaultFrameworkModelSelection(frameworkCatalog.value, taskKind);
+      if (selection) frameworkSelection.value = selection;
+    }
+  } catch (error) {
+    if (requestId !== frameworkCatalogRequestSequence) return;
+    frameworkCatalog.value = null;
+    frameworkCatalogError.value = getErrorMessage(error, "Unable to load framework capabilities");
+  }
+}
+
+function setFrameworkSelection(selection: FrameworkModelSelection) {
+  frameworkSelection.value = selection;
+  const adapter = compatibleFrameworks(frameworkCatalog.value, selection.taskKind)
+    .find((item) => item.framework === selection.framework);
+  const parameters = taskForFramework(adapter, selection.taskKind)?.parameters ?? [];
+  frameworkParameters.value = Object.fromEntries(
+    parameters.filter((parameter) => parameter.default !== null && parameter.default !== undefined)
+      .map((parameter) => [parameter.name, parameter.default]),
+  );
+  frameworkAdvancedYaml.value = "";
+  form.base_model_id = "";
+  if (selectedFrameworkModel.value?.variant) form.scale = selectedFrameworkModel.value.variant;
+  if (selection.taskKind === "llm_sft") {
+    const model = taskForFramework(adapter, selection.taskKind)?.models
+      .find((item) => item.model_key === selection.modelKey);
+    if (model) llmForm.value.modelId = model.runtime_id || model.model_key;
+  }
+}
+
+function frameworkPipelineFields() {
+  const adapter = compatibleFrameworks(frameworkCatalog.value, frameworkSelection.value.taskKind)
+    .find((item) => item.framework === frameworkSelection.value.framework);
+  const model = taskForFramework(adapter, frameworkSelection.value.taskKind)?.models
+    .find((item) => item.model_key === frameworkSelection.value.modelKey);
+  if (!adapter || !model) return {};
+  const task = pipelineTaskForTaskKind(frameworkSelection.value.taskKind);
+  return {
+    engine: legacyEngineForFramework(adapter.framework),
+    task,
+    scale: model.variant || (task === "llm" ? "llm" : form.scale),
+    framework: adapter.framework,
+    adapter_key: adapter.adapter_key,
+    adapter_version: adapter.adapter_version,
+    task_kind: frameworkSelection.value.taskKind,
+    model_family: model.family || model.model_key,
+    recipe: { model: { key: model.model_key } },
+    params_template: frameworkParameterPayload(),
+  };
+}
+
+function frameworkParameterPayload() {
+  if (!frameworkAdvancedYaml.value.trim()) return { ...frameworkParameters.value };
+  const parsed = parseYaml(frameworkAdvancedYaml.value);
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+    throw new Error("高级 YAML 必须是参数键值对象");
+  }
+  return { ...frameworkParameters.value, ...(parsed as Record<string, unknown>) };
 }
 
 function selectLocalModelFile(event: Event) {
@@ -1823,7 +2002,15 @@ async function startWizard() {
     ElMessage.warning("请上传本地 .pt 模型权重");
     return;
   }
-  const task = createTab.value === "local" ? createForm.localTask : selectedScenario.value.task;
+  if (createTab.value === "zero") {
+    const expectedTaskKind = taskKindForPipelineTask(selectedScenario.value.task);
+    if (frameworkCatalog.value?.task_kind !== expectedTaskKind) {
+      await loadFrameworkCapabilities(expectedTaskKind);
+    }
+  }
+  const task = createTab.value === "local"
+    ? createForm.localTask
+    : pipelineTaskForTaskKind(frameworkSelection.value.taskKind || taskKindForPipelineTask(selectedScenario.value.task));
   const scale = createTab.value === "local" ? createForm.localScale : task === "llm" ? "llm" : "n";
   form.name = name;
   form.task = task;
@@ -1837,6 +2024,7 @@ async function startWizard() {
   configParams.value = {};
   if (task === "llm") {
     llmForm.value = createDefaultLlmTrainingForm(name);
+    llmForm.value.modelId = selectedFrameworkModel.value?.runtime_id || selectedFrameworkModel.value?.model_key || "";
     trainingEnvironment.mode = "remote";
   } else {
     ensureWizardDefaults();
@@ -1850,11 +2038,18 @@ async function startWizard() {
       form.base_model_id = uploadedModel.id;
       createForm.scenarioKey = scenarioKeyForTask(task);
     }
+    const frameworkFields = createTab.value === "zero" ? frameworkPipelineFields() : {};
+    if (createTab.value === "zero" && !Object.keys(frameworkFields).length) {
+      throw new Error("请选择可用的训练框架和模型");
+    }
+    if (createTab.value === "zero" && !selectedFrameworkAdapter.value?.available) {
+      throw new Error(selectedFrameworkAdapter.value?.unavailable_reason || "当前训练框架不可用");
+    }
     const pipeline = await api.createPipeline({
       name: form.name,
-      engine: form.task === "llm" ? "llamafactory" : "yolo26",
-      task: form.task,
-      scale: form.scale,
+      ...(createTab.value === "local"
+        ? { engine: form.task === "llm" ? "llamafactory" : "yolo26", task: form.task, scale: form.scale }
+        : frameworkFields),
       ...(uploadedModel ? { base_model_id: uploadedModel.id } : {}),
     });
     wizardPipelineId.value = pipeline.id;
@@ -1878,6 +2073,16 @@ async function openExistingPipelineWizard(pipeline: TrainingPipelineRecord) {
   form.scale = pipeline.scale || "n";
   form.base_model_id = pipeline.base_model_id || "";
   form.dataset_id = pipeline.dataset_id || "";
+  frameworkSelection.value = {
+    taskKind: pipeline.task_kind || taskKindForPipelineTask(pipeline.task),
+    framework: pipeline.framework || (pipeline.engine === "yolo26" ? "ultralytics" : pipeline.engine) || "ultralytics",
+    adapterKey: pipeline.adapter_key || "",
+    adapterVersion: pipeline.adapter_version || "",
+    modelKey: String((pipeline.recipe?.model as Record<string, unknown> | undefined)?.key || ""),
+  };
+  frameworkParameters.value = pipeline.params_template ?? {};
+  frameworkAdvancedYaml.value = "";
+  void loadFrameworkCapabilities(frameworkSelection.value.taskKind);
   if (pipeline.task === "llm") {
     llmForm.value = llmFormFromPipeline(pipeline);
     trainingEnvironment.mode = "remote";
@@ -1894,6 +2099,24 @@ async function openExistingPipelineWizard(pipeline: TrainingPipelineRecord) {
   viewMode.value = "wizard";
   await syncWizardRoute();
   if (form.dataset_id && pipeline.task !== "llm") await loadWizardProcessingData();
+}
+
+async function cloneWithFrameworkSelection() {
+  const source = activeWizardPipeline.value;
+  if (!source) return;
+  await clonePipelineForEditing(source);
+}
+
+async function clonePipelineForEditing(source: TrainingPipelineRecord) {
+  try {
+    const clone = await api.clonePipeline(source.id, {
+      name: `${source.name} copy`,
+    });
+    pipelines.value = [clone, ...pipelines.value];
+    await openExistingPipelineWizard(clone);
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, "Unable to clone pipeline"));
+  }
 }
 
 function openPipelineCard(pipeline: TrainingPipelineRecord) {
@@ -2236,7 +2459,7 @@ async function goNext() {
     return;
   }
   if (activeStep.value === 1) {
-    if (!form.base_model_id) {
+    if (requiresBaseModel.value && !form.base_model_id) {
       ElMessage.warning("请选择基础模型");
       return;
     }
@@ -2253,7 +2476,7 @@ async function goNext() {
 }
 
 function ensureWizardDefaults() {
-  if (!form.base_model_id) {
+  if (requiresBaseModel.value && !form.base_model_id) {
     const firstModel = selectableBaseModels.value[0];
     if (firstModel) {
       form.base_model_id = firstModel.id;
@@ -2306,7 +2529,7 @@ async function submitTraining() {
     await submitLlmTraining();
     return;
   }
-  if (!form.base_model_id || !form.dataset_id) {
+  if ((requiresBaseModel.value && !form.base_model_id) || !form.dataset_id) {
     ElMessage.warning("请先选择模型和数据集");
     return;
   }
@@ -2325,13 +2548,14 @@ async function submitTraining() {
   try {
     const defaultEnvironment = { device: trainingEnvironment.mode === "remote" ? "0" : "cpu", workers: 2 };
     const jobPayload = trainingJobPayload(defaultEnvironment);
+    const frameworkFields = frameworkPipelineFields();
+    const paramsTemplate = requiresBaseModel.value ? trainingParams() : frameworkParameterPayload();
     if (wizardPipelineId.value) {
       await api.updatePipeline(wizardPipelineId.value, {
-        task: form.task,
-        scale: form.scale,
-        base_model_id: form.base_model_id,
+        ...frameworkFields,
+        base_model_id: requiresBaseModel.value ? form.base_model_id : null,
         dataset_id: form.dataset_id,
-        params_template: trainingParams(),
+        params_template: paramsTemplate,
         default_environment: defaultEnvironment,
       });
       await api.createTrainingJob(wizardPipelineId.value, jobPayload);
@@ -2342,11 +2566,10 @@ async function submitTraining() {
     }
     const pipeline = await api.createPipeline({
       name: form.name,
-      task: form.task,
-      scale: form.scale,
-      base_model_id: form.base_model_id,
+      ...frameworkFields,
+      base_model_id: requiresBaseModel.value ? form.base_model_id : null,
       dataset_id: form.dataset_id,
-      params_template: trainingParams(),
+      params_template: paramsTemplate,
       default_environment: defaultEnvironment,
     });
     await api.createTrainingJob(pipeline.id, jobPayload);
@@ -2369,6 +2592,7 @@ async function saveLlmDraft() {
     ...(llmForm.value.nodeId ? { node_id: llmForm.value.nodeId } : {}),
   };
   const updated = await api.updatePipeline(wizardPipelineId.value, {
+    ...llmFrameworkPipelineFields(),
     name: llmForm.value.name.trim(),
     engine: "llamafactory",
     task: "llm",
@@ -2382,12 +2606,65 @@ async function saveLlmDraft() {
   replacePipeline(updated);
 }
 
+function llmFrameworkPipelineFields() {
+  const adapter = selectedFrameworkAdapter.value;
+  const modelId = llmForm.value.modelId.trim();
+  if (!adapter || !modelId) return frameworkPipelineFields();
+  const catalogModel = taskForFramework(adapter, "llm_sft")?.models.find(
+    (model) => model.model_key === modelId || model.runtime_id === modelId,
+  );
+  const family = catalogModel?.family || modelId;
+  const variant = catalogModel?.variant || "custom";
+  return {
+    engine: "llamafactory" as const,
+    task: "llm",
+    scale: variant,
+    framework: adapter.framework,
+    adapter_key: adapter.adapter_key,
+    adapter_version: adapter.adapter_version,
+    task_kind: "llm_sft",
+    model_family: family,
+    recipe: {
+      model: {
+        key: catalogModel?.model_key || modelId,
+        label: catalogModel?.display_name || modelId,
+        runtime_id: catalogModel?.runtime_id || modelId,
+        family,
+        variant,
+        source: catalogModel?.source || llmForm.value.modelSource,
+        revision: llmForm.value.requestedRevision.trim() || "main",
+      },
+    },
+  };
+}
+
+async function saveFrameworkDraft() {
+  if (!wizardPipelineId.value) return;
+  const updated = await api.updatePipeline(wizardPipelineId.value, {
+    ...frameworkPipelineFields(),
+  });
+  replacePipeline(updated);
+}
+
 async function saveLlmDraftFromAction() {
   try {
     await llmDraftController.saveNow();
     ElMessage.success("草稿已保存");
   } catch (error) {
     ElMessage.error(getErrorMessage(error, "大模型草稿保存失败"));
+  }
+}
+
+async function saveWizardDraftFromAction() {
+  if (isLlmWizard.value) {
+    await saveLlmDraftFromAction();
+    return;
+  }
+  try {
+    await frameworkDraftController.saveNow();
+    ElMessage.success("框架配置已校验并保存");
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, "框架配置保存失败"));
   }
 }
 
@@ -3625,6 +3902,24 @@ function getErrorMessage(error: unknown, fallback: string) {
 .environment-select {
   width: 540px;
   max-width: 100%;
+}
+
+.selected-framework-model {
+  display: grid;
+  width: min(100%, 540px);
+  min-height: 68px;
+  box-sizing: border-box;
+  align-content: center;
+  gap: 5px;
+  padding: 12px 14px;
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  background: var(--visiox-card-surface, #f7f8fa);
+}
+
+.selected-framework-model span {
+  color: #667085;
+  font-size: 13px;
 }
 
 .training-target-switch {

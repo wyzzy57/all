@@ -23,6 +23,7 @@ const apiMock = vi.hoisted(() => ({
   createPipeline: vi.fn(),
   createTrainingJob: vi.fn(),
   updatePipeline: vi.fn(),
+  clonePipeline: vi.fn(),
   deletePipeline: vi.fn(),
   predictPipelineImage: vi.fn(),
   evaluatePipeline: vi.fn(),
@@ -31,6 +32,7 @@ const apiMock = vi.hoisted(() => ({
   createService: vi.fn(),
   listResourcePools: vi.fn(),
   listNodes: vi.fn(),
+  getFrameworkCapabilities: vi.fn(),
 }));
 
 vi.mock("vue-router", () => ({
@@ -258,6 +260,18 @@ describe("ModelSpaceView", () => {
     });
     apiMock.createTrainingJob.mockResolvedValue({ id: "job-1" });
     apiMock.updatePipeline.mockResolvedValue({ id: "pipeline-1" });
+    apiMock.clonePipeline.mockResolvedValue({
+      id: "pipeline-clone",
+      name: "3413 copy",
+      task: "detect",
+      scale: "n",
+      status: "draft",
+      framework: "ultralytics",
+      task_kind: "object_detection",
+      recipe: { model: { key: "yolo26-n" } },
+      params_template: {},
+      default_environment: {},
+    });
     apiMock.deletePipeline.mockResolvedValue(undefined);
     apiMock.evaluatePipeline.mockResolvedValue({
       id: "eval-new",
@@ -337,6 +351,142 @@ describe("ModelSpaceView", () => {
       ],
       total: 1,
     });
+    apiMock.getFrameworkCapabilities.mockImplementation(async (taskKind: string) => ({
+      task_kind: taskKind,
+      adapters: taskKind === "llm_sft" ? [
+        {
+          framework: "llamafactory",
+          adapter_key: "llamafactory.llm_sft.v1",
+          adapter_version: "1.0.0",
+          display_name: "LLaMA-Factory",
+          available: true,
+          tasks: [
+            {
+              task_type: "llm_sft",
+              models: [
+                {
+                  model_key: "qwen3-0.6b",
+                  display_name: "Qwen3-0.6B",
+                  family: "qwen3",
+                  variant: "0.6b",
+                },
+              ],
+              accepted_dataset_formats: ["sharegpt", "alpaca"],
+              convertible_dataset_formats: [],
+              resources: {
+                resource_kinds: ["cuda"],
+                cpu_cores_min: 4,
+                memory_mb_min: 16384,
+                gpu_count_min: 1,
+                gpu_memory_mb_min: 12288,
+              },
+              parameters: [],
+            },
+          ],
+        },
+      ] : [
+        {
+          framework: "ultralytics",
+          adapter_key: "ultralytics.object_detection.v1",
+          adapter_version: "1.0.0",
+          display_name: "Ultralytics",
+          available: true,
+          tasks: [
+            {
+              task_type: "object_detection",
+              models: [
+                {
+                  model_key: "yolo26-n",
+                  display_name: "YOLO26-N",
+                  family: "yolo26",
+                  variant: "n",
+                },
+              ],
+              accepted_dataset_formats: ["yolo"],
+              convertible_dataset_formats: ["coco"],
+              resources: {
+                resource_kinds: ["cpu", "cuda"],
+                cpu_cores_min: 2,
+                memory_mb_min: 4096,
+                gpu_count_min: 0,
+                gpu_memory_mb_min: 0,
+              },
+              parameters: [],
+            },
+          ],
+        },
+        {
+          framework: "paddlex",
+          adapter_key: "paddlex.object_detection.v1",
+          adapter_version: "1.0.0",
+          display_name: "PaddleX",
+          available: true,
+          tasks: [
+            {
+              task_type: "object_detection",
+              models: [
+                {
+                  model_key: "pp-yoloe-s",
+                  display_name: "PP-YOLOE-S",
+                  family: "PP-YOLOE",
+                  variant: "S",
+                },
+              ],
+              accepted_dataset_formats: ["coco"],
+              convertible_dataset_formats: ["yolo"],
+              resources: {
+                resource_kinds: ["cuda"],
+                cpu_cores_min: 4,
+                memory_mb_min: 8192,
+                gpu_count_min: 1,
+                gpu_memory_mb_min: 8192,
+              },
+              parameters: [{ name: "epochs", value_type: "integer", required: false, default: 100 }],
+            },
+          ],
+        },
+      ],
+    }));
+  });
+
+  it("loads the object detection framework catalog before creating a pipeline", async () => {
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
+
+    await wrapper.get('[data-testid="create-pipeline"]').trigger("click");
+
+    await vi.waitFor(() => expect(apiMock.getFrameworkCapabilities).toHaveBeenCalledWith("object_detection"));
+  });
+
+  it("creates a PaddleX pipeline with the selected adapter and model identity", async () => {
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
+
+    await wrapper.get('[data-testid="create-pipeline"]').trigger("click");
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="framework-paddlex"]').exists()).toBe(true));
+    await wrapper.get('[data-testid="framework-paddlex"]').trigger("click");
+    await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.createPipeline).toHaveBeenCalledWith(expect.objectContaining({
+      engine: "paddlex",
+      task: "detect",
+      scale: "S",
+      task_kind: "object_detection",
+      framework: "paddlex",
+      adapter_key: "paddlex.object_detection.v1",
+      model_family: "PP-YOLOE",
+      recipe: { model: { key: "pp-yoloe-s" } },
+    }));
+
+    await wrapper.findAll("button").find((button) => button.text() === "下一步")?.trigger("click");
+    await flushPromises();
+    expect(wrapper.get('[data-testid="selected-framework-model"]').text()).toContain("PP-YOLOE-S");
+
+    await wrapper.findAll("button").find((button) => button.text() === "下一步")?.trigger("click");
+    await flushPromises();
+    const parameterStep = wrapper.findAll(".wizard-steps button").find((button) => button.text().includes("参数准备"));
+    expect(parameterStep?.classes()).toContain("active");
   });
 
   it("opens result files and routes the selected job to native training visualization", async () => {
@@ -419,7 +569,16 @@ describe("ModelSpaceView", () => {
     await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
     await flushPromises();
 
-    expect(apiMock.createPipeline).toHaveBeenCalledWith({ name: "新建产线", engine: "yolo26", task: "detect", scale: "n" });
+    expect(apiMock.createPipeline).toHaveBeenCalledWith(expect.objectContaining({
+      name: "新建产线",
+      engine: "yolo26",
+      task: "detect",
+      scale: "n",
+      task_kind: "object_detection",
+      framework: "ultralytics",
+      model_family: "yolo26",
+      recipe: { model: { key: "yolo26-n" } },
+    }));
     expect(wrapper.text()).toContain("选择产线");
     expect(wrapper.text()).toContain("数据准备");
     expect(wrapper.text()).toContain("参数准备");
@@ -489,7 +648,16 @@ describe("ModelSpaceView", () => {
     await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
     await flushPromises();
 
-    expect(apiMock.createPipeline).toHaveBeenCalledWith({ name: "新建产线", engine: "llamafactory", task: "llm", scale: "llm" });
+    expect(apiMock.createPipeline).toHaveBeenCalledWith(expect.objectContaining({
+      name: "新建产线",
+      engine: "llamafactory",
+      task: "llm",
+      scale: "0.6b",
+      task_kind: "llm_sft",
+      framework: "llamafactory",
+      model_family: "qwen3",
+      recipe: { model: { key: "qwen3-0.6b" } },
+    }));
     expect(wrapper.get('[data-testid="llm-pipeline-wizard"]').text()).toContain("监督微调 SFT");
     expect(wrapper.text()).not.toContain("直接部署");
 
@@ -497,7 +665,7 @@ describe("ModelSpaceView", () => {
     await flushPromises();
 
     const draftPatch = apiMock.updatePipeline.mock.calls[apiMock.updatePipeline.mock.calls.length - 1]?.[1];
-    expect(draftPatch?.params_template).not.toHaveProperty("model_id");
+    expect(draftPatch?.params_template).toHaveProperty("model_id", "qwen3-0.6b");
     expect(draftPatch?.default_environment).not.toHaveProperty("resource_pool_id");
     expect(draftPatch?.default_environment).not.toHaveProperty("node_id");
     expect(wrapper.text()).toContain("模型与数据");
@@ -534,6 +702,44 @@ describe("ModelSpaceView", () => {
 
     expect(wrapper.text()).toContain("模型与数据");
     expect(wrapper.find('[data-testid="llm-pipeline-wizard"]').exists()).toBe(true);
+  });
+
+  it("offers cloning from the detail page after framework identity is locked", async () => {
+    apiMock.listPipelines.mockResolvedValueOnce({
+      items: [
+        {
+          id: "pipeline-locked",
+          name: "Locked PaddleX",
+          engine: "paddlex",
+          task: "detect",
+          scale: "S",
+          status: "success",
+          task_kind: "object_detection",
+          framework: "paddlex",
+          adapter_key: "paddlex.object_detection.v1",
+          adapter_version: "1.0.0",
+          model_family: "PP-YOLOE",
+          recipe: { model: { key: "pp-yoloe-s" } },
+          framework_locked_at: "2026-08-07T01:00:00Z",
+          first_submitted_job_id: "job-locked",
+          params_template: {},
+          default_environment: {},
+        },
+      ],
+    });
+
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
+    await flushPromises();
+    await wrapper.get('[data-testid="pipeline-card-pipeline-locked"]').trigger("click");
+    await wrapper.get('[data-testid="clone-locked-pipeline"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.clonePipeline).toHaveBeenCalledWith("pipeline-locked", { name: "Locked PaddleX copy" });
+    expect(replaceMock).toHaveBeenLastCalledWith({
+      path: "/model-space",
+      query: { pipeline: "pipeline-clone", step: "overview" },
+    });
   });
 
   it("reuses dataset processing visualization tabs in the training wizard", async () => {

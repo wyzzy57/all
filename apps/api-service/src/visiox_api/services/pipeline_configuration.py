@@ -461,6 +461,18 @@ class PipelineConfigurationService:
                             f"recipe model {key} does not match the adapter catalog"
                         )
             return selected
+        if identifiers and task.task_type == "llm_sft" and isinstance(selection, dict):
+            runtime_id = str(selection.get("runtime_id") or selection.get("key") or "").strip()
+            if runtime_id:
+                return ModelCapability(
+                    model_key=str(selection.get("key") or runtime_id),
+                    display_name=str(selection.get("label") or runtime_id),
+                    runtime_id=runtime_id,
+                    family=str(selection.get("family") or runtime_id),
+                    variant=str(selection.get("variant") or "custom"),
+                    source=str(selection.get("source") or "external"),
+                    revision=str(selection.get("revision") or "main"),
+                )
         if identifiers and task.models:
             raise PipelineConfigurationError(
                 "Selected model is not supported by the adapter"

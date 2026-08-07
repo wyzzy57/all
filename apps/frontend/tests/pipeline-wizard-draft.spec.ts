@@ -35,4 +35,16 @@ describe("usePipelineWizardDraft", () => {
     await expect(state.saveNow()).rejects.toThrow("offline");
     expect(state.status.value).toBe("error");
   });
+
+  it("autosaves a selected framework and model as one draft value", async () => {
+    const draft = ref({ framework: "ultralytics", modelKey: "yolo26-n" });
+    const save = vi.fn().mockResolvedValue(undefined);
+    usePipelineWizardDraft(draft, ref(true), save, { delay: 500 });
+
+    draft.value = { framework: "paddlex", modelKey: "pp-yoloe-s" };
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(draft.value).toEqual({ framework: "paddlex", modelKey: "pp-yoloe-s" });
+  });
 });

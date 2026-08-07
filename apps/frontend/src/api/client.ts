@@ -318,10 +318,19 @@ export type LabelProjectRecord = {
 export type TrainingPipelineRecord = {
   id: string;
   name: string;
-  engine?: "yolo26" | "llamafactory";
+  engine?: "yolo26" | "ultralytics" | "paddlex" | "llamafactory";
   task: string;
   scale: string;
   status: string;
+  task_kind?: string;
+  framework?: string;
+  adapter_key?: string;
+  adapter_version?: string;
+  model_family?: string;
+  recipe?: Record<string, unknown>;
+  framework_locked_at?: string | null;
+  first_submitted_job_id?: string | null;
+  cloned_from_pipeline_id?: string | null;
   base_model_id?: string | null;
   dataset_id?: string | null;
   params_template?: Record<string, unknown>;
@@ -333,6 +342,94 @@ export type TrainingPipelineRecord = {
   is_favorite?: boolean;
   created_at?: string;
   updated_at?: string;
+};
+
+export type AdapterIdentityRecord = {
+  framework: string;
+  adapter_key: string;
+  adapter_version: string;
+};
+
+export type FrameworkModelCapabilityRecord = {
+  model_key: string;
+  display_name: string;
+  runtime_id?: string | null;
+  family?: string | null;
+  variant?: string | null;
+  source?: string | null;
+  revision?: string | null;
+  sources?: string[];
+};
+
+export type FrameworkParameterCapabilityRecord = {
+  name: string;
+  value_type: "string" | "integer" | "number" | "boolean";
+  required: boolean;
+  default?: string | number | boolean | null;
+  minimum?: number | null;
+  maximum?: number | null;
+  choices?: Array<string | number | boolean>;
+  description?: string | null;
+  help_text?: string | null;
+  advanced_group?: string | null;
+};
+
+export type FrameworkResourceCapabilityRecord = {
+  resource_kinds: Array<"cpu" | "cuda">;
+  cpu_cores_min: number;
+  memory_mb_min: number;
+  gpu_count_min: number;
+  gpu_memory_mb_min: number;
+};
+
+export type FrameworkTaskCapabilityRecord = {
+  task_type: string;
+  models: FrameworkModelCapabilityRecord[];
+  accepted_dataset_formats: string[];
+  convertible_dataset_formats: string[];
+  resources: FrameworkResourceCapabilityRecord;
+  parameters: FrameworkParameterCapabilityRecord[];
+  operations?: Array<{
+    name: "train" | "stop" | "resume" | "evaluate" | "image_inference" | "export" | "deploy";
+    supported: boolean;
+    implemented: boolean;
+    available: boolean;
+    unavailable_reason?: string | null;
+  }>;
+  observable_metrics?: string[];
+  observable_artifacts?: string[];
+};
+
+export type FrameworkCapabilityRecord = AdapterIdentityRecord & {
+  display_name?: string | null;
+  framework_version?: string | null;
+  framework_version_constraint?: string | null;
+  base_image_reference?: string | null;
+  runtime_components?: Array<{ key: string; value: string }>;
+  training_runtime_image_digest?: string | null;
+  inference_runtime_image_digest?: string | null;
+  availability_baseline_operation?: string;
+  available: boolean;
+  unavailable_reason?: string | null;
+  tasks: FrameworkTaskCapabilityRecord[];
+};
+
+export type FrameworkCapabilityCatalogResponse = {
+  task_kind: string | null;
+  adapters: FrameworkCapabilityRecord[];
+};
+
+export type TrainingAttemptRecord = {
+  id: string;
+  training_job_id: string;
+  attempt_number: number;
+  resolved_snapshot: Record<string, unknown>;
+  artifact_manifest: Record<string, unknown>;
+};
+
+export type ArtifactManifestRecord = {
+  adapter_identity: AdapterIdentityRecord;
+  role_artifacts: Array<Record<string, unknown>>;
 };
 
 export type LlmModelResolution = {
@@ -1088,11 +1185,15 @@ export const api = {
   launchLabelProject: (projectId: string) =>
     request<{ launch_url: string; expires_in: number }>(`/label-projects/${projectId}/launch`, { method: "POST" }),
   getTask: (id: string) => request<TaskRecord>(`/tasks/${id}`),
+  getFrameworkCapabilities: (taskKind?: string) =>
+    request<FrameworkCapabilityCatalogResponse>(`/frameworks/capabilities${query({ task_kind: taskKind })}`),
   createPipeline: (payload: Record<string, unknown>) =>
     request<TrainingPipelineRecord>("/pipelines", { method: "POST", body: JSON.stringify(payload) }),
   listPipelines: () => request<ListResponse<TrainingPipelineRecord>>("/pipelines"),
   updatePipeline: (pipelineId: string, payload: Record<string, unknown>) =>
     request<TrainingPipelineRecord>(`/pipelines/${pipelineId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  clonePipeline: (pipelineId: string, payload: Record<string, unknown>) =>
+    request<TrainingPipelineRecord>(`/pipelines/${pipelineId}/clone`, { method: "POST", body: JSON.stringify(payload) }),
   deletePipeline: (pipelineId: string) => request<void>(`/pipelines/${pipelineId}`, { method: "DELETE" }),
   createTrainingJob: (pipelineId: string, payload: Record<string, unknown>) =>
     request<TrainingJobRecord>(`/pipelines/${pipelineId}/jobs`, { method: "POST", body: JSON.stringify(payload) }),

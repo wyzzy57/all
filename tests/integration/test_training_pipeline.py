@@ -1029,6 +1029,35 @@ def test_create_and_update_llamafactory_pipeline_without_yolo_base_model(
     assert body["params_template"]["model_id"] == "Qwen/Qwen3-0.6B"
 
 
+def test_llamafactory_pipeline_accepts_explicit_external_model_identity(client: TestClient):
+    model_id = "acme/domain-model-7b"
+    created = client.post(
+        "/pipelines",
+        json={
+            "name": "llm-custom-model-identity",
+            "task_kind": "llm_sft",
+            "framework": "llamafactory",
+            "adapter_key": "llamafactory.llm_sft.v1",
+            "model_family": model_id,
+            "recipe": {
+                "model": {
+                    "key": model_id,
+                    "runtime_id": model_id,
+                    "family": model_id,
+                    "variant": "custom",
+                }
+            },
+            "params_template": {"model_id": model_id},
+        },
+    )
+
+    assert created.status_code == 201
+    body = created.json()
+    assert body["model_family"] == model_id
+    assert body["recipe"]["model"]["runtime_id"] == model_id
+    assert body["params_template"]["model_id"] == model_id
+
+
 def test_llamafactory_pipeline_rejects_managed_fields_and_non_llm_dataset(
     client: TestClient, session_factory
 ):
