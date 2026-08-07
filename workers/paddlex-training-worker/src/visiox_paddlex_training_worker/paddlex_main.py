@@ -22,7 +22,7 @@ def apply_runtime_config(
     _set_reader_resize(config, "TrainReader", image_size, batch_random=True)
     _set_reader_resize(config, "EvalReader", image_size, batch_random=False)
     _set_reader_resize(config, "TestReader", image_size, batch_random=False)
-    test_reader = config.get("TestReader")
+    test_reader = config["TestReader"] if "TestReader" in config else None
     if isinstance(test_reader, dict):
         inputs_def = test_reader.get("inputs_def")
         if isinstance(inputs_def, dict) and "image_shape" in inputs_def:

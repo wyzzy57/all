@@ -9,6 +9,7 @@ import subprocess
 import sys
 from threading import Event
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -271,29 +272,38 @@ def test_python_310_training_runtime_does_not_import_datetime_utc() -> None:
 def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
     module = _paddlex_main_module()
 
-    class FakeConfig(dict):
+    class FakeConfig:
         def __init__(self) -> None:
-            super().__init__(
-                worker_num=0,
-                eval_size=[640, 640],
-                TrainReader={
+            self._data = {
+                "worker_num": 0,
+                "eval_size": [640, 640],
+                "TrainReader": {
                     "batch_transforms": [
                         {"BatchRandomResize": {"target_size": [480, 512, 544]}}
                     ]
                 },
-                EvalReader={
+                "EvalReader": {
                     "sample_transforms": [
                         {"Resize": {"target_size": [640, 640]}}
                     ]
                 },
-                TestReader={
+                "TestReader": {
                     "inputs_def": {"image_shape": [3, 640, 640]},
                     "sample_transforms": [
                         {"Resize": {"target_size": [640, 640]}}
                     ]
                 },
-            )
+            }
             self.updated_workers: list[int] = []
+
+        def __contains__(self, key: str) -> bool:
+            return key in self._data
+
+        def __getitem__(self, key: str) -> Any:
+            return self._data[key]
+
+        def __setitem__(self, key: str, value: Any) -> None:
+            self._data[key] = value
 
         def update_num_workers(self, workers: int) -> None:
             self.updated_workers.append(workers)
