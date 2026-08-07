@@ -522,6 +522,32 @@ def test_preflight_accepts_supported_imported_annotation_sources(
     assert report.sample_count == 4
 
 
+def test_preflight_ignores_pending_import_duplicate_when_valid_annotation_exists(
+    session_factory,
+    storage,
+    tmp_path: Path,
+) -> None:
+    with session_factory() as session:
+        valid = session.get(Annotation, "annotation-sample-train-multi")
+        session.add(
+            Annotation(
+                id="annotation-pending-duplicate",
+                dataset_sample_id=valid.dataset_sample_id,
+                source="label_studio",
+                internal_payload=valid.internal_payload,
+                validation_status="pending",
+            )
+        )
+        session.flush()
+        _refresh_source_revision(session)
+        session.commit()
+
+    report = _export(session_factory, storage, tmp_path / "pending-duplicate")
+
+    assert report.sample_count == 4
+    assert report.annotation_count == 4
+
+
 @pytest.mark.parametrize("runtime_model_id", ["PP-YOLOE_plus-S", "RT-DETR-L"])
 def test_export_precheck_accepts_supported_paddlex_runtime_models(
     runtime_model_id: str,

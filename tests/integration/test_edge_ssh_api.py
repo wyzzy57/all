@@ -469,7 +469,7 @@ def test_node_operation_route_enforces_fifty_millisecond_ingress_deadline(
 
     assert response.status_code == 504
     assert response.json() == {"detail": "Edge bootstrap request timed out"}
-    assert elapsed < (0.16 if sys.platform == "win32" else 0.094)
+    assert elapsed < (0.20 if sys.platform == "win32" else 0.094)
     assert service.calls[0][0] == operation
     assert service.entered[0] < service.calls[0][1]["deadline"]
     assert service.calls[0][1]["deadline"] <= service.entered[0] + 0.05

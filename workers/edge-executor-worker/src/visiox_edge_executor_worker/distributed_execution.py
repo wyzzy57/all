@@ -35,6 +35,7 @@ from visiox_api.services.training_artifacts import (
     sync_pipeline_status,
 )
 from visiox_storage.client import ObjectStorageClient
+from visiox_paddlex.datasets import export_paddlex_detection_dataset
 from visiox_training.contracts import ArtifactManifest, LaunchSpec
 from visiox_training.runtime import build_runtime_inputs, encode_runtime_inputs
 from visiox_yolo26.converters import export_yolo26_dataset
@@ -160,6 +161,7 @@ class _RemoteAdapterContract:
 
 _TRUSTED_ARTIFACT_PREPARERS = {
     ("ultralytics.object_detection.v1", "1.0.0"): "_prepare_ultralytics_artifacts",
+    ("paddlex.object_detection.v1", "1.0.0"): "_prepare_paddlex_artifacts",
     ("llamafactory.llm_sft.v1", "1.0.0"): "_prepare_llm_artifacts",
 }
 
@@ -597,6 +599,80 @@ class DistributedTrainingHandler:
                 "unpack_to": "dataset",
             }
         ]
+
+    def _prepare_paddlex_artifacts(
+        self,
+        run: DistributedTrainingRun,
+        job: TrainingJob,
+        _task: Task,
+        _base_model: StoredBaseModel | None,
+        dataset: Dataset,
+    ) -> list[dict[str, Any]]:
+        snapshot = _snapshot_mapping(job)
+        model_snapshot = _required_snapshot_section(snapshot, "model")
+        dataset_snapshot = _required_snapshot_section(snapshot, "dataset")
+        runtime_model_id = model_snapshot.get("runtime_id")
+        if not isinstance(runtime_model_id, str) or not runtime_model_id:
+            raise ValueError("PaddleX runtime model is unavailable")
+        version_id = dataset_snapshot.get("version_id")
+        if not isinstance(version_id, str) or not version_id:
+            raise ValueError("PaddleX dataset version is unavailable")
+        if dataset_snapshot.get("format") != "coco":
+            raise ValueError("PaddleX detection dataset format must be coco")
+        manifest_checksum = str(dataset_snapshot.get("manifest_checksum") or "").lower()
+        if len(manifest_checksum) != 64 or any(
+            char not in "0123456789abcdef" for char in manifest_checksum
+        ):
+            raise ValueError("PaddleX dataset manifest checksum is unavailable")
+
+        with TemporaryDirectory(prefix="visiox-paddlex-distributed-") as temporary:
+            root = Path(temporary)
+            dataset_dir = root / "dataset"
+            with self._session_factory() as session:
+                report = export_paddlex_detection_dataset(
+                    session,
+                    self._storage,
+                    dataset.id,
+                    version_id,
+                    dataset_dir,
+                    runtime_model_id=runtime_model_id,
+                )
+            if report.manifest_checksum != manifest_checksum:
+                raise ValueError("PaddleX dataset manifest checksum did not match")
+            archive = Path(
+                shutil.make_archive(str(root / "dataset"), "gztar", dataset_dir)
+            )
+            archive_checksum = _sha256(archive)
+            dataset_uri = self._storage.put_file(
+                "training",
+                f"distributed/{run.id}/{run.attempt}/paddlex-dataset.tar.gz",
+                archive,
+                content_type="application/gzip",
+            )
+        artifacts = [
+            {
+                "role": "dataset",
+                "download_url": self._storage.presigned_get_url(
+                    dataset_uri, expires=_PRESIGNED_URL_TTL
+                ),
+                "checksum_sha256": archive_checksum,
+                "target_path": "dataset.tar.gz",
+                "unpack_to": "dataset",
+            }
+        ]
+        if run.checkpoint_uri and run.checkpoint_checksum:
+            artifacts.append(
+                {
+                    "role": "checkpoint",
+                    "download_url": self._storage.presigned_get_url(
+                        run.checkpoint_uri, expires=_PRESIGNED_URL_TTL
+                    ),
+                    "checksum_sha256": run.checkpoint_checksum,
+                    "target_path": "checkpoint/last.pt",
+                    "unpack_to": None,
+                }
+            )
+        return artifacts
 
     def _download_storage_uri(self, uri: str, destination: Path) -> None:
         remainder = uri.removeprefix("minio://")

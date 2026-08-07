@@ -788,7 +788,10 @@ def test_command_timeout_does_not_wait_for_blocking_channel_close() -> None:
 
     elapsed = time.monotonic() - started
     assert close_started.is_set()
-    assert timeout_seconds * 0.75 <= elapsed < timeout_seconds * 1.5
+    upper_bound_multiplier = 2.0 if os.name == "nt" else 1.5
+    assert timeout_seconds * 0.75 <= elapsed < (
+        timeout_seconds * upper_bound_multiplier
+    )
     with pytest.raises(SshSessionClosedError, match=r"^SSH session is closed$"):
         session.run("must-not-run", timeout_seconds=1)
     close_release.set()

@@ -36,6 +36,23 @@ MANAGEMENT_REQUESTS = (
     ("GET", "/resource-pools"),
 )
 PROXY_AUTH_TOKEN = "a" * 64
+RUNTIME_DIGESTS = {
+    "VISIOX_DEPLOYMENT_IMAGE_DIGEST": (
+        "registry.example/visiox/yolo26-inference@sha256:" + "a" * 64
+    ),
+    "VISIOX_ULTRALYTICS_TRAINING_IMAGE_DIGEST": (
+        "registry.example/visiox/ultralytics-training@sha256:" + "b" * 64
+    ),
+    "VISIOX_PADDLEX_TRAINING_IMAGE_DIGEST": (
+        "registry.example/visiox/paddlex-training@sha256:" + "c" * 64
+    ),
+    "VISIOX_PADDLEX_INFERENCE_IMAGE_DIGEST": (
+        "registry.example/visiox/paddlex-inference@sha256:" + "d" * 64
+    ),
+    "VISIOX_LLM_TRAINING_IMAGE_DIGEST": (
+        "registry.example/visiox/llm-training@sha256:" + "e" * 64
+    ),
+}
 
 
 class CommandError(AssertionError):
@@ -179,6 +196,7 @@ make_leaf untrusted-client untrusted-ca clientAuth ''
         config_env = cls.compose_env.copy()
         config_env.update(
             {
+                **RUNTIME_DIGESTS,
                 "VISIOX_MANAGEMENT_TLS_CERT_PATH": str(cls.temp_dir / "server.crt"),
                 "VISIOX_MANAGEMENT_TLS_KEY_PATH": str(cls.temp_dir / "server.key"),
                 "VISIOX_MANAGEMENT_OPERATOR_CA_PATH": str(

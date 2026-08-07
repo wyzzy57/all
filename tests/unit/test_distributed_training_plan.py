@@ -550,6 +550,85 @@ def test_remote_adapter_identity_is_validated_without_execution_allowlist() -> N
     assert adapter.adapter_key == "paddlex.object_detection.v1"
 
 
+def test_edge_prepares_paddlex_coco_dataset_from_immutable_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uploaded: dict[str, bytes] = {}
+
+    class Storage:
+        def put_file(self, bucket, object_name, path, content_type=None):
+            assert bucket == "training"
+            assert content_type == "application/gzip"
+            uploaded[object_name] = path.read_bytes()
+            return f"minio://{bucket}/{object_name}"
+
+        def presigned_get_url(self, uri, *, expires):
+            assert expires == distributed_execution._PRESIGNED_URL_TTL
+            return f"https://storage.invalid/{uri.removeprefix('minio://')}"
+
+    def export_dataset(
+        _session,
+        _storage,
+        dataset_id,
+        dataset_version_id,
+        output_dir,
+        *,
+        runtime_model_id,
+    ):
+        assert dataset_id == "dataset-paddlex"
+        assert dataset_version_id == "version-paddlex"
+        assert runtime_model_id == "PP-YOLOE_plus-S"
+        (output_dir / "annotations").mkdir(parents=True)
+        (output_dir / "annotations" / "instance_train.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        return SimpleNamespace(manifest_checksum="b" * 64)
+
+    monkeypatch.setattr(
+        distributed_execution,
+        "export_paddlex_detection_dataset",
+        export_dataset,
+        raising=False,
+    )
+    handler = DistributedTrainingHandler(
+        create_session_factory(create_engine("sqlite://")),
+        object(),
+        Storage(),  # type: ignore[arg-type]
+    )
+    artifacts = handler._prepare_artifacts(
+        SimpleNamespace(id="run-paddlex", attempt=2, checkpoint_uri=None),
+        SimpleNamespace(
+            resolved_snapshot={
+                "model": {"runtime_id": "PP-YOLOE_plus-S"},
+                "dataset": {
+                    "version_id": "version-paddlex",
+                    "format": "coco",
+                    "manifest_checksum": "b" * 64,
+                },
+            }
+        ),
+        SimpleNamespace(),
+        SimpleNamespace(
+            framework="paddlex",
+            adapter_key="paddlex.object_detection.v1",
+            adapter_version="1.0.0",
+        ),
+        None,
+        SimpleNamespace(id="dataset-paddlex"),
+    )
+
+    object_name = "distributed/run-paddlex/2/paddlex-dataset.tar.gz"
+    assert artifacts == [
+        {
+            "role": "dataset",
+            "download_url": f"https://storage.invalid/training/{object_name}",
+            "checksum_sha256": hashlib.sha256(uploaded[object_name]).hexdigest(),
+            "target_path": "dataset.tar.gz",
+            "unpack_to": "dataset",
+        }
+    ]
+
+
 def test_staging_request_matches_remote_script_contract() -> None:
     artifacts = [
         {

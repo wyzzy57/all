@@ -134,14 +134,15 @@ def _preflight(
             .order_by(Annotation.created_at, Annotation.id)
         )
     )
+    annotations_by_sample: dict[str, list[Annotation]] = {}
     for annotation in annotations:
+        if annotation.validation_status == "pending":
+            continue
         if annotation.validation_status != "valid":
             raise PaddleXDatasetError(
                 "sample has an invalid imported annotation: "
                 f"{annotation.dataset_sample_id}"
             )
-    annotations_by_sample: dict[str, list[Annotation]] = {}
-    for annotation in annotations:
         annotations_by_sample.setdefault(annotation.dataset_sample_id, []).append(
             annotation
         )
