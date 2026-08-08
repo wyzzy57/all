@@ -81,9 +81,10 @@ Stop the profile and remove the environment variable after diagnosis. The
 standard operator experience is the Visiox UI; MLflow, TensorBoard, and
 VisualDL are secondary diagnostics.
 
-## Task 16 Production Acceptance Record (2026-08-07)
+## Task 16 Production Acceptance Record (2026-08-08)
 
-Status: blocked before image publication; neither model loop has started.
+Status: partially accepted. PP-YOLOE-S completed two epochs; edge disk blocks
+RT-DETR-L and inference deployment.
 Values in this section are measured production evidence, not examples.
 
 Local regression at baseline `262b93e` plus the verified acceptance fixes:
@@ -134,29 +135,54 @@ Published COCO DatasetVersion:
 - Manifest URI:
   `minio://datasets/bbf3124e-88b6-4700-bf6a-da76cdae8662/versions/1/dataset-manifest.json`.
 
-Authentication was restored with an in-memory 10-minute token for existing
+Authentication was restored with an in-memory short-lived token for existing
 active administrator `db301bee-e768-4ac7-a516-6d88e71c74dc`; no user or refresh
 session was created. Actual responses were HTTP 200 for `/auth/me`, framework
-capabilities, validated datasets, and the published versions endpoint. The
-capability response still reports every PaddleX operation unimplemented and
-has null runtime digests, so that gate did not pass.
+capabilities, validated datasets, and the published versions endpoint.
 
-Image publication blocker:
+Final immutable runtime images in `10.10.40.209:5000`:
 
-- Required base manifest:
-  `sha256:2bd8830dafd258501e7313b320fa1bcc946c70318b3081647b90bc70182e7360`.
-- Docker Hub repeatedly ended a 2,445,884,909-byte layer with TLS timeout or
-  short-read `unexpected EOF`.
-- The official Baidu source was manifest-identical, but its one pull failed
-  blob `sha256:6d999be01a3b22cdb15a2c18ad0ea3751c2f66cca7b08127f16397fce0d447d5`
-  with HTTP 500 and `unexpected EOF` after 335.9 seconds.
-- No complete source exists in the local image store, BuildKit cache, or LAN
-  registry. Training and inference image digests therefore do not exist.
+- Training linux/amd64:
+  `visiox/paddlex-training@sha256:bb51da961967751c35992901496aa35a414704dae6b8af652755e6c627dd54e0`.
+- Inference linux/amd64:
+  `visiox/paddlex-inference@sha256:9e9d4ac732706fa3e29a4a1070324367d101e8efe58fed0d491ec4f5f1389136`.
+- Immutable CUDA base:
+  `nvidia/cuda:11.8.0-base-ubuntu22.04@sha256:79e5b2cf878ee9006f5b3738caeea34fdc7708a32db53fe3e80db0b48bd286a0`.
 
-Uncreated evidence due to that blocker: PP-YOLOE-S job ID, RT-DETR-L job ID,
-trained model IDs/checksums, evaluation IDs, deployment service IDs, and HTTP
-prediction responses. The unrelated GPU service remained running as directed;
-stopping it would not resolve the earlier image/control-plane blockers.
+The images install the exact official PaddlePaddle GPU 3.0.0 cp310 cu118
+wheel. The inference image uses Paddle fallback; TensorRT was not installed or
+claimed. Authenticated capabilities report PaddleX operations implemented and
+available only when both immutable digests and actual operation registrations
+are present.
+
+Verified PP-YOLOE-S production run:
+
+- Pipeline `812f65e7-9021-4838-940d-6488bbf65cfe`.
+- Job `9df01d23-1427-4045-8d73-9f08f05f6945`, status `success`.
+- Attempt `0f6bafba-d3f9-4cd0-bd29-f3af2135caea`; remote container
+  `5db9f31b024f`, exit 0, not OOM-killed.
+- Trained model `dba8fa92-fae4-46a1-a683-19366977b1da`, status `ready`.
+- Launch-spec SHA-256
+  `13843b04b7bf4eb8e854efbd997abda0e21b0a65f852499bb2a91173e318da17`.
+- Static inference JSON SHA-256
+  `805baa6fb80c1a32828c487d388408d5257b2ec7f03b02bdda172a277b9b3fac`.
+- Full artifact-manifest SHA-256
+  `356b7ce3ee6324832e26d5177f514b9d6b25416ed4a1f07517e64e8dc92c7163`.
+
+The successful run completed two epochs, both evaluations, final export,
+artifact upload, and observability capture. Its terminal metrics were bbox mAP
+0.0 and loss 39.052879; acceptance verifies the production path, not model
+quality. A final-image GPU export probe also returned exit 0.
+
+Remaining blocker: after that run the edge root filesystem had only
+816,603,136 bytes available and reported 100 percent use. LVM has `VFree=0`
+and no alternate data filesystem. The inference image was not pulled and
+RT-DETR-L was not launched because another dataset stage/output plus image
+would fill the node. Preserved bind-mounted datasets, outputs, and model cache,
+volumes, running containers, unrelated images, and GPU PID 698553 were not
+removed or stopped. Therefore RT-DETR-L, live inference/deployment,
+stop/recovery, MLflow outage/fallback/recovery, Ultralytics metric comparison,
+and final restart-reconciliation evidence remain unverified.
 
 ## Incident and Rollback
 
