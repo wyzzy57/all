@@ -334,12 +334,15 @@ def test_paddlex_image_inference_uses_static_bundle_and_normalizes_result(tmp_pa
         "inference.json": b"{}",
         "inference.pdiparams": b"static-params",
     }
-    assert request.api_contract == "paddlex.create_model(model_dir=...)"
-    assert request.command[request.command.index("--gpus") + 1] == "device=0"
-    assert request.command[-2] == "gpu:0"
+    assert request.api_contract == "paddlex.create_model(model_name, model_dir=...)"
+    assert request.model_name == "PP-YOLOE_plus-S"
+    runtime_command = request.create_command("test-volume")
+    assert runtime_command[runtime_command.index("--gpus") + 1] == "device=0"
+    assert runtime_command[-3] == "gpu:0"
     assert request.image_path.suffix == ".jpg"
-    assert request.command[-1] == "/workspace/input/image.jpg"
-    assert "/tmp:rw,noexec,nosuid,size=1g" in request.command
+    assert runtime_command[-2] == "/workspace/io/input/image.jpg"
+    assert runtime_command[-1] == "PP-YOLOE_plus-S"
+    assert "/tmp:rw,noexec,nosuid,size=1g" in runtime_command
 
 
 def test_inference_rejects_persisted_framework_mismatch_before_artifact_download(tmp_path):
@@ -616,6 +619,7 @@ def test_static_bundle_integrity_preflight_rejects_before_download(
 def test_paddlex_inference_cpu_runtime_command_has_no_gpu_flag(tmp_path):
     request = PaddleXInferenceRuntimeRequest(
         image_digest=f"registry.example/paddlex@sha256:{'b' * 64}",
+        model_name="PP-YOLOE_plus-S",
         workspace=tmp_path,
         model_dir=tmp_path / "model",
         image_path=tmp_path / "input" / "image",
@@ -624,10 +628,12 @@ def test_paddlex_inference_cpu_runtime_command_has_no_gpu_flag(tmp_path):
         environment="cpu",
     )
 
-    assert "--gpus" not in request.command
-    assert request.command[-2] == "cpu"
-    assert request.command[-1] == "/workspace/input/image.png"
-    assert "/tmp:rw,noexec,nosuid,size=1g" in request.command
+    runtime_command = request.create_command("test-volume")
+    assert "--gpus" not in runtime_command
+    assert runtime_command[-3] == "cpu"
+    assert runtime_command[-2] == "/workspace/io/input/image.png"
+    assert runtime_command[-1] == "PP-YOLOE_plus-S"
+    assert "/tmp:rw,noexec,nosuid,size=1g" in runtime_command
 
 
 def test_ultralytics_latest_without_trained_weight_falls_back_to_base_model(tmp_path):

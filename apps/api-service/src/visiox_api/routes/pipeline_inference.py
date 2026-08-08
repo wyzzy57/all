@@ -161,6 +161,7 @@ async def predict_pipeline_image(
             mounted_input.write_bytes(image_bytes)
             request = PaddleXInferenceRuntimeRequest(
                 image_digest=paddlex_runtime_digest,
+                model_name=_paddlex_runtime_model_name(resolved),
                 workspace=work_dir,
                 model_dir=model_dir,
                 image_path=mounted_input,
@@ -191,6 +192,15 @@ async def predict_pipeline_image(
         predictions=result.predictions,
         result_image=f"data:{result.content_type};base64,{encoded}",
     )
+
+
+def _paddlex_runtime_model_name(resolved: Any) -> str:
+    model = resolved.model
+    identity = model.artifact_manifest.get("model_identity") if model else None
+    runtime_id = identity.get("runtime_model_id") if isinstance(identity, dict) else None
+    if not isinstance(runtime_id, str) or not runtime_id:
+        raise HTTPException(status_code=409, detail="PaddleX runtime model is unavailable")
+    return runtime_id
 
 
 def _resolve_weight_uri(session: Session, pipeline: TrainingPipeline, model_weight: str) -> str:

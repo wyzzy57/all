@@ -455,6 +455,7 @@ def test_api_paddlex_runtime_copies_files_without_host_bind_paths(
     monkeypatch.setattr("visiox_api.services.pipeline_inference.subprocess.run", fake_run)
     request = PaddleXInferenceRuntimeRequest(
         image_digest="registry.example/paddlex@sha256:" + "a" * 64,
+        model_name="PP-YOLOE_plus-S",
         workspace=workspace,
         model_dir=model_dir,
         image_path=image_path,

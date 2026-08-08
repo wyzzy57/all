@@ -50,13 +50,14 @@ class ResolvedPipelineModel:
 @dataclass(frozen=True)
 class PaddleXInferenceRuntimeRequest:
     image_digest: str
+    model_name: str
     workspace: Path
     model_dir: Path
     image_path: Path
     output_dir: Path
     result_path: Path
     environment: str
-    api_contract: str = "paddlex.create_model(model_dir=...)"
+    api_contract: str = "paddlex.create_model(model_name, model_dir=...)"
 
     def create_command(self, output_volume: str) -> tuple[str, ...]:
         device = paddlex_device(self.environment)
@@ -86,6 +87,7 @@ class PaddleXInferenceRuntimeRequest:
                 "/workspace/io/runner.py",
                 device,
                 container_image,
+                self.model_name,
             )
         )
         return tuple(command)
@@ -487,7 +489,8 @@ import sys
 
 device = sys.argv[1]
 image_path = sys.argv[2]
-model = paddlex.create_model(model_dir="/workspace/io/model", device=device)
+model_name = sys.argv[3]
+model = paddlex.create_model(model_name, model_dir="/workspace/io/model", device=device)
 results = list(model.predict(image_path, device=device))
 if not results:
     raise RuntimeError("PaddleX returned no prediction result")
