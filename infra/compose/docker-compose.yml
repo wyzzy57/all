@@ -43,6 +43,7 @@ services:
       VISIOX_AGENT_PUBLIC_WS_URL: ${VISIOX_AGENT_PUBLIC_WS_URL:-ws://host.docker.internal:8000/agent/v1/connect}
       VISIOX_EDGE_BOOTSTRAP_SOCKET: /run/visiox-edge/edge-bootstrap.sock
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
       - training-runs:/workspace/training-runs:ro
       - agent-pki:/var/lib/visiox/pki
       - edge-runtime:/run/visiox-edge

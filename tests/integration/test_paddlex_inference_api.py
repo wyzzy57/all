@@ -389,6 +389,27 @@ def test_paddlex_dockerfile_uses_exported_bundle_without_training_plugin() -> No
     assert "USER visiox" in dockerfile
 
 
+def test_api_service_can_launch_the_isolated_paddlex_runtime() -> None:
+    from pathlib import Path
+
+    import yaml
+
+    dockerfile = Path("apps/api-service/Dockerfile").read_text(encoding="utf-8")
+    compose = yaml.safe_load(
+        Path("infra/compose/docker-compose.yml").read_text(encoding="utf-8")
+    )
+
+    assert "docker.io" in dockerfile
+    socket_mount = "/var/run/docker.sock:/var/run/docker.sock"
+    assert socket_mount in compose["services"]["api-service"]["volumes"]
+    for service_name in (
+        "edge-executor-worker",
+        "label-sync-worker",
+        "training-worker",
+    ):
+        assert socket_mount not in compose["services"][service_name].get("volumes", [])
+
+
 def test_paddlex_inference_documents_static_bundle_runtime() -> None:
     readme = (
         __import__("pathlib")
