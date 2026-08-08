@@ -11,7 +11,6 @@ ENV VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PADDLE_PDX_LOCAL_FONT_FILE_PATH=/opt/paddlex/fonts/PingFang-SC-Regular.ttf \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -33,10 +32,6 @@ RUN sed -i \
         python3.10 \
         python3.10-venv \
     && rm -rf /var/lib/apt/lists/*
-RUN install -d -m 0755 /opt/paddlex/fonts \
-    && curl --fail --location --retry 8 --retry-all-errors \
-        --connect-timeout 30 --output /opt/paddlex/fonts/PingFang-SC-Regular.ttf "$PADDLEX_FONT_URL" \
-    && echo "$PADDLEX_FONT_SHA256  /opt/paddlex/fonts/PingFang-SC-Regular.ttf" | sha256sum -c -
 RUN python3.10 -m venv "$VIRTUAL_ENV" \
     && curl --fail --location --retry 8 --retry-all-errors \
         --connect-timeout 30 --output /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl "$PADDLE_WHEEL_URL" \
@@ -57,6 +52,12 @@ RUN groupadd --gid 10001 visiox \
 
 COPY apps/paddlex-inference/requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir -r /app/requirements.lock
+RUN install -d -m 0755 /opt/paddlex/fonts \
+    && curl --fail --location --retry 8 --retry-all-errors \
+        --connect-timeout 30 --output /opt/paddlex/fonts/PingFang-SC-Regular.ttf "$PADDLEX_FONT_URL" \
+    && echo "$PADDLEX_FONT_SHA256  /opt/paddlex/fonts/PingFang-SC-Regular.ttf" | sha256sum -c -
+
+ENV PADDLE_PDX_LOCAL_FONT_FILE_PATH=/opt/paddlex/fonts/PingFang-SC-Regular.ttf
 
 COPY apps/paddlex-inference/src/visiox_paddlex_inference ./visiox_paddlex_inference
 
