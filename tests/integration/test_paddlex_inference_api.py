@@ -399,7 +399,8 @@ def test_api_service_can_launch_the_isolated_paddlex_runtime() -> None:
         Path("infra/compose/docker-compose.yml").read_text(encoding="utf-8")
     )
 
-    assert "docker.io" in dockerfile
+    assert "docker-cli" in dockerfile
+    assert "docker.io" not in dockerfile
     socket_mount = "/var/run/docker.sock:/var/run/docker.sock"
     assert socket_mount in compose["services"]["api-service"]["volumes"]
     for service_name in (
