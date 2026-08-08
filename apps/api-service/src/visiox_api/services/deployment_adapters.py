@@ -135,12 +135,16 @@ def resolve_deployment_adapter(
             compute_capability_min,
         )
     )
-    if explicit_gpu and not supports_hpi:
+    supports_paddle_inference = bool(
+        "paddle_inference" in compatible_backends
+        and "fp32" in compatible_precisions
+        and precision in {"auto", "fp32"}
+    )
+    if explicit_gpu and not supports_hpi and not supports_paddle_inference:
         raise ValueError("requested GPU is not compatible with PaddleX HPI")
     if not supports_hpi:
-        if "paddle_inference" not in compatible_backends or "fp32" not in compatible_precisions:
+        if not supports_paddle_inference:
             raise ValueError("PaddleX CPU fallback is not declared compatible")
-        selected = ()
     backend = "paddlex_hpi_tensorrt" if supports_hpi else "paddle_inference"
     resolved_precision = hpi_precision if supports_hpi else "fp32"
     values = {
@@ -150,7 +154,7 @@ def resolve_deployment_adapter(
         "model_format": "paddle_inference_bundle",
         "runtime_image_digest": digest,
         "resolved_backend": backend,
-        "device": "gpu:0" if supports_hpi else "cpu",
+        "device": "gpu:0" if selected else "cpu",
         "precision": resolved_precision,
         "input_shape": input_shape,
         "gpu_uuids": selected,

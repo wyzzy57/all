@@ -713,9 +713,33 @@ def test_paddlex_deployment_adapter_falls_back_for_auto_gpu_below_matrix_require
     )
 
     assert resolution.resolved_backend == "paddle_inference"
-    assert resolution.device == "cpu"
+    assert resolution.device == "gpu:0"
     assert resolution.precision == "fp32"
-    assert resolution.gpu_uuids == ()
+    assert resolution.gpu_uuids == ("GPU-x86-fixture",)
+
+
+def test_paddlex_deployment_adapter_runs_paddle_inference_on_explicit_gpu() -> None:
+    pipeline, model = _paddlex_deployment_records()
+    compatibility = model.deployment_compatibility["runtime_compatibility"][0]
+    compatibility["backends"] = ["paddle_inference"]
+    compatibility["precisions"] = ["fp32"]
+
+    resolution = resolve_deployment_adapter(
+        pipeline,
+        model,
+        parse_inventory(json.loads((FIXTURES / "x86.json").read_text(encoding="utf-8"))),
+        runtime_image_digest=(
+            "registry.example/visiox/paddlex-inference@sha256:" + "d" * 64
+        ),
+        precision="fp32",
+        input_shape=(1, 3, 640, 640),
+        gpu_uuids=("GPU-x86-fixture",),
+    )
+
+    assert resolution.resolved_backend == "paddle_inference"
+    assert resolution.device == "gpu:0"
+    assert resolution.precision == "fp32"
+    assert resolution.gpu_uuids == ("GPU-x86-fixture",)
 
 
 def test_paddlex_deployment_adapter_rejects_int8_without_compatibility() -> None:
