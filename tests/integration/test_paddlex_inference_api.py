@@ -11,6 +11,8 @@ from PIL import Image
 import pytest
 from pydantic import ValidationError
 
+from visiox_api.services.pipeline_inference import DockerPaddleXInferenceRuntime
+from visiox_api.services.pipeline_inference import PaddleXInferenceRuntimeRequest
 from visiox_paddlex_inference.config import InferenceConfig
 from visiox_paddlex_inference.main import create_app
 from visiox_paddlex_inference.predict import PredictionResult
@@ -409,6 +411,58 @@ def test_api_service_can_launch_the_isolated_paddlex_runtime() -> None:
         "training-worker",
     ):
         assert socket_mount not in compose["services"][service_name].get("volumes", [])
+
+
+def test_api_paddlex_runtime_copies_files_without_host_bind_paths(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    model_dir = workspace / "model"
+    input_dir = workspace / "input"
+    output_dir = workspace / "output"
+    model_dir.mkdir(parents=True)
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (model_dir / "inference.json").write_text("{}", encoding="utf-8")
+    image_path = input_dir / "image.jpg"
+    image_path.write_bytes(b"image")
+    result_path = output_dir / "inference_result.json"
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command, **_kwargs):
+        call = tuple(command)
+        calls.append(call)
+        if call[:3] == ("docker", "volume", "create"):
+            return SimpleNamespace(returncode=0, stdout="output-volume\n", stderr="")
+        if call[1] == "create":
+            return SimpleNamespace(returncode=0, stdout="container-123\n", stderr="")
+        if call[1] == "cp" and call[2] == "container-123:/workspace/output/.":
+            result_path.write_text('{"boxes": [], "annotated_image": "result.png"}')
+            (output_dir / "result.png").write_bytes(b"png")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("visiox_api.services.pipeline_inference.subprocess.run", fake_run)
+    request = PaddleXInferenceRuntimeRequest(
+        image_digest="registry.example/paddlex@sha256:" + "a" * 64,
+        workspace=workspace,
+        model_dir=model_dir,
+        image_path=image_path,
+        output_dir=output_dir,
+        result_path=result_path,
+        environment="cpu",
+    )
+
+    DockerPaddleXInferenceRuntime().run(request)
+
+    create = next(call for call in calls if call[1] == "create")
+    assert create[:2] == ("docker", "create")
+    assert "--read-only" in create
+    assert "type=volume,source=output-volume,destination=/workspace/output" in create
+    assert "-v" not in create
+    assert all(str(tmp_path) not in part for part in create)
+    assert ("docker", "start", "--attach", "container-123") in calls
+    assert ("docker", "rm", "--force", "--volumes", "container-123") in calls
+    assert calls[-1] == ("docker", "volume", "rm", "--force", "output-volume")
 
 
 def test_paddlex_inference_documents_static_bundle_runtime() -> None:

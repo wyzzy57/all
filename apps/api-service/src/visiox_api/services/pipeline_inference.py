@@ -58,14 +58,12 @@ class PaddleXInferenceRuntimeRequest:
     environment: str
     api_contract: str = "paddlex.create_model(model_dir=...)"
 
-    @property
-    def command(self) -> tuple[str, ...]:
+    def create_command(self, output_volume: str) -> tuple[str, ...]:
         device = paddlex_device(self.environment)
         container_image = f"/workspace/input/image{safe_image_suffix(self.image_path.name)}"
         command = [
             "docker",
-            "run",
-            "--rm",
+            "create",
             "--network",
             "none",
             "--read-only",
@@ -74,19 +72,13 @@ class PaddleXInferenceRuntimeRequest:
             "--pids-limit=512",
             "--tmpfs",
             "/tmp:rw,noexec,nosuid,size=1g",
+            "--mount",
+            f"type=volume,source={output_volume},destination=/workspace/output",
         ]
         if device.startswith("gpu:"):
             command.extend(("--gpus", f"device={device.removeprefix('gpu:')}"))
         command.extend(
             (
-                "-v",
-                f"{(self.workspace / 'paddlex_predict.py').resolve()}:/runner.py:ro",
-                "-v",
-                f"{self.model_dir.resolve()}:/workspace/model:ro",
-                "-v",
-                f"{self.image_path.resolve()}:{container_image}:ro",
-                "-v",
-                f"{self.output_dir.resolve()}:/workspace/output:rw",
                 self.image_digest,
                 "python",
                 "/runner.py",
@@ -105,21 +97,104 @@ class DockerPaddleXInferenceRuntime:
     def run(self, request: PaddleXInferenceRuntimeRequest) -> None:
         script = request.workspace / "paddlex_predict.py"
         script.write_text(_PADDLEX_PREDICT_SCRIPT, encoding="utf-8")
+        output_volume: str | None = None
+        container_id: str | None = None
+        try:
+            output_volume = self._run_checked(
+                ("docker", "volume", "create"), "create output volume"
+            ).stdout.strip()
+            if not output_volume:
+                raise RuntimeError("PaddleX inference output volume has no identifier")
+            self._run_checked(
+                (
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--read-only",
+                    "--cap-drop=ALL",
+                    "--security-opt=no-new-privileges",
+                    "--user",
+                    "0:0",
+                    "--mount",
+                    f"type=volume,source={output_volume},destination=/workspace/output",
+                    request.image_digest,
+                    "chmod",
+                    "0777",
+                    "/workspace/output",
+                ),
+                "initialize output volume",
+            )
+            container_id = self._run_checked(
+                request.create_command(output_volume), "create runtime"
+            ).stdout.strip()
+            if not container_id:
+                raise RuntimeError("PaddleX inference runtime has no container identifier")
+            for source, destination in (
+                (script, "/runner.py"),
+                (request.model_dir, "/workspace/model"),
+                (request.image_path.parent, "/workspace/input"),
+            ):
+                self._run_checked(
+                    ("docker", "cp", str(source), f"{container_id}:{destination}"),
+                    f"copy {source.name}",
+                )
+            self._run_checked(
+                ("docker", "start", "--attach", container_id),
+                "run inference",
+                timeout=900,
+            )
+            self._run_checked(
+                (
+                    "docker",
+                    "cp",
+                    f"{container_id}:/workspace/output/.",
+                    str(request.output_dir),
+                ),
+                "copy inference output",
+            )
+        finally:
+            if container_id:
+                self._run_cleanup(
+                    ("docker", "rm", "--force", "--volumes", container_id)
+                )
+            if output_volume:
+                self._run_cleanup(("docker", "volume", "rm", "--force", output_volume))
+        if not request.result_path.is_file():
+            raise RuntimeError("PaddleX inference did not produce inference_result.json")
+
+    @staticmethod
+    def _run_checked(
+        command: tuple[str, ...], stage: str, *, timeout: int = 60
+    ) -> subprocess.CompletedProcess[str]:
         try:
             completed = subprocess.run(
-                request.command,
+                command,
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=900,
+                timeout=timeout,
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError("PaddleX inference runtime could not be started") from exc
+            raise RuntimeError(f"PaddleX inference could not {stage}") from exc
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout)[-2000:]
-            raise RuntimeError(f"PaddleX inference failed: {detail}")
-        if not request.result_path.is_file():
-            raise RuntimeError("PaddleX inference did not produce inference_result.json")
+            raise RuntimeError(f"PaddleX inference failed to {stage}: {detail}")
+        return completed
+
+    @staticmethod
+    def _run_cleanup(command: tuple[str, ...]) -> None:
+        try:
+            subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def resolve_pipeline_model(
