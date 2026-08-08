@@ -174,3 +174,8 @@ PaddleDetection evaluation runs from the bundled repository rather than the
 image `WORKDIR`. Keep the generated `output_eval` config pinned to the writable
 training output root; otherwise COCO evaluation attempts to create a relative
 `bbox.json` in the read-only repository and exits with `PermissionError`.
+
+The final PaddleX export has the same repository cwd. Keep PaddleDetection
+config `save_dir` synchronized with PaddleX's absolute `Global.output` before
+the export subprocess starts; `--output_dir` alone is applied too late to stop
+trainer initialization from creating a relative `output` directory.

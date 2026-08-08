@@ -35,6 +35,10 @@ def apply_runtime_config(
     config["output_eval"] = str(PurePosixPath(visualdl_dir).parent)
 
 
+def apply_export_runtime_config(config: Any, *, output_dir: str) -> None:
+    config["save_dir"] = str(PurePosixPath(output_dir))
+
+
 def _set_reader_resize(
     config: Any,
     reader_name: str,
@@ -87,8 +91,24 @@ def _patch_detection_trainer() -> None:
     DetTrainer.update_config = update_config
 
 
+def _patch_detection_exportor() -> None:
+    from paddlex.modules.object_detection.exportor import DetExportor
+
+    original = DetExportor.update_config
+
+    def update_config(self: Any) -> None:
+        original(self)
+        apply_export_runtime_config(
+            self.pdx_config,
+            output_dir=self.global_config.output,
+        )
+
+    DetExportor.update_config = update_config
+
+
 def main() -> None:
     _patch_detection_trainer()
+    _patch_detection_exportor()
     from paddlex.engine import Engine
 
     Engine().run()

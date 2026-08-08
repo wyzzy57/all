@@ -341,6 +341,18 @@ def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
     assert config["output_eval"] == "/workspace/output"
 
 
+def test_paddlex_export_config_uses_absolute_output_directory() -> None:
+    module = _paddlex_main_module()
+    config: dict[str, object] = {"save_dir": "output"}
+
+    module.apply_export_runtime_config(
+        config,
+        output_dir="/workspace/output/best_model/inference",
+    )
+
+    assert config["save_dir"] == "/workspace/output/best_model/inference"
+
+
 def test_resource_sample_preserves_each_gpu(monkeypatch) -> None:
     resources = importlib.import_module("visiox_paddlex_training_worker.resources")
 
