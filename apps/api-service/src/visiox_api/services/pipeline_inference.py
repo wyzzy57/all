@@ -60,7 +60,7 @@ class PaddleXInferenceRuntimeRequest:
 
     def create_command(self, output_volume: str) -> tuple[str, ...]:
         device = paddlex_device(self.environment)
-        container_image = f"/workspace/input/image{safe_image_suffix(self.image_path.name)}"
+        container_image = f"/workspace/io/input/image{safe_image_suffix(self.image_path.name)}"
         command = [
             "docker",
             "create",
@@ -73,7 +73,7 @@ class PaddleXInferenceRuntimeRequest:
             "--tmpfs",
             "/tmp:rw,noexec,nosuid,size=1g",
             "--mount",
-            f"type=volume,source={output_volume},destination=/workspace/output",
+            f"type=volume,source={output_volume},destination=/workspace/io",
         ]
         if device.startswith("gpu:"):
             command.extend(("--gpus", f"device={device.removeprefix('gpu:')}"))
@@ -81,7 +81,7 @@ class PaddleXInferenceRuntimeRequest:
             (
                 self.image_digest,
                 "python",
-                "/runner.py",
+                "/workspace/io/runner.py",
                 device,
                 container_image,
             )
@@ -118,11 +118,15 @@ class DockerPaddleXInferenceRuntime:
                     "--user",
                     "0:0",
                     "--mount",
-                    f"type=volume,source={output_volume},destination=/workspace/output",
+                    f"type=volume,source={output_volume},destination=/workspace/io",
                     request.image_digest,
-                    "chmod",
+                    "install",
+                    "-d",
+                    "-m",
                     "0777",
-                    "/workspace/output",
+                    "/workspace/io/model",
+                    "/workspace/io/input",
+                    "/workspace/io/output",
                 ),
                 "initialize output volume",
             )
@@ -131,11 +135,15 @@ class DockerPaddleXInferenceRuntime:
             ).stdout.strip()
             if not container_id:
                 raise RuntimeError("PaddleX inference runtime has no container identifier")
-            for source, destination in (
-                (script, "/runner.py"),
-                (request.model_dir, "/workspace/model"),
-                (request.image_path.parent, "/workspace/input"),
-            ):
+            staged_files = [
+                (script, "/workspace/io/runner.py"),
+                (
+                    request.image_path,
+                    f"/workspace/io/input/image{safe_image_suffix(request.image_path.name)}",
+                ),
+                *((item, f"/workspace/io/model/{item.name}") for item in request.model_dir.iterdir()),
+            ]
+            for source, destination in staged_files:
                 self._run_checked(
                     ("docker", "cp", str(source), f"{container_id}:{destination}"),
                     f"copy {source.name}",
@@ -149,7 +157,7 @@ class DockerPaddleXInferenceRuntime:
                 (
                     "docker",
                     "cp",
-                    f"{container_id}:/workspace/output/.",
+                    f"{container_id}:/workspace/io/output/.",
                     str(request.output_dir),
                 ),
                 "copy inference output",
@@ -476,12 +484,12 @@ import sys
 
 device = sys.argv[1]
 image_path = sys.argv[2]
-model = paddlex.create_model(model_dir="/workspace/model", device=device)
+model = paddlex.create_model(model_dir="/workspace/io/model", device=device)
 results = list(model.predict(image_path, device=device))
 if not results:
     raise RuntimeError("PaddleX returned no prediction result")
 result = results[0]
-output = Path("/workspace/output")
+output = Path("/workspace/io/output")
 output.mkdir(parents=True, exist_ok=True)
 result.save_to_img(str(output))
 images = sorted(output.glob("*.png")) + sorted(output.glob("*.jpg"))

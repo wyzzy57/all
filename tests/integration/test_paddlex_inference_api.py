@@ -437,7 +437,7 @@ def test_api_paddlex_runtime_copies_files_without_host_bind_paths(
             return SimpleNamespace(returncode=0, stdout="output-volume\n", stderr="")
         if call[1] == "create":
             return SimpleNamespace(returncode=0, stdout="container-123\n", stderr="")
-        if call[1] == "cp" and call[2] == "container-123:/workspace/output/.":
+        if call[1] == "cp" and call[2] == "container-123:/workspace/io/output/.":
             result_path.write_text('{"boxes": [], "annotated_image": "result.png"}')
             (output_dir / "result.png").write_bytes(b"png")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -458,9 +458,15 @@ def test_api_paddlex_runtime_copies_files_without_host_bind_paths(
     create = next(call for call in calls if call[1] == "create")
     assert create[:2] == ("docker", "create")
     assert "--read-only" in create
-    assert "type=volume,source=output-volume,destination=/workspace/output" in create
+    assert "type=volume,source=output-volume,destination=/workspace/io" in create
     assert "-v" not in create
     assert all(str(tmp_path) not in part for part in create)
+    assert (
+        "docker",
+        "cp",
+        str(workspace / "paddlex_predict.py"),
+        "container-123:/workspace/io/runner.py",
+    ) in calls
     assert ("docker", "start", "--attach", "container-123") in calls
     assert ("docker", "rm", "--force", "--volumes", "container-123") in calls
     assert calls[-1] == ("docker", "volume", "rm", "--force", "output-volume")
