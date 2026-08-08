@@ -203,6 +203,9 @@ def test_paddlex_runtime_initializes_official_cpu_and_gpu_hpi_options(
     monkeypatch.setitem(
         sys.modules, "paddlex", SimpleNamespace(create_model=create_model)
     )
+    (tmp_path / "inference.yml").write_text(
+        "Global:\n  model_name: PP-YOLOE_plus-S\n", encoding="utf-8"
+    )
     config = InferenceConfig(
         production=True,
         model_dir=tmp_path,
@@ -217,6 +220,7 @@ def test_paddlex_runtime_initializes_official_cpu_and_gpu_hpi_options(
     result = predictor.predict_image(_image_bytes())
 
     assert calls["create_kwargs"] == {
+        "model_name": "PP-YOLOE_plus-S",
         "model_dir": str(tmp_path.resolve()),
         **expected_create_kwargs,
     }
@@ -302,6 +306,9 @@ def test_paddlex_runtime_rejects_invalid_or_excessive_predictions(
         sys.modules,
         "paddlex",
         SimpleNamespace(create_model=lambda **kwargs: FakeModel()),
+    )
+    (tmp_path / "inference.yml").write_text(
+        "Global:\n  model_name: PP-YOLOE_plus-S\n", encoding="utf-8"
     )
     predictor = load_predictor(
         InferenceConfig(production=True, model_dir=tmp_path, device="cpu")

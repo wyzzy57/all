@@ -9,6 +9,7 @@ import time
 from typing import Any, Protocol
 
 from PIL import Image
+import yaml
 
 from visiox_paddlex_inference.config import InferenceConfig
 
@@ -119,6 +120,7 @@ def load_predictor(config: InferenceConfig) -> Predictor:
 
 def _create_model_kwargs(config: InferenceConfig) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
+        "model_name": _bundle_model_name(config.model_dir),
         "model_dir": str(config.model_dir),
         "device": config.device,
         "img_size": config.input_size,
@@ -135,6 +137,21 @@ def _create_model_kwargs(config: InferenceConfig) -> dict[str, Any]:
             },
         }
     return kwargs
+
+
+def _bundle_model_name(model_dir: Any) -> str:
+    path = model_dir / "inference.yml"
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError("PaddleX inference bundle metadata is unavailable") from exc
+    global_config = payload.get("Global") if isinstance(payload, dict) else None
+    model_name = (
+        global_config.get("model_name") if isinstance(global_config, dict) else None
+    )
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("PaddleX inference bundle model identity is unavailable")
+    return model_name.strip()
 
 
 def _dynamic_shapes(input_size: tuple[int, int]) -> list[list[int]]:
