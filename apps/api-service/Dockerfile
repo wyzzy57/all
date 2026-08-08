@@ -30,7 +30,7 @@ COPY infra/migrations ./infra/migrations
 COPY packages ./packages
 COPY workers ./workers
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --retries 8 --timeout 120 .
 
 EXPOSE 8000
 

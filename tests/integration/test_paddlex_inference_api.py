@@ -403,6 +403,7 @@ def test_api_service_can_launch_the_isolated_paddlex_runtime() -> None:
 
     assert "docker-cli" in dockerfile
     assert "docker.io" not in dockerfile
+    assert "pip install --no-cache-dir --retries 8 --timeout 120 ." in dockerfile
     socket_mount = "/var/run/docker.sock:/var/run/docker.sock"
     assert socket_mount in compose["services"]["api-service"]["volumes"]
     for service_name in (
