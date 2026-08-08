@@ -72,6 +72,8 @@ class PaddleXInferenceRuntimeRequest:
             "--pids-limit=512",
             "--tmpfs",
             "/tmp:rw,noexec,nosuid,size=1g",
+            "--env",
+            "HOME=/workspace/io/home",
             "--mount",
             f"type=volume,source={output_volume},destination=/workspace/io",
         ]
@@ -127,6 +129,7 @@ class DockerPaddleXInferenceRuntime:
                     "/workspace/io/model",
                     "/workspace/io/input",
                     "/workspace/io/output",
+                    "/workspace/io/home",
                 ),
                 "initialize output volume",
             )

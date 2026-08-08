@@ -459,6 +459,7 @@ def test_api_paddlex_runtime_copies_files_without_host_bind_paths(
     assert create[:2] == ("docker", "create")
     assert "--read-only" in create
     assert "type=volume,source=output-volume,destination=/workspace/io" in create
+    assert "HOME=/workspace/io/home" in create
     assert "-v" not in create
     assert all(str(tmp_path) not in part for part in create)
     assert (
@@ -468,6 +469,8 @@ def test_api_paddlex_runtime_copies_files_without_host_bind_paths(
         "container-123:/workspace/io/runner.py",
     ) in calls
     assert ("docker", "start", "--attach", "container-123") in calls
+    initialize = next(call for call in calls if call[:2] == ("docker", "run"))
+    assert "/workspace/io/home" in initialize
     assert ("docker", "rm", "--force", "--volumes", "container-123") in calls
     assert calls[-1] == ("docker", "volume", "rm", "--force", "output-volume")
 
