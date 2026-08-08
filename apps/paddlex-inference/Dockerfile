@@ -3,12 +3,15 @@ FROM ${CUDA_BASE_IMAGE}
 
 ARG PADDLE_WHEEL_URL=https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl
 ARG PADDLE_WHEEL_SHA256=6e262ce3a18220a4e066e40656777753fd6dcdd8637c9f397dd449079d12ce9c
+ARG PADDLEX_FONT_URL=https://paddle-model-ecology.bj.bcebos.com/paddlex/PaddleX3.0/fonts/PingFang-SC-Regular.ttf
+ARG PADDLEX_FONT_SHA256=7c31780a74b296162818aa5891c395d6ecdfcf1e71d9e1e4c3326869ad901ab6
 ARG UBUNTU_MIRROR=https://mirrors.aliyun.com/ubuntu
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 ENV VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PADDLE_PDX_LOCAL_FONT_FILE_PATH=/opt/paddlex/fonts/PingFang-SC-Regular.ttf \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -30,6 +33,10 @@ RUN sed -i \
         python3.10 \
         python3.10-venv \
     && rm -rf /var/lib/apt/lists/*
+RUN install -d -m 0755 /opt/paddlex/fonts \
+    && curl --fail --location --retry 8 --retry-all-errors \
+        --connect-timeout 30 --output /opt/paddlex/fonts/PingFang-SC-Regular.ttf "$PADDLEX_FONT_URL" \
+    && echo "$PADDLEX_FONT_SHA256  /opt/paddlex/fonts/PingFang-SC-Regular.ttf" | sha256sum -c -
 RUN python3.10 -m venv "$VIRTUAL_ENV" \
     && curl --fail --location --retry 8 --retry-all-errors \
         --connect-timeout 30 --output /tmp/paddlepaddle_gpu-3.0.0-cp310-cp310-linux_x86_64.whl "$PADDLE_WHEEL_URL" \

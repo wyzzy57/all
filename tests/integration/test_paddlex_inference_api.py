@@ -377,6 +377,16 @@ def test_paddlex_dockerfile_uses_a_pinned_build_arg_base_image() -> None:
         in dockerfile
     )
     assert "pip install --no-cache-dir -r /app/requirements.lock" in dockerfile
+    assert (
+        "ARG PADDLEX_FONT_URL=https://paddle-model-ecology.bj.bcebos.com/"
+        "paddlex/PaddleX3.0/fonts/PingFang-SC-Regular.ttf"
+    ) in dockerfile
+    assert (
+        "ARG PADDLEX_FONT_SHA256="
+        "7c31780a74b296162818aa5891c395d6ecdfcf1e71d9e1e4c3326869ad901ab6"
+    ) in dockerfile
+    assert "PADDLE_PDX_LOCAL_FONT_FILE_PATH=/opt/paddlex/fonts/PingFang-SC-Regular.ttf" in dockerfile
+    assert "echo \"$PADDLEX_FONT_SHA256  /opt/paddlex/fonts/PingFang-SC-Regular.ttf\" | sha256sum -c -" in dockerfile
 
 
 def test_paddlex_dockerfile_uses_exported_bundle_without_training_plugin() -> None:
