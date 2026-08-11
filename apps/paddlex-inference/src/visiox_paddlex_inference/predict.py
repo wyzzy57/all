@@ -8,6 +8,7 @@ import math
 import time
 from typing import Any, Protocol
 
+import numpy as np
 from PIL import Image
 import yaml
 
@@ -16,6 +17,7 @@ from visiox_paddlex_inference.config import InferenceConfig
 MAX_PREDICTIONS = 1000
 MAX_ANNOTATED_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_LABEL_CHARS = 256
+FIXED_INPUT_SHAPE_MODELS = frozenset({"RT-DETR-L"})
 
 
 @dataclass(slots=True)
@@ -55,8 +57,9 @@ class PaddleXPredictor:
         with Image.open(BytesIO(image_bytes)) as opened:
             image = opened.convert("RGB")
             width, height = image.size
+            image_array = np.ascontiguousarray(np.asarray(image))
         results = list(
-            self.model.predict(input=image, threshold=self.config.confidence)
+            self.model.predict(input=image_array, threshold=self.config.confidence)
         )
         if not results:
             raise ValueError("PaddleX returned no prediction result")
@@ -119,13 +122,15 @@ def load_predictor(config: InferenceConfig) -> Predictor:
 
 
 def _create_model_kwargs(config: InferenceConfig) -> dict[str, Any]:
+    model_name = _bundle_model_name(config.model_dir)
     kwargs: dict[str, Any] = {
-        "model_name": _bundle_model_name(config.model_dir),
+        "model_name": model_name,
         "model_dir": str(config.model_dir),
         "device": config.device,
-        "img_size": config.input_size,
         "use_hpip": config.backend == "paddlex_hpi_tensorrt",
     }
+    if model_name not in FIXED_INPUT_SHAPE_MODELS:
+        kwargs["img_size"] = config.input_size
     if config.backend == "paddlex_hpi_tensorrt":
         kwargs["hpi_params"] = {
             "selected_backends": {"gpu": "tensorrt"},
@@ -204,6 +209,8 @@ def _normalize_box(box: dict[str, Any], class_names: list[str]) -> dict[str, Any
 def _encode_result_image(value: Any) -> str | None:
     if value is None:
         return None
+    if isinstance(value, dict):
+        value = value.get("res")
     if isinstance(value, Image.Image):
         image = value
     else:

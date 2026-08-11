@@ -3,6 +3,17 @@
 .migration
 .local-secrets
 .env
+.codex-logs
+.local
+.planning
+.runtime-logs
+.superpowers
+.tmp
+.tmp-paddlex-wheel
+.tools
+.worktrees
+identity-acceptance-tmp
+training-runs
 **/.venv
 **/node_modules
 **/dist

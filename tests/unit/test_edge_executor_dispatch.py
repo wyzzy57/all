@@ -651,6 +651,8 @@ def test_stuck_blocking_work_cannot_hold_worker_process_past_shutdown_grace() ->
             "packages/visiox-common/src",
             "packages/visiox-db/src",
             "packages/visiox-messaging/src",
+            "packages/visiox-paddlex/src",
+            "packages/visiox-training/src",
             "workers/edge-executor-worker/src",
         )
     )

@@ -332,7 +332,6 @@ def clone_pipeline(
         cloned_from_pipeline_id=source.id,
     )
     PipelineConfigurationService(catalog).apply(clone, configuration)
-    clone.status = "draft"
     session.add(clone)
     try:
         session.commit()

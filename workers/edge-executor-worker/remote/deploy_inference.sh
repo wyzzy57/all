@@ -368,6 +368,8 @@ def _container_args(
     )
     if runtime.get("framework", "ultralytics") == "ultralytics":
         args.extend(["-e", "YOLO_CONFIG_DIR=/tmp/visiox-ultralytics"])
+    elif runtime.get("framework") == "paddlex":
+        args.extend(["-e", "HOME=/tmp/visiox-paddlex"])
     args.extend(
         [
             "-p",
@@ -734,13 +736,20 @@ class Operations:
 
     def _host_port(self, container):
         output = _run(["docker", "port", container, "8080/tcp"], timeout=30).stdout.strip()
-        match = re.fullmatch(
-            r"(?:127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\[::\]):([0-9]{4,5})",
-            output,
-        )
-        if match is None:
+        matches = [
+            re.fullmatch(
+                r"(?:127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\[::\]):([0-9]{4,5})",
+                line.strip(),
+            )
+            for line in output.splitlines()
+            if line.strip()
+        ]
+        if not matches or any(match is None for match in matches):
             raise ValueError("container endpoint is invalid")
-        return int(match.group(1))
+        ports = {int(match.group(1)) for match in matches if match is not None}
+        if len(ports) != 1:
+            raise ValueError("container endpoint is invalid")
+        return ports.pop()
 
     def warmup(self, container):
         port = self._host_port(container)

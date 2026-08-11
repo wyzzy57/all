@@ -12,6 +12,7 @@ __pycache__/
 *.egg-info/
 .env
 /dist/
+/node_modules/
 /.local/visiox-agent/
 .local-secrets/
 .migration/

@@ -34,6 +34,7 @@ from visiox_edge_executor_worker.distributed_execution import (
     _llamafactory_dataset_info,
     _launch_request,
     _resolved_runtime_inputs,
+    _resume_staging_request,
     _set_container_dataset_root,
     _staging_request,
     _artifact_uri,
@@ -319,6 +320,95 @@ def test_remote_staging_verifies_fixed_entrypoint_exists_in_image() -> None:
 
     assert '"--entrypoint", "/usr/bin/test"' in script
     assert '"-x", FIXED_ENTRYPOINT' in script
+
+
+def test_remote_staging_resume_reuses_workspace_without_docker(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = load_packaged_script("stage_training.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "stage_training.sh", "exec"), namespace)
+
+    launch_spec = LaunchSpec(
+        adapter_key="paddlex.object_detection.v1",
+        adapter_version="1.0.0",
+        argv=("/usr/local/bin/visiox-train",),
+        working_directory="workspace",
+        env={
+            "VISIOX_TRAINING_JOB_ID": "job-1",
+            "VISIOX_TRAINING_RUN_ID": "run-1",
+            "VISIOX_TRAINING_ATTEMPT": "2",
+            "VISIOX_FRAMEWORK": "paddlex",
+            "VISIOX_NODE_ID": "node-1",
+            "VISIOX_NODE_RANK": "0",
+            "VISIOX_NNODES": "1",
+            "VISIOX_NPROC_PER_NODE": "1",
+            "VISIOX_GPU_UUIDS_JSON": '["GPU-one"]',
+            "VISIOX_MASTER_ADDR": "10.0.0.1",
+            "VISIOX_MASTER_PORT": "29500",
+            "VISIOX_OUTPUT_DIR": "/workspace/output",
+            "VISIOX_DATASET_DIR": "/workspace/dataset",
+            "VISIOX_RUNTIME_INPUTS_JSON": json.dumps(_runtime_inputs("paddlex")),
+        },
+    ).model_dump(mode="json")
+    assert namespace["validate_launch_spec"](launch_spec) == launch_spec  # type: ignore[operator]
+    encoded = json.dumps(
+        launch_spec,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    root = tmp_path / ".local" / "share" / "visiox" / "training" / "run-1" / "2"
+    input_dir = root / "input"
+    output_dir = root / "output"
+    input_dir.mkdir(parents=True)
+    output_dir.mkdir()
+    (input_dir / "launch-spec.json").write_bytes(encoded)
+    request_path = tmp_path / "request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "action": "resume",
+                "run_id": "run-1",
+                "attempt": 2,
+                "training_job_id": "job-1",
+                "adapter_key": "paddlex.object_detection.v1",
+                "adapter_version": "1.0.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    path_type = type(Path())
+
+    class WorkspacePath(path_type):
+        @classmethod
+        def home(cls):
+            return cls(tmp_path)
+
+    namespace["Path"] = WorkspacePath
+    monkeypatch.setattr(
+        namespace["subprocess"],
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("resume must not invoke Docker")
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["stage_training.py", str(request_path)])
+
+    assert namespace["main"]() == 0  # type: ignore[operator]
+    response = json.loads(capsys.readouterr().out)
+    assert response["root"] == str(root)
+    assert response["paths"] == {
+        "output": str(output_dir),
+        "launch_spec": str(input_dir / "launch-spec.json"),
+        "artifacts": {},
+    }
 
 
 def test_remote_staging_rejects_downloaded_artifact_checksum_mismatch(
@@ -656,6 +746,7 @@ def test_staging_request_matches_remote_script_contract() -> None:
         "1.0.0",
         _runtime_inputs("paddlex", ("dataset",)),
         artifacts,
+        mlflow_tracking_uri="http://platform.test:5001",
     )
 
     assert request["schema_version"] == "1.0"
@@ -670,6 +761,9 @@ def test_staging_request_matches_remote_script_contract() -> None:
     assert spec.env["VISIOX_MASTER_ADDR"] == "10.10.40.10"
     assert spec.env["VISIOX_MASTER_PORT"] == "29500"
     assert spec.env["VISIOX_OUTPUT_DIR"] == "/workspace/output"
+    assert spec.env["MLFLOW_TRACKING_URI"] == "http://platform.test:5001"
+    assert spec.env["MLFLOW_HTTP_REQUEST_TIMEOUT"] == "3"
+    assert spec.env["MLFLOW_HTTP_REQUEST_MAX_RETRIES"] == "0"
     runtime_inputs = json.loads(spec.env["VISIOX_RUNTIME_INPUTS_JSON"])
     assert runtime_inputs["parameters"] == {"epochs": 1}
     assert runtime_inputs["artifacts"] == [
@@ -680,6 +774,120 @@ def test_staging_request_matches_remote_script_contract() -> None:
     assert len(request["launch_spec_checksum"]) == 64
     assert "action" not in request
     assert "engine" not in request
+
+
+def test_resume_staging_request_contains_only_persisted_workspace_identity() -> None:
+    request = _resume_staging_request(  # type: ignore[arg-type]
+        SimpleNamespace(id="run-1", attempt=2),
+        SimpleNamespace(id="job-1"),
+        SimpleNamespace(
+            adapter_key="paddlex.object_detection.v1",
+            adapter_version="1.0.0",
+        ),
+    )
+
+    assert request == {
+        "schema_version": "1.0",
+        "action": "resume",
+        "run_id": "run-1",
+        "attempt": 2,
+        "training_job_id": "job-1",
+        "adapter_key": "paddlex.object_detection.v1",
+        "adapter_version": "1.0.0",
+    }
+
+
+def test_active_distributed_job_reuses_persisted_container_without_relaunching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LaunchSpec(
+        adapter_key="paddlex.object_detection.v1",
+        adapter_version="1.0.0",
+        argv=("/usr/local/bin/visiox-train",),
+    )
+    run = SimpleNamespace(
+        id="run-resume",
+        attempt=1,
+        node_ids=["node-1"],
+        ranks=[
+            {
+                "node_id": "node-1",
+                "node_rank": 0,
+                "lan_address": "10.0.0.1",
+                "gpu_uuids": ["GPU-one"],
+            }
+        ],
+        container_ids=["a" * 64],
+    )
+    job = SimpleNamespace(id="job-resume")
+    attempt = SimpleNamespace(
+        launch_spec=spec.model_dump(mode="json"),
+        launch_spec_checksum=spec.canonical_checksum_sha256(),
+    )
+    pipeline = SimpleNamespace(
+        framework="paddlex",
+        adapter_key="paddlex.object_detection.v1",
+        adapter_version="1.0.0",
+        engine="paddlex",
+    )
+    execution = SimpleNamespace(id="execution-resume")
+    handler = DistributedTrainingHandler(lambda: None, object(), object())  # type: ignore[arg-type]
+    handler._converge_existing_success = lambda _execution_id: False  # type: ignore[method-assign]
+    handler._load = lambda _execution: (  # type: ignore[method-assign]
+        run,
+        job,
+        attempt,
+        SimpleNamespace(),
+        pipeline,
+        None,
+        SimpleNamespace(),
+    )
+    handler._ensure_log_stream = lambda *_args: None  # type: ignore[method-assign]
+    handler._transition = lambda *_args: None  # type: ignore[method-assign]
+    handler._prepare_artifacts = lambda *_args: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("active recovery must not prepare artifacts")
+    )
+    handler._container_ids = lambda _run_id: ("a" * 64,)  # type: ignore[method-assign]
+    handler._mark_training = lambda _execution_id: None  # type: ignore[method-assign]
+    handler._wait_for_completion = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
+    handler._collect_rank_zero = lambda *_args, **_kwargs: SimpleNamespace(  # type: ignore[method-assign]
+        artifacts={}
+    )
+    handler._cache_final_observability = lambda *_args: None  # type: ignore[method-assign]
+    handler._mark_succeeded = lambda *_args: None  # type: ignore[method-assign]
+    handler._close_log_stream = lambda *_args: None  # type: ignore[method-assign]
+    handler._mark_failed = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    resume_requests: list[dict[str, object]] = []
+    handler._stage._load_target = lambda _node_id: object()  # type: ignore[method-assign]
+    handler._stage._run_script = lambda _target, request: (  # type: ignore[method-assign]
+        resume_requests.append(request)
+        or {
+            "root": "/home/edge/.local/share/visiox/training/run-resume/1",
+            "paths": {
+                "output": "/home/edge/.local/share/visiox/training/run-resume/1/output",
+                "launch_spec": "/home/edge/.local/share/visiox/training/run-resume/1/input/launch-spec.json",
+                "artifacts": {},
+            },
+        }
+    )
+    handler._launch._run_script = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("active recovery must not launch another container")
+    )
+
+    result = handler.execute(execution)  # type: ignore[arg-type]
+
+    assert result.status == "succeeded"
+    assert resume_requests == [
+        {
+            "schema_version": "1.0",
+            "action": "resume",
+            "run_id": "run-resume",
+            "attempt": 1,
+            "training_job_id": "job-resume",
+            "adapter_key": "paddlex.object_detection.v1",
+            "adapter_version": "1.0.0",
+        }
+    ]
 
 
 def test_launch_request_matches_remote_script_contract() -> None:
@@ -747,6 +955,80 @@ def test_exported_dataset_uses_training_container_mount_root(tmp_path: Path) -> 
     assert data_yaml.read_text(encoding="utf-8").startswith(
         "path: /workspace/dataset\ntrain: images/train\n"
     )
+
+
+def test_managed_dataset_mount_is_writable_but_model_inputs_remain_read_only() -> None:
+    mounts = distributed_execution._artifact_mounts(
+        {
+            "dataset": "/home/edge/run/input/dataset",
+            "model": "/home/edge/run/input/model.pt",
+            "checkpoint": "/home/edge/run/input/last.pt",
+        }
+    )
+
+    assert mounts == [
+        {
+            "source": "/home/edge/run/input/dataset",
+            "target": "/workspace/dataset",
+            "read_only": False,
+        },
+        {
+            "source": "/home/edge/run/input/model.pt",
+            "target": "/workspace/model/base.pt",
+            "read_only": True,
+        },
+        {
+            "source": "/home/edge/run/input/last.pt",
+            "target": "/workspace/checkpoint/last.pt",
+            "read_only": True,
+        },
+    ]
+
+
+def test_remote_rank_accepts_only_the_managed_dataset_as_writable(
+    tmp_path: Path,
+) -> None:
+    script = load_packaged_script("launch_rank.sh").decode("utf-8")
+    embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    namespace: dict[str, object] = {"__name__": "visiox_script_test"}
+    exec(compile(embedded, "launch_rank.sh", "exec"), namespace)
+    validate = namespace["validate"]
+    staged_request = _generic_staging_request()
+    root = tmp_path / "run"
+    input_path = root / "input"
+    output_path = root / "output"
+    dataset_path = input_path / "dataset"
+    model_path = input_path / "model.pt"
+    input_path.mkdir(parents=True)
+    output_path.mkdir()
+    dataset_path.mkdir()
+    model_path.write_bytes(b"model")
+    launch_spec_path = input_path / "launch-spec.json"
+    launch_spec_path.write_text("{}", encoding="utf-8")
+    request = _launch_request(  # type: ignore[arg-type]
+        SimpleNamespace(
+            id="run-1",
+            attempt=1,
+            training_image_digest=staged_request["runtime_image_digest"],
+        ),
+        SimpleNamespace(node_rank=0, gpu_uuids=("GPU-one",)),
+        SimpleNamespace(
+            paths={
+                "output": str(output_path),
+                "launch_spec": str(launch_spec_path),
+                "artifacts": {
+                    "dataset": str(dataset_path),
+                    "model": str(model_path),
+                },
+            }
+        ),
+        staged_request,
+    )
+
+    assert validate(request) == request  # type: ignore[operator]
+    request["mounts"][1]["read_only"] = False
+    with pytest.raises(ValueError, match="distributed rank request"):
+        validate(request)  # type: ignore[operator]
 
 
 def test_remote_rank_script_rejects_control_characters() -> None:

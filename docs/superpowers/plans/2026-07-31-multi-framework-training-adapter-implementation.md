@@ -473,7 +473,7 @@ Expected: compose resolves without warnings, startup performs no large PaddleX d
 
 **Files:** Modify only files from prior tasks when a verified defect is found.
 
-- [ ] Run the backend regression suite:
+- [x] Run the backend regression suite:
 
 ```powershell
 pytest tests/unit tests/integration -q
@@ -481,7 +481,7 @@ pytest tests/unit tests/integration -q
 
 Expected: zero failures; tests requiring an external GPU remain explicitly marked and are not silently skipped in the acceptance profile.
 
-- [ ] Run frontend verification:
+- [x] Run frontend verification:
 
 ```powershell
 npm --prefix apps/frontend test
@@ -491,23 +491,23 @@ npm --prefix apps/frontend run build
 
 Expected: Vitest, Vue type checking, and production build all pass.
 
-- [ ] Build and push the PaddleX training and inference images to the configured registry, inspect their immutable digests, and store those digests in platform configuration.
-- [ ] On an authorized x86 NVIDIA GPU node, run a two-epoch `PP-YOLOE-S` job using a real validated COCO dataset. Verify live logs, loss, learning rate, GPU/CPU/RAM metrics, AP metrics, VisualDL/MLflow/TensorBoard sources, best/static artifacts, evaluation, image inference, deployment, stop/start, and restart reconciliation.
-- [ ] Repeat the full two-epoch loop for `RT-DETR-L`.
-- [ ] Restart API, edge executor, Redis, and frontend while one job is active. Verify job/attempt identity, progress, logs, metrics, and final artifacts remain correct.
-- [ ] Clone a completed PaddleX pipeline to Ultralytics with the same dataset. Verify the original framework remains locked and compare only canonical AP/resource metrics.
-- [ ] Temporarily make MLflow unavailable and verify training continues with TensorBoard/VisualDL/JSONL fallback; restore MLflow and verify source availability recovers.
-- [ ] Capture the final image digests, job ids, model checksums, evaluation ids, deployment service ids, and HTTP prediction responses in `docs/operations/paddlex-object-detection-runbook.md`.
-- [ ] Commit verified fixes and evidence with `test: verify PaddleX production loop`.
+- [x] Build and push the PaddleX training and inference images to the configured registry, inspect their immutable digests, and store those digests in platform configuration.
+- [x] On an authorized x86 NVIDIA GPU node, run a two-epoch `PP-YOLOE-S` job using a real validated COCO dataset. Verify live logs, loss, learning rate, GPU/CPU/RAM metrics, AP metrics, VisualDL/MLflow/TensorBoard sources, best/static artifacts, evaluation, image inference, deployment, stop/start, and restart reconciliation.
+- [x] Repeat the full two-epoch loop for `RT-DETR-L`.
+- [x] Restart API, edge executor, Redis, and frontend while one job is active. Verify job/attempt identity, progress, logs, metrics, and final artifacts remain correct.
+- [x] Clone a completed PaddleX pipeline to Ultralytics with the same dataset. Verify the original framework remains locked and compare only canonical AP/resource metrics.
+- [x] Temporarily make MLflow unavailable and verify training continues with TensorBoard/VisualDL/JSONL fallback; restore MLflow and verify source availability recovers.
+- [x] Capture the final image digests, job ids, model checksums, evaluation ids, deployment service ids, and HTTP prediction responses in `docs/operations/paddlex-object-detection-runbook.md`.
+- [x] Commit verified fixes and evidence with `test: verify PaddleX production loop`.
 
 ## Final Review Gate
 
-- [ ] Confirm every framework-specific control-plane branch is behind the adapter registry; remaining `engine` reads exist only in the documented compatibility layer and migration tests.
-- [ ] Confirm all persisted jobs include adapter version, framework version, image digest, model revision/checksum, dataset manifest checksum, allocation, and launch-spec checksum.
-- [ ] Confirm no API container imports PaddlePaddle or PaddleX.
-- [ ] Confirm no user input can set a shell command, container entrypoint, host path, image tag, or unchecked artifact path.
-- [ ] Confirm pipeline framework lock and clone behavior are enforced in API and UI.
-- [ ] Confirm native charts never mix incompatible units or framework-proprietary loss definitions.
+- [x] Confirm every framework-specific control-plane branch is behind the adapter registry; remaining `engine` reads exist only in the documented compatibility layer and migration tests.
+- [x] Confirm all persisted jobs include adapter version, framework version, image digest, model revision/checksum, dataset manifest checksum, allocation, and launch-spec checksum.
+- [x] Confirm no API container imports PaddlePaddle or PaddleX.
+- [x] Confirm no user input can set a shell command, container entrypoint, host path, image tag, or unchecked artifact path.
+- [x] Confirm pipeline framework lock and clone behavior are enforced in API and UI.
+- [x] Confirm native charts never mix incompatible units or framework-proprietary loss definitions.
 - [ ] Confirm stop, resume, failure, reconciliation, evaluation, inference, deployment, rollback, logs, and artifact downloads work for both PaddleX models.
 - [ ] Run `git status --short` and include only intended source, tests, migrations, docs, and lock files in the final commit.
 
@@ -517,4 +517,3 @@ Expected: Vitest, Vue type checking, and production build all pass.
 - PaddlePaddle Docker/runtime compatibility: `https://paddlepaddle.github.io/PaddleX/latest/en/installation/paddlepaddle_install.html`
 - PaddleX VisualDL integration: `https://paddlepaddle.github.io/PaddleX/3.4/en/VisualDL.html`
 - PaddleDetection VisualDL training flags: `https://github.com/PaddlePaddle/PaddleDetection/blob/master/docs/tutorials/QUICK_STARTED.md`
-

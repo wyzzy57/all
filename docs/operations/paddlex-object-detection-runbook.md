@@ -81,18 +81,21 @@ Stop the profile and remove the environment variable after diagnosis. The
 standard operator experience is the Visiox UI; MLflow, TensorBoard, and
 VisualDL are secondary diagnostics.
 
-## Task 16 Production Acceptance Record (2026-08-08)
+## Task 16 Production Acceptance Record (2026-08-11)
 
-Status: partially accepted. PP-YOLOE-S completed two epochs; edge disk blocks
-RT-DETR-L and inference deployment.
+Status: accepted for the production object-detection loop on the authorized
+x86 NVIDIA node. PP-YOLOE-S, RT-DETR-L, deployment, live inference,
+stop/start, restart reconciliation, cross-framework comparison, and
+observability fallback were exercised with real workloads.
 Values in this section are measured production evidence, not examples.
 
-Local regression at baseline `262b93e` plus the verified acceptance fixes:
+Local regression on the final acceptance changes:
 
-- Backend: 1,253 passed, 6 skipped, 2 warnings in 1,624.60 seconds.
+- Backend: 1,276 passed, 6 skipped, 4 warnings in 1,629.28 seconds.
 - Frontend: 307 Vitest tests passed; typecheck and production build exited 0.
-- PaddleX dataset adapter: 25 passed, 1 warning in 62.00 seconds.
-- Distributed edge plan: 67 passed in 1.68 seconds.
+- Ruff passed for every changed Python file; `git diff --check` passed.
+- Compose configuration resolved successfully and the rebuilt edge executor ran
+  the committed MLflow fallback and dataset-mount code.
 
 Authorized edge node:
 
@@ -143,9 +146,9 @@ capabilities, validated datasets, and the published versions endpoint.
 Final immutable runtime images in `10.10.40.209:5000`:
 
 - Training linux/amd64:
-  `visiox/paddlex-training@sha256:bb51da961967751c35992901496aa35a414704dae6b8af652755e6c627dd54e0`.
+  `visiox/paddlex-training@sha256:f207f9f8b886a7393e534b170d6a41c43235075c03f97e5d7feafc715a04b318`.
 - Inference linux/amd64:
-  `visiox/paddlex-inference@sha256:9e9d4ac732706fa3e29a4a1070324367d101e8efe58fed0d491ec4f5f1389136`.
+  `visiox/paddlex-inference@sha256:31e8342d0e8c0e0fa81ba946622bc83899a6e5f653887f35d3855cdf7a86ae75`.
 - Immutable CUDA base:
   `nvidia/cuda:11.8.0-base-ubuntu22.04@sha256:79e5b2cf878ee9006f5b3738caeea34fdc7708a32db53fe3e80db0b48bd286a0`.
 
@@ -174,15 +177,74 @@ artifact upload, and observability capture. Its terminal metrics were bbox mAP
 0.0 and loss 39.052879; acceptance verifies the production path, not model
 quality. A final-image GPU export probe also returned exit 0.
 
-Remaining blocker: after that run the edge root filesystem had only
-816,603,136 bytes available and reported 100 percent use. LVM has `VFree=0`
-and no alternate data filesystem. The inference image was not pulled and
-RT-DETR-L was not launched because another dataset stage/output plus image
-would fill the node. Preserved bind-mounted datasets, outputs, and model cache,
-volumes, running containers, unrelated images, and GPU PID 698553 were not
-removed or stopped. Therefore RT-DETR-L, live inference/deployment,
-stop/recovery, MLflow outage/fallback/recovery, Ultralytics metric comparison,
-and final restart-reconciliation evidence remain unverified.
+Verified restart-safe RT-DETR-L production run:
+
+- Pipeline `40b0080b-9d61-406e-ac03-d859e902151f`.
+- Job `e4986683-124a-4fbd-bef7-a4fc69ca0b21`; run
+  `efbe4c8c-d538-4976-a5a4-5ddd9adb0e9a`; remote execution
+  `3c026e75-16bb-4dce-8123-0ba26cc7e5ae`.
+- Trained model `430cdb3c-759b-4b6e-8b82-aed49660a996`.
+- The active remote container remained `bb6ca5...` across the control-plane
+  restart. Job identity, logs, metrics, and artifacts reconciled successfully.
+- Terminal metrics: bbox mAP 0.735, AP50 0.894, AP75 0.859, AR 0.877.
+- MLflow, TensorBoard, VisualDL, and GPU telemetry were present.
+
+Verified deployment and HTTP inference:
+
+- Service `6929d02d-f079-45b1-aab8-0d805572b514`; instance
+  `289a3cf5...`; container `2f4edbadacd07c884e40007760c470c752ae76387e58aa07b0cb5af1948bde21`.
+- Endpoint `http://10.10.13.20:18083` returned a real image prediction with
+  51 detections, labels `0` and `2`, and 226 ms reported latency.
+- Stop/start completed successfully. Restart reconciliation retained the same
+  container and reported phase `reconciled_running` with a healthy endpoint.
+
+Verified Ultralytics comparison on the same DatasetVersion:
+
+- The original PaddleX pipeline rejected a framework mutation with HTTP 409
+  and `Pipeline framework identity is locked; clone the pipeline to change it`.
+- Clone pipeline `353f47fd-73da-4f76-9d74-5b5556ea9278`; job
+  `a0cef819-c6f0-4a00-b678-2e5296ff2f0a`; run
+  `2b0b00d1-1129-4f03-a166-b84d1a5e7b3a`; execution
+  `3a881369-eb2d-402d-8aeb-89e3d575c0df`; model
+  `f96453c8-1616-4c09-9baa-6cb8a4067cbe`.
+- The two-epoch job produced `best.pt`, `last.pt`, epoch samples, GPU metrics,
+  and the full visualization set.
+- Canonical comparison metrics: precision 0.403486, recall 0.612153, mAP50
+  0.504386, and mAP50-95 0.316008. Framework-private losses were not compared.
+
+Verified MLflow outage and fallback:
+
+- Pipeline `dacca306-272c-4b8c-b5f8-ec5b4dc83ef5`; job
+  `3bc3f128-fd3c-4b75-ba03-1f27bc4d77e5`; run
+  `1debd5a7-a512-4acc-b2c7-907a699158d6`; execution
+  `6bf8be19-e9cc-4032-a97b-bcfb975029e2`.
+- The two-epoch PaddleX job completed while the configured MLflow endpoint was
+  unavailable. Its immutable run snapshot records MLflow unavailable with the
+  connection timeout reason while VisualDL, JSONL progress, resource telemetry,
+  and artifacts remained available.
+- Terminal metrics: bbox mAP 0.746, AP50 0.912, AP75 0.873, AR 0.852; observed
+  GPU memory 10,567/12,288 MiB.
+- `best_model.pdparams` model `2285e214-c8ad-4034-8dee-3be19399ba1d`
+  and `model_final.pdparams` model `45d3765b-77e8-43cd-8d8a-04efd750d9c0`
+  both have SHA-256
+  `37df693f0bd1459e8876505659e12ef919b5bf6be023b08f49c4213fae3fcc47`.
+  Static `inference.json` model `7b122750-a027-4d39-8953-1aa1dacb7da1`
+  has SHA-256
+  `bc5a85c0bf535ab3ef1578e78e99cf1bf23bd0ffbe22f696447eddc41914caef`.
+- Validation ran inside the training attempt and did not create a separate
+  `PipelineEvaluation` row, so there is no standalone evaluation ID for this
+  run. The evaluation metrics above remain attached to the immutable run.
+- After MLflow was restored, its HTTP endpoint returned 200 and the authenticated
+  observability summary reported MLflow available again. The historical run
+  snapshot correctly remained a record of the outage experienced during training.
+
+During acceptance, a failed run exposed edge disk exhaustion rather than a
+PaddleX or MLflow failure. Cleanup removed only stopped, run-labelled
+containers and their exact resolved workspaces after durable failure or success
+was confirmed. Two unreferenced Ultralytics images were removed only after
+verifying that no container used them; their immutable registry manifests were
+preserved. No running container, volume, dataset, model cache, database record,
+or object-storage artifact was deleted.
 
 ## Incident and Rollback
 

@@ -906,7 +906,7 @@ def test_clone_locked_pipeline_copies_configuration_without_jobs(
     assert body["cloned_from_pipeline_id"] == source.json()["id"]
     assert body["framework_locked_at"] is None
     assert body["first_submitted_job_id"] is None
-    assert body["status"] == "draft"
+    assert body["status"] == "ready"
     assert body["dataset_id"] == dataset_id
     assert body["base_model_id"] == base_model_id
     assert body["params_template"] == source.json()["params_template"]

@@ -14,6 +14,10 @@ class FakeMlflow:
         self.started: list[dict[str, object]] = []
         self.metrics: list[tuple[dict[str, float], int]] = []
         self.ended: list[str] = []
+        self.tracking_uris: list[str] = []
+
+    def set_tracking_uri(self, uri: str) -> None:
+        self.tracking_uris.append(uri)
 
     def start_run(self, **kwargs) -> None:
         self.started.append(kwargs)
@@ -111,6 +115,7 @@ def test_recorder_writes_canonical_jsonl_and_mirrors_metrics(tmp_path) -> None:
         tmp_path,
         run_name="visiox-job-1",
         tags={"visiox.training_job_id": "job-1"},
+        mlflow_tracking_uri="http://platform.test:5001",
         mlflow_module=mlflow,
         writer_factory=lambda _: writer,
     )
@@ -138,6 +143,7 @@ def test_recorder_writes_canonical_jsonl_and_mirrors_metrics(tmp_path) -> None:
             "tags": {"visiox.training_job_id": "job-1"},
         }
     ]
+    assert mlflow.tracking_uris == ["http://platform.test:5001"]
     assert mlflow.metrics == [({"learning_rate": 0.001, "loss": 2.5}, 10)]
     assert writer.scalars == [
         ("learning_rate", 0.001, 10),

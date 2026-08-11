@@ -19,7 +19,6 @@ from visiox_paddlex_training_worker.config import (
     ADAPTER_KEY,
     ADAPTER_VERSION,
     BEST_INFERENCE_DIR,
-    build_export_command,
     build_training_command,
     build_training_config,
 )
@@ -48,7 +47,6 @@ def run_training(
 ) -> int:
     config = build_training_config(payload)
     command = build_training_command(config)
-    export_command = build_export_command(config)
     environment = dict(payload.get("env", {}))
     task_id = str(environment["VISIOX_TRAINING_JOB_ID"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -59,6 +57,7 @@ def run_training(
         output_dir,
         run_name=f"visiox-{task_id}",
         tags={"visiox.training_job_id": task_id, "visiox.framework": "paddlex"},
+        mlflow_tracking_uri=environment.get("MLFLOW_TRACKING_URI"),
         mlflow_module=mlflow_module,
         writer_factory=writer_factory,
     )
@@ -112,24 +111,12 @@ def run_training(
                     )
                     stderr.flush()
                     exit_code = 1
-                else:
-                    exit_code = _run_command(
-                        export_command,
-                        environment=managed_environment,
-                        stdout=stdout,
-                        stderr=stderr,
-                        popen_factory=popen_factory,
-                        stop_event=stop_event,
-                        on_tick=update_running_state,
-                        sleep=sleep,
-                        monotonic=monotonic,
+                elif not _static_bundle_is_complete(output_dir):
+                    stderr.write(
+                        "PaddleX training did not create a complete best-model static inference bundle\n"
                     )
-                    if exit_code == 0 and not _static_bundle_is_complete(output_dir):
-                        stderr.write(
-                            "PaddleX export did not create a complete static inference bundle\n"
-                        )
-                        stderr.flush()
-                        exit_code = 1
+                    stderr.flush()
+                    exit_code = 1
         state = (
             "canceled"
             if stop_event.is_set()

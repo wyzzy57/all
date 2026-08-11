@@ -116,7 +116,7 @@ def test_typed_parameters_build_an_argv_command_with_managed_paths() -> None:
     assert all("\n" not in argument for argument in command)
 
 
-def test_export_command_uses_trained_best_weights_and_static_bundle_dir() -> None:
+def test_export_command_uses_trained_dataset_identity_and_best_weights() -> None:
     module = _config_module()
     config = module.build_training_config(_launch_spec())
 
@@ -127,6 +127,8 @@ def test_export_command_uses_trained_best_weights_and_static_bundle_dir() -> Non
         "/opt/paddlex-runtime/paddlex/configs/modules/object_detection/RT-DETR-L.yaml",
         "-o",
         "Global.mode=export",
+        "-o",
+        "Global.dataset_dir=/workspace/dataset",
         "-o",
         "Global.output=/workspace/output/best_model/inference",
         "-o",

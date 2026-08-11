@@ -228,51 +228,67 @@ class DistributedTrainingHandler:
             ranks = tuple(_Rank.model_validate(item) for item in run.ranks)
             if not ranks or {rank.node_id for rank in ranks} != set(run.node_ids):
                 raise ValueError("distributed rank plan is incomplete")
-            self._transition(execution.id, "staging", 20)
-            artifacts = self._prepare_artifacts(
-                run, job, task, adapter, base_model, dataset
-            )
             staged: dict[str, _StageResult] = {}
-            runtime_inputs = _resolved_runtime_inputs(
-                job,
-                base_launch_spec,
-                artifacts,
-            )
-            staged_requests: dict[str, dict[str, Any]] = {}
-            for rank in ranks:
-                staging_request = _staging_request(
-                    run,
+            persisted_container_ids = tuple(run.container_ids or ())
+            if persisted_container_ids:
+                if len(persisted_container_ids) != len(ranks):
+                    raise ValueError("persisted distributed containers are incomplete")
+                resume_request = _resume_staging_request(
+                    run, job, adapter
+                )
+                for rank in ranks:
+                    target = self._stage._load_target(rank.node_id)
+                    response = self._stage._run_script(target, resume_request)
+                    staged[rank.node_id] = _StageResult.model_validate(response)
+                    launched.append((rank.node_id, rank.node_rank))
+            else:
+                self._transition(execution.id, "staging", 20)
+                artifacts = self._prepare_artifacts(
+                    run, job, task, adapter, base_model, dataset
+                )
+                runtime_inputs = _resolved_runtime_inputs(
                     job,
-                    rank,
-                    ranks,
-                    adapter.framework,
-                    base_launch_spec.adapter_key,
-                    base_launch_spec.adapter_version,
-                    runtime_inputs,
+                    base_launch_spec,
                     artifacts,
-                    environment=dict(base_launch_spec.env),
                 )
-                target = self._stage._load_target(rank.node_id)
-                response = self._stage._run_script(
-                    target,
-                    staging_request,
-                )
-                staged[rank.node_id] = _StageResult.model_validate(response)
-                staged_requests[rank.node_id] = staging_request
+                staged_requests: dict[str, dict[str, Any]] = {}
+                for rank in ranks:
+                    staging_request = _staging_request(
+                        run,
+                        job,
+                        rank,
+                        ranks,
+                        adapter.framework,
+                        base_launch_spec.adapter_key,
+                        base_launch_spec.adapter_version,
+                        runtime_inputs,
+                        artifacts,
+                        environment=dict(base_launch_spec.env),
+                        mlflow_tracking_uri=get_settings().mlflow_public_url,
+                    )
+                    target = self._stage._load_target(rank.node_id)
+                    response = self._stage._run_script(
+                        target,
+                        staging_request,
+                    )
+                    staged[rank.node_id] = _StageResult.model_validate(response)
+                    staged_requests[rank.node_id] = staging_request
 
-            self._transition(execution.id, "launching", 55)
-            for rank in ranks:
-                stage = staged[rank.node_id]
-                target = self._launch._load_target(rank.node_id)
-                response = self._launch._run_script(
-                    target,
-                    _launch_request(run, rank, stage, staged_requests[rank.node_id]),
-                )
-                launched_rank = _LaunchResult.model_validate(response)
-                if launched_rank.node_rank != rank.node_rank:
-                    raise ValueError("remote rank did not match the persisted plan")
-                launched.append((rank.node_id, rank.node_rank))
-                self._persist_container(run.id, launched_rank.container_id)
+                self._transition(execution.id, "launching", 55)
+                for rank in ranks:
+                    stage = staged[rank.node_id]
+                    target = self._launch._load_target(rank.node_id)
+                    response = self._launch._run_script(
+                        target,
+                        _launch_request(
+                            run, rank, stage, staged_requests[rank.node_id]
+                        ),
+                    )
+                    launched_rank = _LaunchResult.model_validate(response)
+                    if launched_rank.node_rank != rank.node_rank:
+                        raise ValueError("remote rank did not match the persisted plan")
+                    launched.append((rank.node_id, rank.node_rank))
+                    self._persist_container(run.id, launched_rank.container_id)
 
             self._mark_training(execution.id)
             containers = tuple(
@@ -1552,6 +1568,7 @@ def _staging_request(
     artifacts: list[dict[str, Any]],
     *,
     environment: Mapping[str, str] | None = None,
+    mlflow_tracking_uri: str | None = None,
 ) -> dict[str, Any]:
     signed_environment = {
         **dict(environment or {}),
@@ -1574,6 +1591,10 @@ def _staging_request(
         "HF_HOME": "/workspace/model-cache/huggingface",
         "MODELSCOPE_CACHE": "/workspace/model-cache/modelscope",
     }
+    if mlflow_tracking_uri:
+        signed_environment["MLFLOW_TRACKING_URI"] = mlflow_tracking_uri
+        signed_environment["MLFLOW_HTTP_REQUEST_TIMEOUT"] = "3"
+        signed_environment["MLFLOW_HTTP_REQUEST_MAX_RETRIES"] = "0"
     launch_spec_model = LaunchSpec(
         adapter_key=adapter_key,
         adapter_version=adapter_version,
@@ -1591,6 +1612,22 @@ def _staging_request(
         "launch_spec": launch_spec,
         "launch_spec_checksum": checksum,
         "artifacts": artifacts,
+    }
+
+
+def _resume_staging_request(
+    run: DistributedTrainingRun,
+    job: TrainingJob,
+    adapter: _RemoteAdapterContract,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "action": "resume",
+        "run_id": run.id,
+        "attempt": run.attempt,
+        "training_job_id": job.id,
+        "adapter_key": adapter.adapter_key,
+        "adapter_version": adapter.adapter_version,
     }
 
 
@@ -1710,7 +1747,11 @@ def _artifact_mounts(paths: Any) -> list[dict[str, Any]]:
         "checkpoint": "/workspace/checkpoint/last.pt",
     }
     return [
-        {"source": source, "target": targets[role], "read_only": True}
+        {
+            "source": source,
+            "target": targets[role],
+            "read_only": role != "dataset",
+        }
         for role, source in paths.items()
         if role in targets
     ]

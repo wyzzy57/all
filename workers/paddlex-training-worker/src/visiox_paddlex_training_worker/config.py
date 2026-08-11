@@ -133,6 +133,7 @@ def build_training_command(config: PaddleXTrainingConfig) -> tuple[str, ...]:
 def build_export_command(config: PaddleXTrainingConfig) -> tuple[str, ...]:
     overrides = (
         "Global.mode=export",
+        f"Global.dataset_dir={config.dataset_dir}",
         f"Global.output={BEST_INFERENCE_DIR}",
         "Global.device=gpu:" + ",".join(str(item) for item in config.devices),
         f"Export.weight_path={BEST_WEIGHTS_PATH}",

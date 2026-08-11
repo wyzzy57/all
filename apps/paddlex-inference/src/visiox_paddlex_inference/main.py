@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any
 
@@ -26,7 +26,7 @@ def create_app(
     runtime_config = config or load_config()
     runtime_predictor = predictor or load_predictor(runtime_config)
     runtime_metadata = runtime_predictor.runtime_metadata
-    loaded_at = datetime.now(UTC)
+    loaded_at = datetime.now(timezone.utc)
     app = FastAPI(title="Visiox PaddleX Inference", version="0.1.0")
 
     @app.get("/health")
@@ -72,7 +72,7 @@ def create_app(
                 width, height = image.size
         except (OSError, UnidentifiedImageError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Image content is invalid",
             ) from exc
         if width * height > MAX_IMAGE_PIXELS:
@@ -87,7 +87,7 @@ def create_app(
             )
         except Exception as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
             ) from exc
         return {
             "task": result.task,

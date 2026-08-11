@@ -80,6 +80,7 @@ def _launch_spec() -> dict[str, object]:
             ),
             "VISIOX_TRAINING_JOB_ID": "job-1",
             "VISIOX_OUTPUT_DIR": "/workspace/output",
+            "MLFLOW_TRACKING_URI": "http://platform.test:5001",
         },
         "working_directory": "workspace",
     }
@@ -341,18 +342,6 @@ def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
     assert config["output_eval"] == "/workspace/output"
 
 
-def test_paddlex_export_config_uses_absolute_output_directory() -> None:
-    module = _paddlex_main_module()
-    config: dict[str, object] = {"save_dir": "output"}
-
-    module.apply_export_runtime_config(
-        config,
-        output_dir="/workspace/output/best_model/inference",
-    )
-
-    assert config["save_dir"] == "/workspace/output/best_model/inference"
-
-
 def test_resource_sample_preserves_each_gpu(monkeypatch) -> None:
     resources = importlib.import_module("visiox_paddlex_training_worker.resources")
 
@@ -389,6 +378,14 @@ def test_worker_always_writes_durable_outputs_and_manifest(
 ) -> None:
     worker = _worker_module()
     popen_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    telemetry_calls: list[dict[str, object]] = []
+    recorder_type = worker.TelemetryRecorder
+
+    def recorder(*args, **kwargs):
+        telemetry_calls.append(dict(kwargs))
+        return recorder_type(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "TelemetryRecorder", recorder)
 
     class FakeProcess:
         def __init__(self, command, stdout, stderr) -> None:
@@ -405,6 +402,11 @@ def test_worker_always_writes_durable_outputs_and_manifest(
                 best = tmp_path / "best_model"
                 best.mkdir(parents=True, exist_ok=True)
                 (best / "best_model.pdparams").write_bytes(b"dynamic")
+                if returncode == 0:
+                    bundle = best / "inference"
+                    bundle.mkdir(parents=True, exist_ok=True)
+                    (bundle / "inference.json").write_text("{}", encoding="utf-8")
+                    (bundle / "inference.pdiparams").write_bytes(b"trained-static")
                 stdout.write(
                     "Epoch: [1] [1/2] learning_rate: 0.001 loss: 2.5\n"
                 )
@@ -454,7 +456,10 @@ def test_worker_always_writes_durable_outputs_and_manifest(
     )
 
     assert exit_code == returncode
-    assert len(popen_calls) == (2 if returncode == 0 and not stop_requested else 1)
+    assert telemetry_calls[0]["mlflow_tracking_uri"] == (
+        "http://platform.test:5001"
+    )
+    assert len(popen_calls) == 1
     assert popen_calls[0][0][:4] == (
         "python",
         "/opt/paddlex-runtime/paddlex_main.py",
@@ -470,9 +475,8 @@ def test_worker_always_writes_durable_outputs_and_manifest(
     assert (tmp_path / "stdout.log").read_text(encoding="utf-8").endswith(
         "loss: 2.5\n"
     )
-    expected_warning_count = 2 if returncode == 0 and not stop_requested else 1
     assert (tmp_path / "stderr.log").read_text(encoding="utf-8") == (
-        "durable warning\n" * expected_warning_count
+        "durable warning\n"
     )
     progress = json.loads(
         (tmp_path / "visiox-progress.json").read_text(encoding="utf-8")
@@ -496,7 +500,7 @@ def test_worker_always_writes_durable_outputs_and_manifest(
     } <= paths
 
 
-def test_export_failure_marks_the_training_run_failed(
+def test_missing_trainer_static_bundle_marks_the_training_run_failed(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -507,7 +511,7 @@ def test_export_failure_marks_the_training_run_failed(
         def __init__(self, command) -> None:
             nonlocal calls
             calls += 1
-            self.returncode = 0 if "Global.mode=train" in command else 9
+            self.returncode = 0
 
         def poll(self):
             return self.returncode
@@ -543,8 +547,8 @@ def test_export_failure_marks_the_training_run_failed(
         writer_factory=lambda _: None,
     )
 
-    assert calls == 2
-    assert exit_code == 9
+    assert calls == 1
+    assert exit_code == 1
     result = json.loads((tmp_path / "train_result.json").read_text(encoding="utf-8"))
     assert result["status"] == "failed"
 

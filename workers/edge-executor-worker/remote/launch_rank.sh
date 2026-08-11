@@ -118,10 +118,13 @@ def validate(request):
         invalid("mounts")
     targets = set()
     for mount in mounts:
-        if not isinstance(mount, dict) or set(mount) != {"source", "target", "read_only"} or mount["read_only"] is not True:
+        if not isinstance(mount, dict) or set(mount) != {"source", "target", "read_only"}:
             invalid("mount")
         if mount["target"] not in ALLOWED_ARTIFACT_TARGETS or mount["target"] in targets:
             invalid("mount-target")
+        expected_read_only = mount["target"] != "/workspace/dataset"
+        if mount["read_only"] is not expected_read_only:
+            invalid("mount-mode")
         source = Path(mount["source"]).resolve() if isinstance(mount["source"], str) else None
         if source is None or root not in source.parents or not source.exists():
             invalid("mount-source")
@@ -295,7 +298,10 @@ def main():
             "--mount", f"type=bind,src={cache_root},dst=/workspace/model-cache",
         ]
         for mount in request["mounts"]:
-            command.extend(["--mount", f"type=bind,src={mount['source']},dst={mount['target']},readonly"])
+            mount_option = f"type=bind,src={mount['source']},dst={mount['target']}"
+            if mount["read_only"]:
+                mount_option += ",readonly"
+            command.extend(["--mount", mount_option])
         base_environment = {"HOME": "/tmp", "USER": "visiox-edge", "LOGNAME": "visiox-edge", "YOLO_CONFIG_DIR": "/tmp", "MPLCONFIGDIR": "/tmp", "TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor"}
         for key, value in {**base_environment, **spec["env"]}.items():
             command.extend(["-e", f"{key}={value}"])

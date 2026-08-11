@@ -75,6 +75,7 @@ class TelemetryRecorder:
         *,
         run_name: str,
         tags: dict[str, str],
+        mlflow_tracking_uri: str | None = None,
         mlflow_module: Any | None = None,
         writer_factory: Callable[[str], Any] | None = None,
     ) -> None:
@@ -100,6 +101,8 @@ class TelemetryRecorder:
             self.mlflow_reason = "mlflow package is unavailable"
         else:
             try:
+                if mlflow_tracking_uri:
+                    self._mlflow.set_tracking_uri(mlflow_tracking_uri)
                 self._mlflow.start_run(run_name=run_name, tags=tags)
                 self.mlflow_available = True
                 self._mlflow_run_started = True

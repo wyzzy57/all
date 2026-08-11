@@ -127,6 +127,18 @@ def validate_launch_spec(spec):
 
 
 def validate(request):
+    if isinstance(request, dict) and request.get("action") == "resume":
+        expected = {"schema_version", "action", "run_id", "attempt", "training_job_id", "adapter_key", "adapter_version"}
+        if set(request) != expected or request.get("schema_version") != "1.0":
+            invalid()
+        if not isinstance(request["run_id"], str) or not IDENTIFIER.fullmatch(request["run_id"]):
+            invalid()
+        if not isinstance(request["attempt"], int) or isinstance(request["attempt"], bool) or request["attempt"] < 1:
+            invalid()
+        for key in ("training_job_id", "adapter_key", "adapter_version"):
+            if not isinstance(request[key], str) or not IDENTIFIER.fullmatch(request[key]):
+                invalid()
+        return request
     expected = {"schema_version", "run_id", "attempt", "runtime_image_digest", "launch_spec", "launch_spec_checksum", "artifacts"}
     if not isinstance(request, dict) or set(request) != expected or request.get("schema_version") != "1.0":
         invalid()
@@ -219,6 +231,30 @@ def main():
     try:
         with open(sys.argv[1], "r", encoding="utf-8") as source:
             request = validate(json.load(source))
+        root = Path.home() / ".local" / "share" / "visiox" / "training" / request["run_id"] / str(request["attempt"])
+        input_dir = root / "input"
+        output_dir = root / "output"
+        launch_spec_path = input_dir / "launch-spec.json"
+        if request.get("action") == "resume":
+            stage = "workspace-resume"
+            if not launch_spec_path.is_file() or not output_dir.is_dir():
+                raise ValueError("training workspace is unavailable")
+            encoded_spec = launch_spec_path.read_bytes()
+            spec = validate_launch_spec(json.loads(encoded_spec))
+            canonical_spec = json.dumps(spec, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            env = spec["env"]
+            if encoded_spec != canonical_spec:
+                raise ValueError("training launch spec is not canonical")
+            if (
+                spec["adapter_key"] != request["adapter_key"]
+                or spec["adapter_version"] != request["adapter_version"]
+                or env["VISIOX_TRAINING_JOB_ID"] != request["training_job_id"]
+                or env["VISIOX_TRAINING_RUN_ID"] != request["run_id"]
+                or env["VISIOX_TRAINING_ATTEMPT"] != str(request["attempt"])
+            ):
+                raise ValueError("training workspace identity mismatch")
+            print(json.dumps({"root": str(root), "paths": {"output": str(output_dir), "launch_spec": str(launch_spec_path), "artifacts": {}}}, ensure_ascii=True, separators=(",", ":"), sort_keys=True))
+            return 0
         stage = "runtime-image-pull"
         subprocess.run(["docker", "pull", request["runtime_image_digest"]], check=True, capture_output=True, text=True, timeout=1800)
         stage = "runtime-entrypoint-check"
@@ -230,9 +266,6 @@ def main():
             timeout=60,
         )
         stage = "workspace-prepare"
-        root = Path.home() / ".local" / "share" / "visiox" / "training" / request["run_id"] / str(request["attempt"])
-        input_dir = root / "input"
-        output_dir = root / "output"
         input_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
         output_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
         artifact_paths = {}
@@ -246,7 +279,6 @@ def main():
                 artifact_path = input_dir / artifact["unpack_to"]
                 unpack_dataset(destination, artifact_path)
             artifact_paths[artifact["role"]] = str(artifact_path)
-        launch_spec_path = input_dir / "launch-spec.json"
         launch_spec_path.write_text(json.dumps(request["launch_spec"], ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True), encoding="utf-8")
         launch_spec_path.chmod(0o440)
         print(json.dumps({"root": str(root), "paths": {"output": str(output_dir), "launch_spec": str(launch_spec_path), "artifacts": artifact_paths}}, ensure_ascii=True, separators=(",", ":"), sort_keys=True))

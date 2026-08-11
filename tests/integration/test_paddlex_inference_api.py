@@ -7,6 +7,7 @@ import sys
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import numpy as np
 from PIL import Image
 import pytest
 from pydantic import ValidationError
@@ -187,12 +188,13 @@ def test_paddlex_runtime_initializes_official_cpu_and_gpu_hpi_options(
                 ]
             }
         }
-        img = Image.new("RGB", (64, 48), "red")
+        img = {"res": Image.new("RGB", (64, 48), "red")}
 
     class FakeModel:
         def predict(self, **kwargs):
             image = kwargs["input"]
-            calls["predict_image_size"] = image.size
+            calls["predict_image_shape"] = image.shape
+            calls["predict_image_type"] = type(image)
             calls["predict_kwargs"] = kwargs
             return [FakeResult()]
 
@@ -224,10 +226,11 @@ def test_paddlex_runtime_initializes_official_cpu_and_gpu_hpi_options(
         "model_dir": str(tmp_path.resolve()),
         **expected_create_kwargs,
     }
-    assert calls["predict_image_size"] == (64, 48)
+    assert calls["predict_image_shape"] == (48, 64, 3)
+    assert calls["predict_image_type"] is np.ndarray
     assert set(calls["predict_kwargs"]) == {"input", "threshold"}
     assert calls["predict_kwargs"]["threshold"] == 0.25
-    assert calls["predict_kwargs"]["input"].size == (64, 48)
+    assert calls["predict_kwargs"]["input"].flags.c_contiguous
     assert predictor.runtime_metadata == expected_metadata
     assert result.predictions == [
         {
@@ -242,6 +245,43 @@ def test_paddlex_runtime_initializes_official_cpu_and_gpu_hpi_options(
     assert header == "data:image/png;base64"
     with Image.open(BytesIO(base64.b64decode(encoded))) as rendered:
         assert rendered.size == (64, 48)
+
+
+def test_paddlex_runtime_does_not_override_rt_detr_static_input_shape(
+    tmp_path, monkeypatch
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeModel:
+        pass
+
+    def create_model(**kwargs):
+        calls["create_kwargs"] = kwargs
+        return FakeModel()
+
+    monkeypatch.setitem(
+        sys.modules, "paddlex", SimpleNamespace(create_model=create_model)
+    )
+    (tmp_path / "inference.yml").write_text(
+        "Global:\n  model_name: RT-DETR-L\n", encoding="utf-8"
+    )
+
+    load_predictor(
+        InferenceConfig(
+            production=True,
+            model_dir=tmp_path,
+            device="gpu:0",
+            backend="paddle_inference",
+            input_size=(640, 640),
+        )
+    )
+
+    assert calls["create_kwargs"] == {
+        "model_name": "RT-DETR-L",
+        "model_dir": str(tmp_path.resolve()),
+        "device": "gpu:0",
+        "use_hpip": False,
+    }
 
 
 def test_paddlex_inference_rejects_invalid_image_and_unbounded_results(
@@ -267,6 +307,30 @@ def test_paddlex_inference_rejects_invalid_image_and_unbounded_results(
         )
 
     assert invalid.status_code == 422
+
+
+def test_paddlex_inference_returns_422_when_runtime_rejects_valid_image(
+    tmp_path,
+) -> None:
+    class FailingPredictor:
+        runtime_metadata = {
+            "resolved_backend": "paddle_inference",
+            "resolved_precision": "fp32",
+        }
+
+        def predict_image(self, image_bytes: bytes, metadata=None) -> PredictionResult:
+            raise ValueError("prediction failed")
+
+    with TestClient(
+        create_app(InferenceConfig(model_dir=tmp_path), predictor=FailingPredictor())
+    ) as client:
+        response = client.post(
+            "/predict/image",
+            files={"file": ("valid.png", _image_bytes(), "image/png")},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "prediction failed"}
 
 
 def test_paddlex_inference_rejects_image_with_too_many_pixels(
@@ -406,6 +470,17 @@ def test_paddlex_dockerfile_uses_exported_bundle_without_training_plugin() -> No
     assert "paddlex --install" not in dockerfile
     assert "PaddleDetection.git" not in dockerfile
     assert "USER visiox" in dockerfile
+
+
+def test_paddlex_inference_entrypoint_is_compatible_with_python_3_10() -> None:
+    source = (
+        __import__("pathlib")
+        .Path("apps/paddlex-inference/src/visiox_paddlex_inference/main.py")
+        .read_text(encoding="utf-8")
+    )
+
+    assert "from datetime import UTC" not in source
+    assert "datetime.now(UTC)" not in source
 
 
 def test_api_service_can_launch_the_isolated_paddlex_runtime() -> None:

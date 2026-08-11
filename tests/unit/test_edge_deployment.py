@@ -951,6 +951,7 @@ def test_paddlex_remote_request_mounts_verified_bundle_directory_read_only() -> 
         for mount in mounts
     )
     assert "VISIOX_INFERENCE_CONFIG=/app/config.json" in args
+    assert "HOME=/tmp/visiox-paddlex" in args
     assert "com.visiox.framework=paddlex" in args
     assert "com.visiox.resolved-backend=paddlex_hpi_tensorrt" in args
 
@@ -1028,6 +1029,24 @@ def test_deploy_script_exposes_only_active_container_to_the_lan() -> None:
     assert ["-p", "0.0.0.0:18080:8080"] == active_args[
         active_args.index("-p") : active_args.index("-p") + 2
     ]
+
+
+def test_deploy_script_accepts_dual_stack_docker_port_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _script_namespace("deploy_inference.sh")
+    operations_type = namespace["Operations"]
+    operations = object.__new__(operations_type)  # type: ignore[arg-type]
+
+    monkeypatch.setitem(
+        namespace,
+        "_run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout="0.0.0.0:18080\n[::]:18080\n"
+        ),
+    )
+
+    assert operations._host_port("a" * 64) == 18080
 
 
 def test_deploy_script_writes_production_image_only_inference_config(
