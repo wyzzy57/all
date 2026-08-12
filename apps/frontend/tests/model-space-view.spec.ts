@@ -954,7 +954,7 @@ describe("ModelSpaceView", () => {
     await wrapper.get('[data-testid="yaml-tab"]').trigger("click");
     const editor = wrapper.get<HTMLTextAreaElement>('[data-testid="framework-yaml-editor"]');
     await editor.setValue("unknown_parameter: 1");
-    expect(wrapper.get('[data-testid="yaml-errors"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="yaml-errors"]').exists()).toBe(true);
 
     await stepButtons[3].trigger("click");
     await flushPromises();
