@@ -1,6 +1,6 @@
 :root {
   color: #172033;
-  background: #f7f7f8;
+  background: #ffffff;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   --visiox-primary: #2563eb;
@@ -11,12 +11,12 @@
   --visiox-border: #dfe5ef;
   --visiox-border-soft: #e9edf4;
   --visiox-surface: #ffffff;
-  --visiox-card-surface: #f3f4f6;
-  --visiox-card-surface-raised: #f6f7f8;
+  --visiox-card-surface: #ffffff;
+  --visiox-card-surface-raised: #ffffff;
   --visiox-card-border: #e0e2e6;
   --visiox-card-radius: 8px;
-  --visiox-canvas: #f7f7f8;
-  --visiox-sidebar: #f3f3f3;
+  --visiox-canvas: #ffffff;
+  --visiox-sidebar: #ffffff;
   --visiox-neutral-hover: #ececec;
   --visiox-neutral-active: #e7e7e7;
   --visiox-radius: 6px;

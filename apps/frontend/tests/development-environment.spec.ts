@@ -25,6 +25,12 @@ describe("frontend development environment", () => {
     expect(source).toContain('"/llm": apiProxy');
   });
 
+  it("proxies training framework capability APIs in local development", () => {
+    const source = readFileSync(resolve(process.cwd(), "vite.config.ts"), "utf8");
+
+    expect(source).toContain('"/frameworks": apiProxy');
+  });
+
   it("proxies identity and account APIs in local development", () => {
     const source = readFileSync(resolve(process.cwd(), "vite.config.ts"), "utf8");
 

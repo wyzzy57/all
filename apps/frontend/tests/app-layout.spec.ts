@@ -63,9 +63,9 @@ describe("global application header", () => {
     );
   });
 
-  it("uses a neutral ChatGPT-style canvas and neutral selected navigation", () => {
-    expect(stylesSource).toContain("--visiox-canvas: #f7f7f8");
-    expect(stylesSource).toContain("--visiox-sidebar: #f3f3f3");
+  it("uses a white application canvas and neutral selected navigation", () => {
+    expect(stylesSource).toContain("--visiox-canvas: #ffffff");
+    expect(stylesSource).toContain("--visiox-sidebar: #ffffff");
     expect(stylesSource).toMatch(/\.nav-menu \.el-menu-item\.is-active\s*\{[^}]*background:\s*#e7e7e7;[^}]*color:\s*#171717/s);
     expect(stylesSource).not.toMatch(/\.nav-menu \.el-menu-item\.is-active::before/);
     expect(stylesSource).toContain(".nav-group");
@@ -75,10 +75,17 @@ describe("global application header", () => {
 
   it("defines the shared business card surface tokens on the root", () => {
     const rootRule = topLevelRuleDeclarations(stylesSource, ":root");
-    expect(rootRule?.get("--visiox-card-surface")).toEqual(["#f3f4f6"]);
-    expect(rootRule?.get("--visiox-card-surface-raised")).toEqual(["#f6f7f8"]);
+    expect(rootRule?.get("--visiox-surface")).toEqual(["#ffffff"]);
+    expect(rootRule?.get("--visiox-card-surface")).toEqual(["#ffffff"]);
+    expect(rootRule?.get("--visiox-card-surface-raised")).toEqual(["#ffffff"]);
     expect(rootRule?.get("--visiox-card-border")).toEqual(["#e0e2e6"]);
     expect(rootRule?.get("--visiox-card-radius")).toEqual(["8px"]);
+  });
+
+  it("keeps the workbench surfaces white while preserving bordered sections", () => {
+    expect(workbenchSource).toContain("--workbench-surface: #ffffff");
+    expect(workbenchSource).toContain("--workbench-surface-raised: #ffffff");
+    expect(workbenchSource).toContain("border: 1px solid var(--workbench-border)");
   });
 
   it("visually collapses the sidebar on narrow screens and keeps an explicit account focus ring", () => {

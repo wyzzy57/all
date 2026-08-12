@@ -320,8 +320,8 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .workbench-view {
-  --workbench-surface: #f3f4f6;
-  --workbench-surface-raised: #f6f7f8;
+  --workbench-surface: #ffffff;
+  --workbench-surface-raised: #ffffff;
   --workbench-border: #e0e2e6;
 
   container: workbench / inline-size;

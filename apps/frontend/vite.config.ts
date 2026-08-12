@@ -22,6 +22,7 @@ export default defineConfig({
       "/auth": apiProxy,
       "/base-models": apiProxy,
       "/datasets": apiProxy,
+      "/frameworks": apiProxy,
       "/health": apiProxy,
       "/label-projects": apiProxy,
       "/log-streams": apiProxy,
