@@ -359,6 +359,10 @@ export type FrameworkModelCapabilityRecord = {
   source?: string | null;
   revision?: string | null;
   sources?: string[];
+  config_format?: "yaml" | null;
+  config_template?: string | null;
+  basic_parameter_names?: string[];
+  managed_parameter_names?: string[];
 };
 
 export type FrameworkParameterCapabilityRecord = {
