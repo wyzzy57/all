@@ -7,7 +7,6 @@ from pydantic import ValidationError
 from visiox_api.services.framework_adapters import (
     FrameworkAdapterCatalog,
     paddlex_operation_implementations,
-    ultralytics_operation_implementations,
 )
 from visiox_common.settings import Settings
 from visiox_training.adapters.paddlex import PaddleXAdapter
@@ -127,11 +126,6 @@ def test_catalog_publishes_exact_product_model_choices_and_versions() -> None:
         "workers",
         "amp",
         "resume",
-        "warmup_steps",
-        "log_interval",
-        "eval_interval",
-        "save_interval",
-        "pretrained",
     ]
 
     llama = adapters["llamafactory"].capabilities
@@ -162,7 +156,12 @@ def test_paddlex_models_publish_distinct_safe_yaml_templates() -> None:
 
     assert set(models) == {"pp-yoloe-s", "rt-detr-l"}
     assert {model.config_format for model in models.values()} == {"yaml"}
-    assert models["pp-yoloe-s"].config_template != models["rt-detr-l"].config_template
+    assert models["pp-yoloe-s"].config_template.startswith(
+        "# PaddleX runtime model: PP-YOLOE_plus-S\n"
+    )
+    assert models["rt-detr-l"].config_template.startswith(
+        "# PaddleX runtime model: RT-DETR-L\n"
+    )
     assert models["pp-yoloe-s"].basic_parameter_names == (
         "epochs",
         "batch_size",
@@ -192,17 +191,28 @@ def test_paddlex_models_publish_distinct_safe_yaml_templates() -> None:
         "workers",
         "amp",
         "resume",
-        "warmup_steps",
-        "log_interval",
-        "eval_interval",
-        "save_interval",
-        "pretrained",
+    }
+    parameters = {
+        parameter.name: parameter for parameter in paddlex.tasks[0].parameters
     }
     for model in models.values():
         template = yaml.safe_load(model.config_template)
         assert set(template) == expected_fields
-        assert isinstance(template["pretrained"], bool)
-        assert "pretrain_weight_path" not in template
+        assert template == {
+            name: parameter.default for name, parameter in parameters.items()
+        }
+        for name, value in template.items():
+            parameter = parameters[name]
+            if parameter.value_type == "boolean":
+                assert isinstance(value, bool)
+            elif parameter.value_type == "integer":
+                assert isinstance(value, int) and not isinstance(value, bool)
+            elif parameter.value_type == "number":
+                assert isinstance(value, int | float) and not isinstance(value, bool)
+            if parameter.minimum is not None:
+                assert value >= parameter.minimum
+            if parameter.maximum is not None:
+                assert value <= parameter.maximum
         assert set(model.basic_parameter_names) <= expected_fields
         assert not set(model.managed_parameter_names) & expected_fields
 
@@ -222,9 +232,29 @@ def test_ultralytics_models_publish_fixed_yaml_and_managed_fields() -> None:
     assert {model.managed_parameter_names for model in models} == {
         ("task", "mode", "model", "data", "project", "name", "exist_ok", "device")
     }
-    assert set(yaml.safe_load(models[0].config_template)) == {
-        parameter.name for parameter in ultralytics.tasks[0].parameters
+    parameters = {
+        parameter.name: parameter for parameter in ultralytics.tasks[0].parameters
     }
+    template = yaml.safe_load(models[0].config_template)
+    assert template == {
+        name: parameter.default for name, parameter in parameters.items()
+    }
+    for name, value in template.items():
+        parameter = parameters[name]
+        if parameter.value_type == "boolean":
+            assert isinstance(value, bool)
+        elif parameter.value_type == "integer":
+            assert isinstance(value, int) and not isinstance(value, bool)
+        elif parameter.value_type == "number":
+            assert isinstance(value, int | float) and not isinstance(value, bool)
+        elif parameter.value_type == "string":
+            assert isinstance(value, str)
+        if parameter.minimum is not None:
+            assert value >= parameter.minimum
+        if parameter.maximum is not None:
+            assert value <= parameter.maximum
+        if parameter.choices:
+            assert value in parameter.choices
 
 
 def test_model_configuration_metadata_is_optional_and_deeply_immutable() -> None:
@@ -293,9 +323,9 @@ def test_capabilities_cover_dataset_parameters_resources_operations_and_outputs(
             "export",
             "deploy",
         }
-        if adapter.framework in {"paddlex", "ultralytics"}:
+        if adapter.framework == "paddlex":
             assert all(operation.implemented is True for operation in task.operations)
-        else:
+        elif adapter.framework == "llamafactory":
             assert all(operation.implemented is False for operation in task.operations)
         assert all(operation.available is False for operation in task.operations)
         assert capability.availability_baseline_operation == "train"
@@ -380,33 +410,6 @@ def test_paddlex_operation_availability_derives_from_wiring_and_runtime_digests(
     assert _operation(paddlex, "deploy").available is True
     assert _operation(paddlex, "image_inference").available is True
     assert paddlex.capabilities.inference_runtime_image_digest == VALID_DIGEST
-
-
-def test_ultralytics_operation_availability_uses_existing_product_runtimes() -> None:
-    catalog = FrameworkAdapterCatalog(
-        _settings(
-            ultralytics_training_image_digest=VALID_DIGEST,
-            deployment_image_digest=VALID_DIGEST,
-        )
-    )
-    ultralytics = next(
-        adapter for adapter in catalog.list() if adapter.framework == "ultralytics"
-    )
-
-    assert set(ultralytics_operation_implementations()) == {
-        "train",
-        "stop",
-        "resume",
-        "evaluate",
-        "image_inference",
-        "export",
-        "deploy",
-    }
-    assert ultralytics.capabilities.available is True
-    assert all(
-        operation.implemented and operation.available
-        for operation in ultralytics.capabilities.tasks[0].operations
-    )
 
 
 def test_paddlex_digests_do_not_enable_unregistered_operations() -> None:

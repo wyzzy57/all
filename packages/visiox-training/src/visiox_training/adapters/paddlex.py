@@ -34,31 +34,23 @@ _MANAGED_PARAMETER_NAMES = (
     "device",
     "resume_path",
 )
-_PP_YOLOE_S_CONFIG_TEMPLATE = """epochs: 100
+_PP_YOLOE_S_CONFIG_TEMPLATE = """# PaddleX runtime model: PP-YOLOE_plus-S
+epochs: 100
 batch_size: 8
 learning_rate: 0.001
 image_size: 640
 workers: 4
 amp: true
 resume: false
-warmup_steps: 1000
-log_interval: 10
-eval_interval: 1
-save_interval: 1
-pretrained: true
 """
-_RT_DETR_L_CONFIG_TEMPLATE = """epochs: 72
-batch_size: 4
-learning_rate: 0.0001
+_RT_DETR_L_CONFIG_TEMPLATE = """# PaddleX runtime model: RT-DETR-L
+epochs: 100
+batch_size: 8
+learning_rate: 0.001
 image_size: 640
 workers: 4
 amp: true
 resume: false
-warmup_steps: 1000
-log_interval: 10
-eval_interval: 1
-save_interval: 1
-pretrained: true
 """
 
 
@@ -211,49 +203,6 @@ class PaddleXAdapter(FrameworkAdapter):
                             value_type="boolean",
                             default=False,
                             help_text="Resume from the managed last checkpoint",
-                            advanced_group="training",
-                        ),
-                        ParameterCapability(
-                            name="warmup_steps",
-                            value_type="integer",
-                            default=1000,
-                            minimum=0,
-                            maximum=1000000,
-                            help_text="Number of optimizer warmup steps",
-                            advanced_group="optimizer",
-                        ),
-                        ParameterCapability(
-                            name="log_interval",
-                            value_type="integer",
-                            default=10,
-                            minimum=1,
-                            maximum=10000,
-                            help_text="Training steps between log records",
-                            advanced_group="observability",
-                        ),
-                        ParameterCapability(
-                            name="eval_interval",
-                            value_type="integer",
-                            default=1,
-                            minimum=1,
-                            maximum=1000,
-                            help_text="Training epochs between evaluations",
-                            advanced_group="evaluation",
-                        ),
-                        ParameterCapability(
-                            name="save_interval",
-                            value_type="integer",
-                            default=1,
-                            minimum=1,
-                            maximum=1000,
-                            help_text="Training epochs between checkpoints",
-                            advanced_group="checkpointing",
-                        ),
-                        ParameterCapability(
-                            name="pretrained",
-                            value_type="boolean",
-                            default=True,
-                            help_text="Use the model catalog's managed pretrained weights",
                             advanced_group="training",
                         ),
                     ),
