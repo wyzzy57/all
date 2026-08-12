@@ -47,6 +47,13 @@ async function mountDialog(role: "member" | "admin", initialSection: ManagementS
 }
 
 describe("ManagementCenterDialog", () => {
+  it("gives desktop management tables more room without widening the navigation rail", async () => {
+    const wrapper = await mountDialog("admin", "users");
+
+    expect(wrapper.get(".el-dialog").attributes("style")).toContain("width: min(1320px, 94vw)");
+    expect(wrapper.get(".management-center-frame").classes()).toContain("management-center-frame");
+  });
+
   it("opens directly on the requested administrator section", async () => {
     const wrapper = await mountDialog("admin", "users");
 
