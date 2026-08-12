@@ -146,7 +146,7 @@ describe("identity administration views", () => {
 
   it("loads all member selector pages and replaces group membership", async () => {
     vi.spyOn(api, "listUserGroups").mockResolvedValue({
-      items: [{ id: "g1", name: "研发组", description: null, status: "active", member_ids: ["u1"], member_count: 1 }],
+      items: [{ id: "g1", name: "研发组", description: null, status: "active", member_ids: ["deleted-user", "u1"], member_count: 2 }],
       total: 1,
     });
     const listUsers = vi.spyOn(api, "listUsers").mockImplementation(async ({ offset = 0 } = {}) => (
