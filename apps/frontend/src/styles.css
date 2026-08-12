@@ -94,8 +94,8 @@ textarea {
 .brand-x {
   margin-left: 1px;
   color: #3269eb;
-  font-style: italic;
-  transform: skewX(-9deg);
+  font-style: normal;
+  transform: none;
 }
 
 .app-sidebar {

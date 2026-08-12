@@ -63,6 +63,12 @@ describe("global application header", () => {
     );
   });
 
+  it("renders the blue wordmark X upright", () => {
+    expect(stylesSource).toMatch(
+      /\.brand-x\s*\{[^}]*font-style:\s*normal;[^}]*transform:\s*none;/s,
+    );
+  });
+
   it("uses a white application canvas and neutral selected navigation", () => {
     expect(stylesSource).toContain("--visiox-canvas: #ffffff");
     expect(stylesSource).toContain("--visiox-sidebar: #ffffff");
