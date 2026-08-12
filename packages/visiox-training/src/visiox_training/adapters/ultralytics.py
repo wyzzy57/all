@@ -7,6 +7,7 @@ from visiox_training.adapters.base import FrameworkAdapter
 from visiox_training.capabilities import (
     FrameworkCapabilities,
     ModelCapability,
+    OperationName,
     ParameterCapability,
     ResourceCapability,
     TaskCapability,
@@ -23,8 +24,41 @@ from visiox_training.contracts import (
 from visiox_training.errors import UnsupportedAdapterOperationError
 
 
+_BASIC_PARAMETER_NAMES = ("epochs", "batch", "imgsz", "lr0")
+_MANAGED_PARAMETER_NAMES = (
+    "task",
+    "mode",
+    "model",
+    "data",
+    "project",
+    "name",
+    "exist_ok",
+    "device",
+)
+_CONFIG_TEMPLATE = """epochs: 100
+batch: 16
+imgsz: 640
+lr0: 0.01
+workers: 8
+amp: true
+resume: false
+warmup_epochs: 3.0
+patience: 100
+save_period: -1
+optimizer: auto
+cos_lr: false
+close_mosaic: 10
+"""
+
+
 class UltralyticsAdapter(FrameworkAdapter):
-    def __init__(self, training_image_digest: str, inference_image_digest: str) -> None:
+    def __init__(
+        self,
+        training_image_digest: str,
+        inference_image_digest: str,
+        *,
+        implemented_operations: set[OperationName] | None = None,
+    ) -> None:
         training_digest, training_reason = runtime_image_readiness(
             training_image_digest, "VISIOX_ULTRALYTICS_TRAINING_IMAGE_DIGEST"
         )
@@ -39,11 +73,14 @@ class UltralyticsAdapter(FrameworkAdapter):
                 family="YOLO26",
                 variant=variant.upper(),
                 source="ultralytics",
+                config_format="yaml",
+                config_template=_CONFIG_TEMPLATE,
+                basic_parameter_names=_BASIC_PARAMETER_NAMES,
+                managed_parameter_names=_MANAGED_PARAMETER_NAMES,
             )
             for variant in ("n", "s", "m", "l", "x")
         )
-        operations = operation_capabilities(
-            supported={
+        supported_operations = {
                 "train",
                 "stop",
                 "resume",
@@ -51,8 +88,10 @@ class UltralyticsAdapter(FrameworkAdapter):
                 "image_inference",
                 "export",
                 "deploy",
-            },
-            implemented=set(),
+        }
+        operations = operation_capabilities(
+            supported=supported_operations,
+            implemented=set(implemented_operations or ()),
             training_unavailable_reason=training_reason,
             inference_unavailable_reason=inference_reason,
         )
@@ -107,6 +146,99 @@ class UltralyticsAdapter(FrameworkAdapter):
                             maximum=4096,
                             help_text="Square training image size in pixels",
                             advanced_group="data",
+                        ),
+                        ParameterCapability(
+                            name="lr0",
+                            value_type="number",
+                            default=0.01,
+                            minimum=0.0000001,
+                            maximum=1.0,
+                            help_text="Initial optimizer learning rate",
+                            advanced_group="optimizer",
+                        ),
+                        ParameterCapability(
+                            name="workers",
+                            value_type="integer",
+                            default=8,
+                            minimum=0,
+                            maximum=256,
+                            help_text="Data loading worker processes",
+                            advanced_group="resources",
+                        ),
+                        ParameterCapability(
+                            name="amp",
+                            value_type="boolean",
+                            default=True,
+                            help_text="Enable automatic mixed precision training",
+                            advanced_group="resources",
+                        ),
+                        ParameterCapability(
+                            name="resume",
+                            value_type="boolean",
+                            default=False,
+                            help_text="Resume from the managed last checkpoint",
+                            advanced_group="training",
+                        ),
+                        ParameterCapability(
+                            name="warmup_epochs",
+                            value_type="number",
+                            default=3.0,
+                            minimum=0.0,
+                            maximum=10000.0,
+                            help_text="Number of learning-rate warmup epochs",
+                            advanced_group="optimizer",
+                        ),
+                        ParameterCapability(
+                            name="patience",
+                            value_type="integer",
+                            default=100,
+                            minimum=0,
+                            maximum=10000,
+                            help_text="Epochs without improvement before early stopping",
+                            advanced_group="training",
+                        ),
+                        ParameterCapability(
+                            name="save_period",
+                            value_type="integer",
+                            default=-1,
+                            minimum=-1,
+                            maximum=10000,
+                            help_text="Checkpoint interval in epochs; -1 disables periodic saves",
+                            advanced_group="checkpointing",
+                        ),
+                        ParameterCapability(
+                            name="optimizer",
+                            value_type="string",
+                            default="auto",
+                            choices=(
+                                "auto",
+                                "SGD",
+                                "MuSGD",
+                                "Adam",
+                                "Adamax",
+                                "AdamW",
+                                "NAdam",
+                                "RAdam",
+                                "RMSProp",
+                            ),
+                            help_text="Optimizer used for training",
+                            advanced_group="optimizer",
+                        ),
+                        ParameterCapability(
+                            name="cos_lr",
+                            value_type="boolean",
+                            default=False,
+                            help_text="Use a cosine learning-rate schedule",
+                            advanced_group="optimizer",
+                        ),
+                        ParameterCapability(
+                            name="close_mosaic",
+                            value_type="integer",
+                            default=10,
+                            minimum=0,
+                            maximum=10000,
+                            help_text="Disable mosaic augmentation for the final epochs",
+                            advanced_group="augmentation",
                         ),
                     ),
                     operations=operations,

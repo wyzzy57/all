@@ -49,10 +49,18 @@ class ModelCapability(ImmutableCapability):
     source: str | None = None
     revision: str | None = None
     sources: Sequence[str] = ()
+    config_format: Literal["yaml"] | None = None
+    config_template: str | None = None
+    basic_parameter_names: Sequence[str] = ()
+    managed_parameter_names: Sequence[str] = ()
 
-    @field_validator("sources")
+    @field_validator(
+        "sources",
+        "basic_parameter_names",
+        "managed_parameter_names",
+    )
     @classmethod
-    def freeze_sources(cls, value: Sequence[str]) -> Sequence[str]:
+    def freeze_sequences(cls, value: Sequence[str]) -> Sequence[str]:
         return tuple(value)
 
 

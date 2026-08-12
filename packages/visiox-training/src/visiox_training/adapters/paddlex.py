@@ -25,6 +25,43 @@ from visiox_training.contracts import (
 from visiox_training.errors import UnsupportedAdapterOperationError
 
 
+_BASIC_PARAMETER_NAMES = ("epochs", "batch_size", "learning_rate", "image_size")
+_MANAGED_PARAMETER_NAMES = (
+    "mode",
+    "model",
+    "dataset_dir",
+    "output",
+    "device",
+    "resume_path",
+)
+_PP_YOLOE_S_CONFIG_TEMPLATE = """epochs: 100
+batch_size: 8
+learning_rate: 0.001
+image_size: 640
+workers: 4
+amp: true
+resume: false
+warmup_steps: 1000
+log_interval: 10
+eval_interval: 1
+save_interval: 1
+pretrained: true
+"""
+_RT_DETR_L_CONFIG_TEMPLATE = """epochs: 72
+batch_size: 4
+learning_rate: 0.0001
+image_size: 640
+workers: 4
+amp: true
+resume: false
+warmup_steps: 1000
+log_interval: 10
+eval_interval: 1
+save_interval: 1
+pretrained: true
+"""
+
+
 class PaddleXAdapter(FrameworkAdapter):
     def __init__(
         self,
@@ -88,6 +125,10 @@ class PaddleXAdapter(FrameworkAdapter):
                             variant="S",
                             source="paddlex",
                             revision="paddlex-model-zoo/3.0.3/PP-YOLOE_plus-S",
+                            config_format="yaml",
+                            config_template=_PP_YOLOE_S_CONFIG_TEMPLATE,
+                            basic_parameter_names=_BASIC_PARAMETER_NAMES,
+                            managed_parameter_names=_MANAGED_PARAMETER_NAMES,
                         ),
                         ModelCapability(
                             model_key="rt-detr-l",
@@ -97,6 +138,10 @@ class PaddleXAdapter(FrameworkAdapter):
                             variant="L",
                             source="paddlex",
                             revision="paddlex-model-zoo/3.0.3/RT-DETR-L",
+                            config_format="yaml",
+                            config_template=_RT_DETR_L_CONFIG_TEMPLATE,
+                            basic_parameter_names=_BASIC_PARAMETER_NAMES,
+                            managed_parameter_names=_MANAGED_PARAMETER_NAMES,
                         ),
                     ),
                     accepted_dataset_formats=("coco",),
@@ -135,6 +180,81 @@ class PaddleXAdapter(FrameworkAdapter):
                             maximum=1.0,
                             help_text="Initial optimizer learning rate",
                             advanced_group="optimizer",
+                        ),
+                        ParameterCapability(
+                            name="image_size",
+                            value_type="integer",
+                            default=640,
+                            minimum=32,
+                            maximum=4096,
+                            help_text="Square training image size in pixels",
+                            advanced_group="data",
+                        ),
+                        ParameterCapability(
+                            name="workers",
+                            value_type="integer",
+                            default=4,
+                            minimum=0,
+                            maximum=64,
+                            help_text="Data loading worker processes",
+                            advanced_group="resources",
+                        ),
+                        ParameterCapability(
+                            name="amp",
+                            value_type="boolean",
+                            default=True,
+                            help_text="Enable PaddleX O1 mixed precision training",
+                            advanced_group="resources",
+                        ),
+                        ParameterCapability(
+                            name="resume",
+                            value_type="boolean",
+                            default=False,
+                            help_text="Resume from the managed last checkpoint",
+                            advanced_group="training",
+                        ),
+                        ParameterCapability(
+                            name="warmup_steps",
+                            value_type="integer",
+                            default=1000,
+                            minimum=0,
+                            maximum=1000000,
+                            help_text="Number of optimizer warmup steps",
+                            advanced_group="optimizer",
+                        ),
+                        ParameterCapability(
+                            name="log_interval",
+                            value_type="integer",
+                            default=10,
+                            minimum=1,
+                            maximum=10000,
+                            help_text="Training steps between log records",
+                            advanced_group="observability",
+                        ),
+                        ParameterCapability(
+                            name="eval_interval",
+                            value_type="integer",
+                            default=1,
+                            minimum=1,
+                            maximum=1000,
+                            help_text="Training epochs between evaluations",
+                            advanced_group="evaluation",
+                        ),
+                        ParameterCapability(
+                            name="save_interval",
+                            value_type="integer",
+                            default=1,
+                            minimum=1,
+                            maximum=1000,
+                            help_text="Training epochs between checkpoints",
+                            advanced_group="checkpointing",
+                        ),
+                        ParameterCapability(
+                            name="pretrained",
+                            value_type="boolean",
+                            default=True,
+                            help_text="Use the model catalog's managed pretrained weights",
+                            advanced_group="training",
                         ),
                     ),
                     operations=operations,

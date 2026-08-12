@@ -1,17 +1,20 @@
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from visiox_api.services.framework_adapters import (
     FrameworkAdapterCatalog,
     paddlex_operation_implementations,
+    ultralytics_operation_implementations,
 )
 from visiox_common.settings import Settings
 from visiox_training.adapters.paddlex import PaddleXAdapter
 from visiox_training.contracts import DatasetManifest
 from visiox_training.capabilities import (
     FrameworkCapabilities,
+    ModelCapability,
     OperationCapability,
     TaskCapability,
     runtime_image_readiness,
@@ -116,6 +119,20 @@ def test_catalog_publishes_exact_product_model_choices_and_versions() -> None:
             "paddlex-model-zoo/3.0.3/RT-DETR-L",
         ),
     ]
+    assert [parameter.name for parameter in paddlex.tasks[0].parameters] == [
+        "epochs",
+        "batch_size",
+        "learning_rate",
+        "image_size",
+        "workers",
+        "amp",
+        "resume",
+        "warmup_steps",
+        "log_interval",
+        "eval_interval",
+        "save_interval",
+        "pretrained",
+    ]
 
     llama = adapters["llamafactory"].capabilities
     assert llama.adapter_key == "llamafactory.llm_sft.v1"
@@ -134,6 +151,122 @@ def test_catalog_publishes_exact_product_model_choices_and_versions() -> None:
     assert {model.sources for model in llama.tasks[0].models} == {
         ("huggingface", "modelscope")
     }
+
+
+def test_paddlex_models_publish_distinct_safe_yaml_templates() -> None:
+    catalog = FrameworkAdapterCatalog(_settings())
+    paddlex = next(
+        adapter for adapter in catalog.list() if adapter.framework == "paddlex"
+    ).capabilities
+    models = {model.model_key: model for model in paddlex.tasks[0].models}
+
+    assert set(models) == {"pp-yoloe-s", "rt-detr-l"}
+    assert {model.config_format for model in models.values()} == {"yaml"}
+    assert models["pp-yoloe-s"].config_template != models["rt-detr-l"].config_template
+    assert models["pp-yoloe-s"].basic_parameter_names == (
+        "epochs",
+        "batch_size",
+        "learning_rate",
+        "image_size",
+    )
+    assert models["rt-detr-l"].basic_parameter_names == (
+        "epochs",
+        "batch_size",
+        "learning_rate",
+        "image_size",
+    )
+    assert models["pp-yoloe-s"].managed_parameter_names == (
+        "mode",
+        "model",
+        "dataset_dir",
+        "output",
+        "device",
+        "resume_path",
+    )
+
+    expected_fields = {
+        "epochs",
+        "batch_size",
+        "learning_rate",
+        "image_size",
+        "workers",
+        "amp",
+        "resume",
+        "warmup_steps",
+        "log_interval",
+        "eval_interval",
+        "save_interval",
+        "pretrained",
+    }
+    for model in models.values():
+        template = yaml.safe_load(model.config_template)
+        assert set(template) == expected_fields
+        assert isinstance(template["pretrained"], bool)
+        assert "pretrain_weight_path" not in template
+        assert set(model.basic_parameter_names) <= expected_fields
+        assert not set(model.managed_parameter_names) & expected_fields
+
+
+def test_ultralytics_models_publish_fixed_yaml_and_managed_fields() -> None:
+    catalog = FrameworkAdapterCatalog(_settings())
+    ultralytics = next(
+        adapter for adapter in catalog.list() if adapter.framework == "ultralytics"
+    ).capabilities
+    models = ultralytics.tasks[0].models
+
+    assert len({model.config_template for model in models}) == 1
+    assert {model.config_format for model in models} == {"yaml"}
+    assert {model.basic_parameter_names for model in models} == {
+        ("epochs", "batch", "imgsz", "lr0")
+    }
+    assert {model.managed_parameter_names for model in models} == {
+        ("task", "mode", "model", "data", "project", "name", "exist_ok", "device")
+    }
+    assert set(yaml.safe_load(models[0].config_template)) == {
+        parameter.name for parameter in ultralytics.tasks[0].parameters
+    }
+
+
+def test_model_configuration_metadata_is_optional_and_deeply_immutable() -> None:
+    plain = ModelCapability(model_key="plain", display_name="Plain")
+    configured = ModelCapability(
+        model_key="configured",
+        display_name="Configured",
+        config_format="yaml",
+        config_template="epochs: 1\n",
+        basic_parameter_names=["epochs"],
+        managed_parameter_names=["model"],
+    )
+
+    assert plain.config_format is None
+    assert plain.config_template is None
+    assert plain.basic_parameter_names == ()
+    assert plain.managed_parameter_names == ()
+    with pytest.raises(TypeError):
+        configured.basic_parameter_names[0] = "batch"
+
+
+def test_ultralytics_parameter_catalog_matches_supported_training_surface() -> None:
+    catalog = FrameworkAdapterCatalog(_settings())
+    ultralytics = next(
+        adapter for adapter in catalog.list() if adapter.framework == "ultralytics"
+    ).capabilities
+
+    assert [parameter.name for parameter in ultralytics.tasks[0].parameters] == [
+        "epochs",
+        "batch",
+        "imgsz",
+        "lr0",
+        "workers",
+        "amp",
+        "resume",
+        "warmup_epochs",
+        "patience",
+        "save_period",
+        "optimizer",
+        "cos_lr",
+        "close_mosaic",
+    ]
 
 
 def test_capabilities_cover_dataset_parameters_resources_operations_and_outputs() -> (
@@ -160,7 +293,7 @@ def test_capabilities_cover_dataset_parameters_resources_operations_and_outputs(
             "export",
             "deploy",
         }
-        if adapter.framework == "paddlex":
+        if adapter.framework in {"paddlex", "ultralytics"}:
             assert all(operation.implemented is True for operation in task.operations)
         else:
             assert all(operation.implemented is False for operation in task.operations)
@@ -247,6 +380,33 @@ def test_paddlex_operation_availability_derives_from_wiring_and_runtime_digests(
     assert _operation(paddlex, "deploy").available is True
     assert _operation(paddlex, "image_inference").available is True
     assert paddlex.capabilities.inference_runtime_image_digest == VALID_DIGEST
+
+
+def test_ultralytics_operation_availability_uses_existing_product_runtimes() -> None:
+    catalog = FrameworkAdapterCatalog(
+        _settings(
+            ultralytics_training_image_digest=VALID_DIGEST,
+            deployment_image_digest=VALID_DIGEST,
+        )
+    )
+    ultralytics = next(
+        adapter for adapter in catalog.list() if adapter.framework == "ultralytics"
+    )
+
+    assert set(ultralytics_operation_implementations()) == {
+        "train",
+        "stop",
+        "resume",
+        "evaluate",
+        "image_inference",
+        "export",
+        "deploy",
+    }
+    assert ultralytics.capabilities.available is True
+    assert all(
+        operation.implemented and operation.available
+        for operation in ultralytics.capabilities.tasks[0].operations
+    )
 
 
 def test_paddlex_digests_do_not_enable_unregistered_operations() -> None:
