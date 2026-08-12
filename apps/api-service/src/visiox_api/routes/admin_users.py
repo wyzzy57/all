@@ -184,6 +184,8 @@ def list_users(
         )
     if status_filter:
         statement = statement.where(User.status == status_filter)
+    else:
+        statement = statement.where(User.status != STATUS_DELETED)
     if role:
         statement = statement.where(User.role == role)
     total = session.scalar(select(func.count()).select_from(statement.subquery())) or 0

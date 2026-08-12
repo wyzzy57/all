@@ -356,6 +356,10 @@ watch(
 }
 
 .management-center-content-body :deep(.identity-page-header) {
+  justify-content: flex-end;
+}
+
+.management-center-content-body :deep(.identity-page-header > div) {
   display: none;
 }
 

@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import ManagementCenterDialog from "@/components/account/ManagementCenterDialog.vue";
 import type { ManagementSection } from "@/components/account/ManagementCenterDialog.vue";
+import managementCenterSource from "@/components/account/ManagementCenterDialog.vue?raw";
 import { useAuthStore } from "@/stores/auth";
 
 const user = {
@@ -47,6 +48,14 @@ async function mountDialog(role: "member" | "admin", initialSection: ManagementS
 }
 
 describe("ManagementCenterDialog", () => {
+  it("keeps embedded identity actions visible while hiding duplicate heading copy", () => {
+    expect(managementCenterSource).toContain(".identity-page-header > div");
+    expect(managementCenterSource).toContain("justify-content: flex-end");
+    expect(managementCenterSource).not.toMatch(
+      /:deep\(\.identity-page-header\)\s*\{\s*display:\s*none;/,
+    );
+  });
+
   it("gives desktop management tables more room without widening the navigation rail", async () => {
     const wrapper = await mountDialog("admin", "users");
 

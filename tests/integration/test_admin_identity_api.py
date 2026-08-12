@@ -158,6 +158,21 @@ def test_user_update_reset_and_soft_delete_revoke_sessions(
     )
     assert deleted.status_code == 204
 
+    default_listing = client.get(
+        "/admin/users", headers=identity["admin_headers"]
+    )
+    deleted_listing = client.get(
+        "/admin/users?status=deleted", headers=identity["admin_headers"]
+    )
+    assert default_listing.status_code == 200
+    assert identity["member_id"] not in {
+        item["id"] for item in default_listing.json()["items"]
+    }
+    assert deleted_listing.status_code == 200
+    assert [item["id"] for item in deleted_listing.json()["items"]] == [
+        identity["member_id"]
+    ]
+
     with session_factory() as session:
         user = session.get(User, identity["member_id"])
         persisted_session = session.scalar(
