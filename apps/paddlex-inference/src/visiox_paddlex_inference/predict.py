@@ -17,7 +17,7 @@ from visiox_paddlex_inference.config import InferenceConfig
 MAX_PREDICTIONS = 1000
 MAX_ANNOTATED_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_LABEL_CHARS = 256
-FIXED_INPUT_SHAPE_MODELS = frozenset({"RT-DETR-L"})
+FIXED_INPUT_SHAPE_MODELS = frozenset({"PP-YOLOE_plus-S", "RT-DETR-L"})
 
 
 @dataclass(slots=True)

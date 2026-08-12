@@ -148,7 +148,7 @@ Final immutable runtime images in `10.10.40.209:5000`:
 - Training linux/amd64:
   `visiox/paddlex-training@sha256:f207f9f8b886a7393e534b170d6a41c43235075c03f97e5d7feafc715a04b318`.
 - Inference linux/amd64:
-  `visiox/paddlex-inference@sha256:31e8342d0e8c0e0fa81ba946622bc83899a6e5f653887f35d3855cdf7a86ae75`.
+  `visiox/paddlex-inference@sha256:4b04842bd3b0963d84301fe851dd21eda501ca9c01998f6a42e19ea2707d7465`.
 - Immutable CUDA base:
   `nvidia/cuda:11.8.0-base-ubuntu22.04@sha256:79e5b2cf878ee9006f5b3738caeea34fdc7708a32db53fe3e80db0b48bd286a0`.
 
@@ -197,6 +197,33 @@ Verified deployment and HTTP inference:
   51 detections, labels `0` and `2`, and 226 ms reported latency.
 - Stop/start completed successfully. Restart reconciliation retained the same
   container and reported phase `reconciled_running` with a healthy endpoint.
+
+Verified PP-YOLOE-S deployment lifecycle:
+
+- Service `23f0ef27-de2b-42fc-a6b9-b5522fa27ec2`; instance
+  `a6330a44-5b67-441e-974f-0fb13fa1ecf7`; endpoint
+  `http://10.10.13.20:18084`.
+- Model bundle SHA-256
+  `41eb24e0d460f1471e14ebbdde8ef9243c80eabcbcba7871775b9435f10db376`.
+- Initial deploy execution `412d28b7-2e60-4499-a10b-3748df9433a8`, stop
+  `6e79877e-3af0-43cb-86ea-485a03237d99`, and start
+  `aa9304f3-165f-40c3-b9ca-41818426988a` all succeeded. Start reconciliation
+  retained the same full container identity and a healthy endpoint.
+- A real image request returned HTTP success, a rendered result image, and
+  184.643 ms reported latency. This low-quality two-epoch acceptance model
+  returned zero detections for the sample; the API and image post-processing
+  path completed normally.
+- Upgrade execution `ac364eaf-9602-4256-9e7f-73495d004b18` advanced both
+  service and instance to revision 3 with container
+  `55b57a67319573f6f7f5fb45943130b6eb9b264ade49c1f734c968a93440e1a0`.
+- Rollback execution `6760da45-e0a7-432c-8fe5-6e53a41b86ba` restored container
+  `09014fa955123eafb73cef40b0a6f5f86e703e5a3ad7cfa024fde368019d0863`;
+  service and instance both converged to revision 2, phase
+  `reconciled_running`, and health `healthy`.
+- Acceptance exposed and fixed two production defects: PaddleX static-input
+  models must preserve the exported input shape, and rollback comparison must
+  use full Docker container identities. The control plane now also persists
+  the target rollback revision instead of the queued revision.
 
 Verified Ultralytics comparison on the same DatasetVersion:
 

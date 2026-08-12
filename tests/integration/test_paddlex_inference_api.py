@@ -123,7 +123,6 @@ def test_paddlex_inference_rejects_non_image_and_oversized_upload(tmp_path) -> N
             (640, 640),
             {
                 "device": "cpu",
-                "img_size": (640, 640),
                 "use_hpip": False,
             },
             {
@@ -138,7 +137,6 @@ def test_paddlex_inference_rejects_non_image_and_oversized_upload(tmp_path) -> N
             (640, 384),
             {
                 "device": "gpu:1",
-                "img_size": (640, 384),
                 "use_hpip": True,
                 "hpi_params": {
                     "selected_backends": {"gpu": "tensorrt"},
@@ -278,6 +276,43 @@ def test_paddlex_runtime_does_not_override_rt_detr_static_input_shape(
 
     assert calls["create_kwargs"] == {
         "model_name": "RT-DETR-L",
+        "model_dir": str(tmp_path.resolve()),
+        "device": "gpu:0",
+        "use_hpip": False,
+    }
+
+
+def test_paddlex_runtime_does_not_override_pp_yoloe_static_input_shape(
+    tmp_path, monkeypatch
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeModel:
+        pass
+
+    def create_model(**kwargs):
+        calls["create_kwargs"] = kwargs
+        return FakeModel()
+
+    monkeypatch.setitem(
+        sys.modules, "paddlex", SimpleNamespace(create_model=create_model)
+    )
+    (tmp_path / "inference.yml").write_text(
+        "Global:\n  model_name: PP-YOLOE_plus-S\n", encoding="utf-8"
+    )
+
+    load_predictor(
+        InferenceConfig(
+            production=True,
+            model_dir=tmp_path,
+            device="gpu:0",
+            backend="paddle_inference",
+            input_size=(640, 640),
+        )
+    )
+
+    assert calls["create_kwargs"] == {
+        "model_name": "PP-YOLOE_plus-S",
         "model_dir": str(tmp_path.resolve()),
         "device": "gpu:0",
         "use_hpip": False,

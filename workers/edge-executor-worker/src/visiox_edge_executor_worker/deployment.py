@@ -896,6 +896,9 @@ class RollbackDeploymentHandler(_DeploymentHandlerBase):
                 rolled_back,
                 endpoint=_endpoint(target.host, rolled_back.port),
                 rollback_metadata=current or {},
+                deployment_revision=max(
+                    1, context.instance.deployment_revision - 1
+                ),
             )
             return ExecutionResult.succeeded(phase="running")
         except Exception:
@@ -1212,6 +1215,7 @@ def _persist_running(
     *,
     endpoint: str,
     rollback_metadata: Mapping[str, Any],
+    deployment_revision: int | None = None,
 ) -> None:
     now = datetime.now(UTC)
     with session_factory() as session:
@@ -1230,6 +1234,8 @@ def _persist_running(
         execution.error_message = None
         service.status = "running"
         service.desired_state = "running"
+        if deployment_revision is not None:
+            instance.deployment_revision = deployment_revision
         service.active_revision = instance.deployment_revision
         service.endpoint = endpoint
         deployment = service.config.get("deployment")

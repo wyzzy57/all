@@ -781,8 +781,10 @@ def test_rollback_handler_uses_exact_prior_tuple_and_swaps_rollback_metadata() -
         service = database.get(DeploymentService, "service-1")
         assert instance is not None
         assert service is not None
+        instance.deployment_revision = 2
         instance.rollback_metadata = previous
         instance.status = "rollback_queued"
+        service.active_revision = 2
         service.status = "rollback_queued"
         database.commit()
     ssh_session = DeploymentSshSession(
@@ -820,6 +822,10 @@ def test_rollback_handler_uses_exact_prior_tuple_and_swaps_rollback_metadata() -
         assert instance.image_digest == previous["image_digest"]
         assert instance.model_checksum == previous["model_checksum"]
         assert instance.rollback_metadata["container_id"] == "a" * 64
+        assert instance.deployment_revision == 1
+        service = database.get(DeploymentService, "service-1")
+        assert service is not None
+        assert service.active_revision == 1
 
 
 def test_production_handler_factory_registers_all_deployment_operations() -> None:
@@ -954,6 +960,47 @@ def test_paddlex_remote_request_mounts_verified_bundle_directory_read_only() -> 
     assert "HOME=/tmp/visiox-paddlex" in args
     assert "com.visiox.framework=paddlex" in args
     assert "com.visiox.resolved-backend=paddlex_hpi_tensorrt" in args
+
+
+def test_paddlex_deploy_config_preserves_exported_model_input_shape(
+    tmp_path: Path,
+) -> None:
+    namespace = _script_namespace("deploy_inference.sh")
+    request = namespace["_validate_request"](_remote_paddlex_deploy_request())  # type: ignore[operator]
+    config_path = tmp_path / "config.json"
+
+    namespace["_write_config"](  # type: ignore[operator]
+        config_path,
+        request,
+        tmp_path / "paddle-inference-bundle",
+    )
+
+    config = json.loads(config_path.read_text(encoding="ascii"))
+    assert config["model_format"] == "paddle_inference_bundle"
+    assert "input_size" not in config
+
+
+def test_deploy_script_compares_full_previous_container_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _script_namespace("deploy_inference.sh")
+    operations_type = namespace["Operations"]
+    request = namespace["_validate_request"](_remote_paddlex_deploy_request())  # type: ignore[operator]
+    previous = "a" * 64
+    request["previous_container_id"] = previous
+    calls: list[list[str]] = []
+
+    def run(args, **_kwargs):
+        calls.append(args)
+        return SimpleNamespace(stdout=previous + "\n")
+
+    monkeypatch.setitem(namespace, "_run", run)
+    operations = object.__new__(operations_type)  # type: ignore[arg-type]
+    operations.request = request
+
+    operations.verify_previous()
+
+    assert calls[0][:3] == ["docker", "ps", "--no-trunc"]
 
 
 def test_paddlex_bundle_extraction_rejects_traversal_before_writing(

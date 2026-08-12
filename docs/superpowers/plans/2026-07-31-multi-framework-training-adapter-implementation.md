@@ -508,8 +508,8 @@ Expected: Vitest, Vue type checking, and production build all pass.
 - [x] Confirm no user input can set a shell command, container entrypoint, host path, image tag, or unchecked artifact path.
 - [x] Confirm pipeline framework lock and clone behavior are enforced in API and UI.
 - [x] Confirm native charts never mix incompatible units or framework-proprietary loss definitions.
-- [ ] Confirm stop, resume, failure, reconciliation, evaluation, inference, deployment, rollback, logs, and artifact downloads work for both PaddleX models.
-- [ ] Run `git status --short` and include only intended source, tests, migrations, docs, and lock files in the final commit.
+- [x] Confirm stop, resume, failure, reconciliation, evaluation, inference, deployment, rollback, logs, and artifact downloads work for both PaddleX models.
+- [x] Run `git status --short` and include only intended source, tests, migrations, docs, and lock files in the final commit.
 
 ## Official Implementation References
 

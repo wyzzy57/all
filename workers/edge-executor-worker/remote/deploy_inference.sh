@@ -534,7 +534,6 @@ def _write_config(path, request, artifact_path):
             "device": runtime["device"],
             "backend": runtime["resolved_backend"],
             "precision": runtime["precision"],
-            "input_size": runtime["input_shape"][2:],
             "optimization": runtime["optimization"],
         }
     else:
@@ -572,6 +571,7 @@ class Operations:
             [
                 "docker",
                 "ps",
+                "--no-trunc",
                 "--filter",
                 "label=com.visiox.deployment-instance-id="
                 + self.request["labels"]["com.visiox.deployment-instance-id"],
