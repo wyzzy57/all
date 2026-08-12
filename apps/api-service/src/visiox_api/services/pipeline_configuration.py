@@ -6,6 +6,7 @@ from typing import Any
 from packaging.version import InvalidVersion, Version
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+import yaml
 
 from visiox_api.services.framework_adapters import FrameworkAdapterCatalog
 from visiox_api.services.llm_training import (
@@ -35,6 +36,12 @@ from visiox_yolo26.training.prechecks import (
 IDENTITY_LOCK_DETAIL = (
     "Pipeline framework identity is locked; clone the pipeline to change it"
 )
+_ULTRALYTICS_PARAMETER_ALIASES = {
+    "batch_size": "batch",
+    "learning_rate": "lr0",
+    "image_size": "imgsz",
+    "warmup_steps": "warmup_epochs",
+}
 
 
 class PipelineConfigurationError(ValueError):
@@ -233,6 +240,8 @@ class PipelineConfigurationService:
         values = dict(values)
         fields_set = set(fields_set)
         task_kind, framework = self._resolve_task_framework(values, fields_set, current)
+        if framework == "pending":
+            return self._resolve_pending_capability(values, fields_set, current)
         if (
             framework == "ultralytics"
             and "base_model_id" in fields_set
@@ -293,6 +302,9 @@ class PipelineConfigurationService:
         environment = dict(values.get("default_environment") or {})
 
         if framework == "ultralytics":
+            params = self._validate_model_parameters(
+                framework, task_capability, model, params
+            )
             params, environment, pipeline_status = self._validate_ultralytics(
                 session,
                 task=task,
@@ -312,9 +324,10 @@ class PipelineConfigurationService:
             )
             base_model_id = None
         elif framework == "paddlex":
-            params, environment = self._validate_paddlex(
-                task_capability, params, environment
+            params = self._validate_model_parameters(
+                framework, task_capability, model, params
             )
+            params, environment = self._validate_paddlex(params, environment)
             if base_model_id is not None:
                 raise PipelineConfigurationError(
                     "PaddleX official models do not use base_model_id until managed artifacts are supported"
@@ -367,6 +380,43 @@ class PipelineConfigurationService:
             status=pipeline_status,
         )
 
+    @staticmethod
+    def _resolve_pending_capability(
+        values: dict[str, Any],
+        fields_set: set[str],
+        current: ResolvedPipelineConfiguration | None,
+    ) -> ResolvedPipelineConfiguration:
+        task_kind = str(values.get("task_kind") or values.get("task") or "").strip()
+        task = str(values.get("task") or task_kind).strip()
+        expected_key = f"pending.{task_kind}.v1"
+        if not task_kind or not task:
+            raise PipelineConfigurationError("Pending capability task is required")
+        if values.get("adapter_key") not in (None, expected_key):
+            raise PipelineConfigurationError("Pending capability adapter_key does not match task")
+        if values.get("base_model_id") or values.get("dataset_id"):
+            raise PipelineConfigurationError("Pending capability drafts cannot bind training assets")
+        recipe = dict(values.get("recipe") or {})
+        if recipe.get("capability_status") != "pending":
+            raise PipelineConfigurationError("Pending capability draft marker is required")
+        if current is not None and current.framework != "pending":
+            raise PipelineConfigurationError("Registered pipelines cannot be changed to pending capability drafts")
+        return ResolvedPipelineConfiguration(
+            engine="pending",
+            task=task,
+            scale="pending",
+            task_kind=task_kind,
+            framework="pending",
+            adapter_key=expected_key,
+            adapter_version="1.0.0",
+            model_family="pending",
+            recipe=recipe,
+            base_model_id=None,
+            dataset_id=None,
+            params_template={},
+            default_environment={},
+            status="draft",
+        )
+
     def _resolve_task_framework(
         self,
         values: dict[str, Any],
@@ -384,6 +434,9 @@ class PipelineConfigurationService:
             except FrameworkAdapterError:
                 if engine == "paddlex":
                     legacy_task, legacy_framework = "object_detection", "paddlex"
+                elif engine == "pending":
+                    legacy_task = str(values.get("task_kind") or values.get("task") or "")
+                    legacy_framework = "pending"
                 else:
                     raise PipelineConfigurationError(
                         f"Unknown legacy engine {engine!r}"
@@ -646,18 +699,9 @@ class PipelineConfigurationService:
 
     @staticmethod
     def _validate_paddlex(
-        task: TaskCapability,
         params: dict[str, Any],
         environment: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        schema = {parameter.name: parameter for parameter in task.parameters}
-        unknown = sorted(set(params) - set(schema))
-        if unknown:
-            raise PipelineConfigurationError(
-                f"Unknown PaddleX parameters: {', '.join(unknown)}"
-            )
-        for name, value in params.items():
-            PipelineConfigurationService._validate_parameter(schema[name], value)
         try:
             normalized_environment = validate_training_environment(environment)
         except TrainingParamsError as exc:
@@ -665,7 +709,53 @@ class PipelineConfigurationService:
         return dict(params), normalized_environment
 
     @staticmethod
-    def _validate_parameter(parameter: ParameterCapability, value: Any) -> None:
+    def _validate_model_parameters(
+        framework: str,
+        task: TaskCapability,
+        model: ModelCapability | None,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = dict(params)
+        if framework == "ultralytics":
+            for alias, native_name in _ULTRALYTICS_PARAMETER_ALIASES.items():
+                if alias not in normalized:
+                    continue
+                if native_name in normalized:
+                    raise PipelineConfigurationError(
+                        f"{alias} cannot be used together with {native_name}"
+                    )
+                normalized[native_name] = normalized.pop(alias)
+        if model is None:
+            return normalized
+
+        managed = sorted(set(normalized) & set(model.managed_parameter_names))
+        if managed:
+            raise PipelineConfigurationError(
+                f"Managed {framework} parameters cannot be overridden: "
+                f"{', '.join(managed)}"
+            )
+        schema = {parameter.name: parameter for parameter in task.parameters}
+        template = yaml.safe_load(model.config_template or "") or {}
+        if not isinstance(template, dict):
+            raise PipelineConfigurationError(
+                f"{framework} model config_template must be a mapping"
+            )
+        allowed = set(template) | set(model.basic_parameter_names)
+        unknown = sorted(set(normalized) - allowed)
+        if unknown:
+            raise PipelineConfigurationError(
+                f"Unknown {framework} training parameters: {', '.join(unknown)}"
+            )
+        for name, value in normalized.items():
+            PipelineConfigurationService._validate_parameter(
+                framework, schema[name], value
+            )
+        return normalized
+
+    @staticmethod
+    def _validate_parameter(
+        framework: str, parameter: ParameterCapability, value: Any
+    ) -> None:
         valid_type = {
             "integer": isinstance(value, int) and not isinstance(value, bool),
             "number": isinstance(value, (int, float)) and not isinstance(value, bool),
@@ -674,13 +764,18 @@ class PipelineConfigurationService:
         }[parameter.value_type]
         if not valid_type:
             raise PipelineConfigurationError(
-                f"PaddleX parameter {parameter.name} must be {parameter.value_type}"
+                f"{framework} parameter {parameter.name} must be {parameter.value_type}"
             )
         if parameter.minimum is not None and value < parameter.minimum:
             raise PipelineConfigurationError(
-                f"PaddleX parameter {parameter.name} must be at least {parameter.minimum}"
+                f"{framework} parameter {parameter.name} must be at least {parameter.minimum}"
             )
         if parameter.maximum is not None and value > parameter.maximum:
             raise PipelineConfigurationError(
-                f"PaddleX parameter {parameter.name} must be at most {parameter.maximum}"
+                f"{framework} parameter {parameter.name} must be at most {parameter.maximum}"
+            )
+        if parameter.choices and value not in parameter.choices:
+            raise PipelineConfigurationError(
+                f"{framework} parameter {parameter.name} must be one of: "
+                f"{', '.join(map(str, parameter.choices))}"
             )

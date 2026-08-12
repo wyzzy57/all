@@ -10,6 +10,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from visiox_api.services.framework_adapters import FrameworkAdapterCatalog
+from visiox_api.services.pipeline_configuration import (
+    PipelineConfigurationError,
+    PipelineConfigurationService,
+)
 from visiox_common.settings import Settings
 from visiox_db.models import BaseModel as StoredBaseModel
 from visiox_db.models import (
@@ -20,6 +24,7 @@ from visiox_db.models import (
     TrainingPipeline,
 )
 from visiox_edge_executor_worker.deployment import validate_image_digest
+from visiox_training.capabilities import ModelCapability, TaskCapability
 from visiox_training.contracts import LaunchSpec
 
 
@@ -102,10 +107,26 @@ class TrainingSubmissionService:
             for item in adapter.capabilities.tasks
             if item.task_type == pipeline.task_kind
         )
+        model = self._current_model(task, pipeline)
+        try:
+            template = PipelineConfigurationService._validate_model_parameters(
+                pipeline.framework,
+                task,
+                model,
+                copy.deepcopy(pipeline.params_template or {}),
+            )
+            override_params = PipelineConfigurationService._validate_model_parameters(
+                pipeline.framework,
+                task,
+                model,
+                copy.deepcopy(overrides),
+            )
+        except PipelineConfigurationError as exc:
+            raise TrainingSubmissionError(exc.detail, status_code=422) from exc
         definitions = {item.name: item for item in task.parameters}
         supplied = {
-            **copy.deepcopy(pipeline.params_template or {}),
-            **copy.deepcopy(overrides),
+            **template,
+            **override_params,
         }
         unknown = sorted(set(supplied) - set(definitions))
         if unknown:
@@ -144,6 +165,25 @@ class TrainingSubmissionService:
                 float(value) if definition.value_type == "number" else value
             )
         return normalized
+
+    @staticmethod
+    def _current_model(
+        task: TaskCapability, pipeline: TrainingPipeline
+    ) -> ModelCapability | None:
+        recipe_model = (pipeline.recipe or {}).get("model") or {}
+        identifiers = {
+            str(recipe_model.get(name)).casefold()
+            for name in ("key", "runtime_id")
+            if isinstance(recipe_model, dict) and recipe_model.get(name)
+        }
+        for model in task.models:
+            candidates = {
+                model.model_key.casefold(),
+                str(model.runtime_id or "").casefold(),
+            }
+            if identifiers & candidates:
+                return model
+        return None
 
     def resolve(
         self,

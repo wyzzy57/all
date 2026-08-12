@@ -479,6 +479,33 @@ def test_create_pipeline_without_training_resources_persists_draft(client: TestC
     assert duplicate.json()["detail"] == "产线名称已存在，请使用其他名称"
 
 
+def test_create_pipeline_allows_pending_capability_draft(client: TestClient):
+    response = client.post(
+        "/pipelines",
+        json={
+            "name": "document-capability-draft",
+            "task": "document",
+            "task_kind": "document",
+            "framework": "pending",
+            "adapter_key": "pending.document.v1",
+            "adapter_version": "1.0.0",
+            "model_family": "pending",
+            "recipe": {"capability_status": "pending"},
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    expected = {
+        "task": "document",
+        "task_kind": "document",
+        "framework": "pending",
+        "adapter_key": "pending.document.v1",
+        "status": "draft",
+    }
+    assert {key: body[key] for key in expected} == expected
+
+
 @pytest.mark.parametrize(
     ("name", "explicit", "legacy", "expected_family", "expected_model"),
     [
@@ -1228,7 +1255,7 @@ def test_update_pipeline_revalidates_and_syncs_base_model_task_scale(
     assert body["scale"] == "n"
 
 
-def test_create_pipeline_accepts_ultralytics_yolo26_training_params(
+def test_create_pipeline_accepts_current_ultralytics_model_template_params(
     client: TestClient, session_factory
 ):
     base_model_id, dataset_id, _sample_id = seed_training_ready_rows(session_factory)
@@ -1242,27 +1269,15 @@ def test_create_pipeline_accepts_ultralytics_yolo26_training_params(
             "batch": -1,
             "imgsz": 640,
             "lr0": 0.005,
-            "lrf": 0.05,
             "optimizer": "MuSGD",
             "warmup_epochs": 3.0,
+            "patience": 20,
             "save_period": 1,
             "amp": True,
+            "resume": False,
+            "workers": 2,
             "cos_lr": True,
             "close_mosaic": 10,
-            "box": 5.6,
-            "cls": 0.56,
-            "dfl": 9.0,
-            "hsv_h": 0.015,
-            "mosaic": 0.9,
-            "classes": [0, 1],
-            "save_json": True,
-            "augment": True,
-            "agnostic_nms": True,
-            "vid_stride": 2,
-            "line_width": 3,
-            "format": "onnx",
-            "embed": [10, 12],
-            "tracker": "bytetrack.yaml",
         },
     )
 
@@ -1270,12 +1285,10 @@ def test_create_pipeline_accepts_ultralytics_yolo26_training_params(
     params = response.json()["params_template"]
     assert params["optimizer"] == "MuSGD"
     assert params["batch"] == -1
-    assert params["classes"] == [0, 1]
     assert params["cos_lr"] is True
     assert params["warmup_epochs"] == 3.0
-    assert params["save_json"] is True
-    assert params["format"] == "onnx"
-    assert params["embed"] == [10, 12]
+    assert params["patience"] == 20
+    assert params["workers"] == 2
 
 
 def test_create_pipeline_maps_legacy_warmup_steps_to_ultralytics_warmup_epochs(
@@ -1294,6 +1307,111 @@ def test_create_pipeline_maps_legacy_warmup_steps_to_ultralytics_warmup_epochs(
     params = response.json()["params_template"]
     assert "warmup_steps" not in params
     assert params["warmup_epochs"] == 5.0
+
+
+def test_create_pipeline_maps_legacy_ultralytics_parameter_names(
+    client: TestClient, session_factory
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+
+    response = create_pipeline(
+        client,
+        base_model_id,
+        dataset_id,
+        params_template={
+            "epochs": 4,
+            "batch_size": 2,
+            "learning_rate": 0.002,
+            "image_size": 512,
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["params_template"] == {
+        "epochs": 4,
+        "batch": 2,
+        "lr0": 0.002,
+        "imgsz": 512,
+    }
+
+
+@pytest.mark.parametrize(
+    ("params_template", "field"),
+    [
+        ({"batch": 4, "batch_size": 2}, "batch_size"),
+        ({"learning_rate": 0.001, "lr0": 0.01}, "learning_rate"),
+        ({"image_size": 512, "imgsz": 640}, "image_size"),
+        ({"optimizer": "not-an-optimizer"}, "optimizer"),
+        ({"model": "other.pt"}, "model"),
+        ({"unknown": 2}, "unknown"),
+    ],
+)
+def test_create_pipeline_rejects_invalid_model_configuration_fields(
+    client: TestClient,
+    session_factory,
+    params_template: dict,
+    field: str,
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+
+    response = create_pipeline(
+        client,
+        base_model_id,
+        dataset_id,
+        params_template=params_template,
+    )
+
+    assert response.status_code == 422
+    assert field in response.json()["detail"]
+
+
+def test_create_paddlex_pipeline_accepts_only_current_worker_flat_parameters(
+    client: TestClient,
+):
+    params = {
+        "epochs": 4,
+        "batch_size": 2,
+        "learning_rate": 0.002,
+        "image_size": 512,
+        "workers": 2,
+        "amp": True,
+        "resume": False,
+    }
+
+    response = client.post(
+        "/pipelines",
+        json={
+            "name": "paddlex-safe-yaml-template",
+            "task_kind": "object_detection",
+            "framework": "paddlex",
+            "adapter_key": "paddlex.object_detection.v1",
+            "recipe": {"model": "PP-YOLOE-S"},
+            "params_template": params,
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["params_template"] == params
+
+
+@pytest.mark.parametrize("field", ["model", "dataset_dir", "Train"])
+def test_create_paddlex_pipeline_rejects_managed_or_nested_yaml_fields(
+    client: TestClient, field: str
+):
+    response = client.post(
+        "/pipelines",
+        json={
+            "name": f"paddlex-rejected-{field}",
+            "task_kind": "object_detection",
+            "framework": "paddlex",
+            "adapter_key": "paddlex.object_detection.v1",
+            "recipe": {"model": "PP-YOLOE-S"},
+            "params_template": {field: {} if field == "Train" else "override"},
+        },
+    )
+
+    assert response.status_code == 422
+    assert field in response.json()["detail"]
 
 
 @pytest.mark.parametrize(
@@ -1438,6 +1556,49 @@ def test_create_training_job_creates_task_and_enqueues_command(
     for item in (list_item, detail_item):
         assert item["resolved_snapshot"] == expected_snapshot
         assert [attempt["attempt_number"] for attempt in item["attempts"]] == [1, 2]
+
+
+def test_training_job_normalizes_legacy_aliases_in_snapshot_and_launch_spec(
+    client: TestClient,
+    session_factory,
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(
+        client,
+        base_model_id,
+        dataset_id,
+        params_template={
+            "epochs": 10,
+            "batch_size": 2,
+            "learning_rate": 0.002,
+            "image_size": 512,
+        },
+    ).json()["id"]
+
+    response = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={},
+    )
+
+    assert response.status_code == 201, response.text
+    with session_factory() as session:
+        job = session.get(TrainingJob, response.json()["id"])
+        attempt = session.scalar(
+            select(TrainingJobAttempt).where(
+                TrainingJobAttempt.training_job_id == job.id
+            )
+        )
+    assert job.resolved_snapshot["parameters"] == {
+        "epochs": 10,
+        "batch": 2,
+        "lr0": 0.002,
+        "imgsz": 512,
+    }
+    assert attempt is not None
+    assert (
+        LaunchSpec.model_validate(attempt.launch_spec).canonical_checksum_sha256()
+        == job.launch_spec_checksum
+    )
 
 
 def test_training_snapshot_is_independent_from_request_and_pipeline_mutation(
