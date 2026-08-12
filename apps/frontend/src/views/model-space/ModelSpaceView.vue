@@ -501,8 +501,9 @@
         :steps="wizardSteps"
         :active-step="activeStep"
         :submitting="submitting"
-        :show-direct-deploy="!isLlmWizard"
-        :show-save-draft="true"
+        :show-direct-deploy="!isLlmWizard && !isPendingCapabilityWizard"
+        :show-save-draft="!isPendingCapabilityWizard"
+        :next-disabled="isPendingCapabilityWizard"
         :draft-saving="wizardDraftSaving"
         :draft-status="wizardDraftStatus"
         @back="backToList"
@@ -527,45 +528,52 @@
         />
 
         <template v-else>
-        <div v-if="activeStep === 0" class="step-panel">
-          <h2>选择产线</h2>
-          <FrameworkModelSelector
-            v-if="frameworkCatalog"
-            :catalog="frameworkCatalog"
-            :selection="frameworkSelection"
-            :parameter-values="frameworkParameters"
-            :advanced-yaml="frameworkAdvancedYaml"
-            :locked="Boolean(activeWizardPipeline?.framework_locked_at)"
-            :lock-reason="frameworkLockReason"
-            @update:selection="setFrameworkSelection"
-            @update:parameter-values="frameworkParameters = $event"
-            @update:advanced-yaml="frameworkAdvancedYaml = $event"
-            @clone="cloneWithFrameworkSelection"
-          />
-          <button class="scenario-card selected" type="button">
-            <strong>{{ form.name || selectedScenario.label }}</strong>
-            <span>{{ selectedScenario.description }}</span>
-            <em>{{ taskLabel(form.task) }}</em>
-            <a>在线体验</a>
-          </button>
+        <div v-if="activeStep === 0" class="step-panel framework-step">
+          <header class="framework-step__heading">
+            <div>
+              <h2>选择训练框架</h2>
+              <p>根据当前任务选择训练引擎，模型将在下一步配置。</p>
+            </div>
+            <span>{{ taskLabel(form.task) }}</span>
+          </header>
+          <section v-if="isPendingCapabilityWizard" class="pending-capability" data-testid="pending-capability">
+            <strong>{{ taskLabel(form.task) }}训练能力待接入</strong>
+            <p>产线草稿已创建并保存在模型空间。当前版本暂不提供该任务的训练框架、模型和参数配置，能力接入后可继续配置。</p>
+          </section>
+          <div v-else-if="frameworkCatalog" class="framework-step__layout">
+            <FrameworkModelSelector
+              mode="framework"
+              :catalog="frameworkCatalog"
+              :selection="frameworkSelection"
+              :locked="Boolean(activeWizardPipeline?.framework_locked_at)"
+              :lock-reason="frameworkLockReason"
+              @update:selection="setFrameworkSelection"
+              @clone="cloneWithFrameworkSelection"
+            />
+            <aside class="pipeline-summary" aria-label="当前产线摘要">
+              <span class="pipeline-summary__eyebrow">当前产线</span>
+              <strong>{{ form.name || selectedScenario.label }}</strong>
+              <p>{{ selectedScenario.description }}</p>
+              <dl>
+                <div><dt>任务场景</dt><dd>{{ taskLabel(form.task) }}</dd></div>
+                <div><dt>模型配置</dt><dd>下一步选择</dd></div>
+              </dl>
+            </aside>
+          </div>
         </div>
 
         <div v-else-if="activeStep === 1" class="step-panel data-step">
           <div class="step-main">
             <h2>请选择模型并添加数据集</h2>
             <label class="field-label required">选择模型</label>
-            <el-select v-if="requiresBaseModel" v-model="form.base_model_id" class="full-input" placeholder="请选择基础模型" @change="syncScaleFromModel">
-              <el-option
-                v-for="model in selectableBaseModels"
-                :key="model.id"
-                :label="modelLabel(model)"
-                :value="model.id"
-              />
-            </el-select>
-            <div v-else class="selected-framework-model" data-testid="selected-framework-model">
-              <strong>{{ selectedFrameworkModel?.display_name || frameworkSelection.modelKey }}</strong>
-              <span>{{ selectedFrameworkAdapter?.display_name || frameworkSelection.framework }} 官方模型</span>
-            </div>
+            <el-cascader
+              v-model="modelCascaderValue"
+              class="full-input"
+              data-testid="framework-model-cascader"
+              :options="modelCascaderOptions"
+              :props="{ expandTrigger: 'hover' }"
+              placeholder="请选择当前任务与框架支持的模型"
+            />
 
             <label class="field-label required">添加数据集</label>
             <div class="dataset-picker">
@@ -669,77 +677,14 @@
         </div>
 
         <div v-else-if="activeStep === 2" class="step-panel params-step">
-          <div class="params-header">
-            <h2>请设置模型参数 <span>{{ selectedModelName }}</span></h2>
-            <button type="button" class="link-button" @click="configMode = !configMode">
-              {{ configMode ? "退出修改配置文件" : "修改配置文件" }}
-            </button>
-          </div>
-
-          <textarea v-if="configMode" v-model="configText" class="config-editor" spellcheck="false" />
-
-          <div v-else class="params-form">
-            <label class="param-field">
-              <span>* 轮次(Epochs)</span>
-              <el-input-number v-model="form.epochs" :min="1" :max="10000" />
-              <small>训练轮次越大，耗时越久，最终精度通常越高</small>
-            </label>
-            <label class="param-field">
-              <span>* 批大小(Batch Size)</span>
-              <el-input-number v-model="form.batch" :min="1" :max="1024" />
-              <small>单卡Batch Size，值越大，显存占用越高</small>
-            </label>
-            <label class="param-field">
-              <span>* 类别数量(Class Num)</span>
-              <el-input-number v-model="form.class_num" :min="1" :max="10000" />
-              <small>类别的数量，根据实际情况填写</small>
-            </label>
-            <label class="param-field">
-              <span>* 学习率(Learning Rate)</span>
-              <el-input v-model="form.lr0" />
-              <small>学习率建议参考Batch Size进行同比例的调整</small>
-            </label>
-
-            <details class="advanced-config" open>
-              <summary>高级配置</summary>
-              <label class="param-field">
-                <span>log打印间隔(Log Interval) / step</span>
-                <el-input-number v-model="form.log_interval" :min="1" :max="100000" />
-                <small>每隔多少个step打印一次log信息</small>
-              </label>
-              <label class="param-field">
-                <span>断点训练权重</span>
-                <el-select v-model="form.resume_weight" class="full-input" placeholder="请选择">
-                  <el-option label="不使用断点权重" value="" />
-                  <el-option label="上次训练checkpoint" value="last.pt" />
-                </el-select>
-                <small>从训练中断保存的checkpoint继续训练</small>
-              </label>
-              <label class="param-field">
-                <span>预训练权重</span>
-                <el-select v-model="form.pretrained" class="full-input">
-                  <el-option label="官方权重.pt" value="official" />
-                  <el-option label="不使用预训练权重" value="false" />
-                </el-select>
-                <small>从预训练的权重开始微调，提高训练效率</small>
-              </label>
-              <label class="param-field">
-                <span>热启动步数（WarmUp Steps）</span>
-                <el-input-number v-model="form.warmup_epochs" :min="0" :max="10000" :step="0.5" />
-                <small>在训练初始阶段以较小学习率训练的step数</small>
-              </label>
-              <label class="param-field">
-                <span>保存间隔(Save Interval) / epoch</span>
-                <el-input-number v-model="form.save_period" :min="-1" :max="10000" />
-                <small>每隔多少个epoch进行一次模型保存</small>
-              </label>
-              <label class="param-field">
-                <span>评估、保存间隔(Eval Interval) / epoch</span>
-                <el-input-number v-model="form.eval_interval" :min="1" :max="10000" />
-                <small>每隔多少个epoch进行一次模型评估及模型保存</small>
-              </label>
-            </details>
-          </div>
+          <ObjectDetectionTrainingConfig
+            v-if="selectedFrameworkModel"
+            v-model="frameworkParameters"
+            :model="selectedFrameworkModel"
+            :parameters="selectedFrameworkTask?.parameters ?? []"
+            @update:valid="frameworkConfigValid = $event"
+          />
+          <el-alert v-else type="error" :closable="false" title="当前框架没有可配置的模型" />
         </div>
 
         <div v-else class="step-panel submit-step">
@@ -983,17 +928,6 @@
             </span>
           </button>
         </div>
-        <FrameworkModelSelector
-          v-if="frameworkCatalog"
-          :catalog="frameworkCatalog"
-          :selection="frameworkSelection"
-          :parameter-values="frameworkParameters"
-          :advanced-yaml="frameworkAdvancedYaml"
-          @update:selection="setFrameworkSelection"
-          @update:parameter-values="frameworkParameters = $event"
-          @update:advanced-yaml="frameworkAdvancedYaml = $event"
-        />
-        <p v-else-if="frameworkCatalogError" class="framework-catalog-error">{{ frameworkCatalogError }}</p>
       </div>
 
       <div v-else class="create-form local-form">
@@ -1103,6 +1037,7 @@ import ServiceExperiencePanel from "@/components/ServiceExperiencePanel.vue";
 import ResourceSharingDialog from "@/components/sharing/ResourceSharingDialog.vue";
 import PipelineWizardShell from "@/features/pipeline-wizard/PipelineWizardShell.vue";
 import FrameworkModelSelector from "@/features/pipeline-wizard/FrameworkModelSelector.vue";
+import ObjectDetectionTrainingConfig from "@/features/pipeline-wizard/ObjectDetectionTrainingConfig.vue";
 import { usePipelineWizardDraft } from "@/features/pipeline-wizard/usePipelineWizardDraft";
 import {
   compatibleFrameworks,
@@ -1183,6 +1118,9 @@ type TrainForm = {
   warmup_epochs: number;
   save_period: number;
   eval_interval: number;
+  image_size: number;
+  workers: number;
+  amp: boolean;
   device: string;
 };
 
@@ -1208,6 +1146,7 @@ const scenarios: Scenario[] = [
   { key: "attribute", label: "属性识别", task: "attribute", description: "识别目标对象的多维属性标签", icon: PriceTag, tone: "blue" },
   { key: "llm", label: "大模型训练", task: "llm", description: "完成大模型偏好对齐与参数微调", icon: Cpu, tone: "blue" },
 ];
+const implementedZeroCodeTasks = new Set(["detect", "llm"]);
 
 const localModelTaskOptions = [
   { label: "目标检测", value: "detect" },
@@ -1380,6 +1319,7 @@ const configParams = ref<Record<string, unknown>>({});
 const frameworkCatalog = ref<FrameworkCapabilityCatalogResponse | null>(null);
 const frameworkCatalogError = ref("");
 const frameworkParameters = ref<Record<string, unknown>>({});
+const frameworkConfigValid = ref(true);
 const frameworkAdvancedYaml = ref("");
 const frameworkSelection = ref<FrameworkModelSelection>({
   taskKind: "object_detection",
@@ -1459,6 +1399,9 @@ const form = reactive<TrainForm>({
   warmup_epochs: 3,
   save_period: 1,
   eval_interval: 1,
+  image_size: 640,
+  workers: 4,
+  amp: true,
   device: "cpu",
 });
 
@@ -1477,6 +1420,7 @@ const typeOptions = computed(() => Array.from(new Set(pipelines.value.map((item)
 const selectedScenario = computed(
   () => scenarios.find((scenario) => scenario.key === createForm.scenarioKey) || scenarios[0],
 );
+const isPendingCapabilityWizard = computed(() => !implementedZeroCodeTasks.has(form.task));
 const activeWizardPipeline = computed(() => pipelines.value.find((pipeline) => pipeline.id === wizardPipelineId.value));
 const frameworkLockReason = computed(() => activeWizardPipeline.value?.framework_locked_at ? "Framework and model are locked because this pipeline has already been submitted for training." : "");
 const isLlmWizard = computed(() => form.task === "llm");
@@ -1485,15 +1429,29 @@ const selectedFrameworkAdapter = computed(() => compatibleFrameworks(frameworkCa
 const selectedFrameworkTask = computed(() => taskForFramework(selectedFrameworkAdapter.value, frameworkSelection.value.taskKind));
 const selectedFrameworkModel = computed(() => selectedFrameworkTask.value?.models
   .find((model) => model.model_key === frameworkSelection.value.modelKey));
+const isPaddleXFramework = computed(() => frameworkSelection.value.framework === "paddlex");
 const requiresBaseModel = computed(() => frameworkSelection.value.framework === "ultralytics");
+const modelCascaderOptions = computed(() => [{
+  value: frameworkSelection.value.taskKind,
+  label: taskLabel(form.task),
+  children: (selectedFrameworkTask.value?.models ?? []).map((model) => ({
+    value: model.model_key,
+    label: model.display_name,
+  })),
+}]);
+const modelCascaderValue = computed<string[]>({
+  get: () => frameworkSelection.value.modelKey
+    ? [frameworkSelection.value.taskKind, frameworkSelection.value.modelKey]
+    : [],
+  set: (value) => setFrameworkModel(value[value.length - 1] || ""),
+});
 const frameworkDraft = computed(() => ({
   selection: frameworkSelection.value,
-  parameters: frameworkParameters.value,
-  advancedYaml: frameworkAdvancedYaml.value,
+  parameters: frameworkTrainingParams(),
 }));
 const frameworkDraftController = usePipelineWizardDraft(
   frameworkDraft,
-  computed(() => viewMode.value === "wizard" && !isLlmWizard.value && Boolean(wizardPipelineId.value) && !activeWizardPipeline.value?.framework_locked_at),
+  computed(() => viewMode.value === "wizard" && !isLlmWizard.value && !isPendingCapabilityWizard.value && Boolean(wizardPipelineId.value) && !activeWizardPipeline.value?.framework_locked_at),
   saveFrameworkDraft,
 );
 const llmDraftController = usePipelineWizardDraft(
@@ -1561,7 +1519,7 @@ const selectedDataset = computed(() => datasets.value.find((dataset) => dataset.
 
 const selectedModelName = computed(() => {
   const model = baseModels.value.find((item) => item.id === form.base_model_id);
-  return model ? modelLabel(model) : "YOLO26";
+  return model ? modelLabel(model) : selectedFrameworkModel.value?.display_name || "待选择";
 });
 
 const detailPipeline = computed(() => pipelines.value.find((pipeline) => pipeline.id === detailPipelineId.value) ?? null);
@@ -1810,10 +1768,6 @@ watch([filteredPipelines, pageSize], () => {
   if (currentPage.value > maxPage) currentPage.value = maxPage;
 });
 
-watch(configMode, (enabled) => {
-  if (enabled) configText.value = buildConfigText();
-});
-
 watch(activeStep, (step) => {
   if (step === 3 && resourcePools.value.length === 0 && !edgeResourcesLoading.value) void loadEdgeResources();
   if (viewMode.value === "wizard" && wizardPipelineId.value) void syncWizardRoute();
@@ -1895,7 +1849,13 @@ function nextPipelineName() {
 function selectScenario(key: string) {
   createForm.scenarioKey = key;
   const scenario = scenarios.find((item) => item.key === key);
-  if (scenario) void loadFrameworkCapabilities(taskKindForPipelineTask(scenario.task));
+  if (scenario && implementedZeroCodeTasks.has(scenario.task)) {
+    void loadFrameworkCapabilities(taskKindForPipelineTask(scenario.task));
+  } else {
+    frameworkCatalogRequestSequence += 1;
+    frameworkCatalog.value = null;
+    frameworkCatalogError.value = "";
+  }
 }
 
 let frameworkCatalogRequestSequence = 0;
@@ -1922,7 +1882,18 @@ async function loadFrameworkCapabilities(taskKind: string) {
       };
     } else {
       const selection = defaultFrameworkModelSelection(frameworkCatalog.value, taskKind);
+      const fallbackAdapter = compatibleFrameworks(frameworkCatalog.value, taskKind)[0];
+      const fallbackModel = fallbackAdapter && taskForFramework(fallbackAdapter, taskKind)?.models[0];
       if (selection) frameworkSelection.value = selection;
+      else if (fallbackAdapter && fallbackModel) {
+        frameworkSelection.value = {
+          taskKind,
+          framework: fallbackAdapter.framework,
+          adapterKey: fallbackAdapter.adapter_key,
+          adapterVersion: fallbackAdapter.adapter_version,
+          modelKey: fallbackModel.model_key,
+        };
+      }
     }
   } catch (error) {
     if (requestId !== frameworkCatalogRequestSequence) return;
@@ -1941,13 +1912,37 @@ function setFrameworkSelection(selection: FrameworkModelSelection) {
       .map((parameter) => [parameter.name, parameter.default]),
   );
   frameworkAdvancedYaml.value = "";
-  form.base_model_id = "";
-  if (selectedFrameworkModel.value?.variant) form.scale = selectedFrameworkModel.value.variant;
+  applyFrameworkParameterDefaults(frameworkParameters.value);
+  configParams.value = {};
+  configMode.value = false;
+  syncFrameworkModelSelection();
   if (selection.taskKind === "llm_sft") {
     const model = taskForFramework(adapter, selection.taskKind)?.models
       .find((item) => item.model_key === selection.modelKey);
     if (model) llmForm.value.modelId = model.runtime_id || model.model_key;
   }
+}
+
+function setFrameworkModel(modelKey: string) {
+  if (!modelKey) return;
+  frameworkSelection.value = { ...frameworkSelection.value, modelKey };
+  syncFrameworkModelSelection();
+}
+
+function syncFrameworkModelSelection() {
+  const model = selectedFrameworkModel.value;
+  form.base_model_id = "";
+  if (!model) return;
+  if (model.variant) form.scale = model.variant;
+  if (!requiresBaseModel.value) return;
+  const runtimeFilename = String(model.runtime_id || "").split(/[\\/]/).pop()?.toLowerCase();
+  const matched = selectableBaseModels.value.find((baseModel) => {
+    const filename = String(baseModel.filename || "").toLowerCase();
+    return (runtimeFilename && filename === runtimeFilename)
+      || (model.variant && baseModel.scale.toLowerCase() === model.variant.toLowerCase()
+        && (!model.family || baseModel.family.toLowerCase() === model.family.toLowerCase()));
+  });
+  form.base_model_id = matched?.id || "";
 }
 
 function frameworkPipelineFields() {
@@ -1967,17 +1962,29 @@ function frameworkPipelineFields() {
     task_kind: frameworkSelection.value.taskKind,
     model_family: model.family || model.model_key,
     recipe: { model: { key: model.model_key } },
-    params_template: frameworkParameterPayload(),
+    params_template: frameworkTrainingParams(),
+  };
+}
+
+function fixedLlmPipelineFields() {
+  const configured = frameworkPipelineFields();
+  if (Object.keys(configured).length) return configured;
+  return {
+    engine: "llamafactory" as const,
+    task: "llm",
+    scale: "0.6b",
+    framework: "llamafactory",
+    adapter_key: "llamafactory.llm_sft.v1",
+    adapter_version: "1.0.0",
+    task_kind: "llm_sft",
+    model_family: "qwen3",
+    recipe: { model: { key: "qwen3-0.6b" } },
+    params_template: {},
   };
 }
 
 function frameworkParameterPayload() {
-  if (!frameworkAdvancedYaml.value.trim()) return { ...frameworkParameters.value };
-  const parsed = parseYaml(frameworkAdvancedYaml.value);
-  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
-    throw new Error("高级 YAML 必须是参数键值对象");
-  }
-  return { ...frameworkParameters.value, ...(parsed as Record<string, unknown>) };
+  return frameworkTrainingParams();
 }
 
 function selectLocalModelFile(event: Event) {
@@ -2002,7 +2009,9 @@ async function startWizard() {
     ElMessage.warning("请上传本地 .pt 模型权重");
     return;
   }
-  if (createTab.value === "zero") {
+  const scenarioTask = selectedScenario.value.task;
+  const usesRegisteredFramework = createTab.value === "zero" && implementedZeroCodeTasks.has(scenarioTask);
+  if (usesRegisteredFramework) {
     const expectedTaskKind = taskKindForPipelineTask(selectedScenario.value.task);
     if (frameworkCatalog.value?.task_kind !== expectedTaskKind) {
       await loadFrameworkCapabilities(expectedTaskKind);
@@ -2010,8 +2019,8 @@ async function startWizard() {
   }
   const task = createTab.value === "local"
     ? createForm.localTask
-    : pipelineTaskForTaskKind(frameworkSelection.value.taskKind || taskKindForPipelineTask(selectedScenario.value.task));
-  const scale = createTab.value === "local" ? createForm.localScale : task === "llm" ? "llm" : "n";
+    : scenarioTask;
+  const scale = createTab.value === "local" ? createForm.localScale : task === "llm" ? "llm" : task === "detect" ? "n" : "pending";
   form.name = name;
   form.task = task;
   form.scale = scale;
@@ -2038,12 +2047,13 @@ async function startWizard() {
       form.base_model_id = uploadedModel.id;
       createForm.scenarioKey = scenarioKeyForTask(task);
     }
-    const frameworkFields = createTab.value === "zero" ? frameworkPipelineFields() : {};
-    if (createTab.value === "zero" && !Object.keys(frameworkFields).length) {
+    const frameworkFields = createTab.value === "zero"
+      ? usesRegisteredFramework
+        ? task === "llm" ? fixedLlmPipelineFields() : frameworkPipelineFields()
+        : pendingCapabilityPipelineFields(task)
+      : {};
+    if (usesRegisteredFramework && !Object.keys(frameworkFields).length) {
       throw new Error("请选择可用的训练框架和模型");
-    }
-    if (createTab.value === "zero" && !selectedFrameworkAdapter.value?.available) {
-      throw new Error(selectedFrameworkAdapter.value?.unavailable_reason || "当前训练框架不可用");
     }
     const pipeline = await api.createPipeline({
       name: form.name,
@@ -2088,7 +2098,9 @@ async function openExistingPipelineWizard(pipeline: TrainingPipelineRecord) {
     trainingEnvironment.mode = "remote";
   } else {
     applyPipelineParams(pipeline);
-    configParams.value = normalizeConfigParams(pipeline.params_template ?? {});
+    configParams.value = pipeline.framework === "paddlex"
+      ? { ...(pipeline.params_template ?? {}) }
+      : normalizeConfigParams(pipeline.params_template ?? {});
   }
   analysisResult.value = null;
   samplesBySplit.value = { train: [], val: [], test: [] };
@@ -2424,20 +2436,25 @@ function rebalanceSplit() {
   form.test_ratio = 0;
 }
 
-function goToWizardStep(index: number) {
+async function goToWizardStep(index: number) {
   if (index === activeStep.value) return;
-  if (!isLlmWizard.value) {
-    activeStep.value = index;
-    return;
-  }
+  if (isPendingCapabilityWizard.value) return;
   if (index < activeStep.value) {
     activeStep.value = index;
     return;
   }
-  if (index === activeStep.value + 1) void goNext();
+  while (activeStep.value < index) {
+    const previousStep = activeStep.value;
+    await goNext();
+    if (activeStep.value === previousStep) return;
+  }
 }
 
 async function goNext() {
+  if (isPendingCapabilityWizard.value) {
+    ElMessage.info("该任务训练能力待接入");
+    return;
+  }
   if (isLlmWizard.value) {
     const validation = llmWizardRef.value?.validateStep(activeStep.value) ?? { valid: false, message: "大模型配置尚未就绪" };
     if (!validation.valid) {
@@ -2469,8 +2486,9 @@ async function goNext() {
     }
     await updateClassCountFromDataset();
   }
-  if (activeStep.value === 2 && configMode.value) {
-    applyConfigText();
+  if (activeStep.value === 2 && !frameworkConfigValid.value) {
+    ElMessage.warning("请先修正训练参数配置中的错误");
+    return;
   }
   activeStep.value += 1;
 }
@@ -2533,7 +2551,10 @@ async function submitTraining() {
     ElMessage.warning("请先选择模型和数据集");
     return;
   }
-  if (configMode.value) applyConfigText();
+  if (!frameworkConfigValid.value) {
+    ElMessage.warning("请先修正训练参数配置中的错误");
+    return;
+  }
   if (trainingEnvironment.mode === "remote") {
     if (!trainingEnvironment.poolId || !trainingEnvironment.nodeId) {
       ElMessage.warning("请选择在线 GPU 服务器");
@@ -2549,7 +2570,7 @@ async function submitTraining() {
     const defaultEnvironment = { device: trainingEnvironment.mode === "remote" ? "0" : "cpu", workers: 2 };
     const jobPayload = trainingJobPayload(defaultEnvironment);
     const frameworkFields = frameworkPipelineFields();
-    const paramsTemplate = requiresBaseModel.value ? trainingParams() : frameworkParameterPayload();
+    const paramsTemplate = frameworkTrainingParams();
     if (wizardPipelineId.value) {
       await api.updatePipeline(wizardPipelineId.value, {
         ...frameworkFields,
@@ -2609,7 +2630,7 @@ async function saveLlmDraft() {
 function llmFrameworkPipelineFields() {
   const adapter = selectedFrameworkAdapter.value;
   const modelId = llmForm.value.modelId.trim();
-  if (!adapter || !modelId) return frameworkPipelineFields();
+  if (!adapter || !modelId) return fixedLlmPipelineFields();
   const catalogModel = taskForFramework(adapter, "llm_sft")?.models.find(
     (model) => model.model_key === modelId || model.runtime_id === modelId,
   );
@@ -2936,6 +2957,38 @@ function trainingParams() {
   });
 }
 
+function paddlexTrainingParams() {
+  return removeEmptyParams({
+    ...configParams.value,
+    epochs: Number(form.epochs),
+    batch_size: Number(form.batch),
+    learning_rate: Number(form.lr0),
+    image_size: Number(form.image_size),
+    workers: Number(form.workers),
+    amp: Boolean(form.amp),
+    resume: Boolean(form.resume_weight),
+  });
+}
+
+function frameworkTrainingParams() {
+  return { ...frameworkParameters.value };
+}
+
+function applyFrameworkParameterDefaults(params: Record<string, unknown>) {
+  if (isPaddleXFramework.value) {
+    form.epochs = numberParam(params.epochs, 100);
+    form.batch = numberParam(params.batch_size, 8);
+    form.lr0 = stringParam(params.learning_rate, "0.001");
+    form.image_size = numberParam(params.image_size, 640);
+    form.workers = numberParam(params.workers, 4);
+    form.amp = params.amp !== false;
+    return;
+  }
+  form.epochs = numberParam(params.epochs, 100);
+  form.batch = numberParam(params.batch, 16);
+  form.lr0 = stringParam(params.lr0, "0.01");
+}
+
 function llmPipelineParams() {
   const modelId = llmForm.value.modelId.trim();
   return {
@@ -3011,8 +3064,11 @@ function applyPipelineParams(pipeline: TrainingPipelineRecord) {
   const params = pipeline.params_template ?? {};
   const environment = pipeline.default_environment ?? {};
   form.epochs = numberParam(params.epochs, form.epochs);
-  form.batch = numberParam(params.batch, form.batch);
-  form.lr0 = stringParam(params.lr0, form.lr0);
+  form.batch = numberParam(params.batch_size ?? params.batch, form.batch);
+  form.lr0 = stringParam(params.learning_rate ?? params.lr0, form.lr0);
+  form.image_size = numberParam(params.image_size, form.image_size);
+  form.workers = numberParam(params.workers, form.workers);
+  form.amp = params.amp !== false;
   form.warmup_epochs = numberParam(params.warmup_epochs ?? params.warmup_steps, form.warmup_epochs);
   form.save_period = numberParam(params.save_period, form.save_period);
   form.pretrained = params.pretrained === false ? "false" : "official";
@@ -3024,6 +3080,15 @@ function applyPipelineParams(pipeline: TrainingPipelineRecord) {
 }
 
 function buildConfigText() {
+  if (isPaddleXFramework.value) {
+    const params = paddlexTrainingParams();
+    const keys = ["epochs", "batch_size", "learning_rate", "image_size", "workers", "amp", "resume"];
+    return [
+      "# PaddleX object detection train config",
+      "# 模型配置、数据集目录、输出目录和 GPU 设备由 Visiox 管理。",
+      ...keys.map((key) => `${key}: ${formatConfigValue(params[key])}`),
+    ].join("\n");
+  }
   const merged = {
     ...yoloParamDefaults,
     ...configParams.value,
@@ -3037,20 +3102,57 @@ function buildConfigText() {
 }
 
 function applyConfigText() {
-  const lines = configText.value.split(/\r?\n/);
-  const next: Record<string, unknown> = {};
-  for (const line of lines) {
-    const match = line.match(/^([a-zA-Z0-9_]+):\s*(.*)$/);
-    if (!match) continue;
-    const [, key, rawValue] = match;
-    const paramKey = key === "warmup_steps" ? "warmup_epochs" : key;
-    if (!yoloParamKeys.includes(paramKey)) continue;
-    const value = rawValue.trim();
-    const parsed = parseConfigValue(value);
-    if (parsed !== undefined) next[paramKey] = parsed;
+  if (isPaddleXFramework.value) {
+    const allowed = new Set(["epochs", "batch_size", "learning_rate", "image_size", "workers", "amp", "resume"]);
+    const next = parseConfigObject(configText.value, allowed);
+    configParams.value = next;
+    form.epochs = numberParam(next.epochs, form.epochs);
+    form.batch = numberParam(next.batch_size, form.batch);
+    form.lr0 = stringParam(next.learning_rate, form.lr0);
+    form.image_size = numberParam(next.image_size, form.image_size);
+    form.workers = numberParam(next.workers, form.workers);
+    form.amp = next.amp !== false;
+    form.resume_weight = next.resume ? "last.pt" : "";
+    return;
   }
+  const parsed = parseConfigObject(configText.value, new Set([...yoloParamKeys, "warmup_steps"]));
+  const next = Object.fromEntries(Object.entries(parsed).map(([key, value]) => [
+    key === "warmup_steps" ? "warmup_epochs" : key,
+    value,
+  ]));
   configParams.value = normalizeConfigParams(next);
   syncCommonFieldsFromConfig(configParams.value);
+}
+
+function parseConfigObject(text: string, allowed: Set<string>) {
+  const parsed = parseYaml(text);
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+    throw new Error("配置文件必须是参数键值对象");
+  }
+  const values = parsed as Record<string, unknown>;
+  const unknown = Object.keys(values).filter((key) => !allowed.has(key));
+  if (unknown.length) throw new Error(`当前框架不支持配置项：${unknown.join("、")}`);
+  return removeEmptyParams(values);
+}
+
+function toggleConfigMode() {
+  if (configMode.value) {
+    if (!commitConfigEditor()) return;
+    configMode.value = false;
+    return;
+  }
+  configText.value = buildConfigText();
+  configMode.value = true;
+}
+
+function commitConfigEditor() {
+  try {
+    applyConfigText();
+    return true;
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, "配置文件解析失败"));
+    return false;
+  }
 }
 
 async function toggleFavorite(pipeline: TrainingPipelineRecord) {
@@ -3205,6 +3307,18 @@ function taskLabel(task?: string) {
 
 function scenarioKeyForTask(task?: string) {
   return scenarios.find((scenario) => scenario.task === task)?.key || "detect";
+}
+
+function pendingCapabilityPipelineFields(task: string) {
+  return {
+    task,
+    task_kind: task,
+    framework: "pending",
+    adapter_key: `pending.${task}.v1`,
+    adapter_version: "1.0.0",
+    model_family: "pending",
+    recipe: { capability_status: "pending" },
+  };
 }
 
 function numberParam(value: unknown, fallback: number) {
@@ -3387,20 +3501,6 @@ function formatConfigValue(value: unknown) {
   if (value === undefined || value === null || value === "") return "null";
   if (Array.isArray(value)) return `[${value.join(", ")}]`;
   return String(value);
-}
-
-function parseConfigValue(value: string): unknown {
-  const trimmed = value.trim();
-  if (!trimmed || trimmed === "null") return undefined;
-  if (trimmed === "true") return true;
-  if (trimmed === "false") return false;
-  if (/^\[[\d\s,.-]*\]$/.test(trimmed)) {
-    const items = trimmed.slice(1, -1).split(",").map((item) => item.trim()).filter(Boolean).map(Number);
-    return items.every(Number.isFinite) ? items : undefined;
-  }
-  const numeric = Number(trimmed);
-  if (Number.isFinite(numeric)) return numeric;
-  return trimmed.replace(/^["']|["']$/g, "");
 }
 
 function unwrapItems<T>(result: PromiseSettledResult<{ items?: T[] }>, label: string): T[] {
@@ -3904,6 +4004,111 @@ function getErrorMessage(error: unknown, fallback: string) {
   max-width: 100%;
 }
 
+.framework-step {
+  max-width: 1120px;
+}
+
+.framework-step__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 22px;
+}
+
+.framework-step__heading h2 {
+  margin-bottom: 6px;
+}
+
+.framework-step__heading p {
+  margin: 0;
+  color: #667085;
+  font-size: 14px;
+}
+
+.framework-step__heading > span {
+  border-radius: 999px;
+  background: #f2f4f7;
+  padding: 6px 11px;
+  color: #344054;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.framework-step__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  align-items: start;
+  gap: 18px;
+}
+
+.pipeline-summary {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid #e1e5eb;
+  border-radius: 8px;
+  background: #fafafa;
+  padding: 18px;
+}
+
+.pipeline-summary__eyebrow {
+  color: #667085;
+  font-size: 12px;
+}
+
+.pipeline-summary > strong {
+  overflow: hidden;
+  color: #101828;
+  font-size: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pipeline-summary > p {
+  min-height: 40px;
+  margin: 0;
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.pipeline-summary dl {
+  display: grid;
+  gap: 9px;
+  margin: 6px 0 0;
+  border-top: 1px solid #e4e7ec;
+  padding-top: 13px;
+}
+
+.pipeline-summary dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pipeline-summary dt,
+.pipeline-summary dd {
+  margin: 0;
+  font-size: 12px;
+}
+
+.pipeline-summary dt { color: #667085; }
+.pipeline-summary dd { color: #101828; font-weight: 600; }
+
+.pending-capability {
+  max-width: 720px;
+  margin-bottom: 20px;
+  padding: 18px 20px;
+  border: 1px solid #d9dee8;
+  border-radius: 6px;
+  background: #f7f8fa;
+}
+
+.pending-capability strong { color: #111827; font-size: 16px; }
+.pending-capability p { margin: 8px 0 0; color: #667085; line-height: 1.7; }
+
 .selected-framework-model {
   display: grid;
   width: min(100%, 540px);
@@ -4083,7 +4288,7 @@ function getErrorMessage(error: unknown, fallback: string) {
   margin-top: 14px;
 }
 
-@media (max-width: 760px) {
+@media not all {
   .training-target-switch,
   .training-resource-options {
     grid-template-columns: 1fr;

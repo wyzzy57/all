@@ -222,5 +222,4 @@ details summary { display: flex; justify-content: space-between; cursor: pointer
 .managed-parameters { align-self: start; padding: 15px; background: #f7f8fa; border-radius: 4px; }
 .managed-parameters p { color: #6b7280; font-size: 12px; line-height: 1.5; }
 .managed-parameters code { display: block; margin-top: 6px; color: #4b5563; }
-@media (max-width: 900px) { .parameter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .yaml-layout { grid-template-columns: 1fr; } }
 </style>

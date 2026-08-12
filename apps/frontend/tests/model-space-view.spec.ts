@@ -50,6 +50,7 @@ vi.mock("element-plus", async () => {
     ...actual,
     ElMessage: {
       error: vi.fn(),
+      info: vi.fn(),
       success: vi.fn(),
       warning: vi.fn(),
     },
@@ -65,6 +66,23 @@ function mountView() {
           inheritAttrs: false,
           emits: ["click"],
           template: "<button :data-testid=\"$attrs['data-testid']\" @click=\"$emit('click')\"><slot /></button>",
+        },
+        "el-cascader": {
+          props: ["modelValue", "options"],
+          emits: ["update:modelValue"],
+          template: `
+            <div data-testid="framework-model-cascader">
+              <template v-for="group in options" :key="group.value">
+                <button
+                  v-for="model in group.children"
+                  :key="model.value"
+                  type="button"
+                  :data-testid="'model-' + model.value"
+                  @click="$emit('update:modelValue', [group.value, model.value])"
+                >{{ model.label }}</button>
+              </template>
+            </div>
+          `,
         },
         "el-checkbox": true,
         "el-dialog": {
@@ -456,36 +474,75 @@ describe("ModelSpaceView", () => {
     await wrapper.get('[data-testid="create-pipeline"]').trigger("click");
 
     await vi.waitFor(() => expect(apiMock.getFrameworkCapabilities).toHaveBeenCalledWith("object_detection"));
+    expect(wrapper.find(".create-dialog .framework-model-selector").exists()).toBe(false);
   });
 
-  it("creates a PaddleX pipeline with the selected adapter and model identity", async () => {
+  it("selects the framework first, selects its model with the dataset, and prepares parameters last", async () => {
     const wrapper = mountView();
     await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
 
     await wrapper.get('[data-testid="create-pipeline"]').trigger("click");
-    await vi.waitFor(() => expect(wrapper.find('[data-testid="framework-paddlex"]').exists()).toBe(true));
-    await wrapper.get('[data-testid="framework-paddlex"]').trigger("click");
+    await vi.waitFor(() => expect(apiMock.getFrameworkCapabilities).toHaveBeenCalledWith("object_detection"));
+    expect(wrapper.find('[data-testid="framework-paddlex"]').exists()).toBe(false);
     await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
     await flushPromises();
 
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="framework-paddlex"]').exists()).toBe(true));
+    expect(wrapper.find('[data-testid="model-yolo26-n"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="model-pp-yoloe-s"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="framework-parameter-epochs"]').exists()).toBe(false);
+    await wrapper.get('[data-testid="framework-paddlex"]').trigger("click");
+    await flushPromises();
+
     expect(apiMock.createPipeline).toHaveBeenCalledWith(expect.objectContaining({
-      engine: "paddlex",
+      engine: "yolo26",
       task: "detect",
-      scale: "S",
+      scale: "n",
       task_kind: "object_detection",
-      framework: "paddlex",
-      adapter_key: "paddlex.object_detection.v1",
-      model_family: "PP-YOLOE",
-      recipe: { model: { key: "pp-yoloe-s" } },
+      framework: "ultralytics",
+      adapter_key: "ultralytics.object_detection.v1",
+      model_family: "yolo26",
+      recipe: { model: { key: "yolo26-n" } },
     }));
+    await vi.waitFor(() => expect(apiMock.updatePipeline).toHaveBeenCalledWith(
+      "pipeline-new",
+      expect.objectContaining({
+        engine: "paddlex",
+        framework: "paddlex",
+        adapter_key: "paddlex.object_detection.v1",
+        recipe: { model: { key: "pp-yoloe-s" } },
+      }),
+    ));
 
     await wrapper.findAll("button").find((button) => button.text() === "下一步")?.trigger("click");
     await flushPromises();
-    expect(wrapper.get('[data-testid="selected-framework-model"]').text()).toContain("PP-YOLOE-S");
+    expect(wrapper.find('[data-testid="framework-paddlex"]').exists()).toBe(false);
+    expect(wrapper.get('[data-testid="model-pp-yoloe-s"]').text()).toContain("PP-YOLOE-S");
+    await wrapper.get('[data-testid="model-pp-yoloe-s"]').trigger("click");
+    await flushPromises();
 
     await wrapper.findAll("button").find((button) => button.text() === "下一步")?.trigger("click");
     await flushPromises();
     const parameterStep = wrapper.findAll(".wizard-steps button").find((button) => button.text().includes("参数准备"));
+    expect(parameterStep?.classes()).toContain("active");
+    expect(wrapper.find('[data-testid="framework-paddlex"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="framework-parameter-epochs"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="advanced-yaml"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="object-detection-training-config"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain("表单配置");
+    expect(wrapper.text()).toContain("YAML 配置");
+    expect(wrapper.text()).not.toContain("轮次(Epochs)");
+    expect(wrapper.text()).not.toContain("修改配置文件");
+
+    await wrapper.get('[data-testid="yaml-tab"]').trigger("click");
+    const configEditor = wrapper.get<HTMLTextAreaElement>('[data-testid="framework-yaml-editor"]');
+    expect(configEditor.element.value).toContain("epochs: 100");
+    expect(configEditor.element.value).not.toContain("Ultralytics");
+    await configEditor.setValue("epochs: fast");
+    expect(wrapper.get('[data-testid="yaml-errors"]').text()).toContain("epochs 必须是整数");
+
+    await wrapper.findAll("button").find((button) => button.text() === "下一步")?.trigger("click");
+    await flushPromises();
     expect(parameterStep?.classes()).toContain("active");
   });
 
@@ -704,6 +761,100 @@ describe("ModelSpaceView", () => {
     expect(wrapper.find('[data-testid="llm-pipeline-wizard"]').exists()).toBe(true);
   });
 
+  it("starts the LLM wizard with LLaMA-Factory even when its runtime probe is unavailable", async () => {
+    apiMock.getFrameworkCapabilities.mockImplementationOnce(async () => ({ task_kind: "object_detection", adapters: [] }));
+    apiMock.getFrameworkCapabilities.mockImplementationOnce(async () => ({
+      task_kind: "llm_sft",
+      adapters: [{
+        framework: "llamafactory",
+        adapter_key: "llamafactory.llm_sft.v1",
+        adapter_version: "1.0.0",
+        display_name: "LLaMA-Factory",
+        available: false,
+        unavailable_reason: "Runtime probe unavailable",
+        tasks: [{
+          task_type: "llm_sft",
+          models: [{ model_key: "qwen3-0.6b", display_name: "Qwen3-0.6B", family: "qwen3", variant: "0.6b" }],
+          accepted_dataset_formats: ["sharegpt"],
+          convertible_dataset_formats: [],
+          resources: { resource_kinds: ["cuda"], cpu_cores_min: 4, memory_mb_min: 16384, gpu_count_min: 1, gpu_memory_mb_min: 12288 },
+          parameters: [],
+        }],
+      }],
+    }));
+    apiMock.createPipeline.mockResolvedValueOnce({
+      id: "pipeline-llm-unavailable-runtime",
+      name: "新建产线",
+      engine: "llamafactory",
+      task: "llm",
+      scale: "0.6b",
+      task_kind: "llm_sft",
+      framework: "llamafactory",
+      adapter_key: "llamafactory.llm_sft.v1",
+      adapter_version: "1.0.0",
+      model_family: "qwen3",
+      recipe: { model: { key: "qwen3-0.6b" } },
+      status: "draft",
+      params_template: {},
+      default_environment: {},
+    });
+
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
+    await wrapper.get('[data-testid="create-pipeline"]').trigger("click");
+    await wrapper.findAll("button").find((button) => button.text().includes("大模型训练"))?.trigger("click");
+    await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.createPipeline).toHaveBeenCalledWith(expect.objectContaining({
+      engine: "llamafactory",
+      task: "llm",
+      framework: "llamafactory",
+      adapter_key: "llamafactory.llm_sft.v1",
+    }));
+    expect(wrapper.find('[data-testid="llm-pipeline-wizard"]').exists()).toBe(true);
+  });
+
+  it("creates an unsupported scenario as a pending capability draft without requiring a framework model", async () => {
+    apiMock.createPipeline.mockResolvedValueOnce({
+      id: "pipeline-document",
+      name: "新建产线",
+      engine: "pending",
+      task: "document",
+      scale: "pending",
+      task_kind: "document",
+      framework: "pending",
+      adapter_key: "pending.document.v1",
+      adapter_version: "1.0.0",
+      model_family: "pending",
+      recipe: { capability_status: "pending" },
+      status: "draft",
+      params_template: {},
+      default_environment: {},
+    });
+
+    const wrapper = mountView();
+    await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
+    await wrapper.get('[data-testid="create-pipeline"]').trigger("click");
+    await wrapper.findAll("button").find((button) => button.text().includes("文档图像信息抽取"))?.trigger("click");
+    await wrapper.get('[data-testid="confirm-create-pipeline"]').trigger("click");
+    await flushPromises();
+
+    expect(apiMock.createPipeline).toHaveBeenCalledWith({
+      name: "新建产线",
+      task: "document",
+      task_kind: "document",
+      framework: "pending",
+      adapter_key: "pending.document.v1",
+      adapter_version: "1.0.0",
+      model_family: "pending",
+      recipe: { capability_status: "pending" },
+    });
+    expect(wrapper.get('[data-testid="pending-capability"]').text()).toContain("训练能力待接入");
+    expect(wrapper.find('[data-testid="framework-paddlex"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="wizard-next"]').exists()).toBe(false);
+  });
+
   it("offers cloning from the detail page after framework identity is locked", async () => {
     apiMock.listPipelines.mockResolvedValueOnce({
       items: [
@@ -766,7 +917,7 @@ describe("ModelSpaceView", () => {
     expect(wrapper.text()).toContain("pepper");
   });
 
-  it("opens an existing pipeline card in the four-step wizard", async () => {
+  it("enforces forward step gates from the top navigation while allowing backward navigation", async () => {
     const wrapper = mountView();
 
     await vi.waitFor(() => expect(apiMock.listPipelines).toHaveBeenCalledTimes(1));
@@ -783,16 +934,43 @@ describe("ModelSpaceView", () => {
     const stepButtons = wrapper.findAll(".wizard-steps button");
     expect(stepButtons).toHaveLength(4);
 
-    await stepButtons[2].trigger("click");
-    expect(wrapper.text()).toContain("Log Interval");
-
     await stepButtons[3].trigger("click");
+    await flushPromises();
+    expect(stepButtons[3].classes()).toContain("active");
     expect(wrapper.find(".submit-step").exists()).toBe(true);
 
-    await stepButtons[0].trigger("click");
-    await wrapper.findAll("button").find((button) => button.text() === "下一步")?.trigger("click");
+    await stepButtons[1].trigger("click");
     await flushPromises();
-    await vi.waitFor(() => expect(apiMock.analyzeDataset).toHaveBeenCalledWith("dataset-1"));
+    expect(stepButtons[1].classes()).toContain("active");
+
+    await stepButtons[2].trigger("click");
+    await flushPromises();
+    expect(stepButtons[2].classes()).toContain("active");
+    expect(wrapper.find('[data-testid="object-detection-training-config"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain("表单配置");
+    expect(wrapper.text()).toContain("YAML 配置");
+    expect(wrapper.text()).not.toContain("Log Interval");
+
+    await wrapper.get('[data-testid="yaml-tab"]').trigger("click");
+    const editor = wrapper.get<HTMLTextAreaElement>('[data-testid="framework-yaml-editor"]');
+    await editor.setValue("unknown_parameter: 1");
+    expect(wrapper.get('[data-testid="yaml-errors"]').exists()).toBe(true);
+
+    await stepButtons[3].trigger("click");
+    await flushPromises();
+    expect(stepButtons[2].classes()).toContain("active");
+    expect(wrapper.find(".submit-step").exists()).toBe(false);
+
+    await editor.setValue("{}");
+    expect(wrapper.find('[data-testid="yaml-errors"]').exists()).toBe(false);
+    await stepButtons[3].trigger("click");
+    await flushPromises();
+    expect(stepButtons[3].classes()).toContain("active");
+    expect(wrapper.find(".submit-step").exists()).toBe(true);
+
+    await stepButtons[1].trigger("click");
+    await flushPromises();
+    expect(stepButtons[1].classes()).toContain("active");
   });
 
   it("selects a real online GPU node and submits the distributed training contract", async () => {
@@ -828,7 +1006,10 @@ describe("ModelSpaceView", () => {
     await flushPromises();
 
     await wrapper.get('[data-testid="pipeline-card-pipeline-1"]').trigger("click");
-    await wrapper.findAll(".wizard-steps button")[3].trigger("click");
+    for (const index of [1, 2, 3]) {
+      await wrapper.findAll(".wizard-steps button")[index].trigger("click");
+      await flushPromises();
+    }
     await vi.waitFor(() => expect(apiMock.listNodes).toHaveBeenCalledTimes(1));
     await flushPromises();
 
@@ -865,7 +1046,10 @@ describe("ModelSpaceView", () => {
     await flushPromises();
 
     await wrapper.get('[data-testid="pipeline-card-pipeline-1"]').trigger("click");
-    await wrapper.findAll(".wizard-steps button")[3].trigger("click");
+    for (const index of [1, 2, 3]) {
+      await wrapper.findAll(".wizard-steps button")[index].trigger("click");
+      await flushPromises();
+    }
     await wrapper.get('[data-testid="training-target-local"]').trigger("click");
     await wrapper.findAll("button").find((button) => button.text() === "提交训练")?.trigger("click");
     await flushPromises();

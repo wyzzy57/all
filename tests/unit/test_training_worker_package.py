@@ -27,7 +27,8 @@ def _runtime_inputs() -> str:
         * 64
         + '","family":"yolo26","id":"model-1","revision":null,'
         '"runtime_id":"yolo26n.pt","source":"base_model"},'
-        '"parameters":{"device":"0,1","epochs":2,"workers":4}}'
+        '"parameters":{"device":"0,1","epochs":2,"workers":4,'
+        '"warmup_epochs":1.5,"patience":25,"optimizer":"AdamW"}}'
     )
 
 
@@ -115,6 +116,9 @@ def test_fixed_entrypoint_preserves_ultralytics_torchrun_semantics() -> None:
         "name=job-job-1",
         "exist_ok=True",
         "epochs=2",
+        "optimizer=AdamW",
+        "patience=25",
+        "warmup_epochs=1.5",
         "workers=4",
     )
 
