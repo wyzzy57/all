@@ -1456,7 +1456,7 @@ def test_create_training_job_creates_task_and_enqueues_command(
     response = client.post(
         f"/pipelines/{pipeline_id}/jobs",
         json={
-            "params": {"epochs": 3, "seed": 42},
+            "params": {"epochs": 3, "optimizer": "SGD"},
             "environment": {"device": "0", "workers": 1},
         },
     )
@@ -1465,7 +1465,10 @@ def test_create_training_job_creates_task_and_enqueues_command(
     body = response.json()
     assert body["pipeline_id"] == pipeline_id
     assert body["status"] == "queued"
-    assert body["params"] == {"epochs": 3, "batch": 4, "imgsz": 640, "seed": 42}
+    assert body["params"]["epochs"] == 3
+    assert body["params"]["batch"] == 4
+    assert body["params"]["imgsz"] == 640
+    assert body["params"]["optimizer"] == "SGD"
     assert body["environment"] == {"device": "0", "workers": 1}
     assert body["task_id"]
     assert len(stream_producer.commands) == 1
@@ -1588,12 +1591,14 @@ def test_training_job_normalizes_legacy_aliases_in_snapshot_and_launch_spec(
                 TrainingJobAttempt.training_job_id == job.id
             )
         )
-    assert job.resolved_snapshot["parameters"] == {
+    parameters = job.resolved_snapshot["parameters"]
+    assert {key: parameters[key] for key in ("epochs", "batch", "lr0", "imgsz")} == {
         "epochs": 10,
         "batch": 2,
         "lr0": 0.002,
         "imgsz": 512,
     }
+    assert not {"batch_size", "learning_rate", "image_size"} & parameters.keys()
     assert attempt is not None
     assert (
         LaunchSpec.model_validate(attempt.launch_spec).canonical_checksum_sha256()
@@ -1601,19 +1606,168 @@ def test_training_job_normalizes_legacy_aliases_in_snapshot_and_launch_spec(
     )
 
 
-def test_training_snapshot_is_independent_from_request_and_pipeline_mutation(
+@pytest.mark.parametrize(
+    ("params", "field"),
+    [
+        ({"lrf": 0.1}, "lrf"),
+        ({"epochs": "3"}, "epochs"),
+        ({"epochs": 0}, "epochs"),
+        ({"optimizer": "invalid"}, "optimizer"),
+        ({"model": "other.pt"}, "model"),
+        ({"classes": [0, 1]}, "classes"),
+    ],
+)
+def test_create_ultralytics_job_rejects_invalid_request_parameters(
+    client: TestClient,
+    session_factory,
+    params: dict,
+    field: str,
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+
+    response = client.post(
+        f"/pipelines/{pipeline_id}/jobs", json={"params": params}
+    )
+
+    assert response.status_code == 422
+    assert field in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("native_name", "native_value", "alias", "alias_value"),
+    [
+        ("batch", 4, "batch_size", 2),
+        ("lr0", 0.01, "learning_rate", 0.002),
+        ("imgsz", 640, "image_size", 512),
+    ],
+)
+def test_create_ultralytics_job_rejects_template_request_alias_conflict(
+    client: TestClient,
+    session_factory,
+    native_name: str,
+    native_value: int | float,
+    alias: str,
+    alias_value: int | float,
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(
+        client,
+        base_model_id,
+        dataset_id,
+        params_template={"epochs": 10, native_name: native_value},
+    ).json()["id"]
+
+    response = client.post(
+        f"/pipelines/{pipeline_id}/jobs", json={"params": {alias: alias_value}}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        f"{alias} cannot be used together with {native_name}"
+    )
+
+
+def test_create_distributed_ultralytics_job_normalizes_request_aliases(
+    client: TestClient,
+    session_factory,
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(
+        client,
+        base_model_id,
+        dataset_id,
+        params_template={"epochs": 10},
+    ).json()["id"]
+    pool_id, node_ids = seed_distributed_pool(session_factory, node_count=1)
+
+    response = client.post(
+        f"/pipelines/{pipeline_id}/jobs",
+        json={
+            "params": {
+                "batch_size": 2,
+                "learning_rate": 0.002,
+                "image_size": 512,
+            },
+            "distributed": {
+                "resource_pool_id": pool_id,
+                "requested_gpus": 1,
+                "node_ids": node_ids,
+                "training_image_digest": (
+                    "registry.example/visiox/training@sha256:" + "a" * 64
+                ),
+            },
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    with session_factory() as session:
+        job = session.get(TrainingJob, response.json()["id"])
+        attempt = session.scalar(
+            select(TrainingJobAttempt).where(
+                TrainingJobAttempt.training_job_id == job.id
+            )
+        )
+    assert {
+        key: job.resolved_snapshot["parameters"][key]
+        for key in ("epochs", "batch", "lr0", "imgsz")
+    } == {
+        "epochs": 10,
+        "batch": 2,
+        "lr0": 0.002,
+        "imgsz": 512,
+    }
+    assert not {
+        "batch_size",
+        "learning_rate",
+        "image_size",
+    } & job.resolved_snapshot["parameters"].keys()
+    assert attempt is not None
+    assert (
+        LaunchSpec.model_validate(attempt.launch_spec).canonical_checksum_sha256()
+        == job.launch_spec_checksum
+    )
+
+
+def test_create_ultralytics_job_normalizes_historical_template_aliases(
+    client: TestClient, session_factory
+):
+    base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
+    pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
+    with session_factory() as session:
+        pipeline = session.get(TrainingPipeline, pipeline_id)
+        pipeline.params_template = {
+            "epochs": 3,
+            "batch_size": 2,
+            "learning_rate": 0.002,
+            "image_size": 512,
+        }
+        session.commit()
+
+    response = client.post(f"/pipelines/{pipeline_id}/jobs", json={})
+
+    assert response.status_code == 201, response.text
+    parameters = response.json()["resolved_snapshot"]["parameters"]
+    assert {key: parameters[key] for key in ("epochs", "batch", "lr0", "imgsz")} == {
+        "epochs": 3,
+        "batch": 2,
+        "lr0": 0.002,
+        "imgsz": 512,
+    }
+    assert not {"batch_size", "learning_rate", "image_size"} & parameters.keys()
+
+
+def test_training_snapshot_is_independent_from_pipeline_mutation(
     client: TestClient,
     session_factory,
 ):
     base_model_id, dataset_id, _ = seed_training_ready_rows(session_factory)
     pipeline_id = create_pipeline(client, base_model_id, dataset_id).json()["id"]
-    request_params = {"epochs": 3, "classes": [0, 1]}
 
     response = client.post(
-        f"/pipelines/{pipeline_id}/jobs", json={"params": request_params}
+        f"/pipelines/{pipeline_id}/jobs", json={"params": {"epochs": 3}}
     )
     assert response.status_code == 201, response.text
-    request_params["classes"].append(2)
     with session_factory() as session:
         pipeline = session.get(TrainingPipeline, pipeline_id)
         pipeline.params_template = {"epochs": 999}
@@ -1621,7 +1775,6 @@ def test_training_snapshot_is_independent_from_request_and_pipeline_mutation(
         session.commit()
     with session_factory() as session:
         job = session.get(TrainingJob, response.json()["id"])
-        assert job.resolved_snapshot["parameters"]["classes"] == [0, 1]
         assert job.resolved_snapshot["parameters"]["epochs"] == 3
         assert job.resolved_snapshot["runtime_model_id"] == "yolo26n.pt"
 

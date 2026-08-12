@@ -64,7 +64,6 @@ from visiox_messaging.streams import RedisStreamProducer
 from visiox_storage.client import ObjectStorageClient
 from visiox_yolo26.training.params import (
     TrainingParamsError,
-    merge_training_params,
     validate_training_environment,
 )
 from visiox_yolo26.training.prechecks import (
@@ -360,11 +359,15 @@ async def create_training_job(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc)
         ) from exc
     try:
-        params = merge_training_params(pipeline.params_template, request.params)
+        params = TrainingSubmissionService(session, settings).normalize_parameters(
+            pipeline, request.params
+        )
         environment = {
             **validate_training_environment(pipeline.default_environment),
             **validate_training_environment(request.environment),
         }
+    except TrainingSubmissionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except TrainingParamsError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)

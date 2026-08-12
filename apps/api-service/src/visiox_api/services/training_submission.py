@@ -109,25 +109,18 @@ class TrainingSubmissionService:
         )
         model = self._current_model(task, pipeline)
         try:
-            template = PipelineConfigurationService._validate_model_parameters(
+            supplied = PipelineConfigurationService._validate_model_parameters(
                 pipeline.framework,
                 task,
                 model,
-                copy.deepcopy(pipeline.params_template or {}),
-            )
-            override_params = PipelineConfigurationService._validate_model_parameters(
-                pipeline.framework,
-                task,
-                model,
-                copy.deepcopy(overrides),
+                {
+                    **copy.deepcopy(pipeline.params_template or {}),
+                    **copy.deepcopy(overrides),
+                },
             )
         except PipelineConfigurationError as exc:
             raise TrainingSubmissionError(exc.detail, status_code=422) from exc
         definitions = {item.name: item for item in task.parameters}
-        supplied = {
-            **template,
-            **override_params,
-        }
         unknown = sorted(set(supplied) - set(definitions))
         if unknown:
             raise TrainingSubmissionError(
