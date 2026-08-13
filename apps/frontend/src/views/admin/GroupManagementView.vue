@@ -126,7 +126,9 @@ async function submitGroup() {
     return;
   }
   try {
-    await api.replaceUserGroupMembers(group.id, [...editor.memberIds]);
+    const activeUserIds = new Set(users.value.map((user) => user.id));
+    const memberIds = editor.memberIds.filter((userId) => activeUserIds.has(userId));
+    await api.replaceUserGroupMembers(group.id, memberIds);
     editorVisible.value = false;
     ElMessage.success("分组已保存");
     await loadGroups();

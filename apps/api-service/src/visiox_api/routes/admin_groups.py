@@ -51,7 +51,9 @@ def _response(session: Session, group: UserGroup) -> GroupResponse:
     member_ids = list(
         session.scalars(
             select(UserGroupMembership.user_id)
+            .join(User, User.id == UserGroupMembership.user_id)
             .where(UserGroupMembership.group_id == group.id)
+            .where(User.status != STATUS_DELETED)
             .order_by(UserGroupMembership.user_id)
         )
     )

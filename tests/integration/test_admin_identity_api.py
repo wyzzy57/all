@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine, delete, func, select
+from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from visiox_api.routes.admin_users import _lock_organization_and_reload_actor
@@ -157,6 +157,21 @@ def test_user_update_reset_and_soft_delete_revoke_sessions(
         f"/admin/users/{identity['member_id']}", headers=identity["admin_headers"]
     )
     assert deleted.status_code == 204
+
+    default_listing = client.get(
+        "/admin/users", headers=identity["admin_headers"]
+    )
+    deleted_listing = client.get(
+        "/admin/users?status=deleted", headers=identity["admin_headers"]
+    )
+    assert default_listing.status_code == 200
+    assert identity["member_id"] not in {
+        item["id"] for item in default_listing.json()["items"]
+    }
+    assert deleted_listing.status_code == 200
+    assert [item["id"] for item in deleted_listing.json()["items"]] == [
+        identity["member_id"]
+    ]
 
     with session_factory() as session:
         user = session.get(User, identity["member_id"])
@@ -592,6 +607,20 @@ def test_group_crud_membership_replacement_and_org_validation(
         identity["member_id"],
         identity["admin_id"],
     }
+    with session_factory.begin() as session:
+        session.execute(
+            update(User)
+            .where(User.id == identity["member_id"])
+            .values(status=STATUS_DELETED)
+        )
+    filtered_listing = client.get(
+        "/admin/groups", headers=identity["admin_headers"]
+    )
+    assert filtered_listing.status_code == 200
+    assert filtered_listing.json()["items"][0]["member_ids"] == [
+        identity["admin_id"]
+    ]
+    assert filtered_listing.json()["items"][0]["member_count"] == 1
     invalid = client.put(
         f"/admin/groups/{group_id}/members",
         headers=identity["admin_headers"],

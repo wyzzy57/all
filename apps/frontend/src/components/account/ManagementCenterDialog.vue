@@ -2,7 +2,7 @@
   <el-dialog
     :model-value="modelValue"
     class="management-center-dialog"
-    width="min(1080px, calc(100vw - 40px))"
+    width="min(1320px, 94vw)"
     :show-close="false"
     :close-on-click-modal="true"
     append-to-body
@@ -356,6 +356,10 @@ watch(
 }
 
 .management-center-content-body :deep(.identity-page-header) {
+  justify-content: flex-end;
+}
+
+.management-center-content-body :deep(.identity-page-header > div) {
   display: none;
 }
 
