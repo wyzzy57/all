@@ -22,6 +22,7 @@
   --visiox-radius: 6px;
   --visiox-shadow: 0 1px 2px rgb(15 23 42 / 4%), 0 8px 24px rgb(15 23 42 / 4%);
   --visiox-async-state-min-height: 180px;
+  --visiox-desktop-canvas-min-width: 1480px;
   font-family:
     Inter, "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, -apple-system,
     BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -425,7 +426,7 @@ textarea {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-@media (max-width: 900px) {
+@media not all {
   .account-sections {
     grid-template-columns: minmax(0, 1fr);
     gap: 8px;
@@ -441,7 +442,7 @@ textarea {
   }
 }
 
-@media (max-width: 640px) {
+@media not all {
   .identity-toolbar,
   .member-selector {
     grid-template-columns: minmax(0, 1fr);
@@ -564,14 +565,16 @@ textarea {
   min-width: 0;
   min-height: 0;
   height: 100%;
-  overflow: hidden;
+  overflow: auto;
   background: var(--visiox-canvas);
 }
 
 .app-main {
-  min-width: 0;
+  flex: 0 0 var(--visiox-desktop-canvas-min-width);
+  width: var(--visiox-desktop-canvas-min-width);
+  min-width: var(--visiox-desktop-canvas-min-width);
   padding: 20px 22px 28px;
-  overflow: auto;
+  overflow: visible;
   overscroll-behavior: contain;
   background: var(--visiox-canvas);
   scrollbar-gutter: stable;
@@ -809,42 +812,6 @@ textarea {
 
 .status-dot.danger {
   background: #dc2626;
-}
-
-@media (max-width: 1180px) {
-  .metric-row {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-@media (max-width: 720px) {
-  .app-main {
-    padding: 14px 12px 22px;
-  }
-
-  .app-sidebar.mobile-expanded {
-    position: absolute;
-    z-index: 10;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    flex-basis: 224px;
-    width: 224px !important;
-    box-shadow: 8px 0 28px rgb(0 0 0 / 14%);
-  }
-
-  .sidebar-scrim {
-    position: fixed;
-    z-index: 9;
-    inset: 0;
-    padding: 0;
-    border: 0;
-    background: rgb(0 0 0 / 28%);
-  }
-
-  .metric-row {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 @media (hover: none) {

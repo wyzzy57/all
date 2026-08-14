@@ -674,7 +674,7 @@ onBeforeUnmount(() => {
   }
 }
 
-@media (max-width: 460px) {
+@media not all {
   .workbench-view {
     gap: 12px;
     font-size: 12px;

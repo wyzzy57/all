@@ -29,6 +29,7 @@ from visiox_edge_executor_worker.distributed import (
 )
 from visiox_edge_executor_worker.distributed_execution import (
     DistributedTrainingHandler,
+    RemoteScriptError,
     StopDistributedTrainingHandler,
     _require_remote_adapter,
     _llamafactory_dataset_info,
@@ -41,6 +42,7 @@ from visiox_edge_executor_worker.distributed_execution import (
     _validate_remote_artifact_manifest,
     build_distributed_handlers,
 )
+from visiox_edge_executor_worker.distributed_execution import _remote_script_failure_message
 from visiox_edge_executor_worker.scripts import load_packaged_script
 from visiox_training.contracts import ArtifactEntry, ArtifactManifest, LaunchSpec
 from visiox_training.runtime import write_artifact_manifest
@@ -55,6 +57,16 @@ def _canonical_checksum(payload: dict[str, object]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def test_remote_script_failure_preserves_diagnostic_message() -> None:
+    error = RemoteScriptError(
+        1,
+        b"pull output\n",
+        b"failed to register layer: no space left on device\n",
+    )
+
+    assert "no space left on device" in _remote_script_failure_message(error)
 
 
 def _generic_staging_request() -> dict[str, object]:
@@ -1692,7 +1704,7 @@ def test_control_plane_reads_real_paddlex_sidecar_contract() -> None:
         {"role": "last_weights", "path": "last_model/model.pdparams"},
         {"role": "evaluation_report", "path": "evaluation_metrics.json"},
         {"role": "visualization", "path": "results.png"},
-        {"role": "visualdl", "path": "visualdl/events.vdlrecords.1"},
+        {"role": "tensorboard_event", "path": "tensorboard/events.out.tfevents.test"},
     ]
     payload = json.dumps(
         {
@@ -1719,7 +1731,7 @@ def test_control_plane_reads_real_paddlex_sidecar_contract() -> None:
         "last_model/model.pdparams": "model_weight",
         "evaluation_metrics.json": "metrics",
         "results.png": "visualization",
-        "visualdl/events.vdlrecords.1": "training_output",
+        "tensorboard/events.out.tfevents.test": "training_output",
     }
     entries = [
         ArtifactEntry(
@@ -2393,7 +2405,6 @@ def test_stop_distributed_training_cancels_active_attempt_and_derives_pipeline()
         "stopped_container_ids": []
     }
     handler._try_collect_checkpoint = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
-
     with session_factory() as session:
         execution = session.get(RemoteExecution, "execution-stop")
         assert execution is not None

@@ -24,13 +24,11 @@ describe("PaddleX training observability", () => {
     expect(groups.find((group) => group.id === "coco-quality")?.charts.map((chart) => chart.unit)).toEqual(["ratio", "ratio"]);
   });
 
-  it("keeps the raw VisualDL link secondary and opens artifact downloads explicitly", async () => {
+  it("keeps artifacts in the dedicated tab and does not expose a second visualization tool", async () => {
     const wrapper = mount(PaddleXTrainingAnalysis, {
       props: {
         series: { bbox_map: [point(1, 0.43)] },
         analysis: { findings: [], availability: {} },
-        artifacts: { items: [{ path: "best_model.pdparams", size_bytes: 1024, sha256: "abc", download_url: "https://files.example/best" }], availability: {} },
-        visualdlUrl: "https://visualdl.example/run/1",
       },
       global: {
         stubs: {
@@ -41,8 +39,7 @@ describe("PaddleX training observability", () => {
     });
     await flushPromises();
 
-    expect(wrapper.get('[data-testid="paddlex-visualdl-link"]').attributes("href")).toBe("https://visualdl.example/run/1");
-    await wrapper.get('[data-testid="paddlex-artifact-best_model.pdparams"]').trigger("click");
-    expect(wrapper.emitted("open-artifact")?.[0]).toEqual([expect.objectContaining({ sha256: "abc" })]);
+    expect(wrapper.find('[data-testid="paddlex-visualdl-link"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="paddlex-artifact-best_model.pdparams"]').exists()).toBe(false);
   });
 });

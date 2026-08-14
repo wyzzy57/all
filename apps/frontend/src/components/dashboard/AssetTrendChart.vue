@@ -226,7 +226,7 @@ onBeforeUnmount(disposeChart);
   border: 0;
 }
 
-@media (max-width: 520px) {
+@media not all {
   .dashboard-chart {
     aspect-ratio: 4 / 3;
   }

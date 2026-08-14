@@ -77,7 +77,7 @@ def run_training(
                 **environment,
                 "VISIOX_PADDLEX_IMAGE_SIZE": str(config.image_size),
                 "VISIOX_PADDLEX_WORKERS": str(config.workers),
-                "VISIOX_PADDLEX_VDL_DIR": str(output_dir / "visualdl"),
+                "VISIOX_PADDLEX_EVAL_DIR": str(output_dir / "evaluation"),
             }
 
             def update_running_state() -> None:
@@ -295,7 +295,6 @@ def _write_progress(
                 "available": telemetry.tensorboard_available,
                 "reason": telemetry.tensorboard_reason,
             },
-            "visualdl": _visualdl_availability(output_dir),
         },
     }
     path = output_dir / "visiox-progress.json"
@@ -342,17 +341,6 @@ def _stop_process_tree(process: Any) -> None:
             wait(timeout=_KILL_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             return
-
-
-def _visualdl_availability(output_dir: Path) -> dict[str, object]:
-    available = any(
-        path.is_file() and "vdlrecords" in path.name.lower()
-        for path in output_dir.rglob("*")
-    )
-    return {
-        "available": available,
-        "reason": None if available else "awaiting PaddleX VisualDL output",
-    }
 
 
 def main() -> int:

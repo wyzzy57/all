@@ -65,5 +65,5 @@ h3 { margin: 0; font-size: 16px; }
 .chart-title span { color: #667085; font-size: 11px; }
 .empty-state { display: grid; min-height: 360px; place-content: center; gap: 8px; text-align: center; }
 .empty-state span { color: #667085; font-size: 13px; }
-@media (max-width: 920px) { .chart-grid { grid-template-columns: 1fr; } }
+@media not all { .chart-grid { grid-template-columns: 1fr; } }
 </style>

@@ -272,7 +272,7 @@ def test_python_310_training_runtime_does_not_import_datetime_utc() -> None:
     assert incompatible == []
 
 
-def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
+def test_paddlex_child_configures_workers_resize_and_evaluation_output() -> None:
     module = _paddlex_main_module()
 
     class FakeConfig:
@@ -320,7 +320,7 @@ def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
         config,
         image_size=768,
         workers=5,
-        visualdl_dir="/workspace/output/visualdl",
+        eval_dir="/workspace/output/evaluation",
     )
 
     assert config.updated_workers == [5]
@@ -337,9 +337,9 @@ def test_paddlex_child_configures_workers_resize_and_visualdl() -> None:
     assert config["TestReader"]["inputs_def"]["image_shape"] == [3, 768, 768]
     assert config["TrainDataset"]["image_dir"] == ""
     assert config["EvalDataset"]["image_dir"] == ""
-    assert config["use_vdl"] is True
-    assert config["vdl_log_dir"] == "/workspace/output/visualdl"
-    assert config["output_eval"] == "/workspace/output"
+    assert "use_vdl" not in config._data
+    assert "vdl_log_dir" not in config._data
+    assert config["output_eval"] == "/workspace/output/evaluation"
 
 
 def test_resource_sample_preserves_each_gpu(monkeypatch) -> None:
@@ -469,8 +469,8 @@ def test_worker_always_writes_durable_outputs_and_manifest(
     assert popen_calls[0][1].get("shell") is not True
     assert popen_calls[0][1]["env"]["VISIOX_PADDLEX_IMAGE_SIZE"] == "640"
     assert popen_calls[0][1]["env"]["VISIOX_PADDLEX_WORKERS"] == "2"
-    assert popen_calls[0][1]["env"]["VISIOX_PADDLEX_VDL_DIR"] == str(
-        tmp_path / "visualdl"
+    assert popen_calls[0][1]["env"]["VISIOX_PADDLEX_EVAL_DIR"] == str(
+        tmp_path / "evaluation"
     )
     assert (tmp_path / "stdout.log").read_text(encoding="utf-8").endswith(
         "loss: 2.5\n"
@@ -607,7 +607,7 @@ def test_artifact_collection_catalogs_prescribed_outputs(tmp_path: Path) -> None
         "checkpoint/epoch_2.pdparams": b"checkpoint",
         "eval/evaluation.json": b"{}",
         "visualizations/sample.jpg": b"jpg",
-        "visualdl/vdlrecords.1.log": b"visualdl",
+        "tensorboard/events.out.tfevents.test": b"tensorboard",
     }
     for relative, content in files.items():
         path = tmp_path / relative
@@ -631,7 +631,7 @@ def test_artifact_collection_catalogs_prescribed_outputs(tmp_path: Path) -> None
         "checkpoint_weights",
         "train_log",
         "visualization",
-        "visualdl",
+        "tensorboard_event",
     }
 
 

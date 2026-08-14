@@ -1205,7 +1205,8 @@ export const api = {
     request<FrameworkCapabilityCatalogResponse>(`/frameworks/capabilities${query({ task_kind: taskKind })}`),
   createPipeline: (payload: Record<string, unknown>) =>
     request<TrainingPipelineRecord>("/pipelines", { method: "POST", body: JSON.stringify(payload) }),
-  listPipelines: () => request<ListResponse<TrainingPipelineRecord>>("/pipelines"),
+  listPipelines: (params: { limit?: number; offset?: number } = {}) =>
+    request<ListResponse<TrainingPipelineRecord>>(`/pipelines${query(params)}`),
   updatePipeline: (pipelineId: string, payload: Record<string, unknown>) =>
     request<TrainingPipelineRecord>(`/pipelines/${pipelineId}`, { method: "PATCH", body: JSON.stringify(payload) }),
   clonePipeline: (pipelineId: string, payload: Record<string, unknown>) =>

@@ -367,7 +367,7 @@ function count(value?: number) {
   color: #dc2626;
 }
 
-@media (max-width: 720px) {
+@media not all {
   .data-asset-card {
     height: auto;
     min-height: 190px;

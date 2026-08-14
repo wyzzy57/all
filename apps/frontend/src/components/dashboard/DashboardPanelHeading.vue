@@ -116,7 +116,7 @@ p {
   outline-offset: 2px;
 }
 
-@media (max-width: 600px) {
+@media not all {
   .dashboard-panel-heading {
     grid-template-columns: minmax(0, 1fr);
     gap: 6px;

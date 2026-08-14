@@ -90,14 +90,10 @@ class TrainingObservabilityService:
         *,
         mlflow_client_factory: Callable[[str], Any] | None = None,
         event_accumulator_factory: Callable[[str], Any] | None = None,
-        visualdl_reader_factory: Callable[[str], Any] | None = None,
     ) -> None:
         self.settings = settings
         self._mlflow_client_factory = mlflow_client_factory or self._default_mlflow_client
         self._event_accumulator_factory = event_accumulator_factory or self._default_event_accumulator
-        self._visualdl_reader_factory = (
-            visualdl_reader_factory or self._default_visualdl_reader
-        )
         self._event_accumulators: OrderedDict[tuple[Path, int], Any] = OrderedDict()
         self._event_accumulator_lock = Lock()
 
@@ -263,7 +259,6 @@ class TrainingObservabilityService:
                 mlflow=mlflow_availability,
                 tensorboard=tensorboard_availability,
                 progress=progress_availability,
-                visualdl=self._visualdl_availability(job, snapshot),
                 resources=self._resources_availability(job, snapshot),
                 logs=self._logs_availability(job),
                 artifacts=self._artifacts_availability(job),
@@ -356,9 +351,8 @@ class TrainingObservabilityService:
                             )
                         )
 
-        visualdl_availability: tuple[bool, str | None] | None = None
         if engine == "paddlex":
-            visualdl_availability = self._fill_paddlex_fallbacks(job, series)
+            self._fill_paddlex_fallbacks(job, series)
 
         progress_keys = {key for key, points in series.items() if not points}
         if progress_keys:
@@ -408,7 +402,6 @@ class TrainingObservabilityService:
                 mlflow=(mlflow_available, mlflow_reason),
                 tensorboard=(tensorboard_available, tensorboard_reason),
                 progress=self._progress_availability(job),
-                visualdl=visualdl_availability,
             ),
         }
 
@@ -516,7 +509,30 @@ class TrainingObservabilityService:
         artifacts: list[dict[str, Any]] = []
         reason: str | None = None
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            if path.is_file():
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            else:
+                metrics = getattr(job, "metrics", {})
+                payload = {
+                    "artifacts": [
+                        {
+                            "path": name,
+                            "artifact_type": "training_output",
+                            # Remote workers currently report artifact URIs before
+                            # the optional local manifest is materialized.
+                            "size_bytes": 0,
+                            "sha256": "",
+                        }
+                        for name in (
+                            list((metrics.get("weights") or {}).keys())
+                            if isinstance(metrics, dict)
+                            and isinstance(metrics.get("weights"), dict)
+                            else []
+                        )
+                    ]
+                }
+                if not payload["artifacts"]:
+                    raise FileNotFoundError("training artifact manifest not found")
             values = payload.get("artifacts") if isinstance(payload, dict) else None
             if not isinstance(values, list):
                 raise ValueError("artifact manifest is invalid")
@@ -526,6 +542,9 @@ class TrainingObservabilityService:
                 artifact_uris = metrics.get("artifacts")
                 if isinstance(artifact_uris, dict):
                     available_names.update(str(name) for name in artifact_uris)
+                weight_uris = metrics.get("weights")
+                if isinstance(weight_uris, dict):
+                    available_names.update(str(name) for name in weight_uris)
                 if isinstance(metrics.get("adapter"), str):
                     available_names.add("adapter_model.safetensors")
             artifacts = [
@@ -624,6 +643,19 @@ class TrainingObservabilityService:
     def _event_accumulator(self, job: Any) -> Any:
         run_path = self._run_path(job)
         event_files = list(run_path.rglob("events.out.tfevents.*"))
+        if not event_files:
+            metrics = getattr(job, "metrics", {})
+            event_uri = (
+                metrics.get("observability", {}).get("tensorboard_event_uri")
+                if isinstance(metrics, dict)
+                and isinstance(metrics.get("observability"), dict)
+                else None
+            )
+            if isinstance(event_uri, str):
+                raise ObservabilitySourceError(
+                    "tensorboard",
+                    "TensorBoard event is stored remotely; open TensorBoard to view it",
+                )
         if not event_files:
             raise ObservabilitySourceError("tensorboard", "event file not found")
         newest = max(event_files, key=lambda path: path.stat().st_mtime_ns)
@@ -778,12 +810,6 @@ class TrainingObservabilityService:
         return MlflowClient(tracking_uri=tracking_uri)
 
     @staticmethod
-    def _default_visualdl_reader(file_path: str) -> Any:
-        from visualdl import LogReader
-
-        return LogReader(file_path=file_path)
-
-    @staticmethod
     def _default_event_accumulator(run_path: str) -> Any:
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
@@ -874,17 +900,16 @@ class TrainingObservabilityService:
 
     def _fill_paddlex_fallbacks(
         self, job: Any, series: dict[str, list[dict[str, Any]]]
-    ) -> tuple[bool, str | None]:
-        visualdl_availability = self._fill_visualdl_scalars(job, series)
+    ) -> None:
         samples = self._jsonl_samples(job, "visiox-metrics.jsonl")
         self._fill_metric_samples(series, samples, source="jsonl")
         if all(series.values()):
-            return visualdl_availability
+            return
         from visiox_api.services.observability.paddlex import parse_log_line
 
         path = self._run_path(job) / "stdout.log"
         if not path.is_file():
-            return visualdl_availability
+            return
         try:
             log_samples: list[dict[str, Any]] = []
             current_step = 0
@@ -904,102 +929,11 @@ class TrainingObservabilityService:
                     sample.setdefault("epoch", current_epoch)
                 log_samples.append(sample)
         except OSError:
-            return visualdl_availability
+            return
         timestamp = path.stat().st_mtime
         for sample in log_samples:
             sample.setdefault("timestamp", timestamp)
         self._fill_metric_samples(series, log_samples, source="logs")
-        return visualdl_availability
-
-    def _fill_visualdl_scalars(
-        self, job: Any, series: dict[str, list[dict[str, Any]]]
-    ) -> tuple[bool, str | None]:
-        try:
-            record_paths = sorted(
-                path
-                for path in self._run_path(job).rglob("*")
-                if path.is_file() and "vdlrecords" in path.name.lower()
-            )
-        except OSError as exc:
-            return False, str(exc)
-        if not record_paths:
-            return False, "VisualDL output not found"
-
-        errors: list[str] = []
-        points_read = 0
-        for record_path in record_paths:
-            try:
-                reader = self._visualdl_reader_factory(str(record_path))
-                tags = reader.get_tags()
-                if not isinstance(tags, dict):
-                    raise ValueError("VisualDL tags are invalid")
-                scalar_tags = tags.get("scalar", [])
-                if not isinstance(scalar_tags, list | tuple):
-                    raise ValueError("VisualDL scalar tags are invalid")
-                count, read_errors = self._fill_visualdl_record(
-                    reader, scalar_tags, series
-                )
-                points_read += count
-                errors.extend(read_errors)
-            except Exception as exc:
-                errors.append(str(exc))
-        if points_read:
-            return True, None
-        return False, errors[0] if errors else "VisualDL output could not be read"
-
-    def _fill_visualdl_record(
-        self,
-        reader: Any,
-        scalar_tags: list[Any] | tuple[Any, ...],
-        series: dict[str, list[dict[str, Any]]],
-    ) -> tuple[int, list[str]]:
-        missing = {key for key, points in series.items() if not points}
-        points_read = 0
-        errors: list[str] = []
-        for tag in scalar_tags:
-            raw_name = tag.decode("utf-8") if isinstance(tag, bytes) else str(tag)
-            identity = self.for_engine("paddlex").metric_identity(raw_name)
-            if identity.unit not in {"loss", "rate", "ratio"}:
-                continue
-            key = next(
-                (
-                    candidate
-                    for candidate in (
-                        identity.canonical_name,
-                        _normalize_metric_name(raw_name),
-                    )
-                    if candidate in missing
-                ),
-                None,
-            )
-            try:
-                values = reader.get_data("scalar", tag)
-            except Exception as exc:
-                errors.append(str(exc))
-                continue
-            for value in values:
-                step = getattr(value, "id", None)
-                timestamp = getattr(value, "timestamp", None)
-                scalar = getattr(value, "value", None)
-                if not all(
-                    isinstance(item, int | float) and not isinstance(item, bool)
-                    for item in (step, timestamp, scalar)
-                ):
-                    continue
-                points_read += 1
-                if key is None:
-                    continue
-                series[key].append(
-                    self._scalar_point(
-                        identity,
-                        step=step,
-                        epoch=None,
-                        value=scalar,
-                        timestamp=timestamp,
-                        source="visualdl",
-                    )
-                )
-        return points_read, errors
 
     def _fill_metric_samples(
         self,
@@ -1102,29 +1036,6 @@ class TrainingObservabilityService:
             return False, exc.message
         return True, None
 
-    def _visualdl_availability(
-        self, job: Any, snapshot: dict[str, Any] | None = None
-    ) -> tuple[bool, str | None]:
-        snapshot = snapshot or {}
-        availability = snapshot.get("availability")
-        visualdl = (
-            availability.get("visualdl") if isinstance(availability, dict) else None
-        )
-        if isinstance(visualdl, dict) and isinstance(
-            visualdl.get("available"), bool
-        ):
-            reason = visualdl.get("reason")
-            return visualdl["available"], str(reason) if reason is not None else None
-        try:
-            available = any(
-                "vdlrecords" in path.name.lower()
-                for path in self._run_path(job).rglob("*")
-                if path.is_file()
-            )
-        except OSError as exc:
-            return False, str(exc)
-        return available, None if available else "VisualDL output not found"
-
     def _resources_availability(
         self, job: Any, snapshot: dict[str, Any] | None = None
     ) -> tuple[bool, str | None]:
@@ -1141,6 +1052,11 @@ class TrainingObservabilityService:
             (run_path / name).is_file()
             for name in ("stdout.log", "stderr.log", "train.log", "training.log")
         )
+        if not available:
+            metrics = getattr(job, "metrics", {})
+            observability = metrics.get("observability") if isinstance(metrics, dict) else None
+            if isinstance(observability, dict) and observability.get("log_stream_id"):
+                return True, None
         return available, None if available else "training logs not found"
 
     def _artifacts_availability(self, job: Any) -> tuple[bool, str | None]:
@@ -1157,7 +1073,6 @@ class TrainingObservabilityService:
         for source, setting in (
             ("mlflow", "mlflow_public_url"),
             ("tensorboard", "tensorboard_public_url"),
-            ("visualdl", "visualdl_public_url"),
         ):
             url = getattr(self.settings, setting, None)
             if isinstance(url, str) and url:
@@ -1171,22 +1086,16 @@ class TrainingObservabilityService:
         mlflow: tuple[bool, str | None],
         tensorboard: tuple[bool, str | None],
         progress: tuple[bool, str | None],
-        visualdl: tuple[bool, str | None] | None = None,
         resources: tuple[bool, str | None] | None = None,
         logs: tuple[bool, str | None] | None = None,
         artifacts: tuple[bool, str | None] | None = None,
     ) -> dict[str, dict[str, bool | str | None]]:
         snapshot: dict[str, Any] = {}
-        if job is not None and (visualdl is None or resources is None):
+        if job is not None and resources is None:
             try:
                 snapshot = self._progress_snapshot(job)
             except ObservabilitySourceError:
                 pass
-        visualdl = visualdl or (
-            self._visualdl_availability(job, snapshot)
-            if job is not None
-            else (False, "not reported")
-        )
         resources = resources or (
             self._resources_availability(job, snapshot)
             if job is not None
@@ -1205,7 +1114,6 @@ class TrainingObservabilityService:
         return {
             "mlflow": {"available": mlflow[0], "reason": mlflow[1]},
             "tensorboard": {"available": tensorboard[0], "reason": tensorboard[1]},
-            "visualdl": {"available": visualdl[0], "reason": visualdl[1]},
             "progress": {"available": progress[0], "reason": progress[1]},
             "resources": {"available": resources[0], "reason": resources[1]},
             "logs": {"available": logs[0], "reason": logs[1]},

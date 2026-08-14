@@ -363,7 +363,7 @@ watch(
   display: none;
 }
 
-@media (max-width: 720px) {
+@media not all {
   :global(.management-center-dialog) {
     width: calc(100vw - 16px) !important;
     height: calc(100dvh - 16px);

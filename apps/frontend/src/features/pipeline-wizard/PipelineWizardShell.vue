@@ -27,7 +27,7 @@
         <el-button v-if="activeStep > 0" plain @click="$emit('previous')">上一步</el-button>
         <el-button v-if="showDirectDeploy && activeStep === 0" plain @click="$emit('directDeploy')">直接部署</el-button>
         <el-button v-if="showSaveDraft" plain :loading="draftSaving" @click="$emit('saveDraft')">保存草稿</el-button>
-        <el-button v-if="activeStep < steps.length - 1" type="primary" @click="$emit('next')">下一步</el-button>
+        <el-button v-if="activeStep < steps.length - 1 && !nextDisabled" type="primary" data-testid="wizard-next" @click="$emit('next')">下一步</el-button>
         <el-button v-else type="primary" :loading="submitting" @click="$emit('submit')">提交训练</el-button>
       </footer>
     </section>
@@ -47,6 +47,7 @@ const props = withDefaults(
     showSaveDraft?: boolean;
     draftSaving?: boolean;
     draftStatus?: string;
+    nextDisabled?: boolean;
   }>(),
   {
     submitting: false,
@@ -54,6 +55,7 @@ const props = withDefaults(
     showSaveDraft: false,
     draftSaving: false,
     draftStatus: "",
+    nextDisabled: false,
   },
 );
 
@@ -93,7 +95,7 @@ const draftStatusTone = computed(() => ({
 .draft-status.saved { color: #027a48; }
 .draft-status.error { color: #b42318; }
 
-@media (max-width: 820px) {
+@media not all {
   .wizard-topbar { display: grid; gap: 14px; }
   .back-link { position: static; justify-self: start; }
   .wizard-steps { width: 100%; }
@@ -102,7 +104,7 @@ const draftStatusTone = computed(() => ({
   .wizard-footer { position: sticky; bottom: 0; z-index: 4; margin: 24px -18px -22px; padding: 12px 18px; border-top: 1px solid #e4e7ec; background: #fff; }
 }
 
-@media (max-width: 560px) {
+@media not all {
   .wizard-steps strong { max-width: 56px; text-align: center; }
   .draft-status { display: none; }
 }

@@ -315,7 +315,11 @@ def main():
         return 0
     except Exception as error:
         detail = f":{error.code}" if isinstance(error, RequestValidationError) else ""
-        print(f"distributed rank operation failed at stage={stage}{detail} ({type(error).__name__})", file=sys.stderr)
+        print(
+            f"distributed rank operation failed at stage={stage}{detail} "
+            f"({type(error).__name__}): {error}",
+            file=sys.stderr,
+        )
         return 1
 
 

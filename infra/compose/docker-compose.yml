@@ -191,30 +191,6 @@ services:
       retries: 6
       start_period: 20s
 
-  visualdl:
-    build:
-      context: ../..
-      dockerfile: infra/observability/Dockerfile
-    command:
-      - visualdl
-      - --logdir
-      - /workspace/training-runs/runs
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8040"
-    profiles: ["visualdl"]
-    ports:
-      - "8040:8040"
-    volumes:
-      - training-runs:/workspace/training-runs:ro
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8040/', timeout=3).read()"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
-      start_period: 20s
-
   postgres:
     image: postgres:16-alpine
     environment:

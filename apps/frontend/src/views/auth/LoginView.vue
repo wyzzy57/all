@@ -153,7 +153,7 @@ async function submit(): Promise<void> {
   margin-top: 6px;
 }
 
-@media (max-width: 520px) {
+@media not all {
   .login-page {
     padding: 24px 16px;
   }

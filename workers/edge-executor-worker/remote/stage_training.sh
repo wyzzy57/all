@@ -284,7 +284,11 @@ def main():
         print(json.dumps({"root": str(root), "paths": {"output": str(output_dir), "launch_spec": str(launch_spec_path), "artifacts": artifact_paths}}, ensure_ascii=True, separators=(",", ":"), sort_keys=True))
         return 0
     except Exception as error:
-        print(f"training artifact staging failed at stage={stage} ({type(error).__name__})", file=sys.stderr)
+        print(
+            f"training artifact staging failed at stage={stage} "
+            f"({type(error).__name__}): {error}",
+            file=sys.stderr,
+        )
         return 1
 
 

@@ -31,6 +31,16 @@ describe("api client", () => {
     vi.restoreAllMocks();
   });
 
+  it("supports loading the complete pipeline list instead of the default first page", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      mockJsonResponse({ items: [], total: 59, limit: 200, offset: 0 }),
+    );
+
+    await api.listPipelines({ limit: 200 });
+
+    expect(fetchMock).toHaveBeenCalledWith("/pipelines?limit=200", expect.anything());
+  });
+
   it("stores refreshed access tokens in memory and includes refresh credentials", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
       if (input === "/auth/refresh") {

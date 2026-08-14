@@ -1803,7 +1803,7 @@ async function loadWorkspace(options: { silent?: boolean } = {}) {
   if (!options.silent) loading.value = true;
   errorMessage.value = "";
   const [pipelineResult, baseResult, trainedResult, datasetResult, jobResult] = await Promise.allSettled([
-    api.listPipelines(),
+    api.listPipelines({ limit: 200 }),
     api.listBaseModels(),
     api.listTrainedModels({ limit: 200 }),
     api.listDatasets(),

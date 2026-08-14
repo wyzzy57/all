@@ -733,7 +733,7 @@ defineExpose({ validateStep, configMode });
 .submit-recap span { color: #667085; font-size: 12px; }
 .submit-recap strong { overflow-wrap: anywhere; }
 
-@media (max-width: 1180px) {
+@media not all {
   .parameter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .resource-preflight-layout, .yaml-layout { grid-template-columns: 1fr; }
   .submit-recap { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -741,7 +741,7 @@ defineExpose({ validateStep, configMode });
   .submit-recap div:nth-child(-n + 2) { border-bottom: 1px solid #e4e7ec; }
 }
 
-@media (max-width: 820px) {
+@media not all {
   .step-heading, .parameter-heading, .section-title { align-items: flex-start; flex-direction: column; }
   .model-entry-grid, .advanced-inline-grid, .parameter-grid, .node-options, .dataset-summary, .submit-recap { grid-template-columns: 1fr; }
   .dataset-summary div, .submit-recap div { border-right: 0; border-bottom: 1px solid #e4e7ec; }

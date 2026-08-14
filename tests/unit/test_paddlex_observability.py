@@ -89,7 +89,6 @@ def _settings(tmp_path: Path) -> SimpleNamespace:
         mlflow_tracking_uri="http://mlflow.test",
         mlflow_public_url="http://mlflow.test",
         tensorboard_public_url="http://tensorboard.test",
-        visualdl_public_url="http://visualdl.test",
         training_runs_root=tmp_path,
     )
 
@@ -128,62 +127,10 @@ def test_detection_metric_canonical_names_match_across_adapters(
         assert paddlex_identity.raw_name == paddlex_name
 
 
-def test_paddlex_reads_visualdl_scalars_with_canonical_metadata(
-    tmp_path: Path,
-) -> None:
-    job = _job()
-    visualdl_dir = tmp_path / "runs" / f"job-{job.id}" / "visualdl"
-    visualdl_dir.mkdir(parents=True)
-    record_path = visualdl_dir / "vdlrecords.1.log"
-    record_path.touch()
-    opened_paths: list[str] = []
-
-    def reader_factory(file_path: str):
-        opened_paths.append(file_path)
-        return FakeVisualDLReader()
-
-    service = TrainingObservabilityService(
-        _settings(tmp_path),
-        mlflow_client_factory=OfflineMlflow,
-        visualdl_reader_factory=reader_factory,
-    )
-
-    result = service.for_engine("paddlex").scalars(
-        job,
-        ["loss.total", "optimization.learning_rate", "detection.ap50"],
-        None,
-        None,
-        100,
-    )
-
-    assert opened_paths == [str(record_path)]
-    assert result["series"]["loss.total"][0] == {
-        "canonical_name": "loss.total",
-        "raw_name": "loss",
-        "unit": "loss",
-        "split": "train",
-        "step": 1.0,
-        "epoch": None,
-        "value": 2.5,
-        "timestamp": 10.0,
-        "source": "visualdl",
-    }
-    assert result["series"]["optimization.learning_rate"][0]["source"] == (
-        "visualdl"
-    )
-    assert result["series"]["detection.ap50"][0]["raw_name"] == "bbox_mAP_50"
-    assert result["availability"]["visualdl"] == {
-        "available": True,
-        "reason": None,
-    }
-
-
-def test_paddlex_visualdl_failure_falls_back_to_jsonl(tmp_path: Path) -> None:
+def test_paddlex_jsonl_fallback_is_the_only_non_external_fallback(tmp_path: Path) -> None:
     job = _job()
     run_path = tmp_path / "runs" / f"job-{job.id}"
-    visualdl_dir = run_path / "visualdl"
-    visualdl_dir.mkdir(parents=True)
-    (visualdl_dir / "vdlrecords.corrupt.log").touch()
+    run_path.mkdir(parents=True)
     (run_path / "visiox-metrics.jsonl").write_text(
         json.dumps(
             {
@@ -195,13 +142,9 @@ def test_paddlex_visualdl_failure_falls_back_to_jsonl(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    def broken_reader(_file_path: str):
-        raise ValueError("corrupt vdlrecords")
-
     service = TrainingObservabilityService(
         _settings(tmp_path),
         mlflow_client_factory=OfflineMlflow,
-        visualdl_reader_factory=broken_reader,
     )
 
     result = service.for_engine("paddlex").scalars(
@@ -209,53 +152,6 @@ def test_paddlex_visualdl_failure_falls_back_to_jsonl(tmp_path: Path) -> None:
     )
 
     assert result["series"]["loss.total"][0]["source"] == "jsonl"
-    assert result["availability"]["visualdl"] == {
-        "available": False,
-        "reason": "corrupt vdlrecords",
-    }
-
-
-def test_paddlex_visualdl_get_data_failure_falls_back_to_jsonl(
-    tmp_path: Path,
-) -> None:
-    job = _job()
-    run_path = tmp_path / "runs" / f"job-{job.id}"
-    visualdl_dir = run_path / "visualdl"
-    visualdl_dir.mkdir(parents=True)
-    (visualdl_dir / "vdlrecords.corrupt-data.log").touch()
-    (run_path / "visiox-metrics.jsonl").write_text(
-        json.dumps(
-            {"timestamp": 12.0, "step": 3, "metrics": {"loss": 1.25}}
-        ),
-        encoding="utf-8",
-    )
-
-    class BrokenDataReader:
-        def get_tags(self):
-            return {"scalar": ["loss"]}
-
-        def get_data(self, component, tag):
-            assert component == "scalar"
-            assert tag == "loss"
-            raise ValueError("VisualDL scalar payload is corrupt")
-
-    service = TrainingObservabilityService(
-        _settings(tmp_path),
-        mlflow_client_factory=OfflineMlflow,
-        visualdl_reader_factory=lambda _path: BrokenDataReader(),
-    )
-
-    result = service.for_engine("paddlex").scalars(
-        job, ["loss.total"], None, None, 100
-    )
-
-    assert result["series"]["loss.total"][0]["source"] == "jsonl"
-    assert result["availability"]["visualdl"] == {
-        "available": False,
-        "reason": "VisualDL scalar payload is corrupt",
-    }
-
-
 def test_paddlex_jsonl_fallback_normalizes_losses_lr_and_coco_metrics(
     tmp_path: Path,
 ) -> None:
@@ -523,9 +419,7 @@ def test_paddlex_summary_exposes_all_sources_and_secondary_actions(
     (run_path / "visiox-progress.json").write_text(
         json.dumps(
             {
-                "availability": {
-                    "visualdl": {"available": True, "reason": None},
-                },
+                "availability": {},
                 "resources": [],
             }
         ),
@@ -548,22 +442,16 @@ def test_paddlex_summary_exposes_all_sources_and_secondary_actions(
     assert set(summary["availability"]) == {
         "mlflow",
         "tensorboard",
-        "visualdl",
         "progress",
         "resources",
         "logs",
         "artifacts",
     }
     assert summary["availability"]["mlflow"]["available"] is False
-    assert summary["availability"]["visualdl"] == {
-        "available": True,
-        "reason": None,
-    }
     assert summary["availability"]["logs"]["available"] is True
     assert summary["secondary_actions"] == [
         {"source": "mlflow", "url": "http://mlflow.test"},
         {"source": "tensorboard", "url": "http://tensorboard.test"},
-        {"source": "visualdl", "url": "http://visualdl.test"},
     ]
     assert "available_histograms" not in summary
 
@@ -571,7 +459,6 @@ def test_paddlex_summary_exposes_all_sources_and_secondary_actions(
     assert set(artifacts["availability"]) == {
         "mlflow",
         "tensorboard",
-        "visualdl",
         "progress",
         "resources",
         "logs",

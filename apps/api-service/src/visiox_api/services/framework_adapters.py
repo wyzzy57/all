@@ -23,6 +23,8 @@ from visiox_training.adapters.paddlex import PaddleXAdapter
 from visiox_training.adapters.ultralytics import UltralyticsAdapter
 from visiox_training.capabilities import OperationName
 from visiox_training.registry import AdapterRegistry, create_registry
+from visiox_yolo26.export.commands import build_export_command as build_yolo_export_command
+from visiox_yolo26.training.commands import build_train_command as build_yolo_train_command
 
 
 def paddlex_operation_implementations() -> Mapping[
@@ -36,6 +38,35 @@ def paddlex_operation_implementations() -> Mapping[
             "evaluate": DockerPaddleXEvaluationRuntime.run,
             "image_inference": PaddleXPredictor.predict_image,
             "export": build_export_command,
+            "deploy": resolve_deployment_adapter,
+        }
+    )
+
+
+def _run_ultralytics_evaluation(*args: object, **kwargs: object) -> object:
+    from visiox_api.routes.pipeline_evaluation import UltralyticsPipelineEvaluator
+
+    return UltralyticsPipelineEvaluator().evaluate(*args, **kwargs)
+
+
+def _run_ultralytics_inference(*args: object, **kwargs: object) -> object:
+    from visiox_api.routes.pipeline_inference import UltralyticsPipelinePredictor
+
+    return UltralyticsPipelinePredictor().predict(*args, **kwargs)
+
+
+def ultralytics_operation_implementations() -> Mapping[
+    OperationName, Callable[..., object]
+]:
+    """Existing product runtimes exposed through the framework capability catalog."""
+    return MappingProxyType(
+        {
+            "train": build_yolo_train_command,
+            "stop": StopDistributedTrainingHandler.execute,
+            "resume": DistributedTrainingHandler.execute,
+            "evaluate": _run_ultralytics_evaluation,
+            "image_inference": _run_ultralytics_inference,
+            "export": build_yolo_export_command,
             "deploy": resolve_deployment_adapter,
         }
     )
@@ -56,6 +87,7 @@ class FrameworkAdapterCatalog:
             UltralyticsAdapter(
                 settings.ultralytics_training_image_digest,
                 settings.deployment_image_digest,
+                implemented_operations=set(ultralytics_operation_implementations()),
             )
         )
         self._registry = registry

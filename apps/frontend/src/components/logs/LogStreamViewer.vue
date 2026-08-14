@@ -209,7 +209,7 @@ function lineTone(level: string) {
 .empty-state { padding: 28px; text-align: center; color: #98a2b3; }
 .older-button { display: block; margin: 8px auto; color: #84adff; }
 .viewer-status { gap: 18px; min-height: 34px; padding: 0 12px; border-top: 1px solid #e8ecf2; color: #667085; font-size: 12px; }
-@media (max-width: 860px) {
+@media not all {
   .viewer-toolbar, .filters { align-items: stretch; flex-direction: column; }
   .filters :deep(.el-input), .filters :deep(.el-select) { width: 100%; }
 }

@@ -23,6 +23,63 @@ const catalog: FrameworkCapabilityCatalogResponse = {
 };
 
 describe("FrameworkModelSelector", () => {
+  it("separates framework selection from parameter preparation", () => {
+    const selection = { taskKind: "object_detection" as const, framework: "paddlex", adapterKey: "paddlex", adapterVersion: "1.0.0", modelKey: "pp-yoloe-s" };
+    const selectionView = mount(FrameworkModelSelector, {
+      props: { catalog, selection, mode: "selection" },
+    });
+    const parameterView = mount(FrameworkModelSelector, {
+      props: { catalog, selection, mode: "parameters" },
+    });
+
+    expect(selectionView.find('[data-testid="framework-paddlex"]').exists()).toBe(true);
+    expect(selectionView.find('[data-testid="framework-parameter-epochs"]').exists()).toBe(false);
+    expect(selectionView.find('[data-testid="advanced-yaml"]').exists()).toBe(false);
+    expect(parameterView.find('[data-testid="framework-paddlex"]').exists()).toBe(false);
+    expect(parameterView.find('[data-testid="framework-parameter-epochs"]').exists()).toBe(true);
+    expect(parameterView.find('[data-testid="advanced-yaml"]').exists()).toBe(true);
+  });
+
+  it("can render framework-only and model-only stages", () => {
+    const selection = { taskKind: "object_detection" as const, framework: "paddlex", adapterKey: "paddlex", adapterVersion: "1.0.0", modelKey: "pp-yoloe-s" };
+    const frameworkView = mount(FrameworkModelSelector, {
+      props: { catalog, selection, mode: "framework" },
+    });
+    const modelView = mount(FrameworkModelSelector, {
+      props: { catalog, selection, mode: "model" },
+    });
+
+    expect(frameworkView.find('[data-testid="framework-paddlex"]').exists()).toBe(true);
+    expect(frameworkView.find('[data-testid="model-pp-yoloe-s"]').exists()).toBe(false);
+    expect(modelView.find('[data-testid="framework-paddlex"]').exists()).toBe(false);
+    expect(modelView.find('[data-testid="model-pp-yoloe-s"]').exists()).toBe(true);
+  });
+
+  it("presents runtime readiness as compact status instead of exposing backend diagnostics", () => {
+    const unavailableCatalog: FrameworkCapabilityCatalogResponse = {
+      ...catalog,
+      adapters: catalog.adapters.map((adapter) => adapter.framework === "ultralytics"
+        ? {
+            ...adapter,
+            available: false,
+            unavailable_reason: "No runtime implementation is registered for this adapter operation; runtime unavailable: Configure VISIOX_ULTRALYTICS_TRAINING_IMAGE_DIGEST with an immutable image digest",
+          }
+        : adapter),
+    };
+    const wrapper = mount(FrameworkModelSelector, {
+      props: {
+        catalog: unavailableCatalog,
+        selection: { taskKind: "object_detection", framework: "paddlex", adapterKey: "paddlex", adapterVersion: "1.0.0", modelKey: "pp-yoloe-s" },
+        mode: "framework",
+      },
+    });
+
+    expect(wrapper.get('[data-testid="framework-paddlex"]').text()).toContain("运行环境可用");
+    expect(wrapper.get('[data-testid="framework-ultralytics"]').text()).toContain("运行环境待配置");
+    expect(wrapper.text()).not.toContain("No runtime implementation");
+    expect(wrapper.get('[data-testid="framework-ultralytics-info"]').attributes("title")).toContain("训练镜像");
+  });
+
   it("shows only compatible object detection frameworks and PaddleX models", async () => {
     const wrapper = mount(FrameworkModelSelector, {
       props: {

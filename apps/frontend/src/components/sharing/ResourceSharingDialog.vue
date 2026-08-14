@@ -256,7 +256,7 @@ watch(
 .principal-row > span:last-child { display: flex; flex-direction: column; gap: 2px; }
 .principal-row strong { color: #27364d; font-size: 13px; }
 .principal-row small { color: #8793a6; font-size: 12px; }
-@media (max-width: 720px) {
+@media not all {
   .scope-option { grid-template-columns: 32px 1fr 16px; padding-inline: 10px; }
   .permission-options { flex-wrap: wrap; gap: 8px 16px; }
 }

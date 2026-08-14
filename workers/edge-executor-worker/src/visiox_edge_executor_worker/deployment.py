@@ -55,6 +55,16 @@ _SHM_SIZE = "1g"
 logger = logging.getLogger(__name__)
 
 
+class RemoteScriptError(RuntimeError):
+    """A remote helper failed; retain its output for durable diagnostics."""
+
+    def __init__(self, exit_status: int, stdout: bytes, stderr: bytes) -> None:
+        super().__init__(f"remote script exited with status {exit_status}")
+        self.exit_status = exit_status
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 class DeploymentLabels:
     MANAGED = "com.visiox.managed"
     INSTANCE_ID = "com.visiox.deployment-instance-id"
@@ -579,7 +589,11 @@ class _DeploymentHandlerBase:
                         result.exit_status,
                         redact(result.stderr.decode("utf-8", errors="replace")),
                     )
-                    raise RuntimeError("remote deployment script failed")
+                    raise RemoteScriptError(
+                        result.exit_status,
+                        result.stdout,
+                        result.stderr,
+                    )
                 self._capture_result(context, result.stdout, result.stderr, "completed")
                 return json.loads(result.stdout)
             finally:

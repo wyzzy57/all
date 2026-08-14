@@ -273,15 +273,12 @@
                 v-if="isLlmRun"
                 :analysis="llmAnalysis"
                 :artifacts="llmArtifacts"
-                @open-artifact="openObservabilityArtifact"
               />
               <PaddleXTrainingAnalysis
                 v-else-if="isPaddlexRun"
                 :series="scalarSeries"
                 :analysis="llmAnalysis"
                 :artifacts="llmArtifacts"
-                :visualdl-url="visualdlUrl"
-                @open-artifact="openObservabilityArtifact"
               />
               <KeepAlive :max="5">
                 <ArtifactGallery
@@ -413,7 +410,6 @@ const isLlmRun = computed(() => summaryData.value?.engine === "llamafactory" || 
 const isPaddlexRun = computed(() => summaryData.value?.engine === "paddlex" || selectedPipeline.value?.engine === "paddlex");
 const llmMetricResponse = computed(() => ({ series: scalarSeries.value, availability: scalarAvailability.value }));
 const llmResourceResponse = computed(() => ({ series: resourceSeries.value, availability: resourceAvailability.value }));
-const visualdlUrl = computed(() => secondaryActions.value.find((action) => action.source === "visualdl")?.url);
 const resolvedSnapshot = computed(() => selectedJob.value?.resolved_snapshot);
 const attempts = computed(() => selectedJob.value?.attempts ?? []);
 const frameworkLabel = computed(() => ({ yolo26: "Ultralytics", ultralytics: "Ultralytics", paddlex: "PaddleX", llamafactory: "LLaMA-Factory" } as Record<string, string>)[summaryData.value?.engine ?? selectedPipeline.value?.engine ?? ""] ?? "-");
@@ -670,7 +666,7 @@ function resetSelectedData(attemptId = selectedJob.value?.attempts?.[0]?.id ?? "
 }
 
 function externalActionLabel(source: string) {
-  return ({ mlflow: "MLflow", tensorboard: "TensorBoard", visualdl: "VisualDL" } as Record<string, string>)[source] || source;
+  return ({ mlflow: "MLflow", tensorboard: "TensorBoard" } as Record<string, string>)[source] || source;
 }
 
 function isActiveStatus(status: string) {
@@ -891,7 +887,7 @@ async function loadRuns() {
   listLoading.value = true;
   try {
     const [pipelineResponse, jobResponse] = await Promise.all([
-      api.listPipelines(),
+      api.listPipelines({ limit: 200 }),
       api.listTrainingJobs({ limit: 200 }),
     ]);
     if (requestGeneration !== generation) return;

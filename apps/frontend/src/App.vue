@@ -6,7 +6,7 @@
     <el-aside
       :width="sidebarWidth"
       class="app-sidebar"
-      :class="{ collapsed: effectiveCollapsed, 'mobile-expanded': isMobile && !effectiveCollapsed }"
+      :class="{ collapsed: userCollapsed }"
     >
       <div class="sidebar-brand">
         <a class="brand" href="/workbench" aria-label="VisioX 首页" @click.prevent="$router.push('/workbench')">
@@ -18,10 +18,9 @@
         <div v-for="(group, groupIndex) in navGroups" :key="groupIndex" class="nav-group">
           <el-menu
             :default-active="$route.path"
-            :collapse="effectiveCollapsed"
+            :collapse="userCollapsed"
             router
             class="nav-menu"
-            @select="handleNavSelect"
           >
             <el-menu-item
               v-for="item in group"
@@ -39,7 +38,7 @@
 
       <div class="sidebar-account">
         <UserAccountMenu
-          :collapsed="effectiveCollapsed"
+          :collapsed="userCollapsed"
           @open-management="openManagement"
         />
       </div>
@@ -47,21 +46,13 @@
       <button
         class="sidebar-toggle"
         type="button"
-        :aria-label="effectiveCollapsed ? '展开侧边栏' : '收起侧边栏'"
-        :title="effectiveCollapsed ? '展开侧边栏' : '收起侧边栏'"
+        :aria-label="userCollapsed ? '展开侧边栏' : '收起侧边栏'"
+        :title="userCollapsed ? '展开侧边栏' : '收起侧边栏'"
         @click="toggleSidebar"
       >
-        <el-icon><ArrowRight v-if="effectiveCollapsed" /><ArrowLeft v-else /></el-icon>
+        <el-icon><ArrowRight v-if="userCollapsed" /><ArrowLeft v-else /></el-icon>
       </button>
     </el-aside>
-
-    <button
-      v-if="isMobile && mobileExpanded"
-      type="button"
-      class="sidebar-scrim"
-      aria-label="关闭侧边栏"
-      @click="mobileExpanded = false"
-    />
 
     <el-container class="app-content-shell">
       <el-main class="app-main">
@@ -88,7 +79,7 @@ import {
   Tickets,
   TrendCharts,
 } from "@element-plus/icons-vue";
-import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, defineAsyncComponent, ref } from "vue";
 import { useRoute } from "vue-router";
 
 import type { ManagementSection } from "@/components/account/ManagementCenterDialog.vue";
@@ -101,34 +92,14 @@ const ManagementCenterDialog = defineAsyncComponent(
 const route = useRoute();
 const isLoginRoute = computed(() => route.name === "login" || route.path.replace(/\/+$/, "") === "/login");
 
-const mobileMedia = window.matchMedia?.("(max-width: 720px)") ?? null;
-const isMobile = ref(mobileMedia?.matches ?? false);
 const userCollapsed = ref(window.localStorage.getItem("visiox.sidebar.collapsed") === "true");
-const mobileExpanded = ref(false);
-const effectiveCollapsed = computed(() => isMobile.value ? !mobileExpanded.value : userCollapsed.value);
-const sidebarWidth = computed(() => (effectiveCollapsed.value ? "64px" : "224px"));
+const sidebarWidth = computed(() => (userCollapsed.value ? "64px" : "224px"));
 const managementOpen = ref(false);
 const managementSection = ref<ManagementSection>("account");
 
-function handleMobileChange(event: MediaQueryListEvent) {
-  isMobile.value = event.matches;
-  mobileExpanded.value = false;
-}
-
-onMounted(() => mobileMedia?.addEventListener("change", handleMobileChange));
-onBeforeUnmount(() => mobileMedia?.removeEventListener("change", handleMobileChange));
-
 function toggleSidebar() {
-  if (isMobile.value) {
-    mobileExpanded.value = !mobileExpanded.value;
-    return;
-  }
   userCollapsed.value = !userCollapsed.value;
   window.localStorage.setItem("visiox.sidebar.collapsed", String(userCollapsed.value));
-}
-
-function handleNavSelect() {
-  if (isMobile.value) mobileExpanded.value = false;
 }
 
 function openManagement(section: ManagementSection) {

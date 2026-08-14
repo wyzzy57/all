@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shutil
 import time
 from collections.abc import Callable, Mapping
@@ -40,10 +41,17 @@ from visiox_training.contracts import ArtifactManifest, LaunchSpec
 from visiox_training.runtime import build_runtime_inputs, encode_runtime_inputs
 from visiox_yolo26.converters import export_yolo26_dataset
 
-from .deployment import _DeploymentHandlerBase, validate_image_digest
+from .deployment import (
+    RemoteScriptError,
+    _DeploymentHandlerBase,
+    validate_image_digest,
+)
 from .log_capture import DurableLogCapture
 from .startup import EdgeExecutorSecurityContext
 from .state import ExecutionResult
+
+
+logger = logging.getLogger(__name__)
 
 
 _PRESIGNED_URL_TTL = timedelta(minutes=30)
@@ -77,12 +85,20 @@ _SIDECAR_MODEL_ROLES = {
     },
     "llamafactory": {"adapter_weights"},
 }
+
+
+def _remote_script_failure_message(error: RemoteScriptError) -> str:
+    output = (error.stderr or error.stdout).decode("utf-8", errors="replace").strip()
+    if not output:
+        return f"Remote training script failed with exit code {error.exit_status}"
+    last_line = output.splitlines()[-1].strip()
+    return f"Remote training script failed with exit code {error.exit_status}: {last_line[:500]}"
 _SIDECAR_NON_MODEL_ROLES = {
     "config",
     "train_log",
     "evaluation_report",
     "visualization",
-    "visualdl",
+    "tensorboard_event",
 }
 _PADDLEX_STATIC_ARTIFACT_TYPES = {"metrics", "training_output"}
 
@@ -191,6 +207,15 @@ class _ScriptRunner(_DeploymentHandlerBase):
         super().__init__(session_factory, security)
 
 
+class TrainingContainerExitedError(RuntimeError):
+    def __init__(self, node_rank: int, exit_code: int) -> None:
+        self.node_rank = node_rank
+        self.exit_code = exit_code
+        super().__init__(
+            f"training container rank {node_rank} exited with code {exit_code}"
+        )
+
+
 class DistributedTrainingHandler:
     def __init__(
         self,
@@ -204,9 +229,13 @@ class DistributedTrainingHandler:
         self._stage = _ScriptRunner("stage_training.sh", session_factory, security)
         self._launch = _ScriptRunner("launch_rank.sh", session_factory, security)
         self._stop = _ScriptRunner("stop_training.sh", session_factory, security)
-
     def execute(self, execution: RemoteExecution) -> ExecutionResult:
         launched: list[tuple[str, int]] = []
+        run: DistributedTrainingRun | None = None
+        ranks: tuple[_Rank, ...] = ()
+        staged: dict[str, _StageResult] = {}
+        job: TrainingJob | None = None
+        base_launch_spec: LaunchSpec | None = None
         log_stream_id: str | None = None
         log_job_id: str | None = None
         failure_code = "EDGE_TRAIN_FAILED"
@@ -228,7 +257,6 @@ class DistributedTrainingHandler:
             ranks = tuple(_Rank.model_validate(item) for item in run.ranks)
             if not ranks or {rank.node_id for rank in ranks} != set(run.node_ids):
                 raise ValueError("distributed rank plan is incomplete")
-            staged: dict[str, _StageResult] = {}
             persisted_container_ids = tuple(run.container_ids or ())
             if persisted_container_ids:
                 if len(persisted_container_ids) != len(ranks):
@@ -341,6 +369,25 @@ class DistributedTrainingHandler:
             return ExecutionResult.succeeded(phase="succeeded")
         except Exception as exc:
             self._stop_peers(execution, launched)
+            if (
+                run is not None
+                and job is not None
+                and base_launch_spec is not None
+                and ranks
+                and ranks[0].node_id in staged
+            ):
+                self._try_collect_checkpoint(
+                    run,
+                    ranks[0],
+                    staged[ranks[0].node_id],
+                    task_id=job.id,
+                    launch_spec=base_launch_spec,
+                )
+            if isinstance(exc, RemoteScriptError):
+                self._capture_remote_script_failure(log_stream_id, exc)
+                failure_message = _remote_script_failure_message(exc)
+            elif isinstance(exc, TrainingContainerExitedError):
+                failure_message = str(exc)
             if isinstance(exc, ArtifactCollectionError):
                 failure_message = str(exc)
             self._mark_failed(
@@ -354,6 +401,23 @@ class DistributedTrainingHandler:
                 error_message=failure_message,
                 phase="failed",
             )
+
+    def _capture_remote_script_failure(
+        self,
+        stream_id: str | None,
+        error: RemoteScriptError,
+    ) -> None:
+        if stream_id is None:
+            return
+        try:
+            self._log_capture.capture_text(
+                stream_id,
+                stdout=error.stdout,
+                stderr=error.stderr,
+                timestamp=datetime.now(UTC),
+            )
+        except Exception:
+            return
 
     def _converge_existing_success(self, execution_id: str) -> bool:
         """Make duplicate delivery idempotent after artifacts were committed."""
@@ -790,7 +854,9 @@ class DistributedTrainingHandler:
                     continue
                 self._capture_container_log(log_stream_id, rank, container_id)
                 if result.exit_code != 0:
-                    return False
+                    raise TrainingContainerExitedError(
+                        rank.node_rank, result.exit_code
+                    )
                 completed += 1
             if completed == len(containers):
                 return True
@@ -1310,11 +1376,10 @@ class DistributedTrainingHandler:
             "visiox-metrics.jsonl",
             "resource_metrics.jsonl",
             "visiox-progress.json",
-            "events.out.tfevents.remote",
         }
         for path in collected.artifacts:
             name = PurePosixPath(path).name
-            if name not in cache_names:
+            if name not in cache_names and "tfevents" not in name.lower():
                 continue
             try:
                 uri = _artifact_uri(job_id, attempt, path)

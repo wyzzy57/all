@@ -123,7 +123,7 @@ function formatValue(value: number | undefined, format: MetricValueFormat) {
   text-align: right;
 }
 
-@media (max-width: 520px) {
+@media not all {
   .metric-card-header { align-items: flex-start; }
   .metric-card-summary { gap: 12px; }
 }

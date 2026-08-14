@@ -123,7 +123,7 @@ strong {
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 520px) {
+@media not all {
   .status-summary-list {
     flex-direction: column;
   }

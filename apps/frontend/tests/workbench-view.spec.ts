@@ -386,7 +386,7 @@ describe("WorkbenchView", () => {
     expect(workbenchSource).toContain(".dataset-panel :deep(.pipeline-status-chart > header > h3)");
     expect(workbenchSource).toContain(".service-panel :deep(.service-health-panel > header > h3)");
     expect(workbenchSource).not.toContain(".resource-panel :deep(.resource-usage-panel > header > h3)");
-    expect(workbenchSource).toMatch(/@media \(max-width: 460px\)\s*\{\s*\.workbench-view\s*\{/);
+    expect(workbenchSource).not.toMatch(/@media\s*\(\s*max-width\s*:/);
   });
 
   it("fits KPI and service-health content inside their desktop tracks", () => {

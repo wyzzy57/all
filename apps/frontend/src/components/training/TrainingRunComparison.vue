@@ -231,5 +231,5 @@ legend span { margin-left: 6px; color: #667085; font-size: 11px; }
 .comparison-table th, .comparison-table td { padding: 10px 12px; border-bottom: 1px solid #e8ecf2; text-align: left; white-space: nowrap; }
 .comparison-table th { background: #f7f8fa; color: #475467; font-weight: 500; }
 .comparison-table td { font-variant-numeric: tabular-nums; }
-@media (max-width: 700px) { .comparison-controls { grid-template-columns: 1fr; } }
+@media not all { .comparison-controls { grid-template-columns: 1fr; } }
 </style>

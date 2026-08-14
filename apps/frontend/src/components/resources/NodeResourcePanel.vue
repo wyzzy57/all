@@ -48,5 +48,5 @@ const items = computed(() => [
 .resource-item { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .resource-item span { color: #667085; font-size: 12px; }
 .resource-item strong { color: #172033; font-size: 14px; font-weight: 600; }
-@media (max-width: 900px) { .resource-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); } }
+@media not all { .resource-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); } }
 </style>

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 
 import ElementPlus from "element-plus";
 import { createPinia } from "pinia";
@@ -17,6 +17,14 @@ import { topLevelRuleDeclarations } from "./helpers/css-rules";
 
 const stylesSource = stylesRawSource || readFileSync("src/styles.css", "utf8");
 
+function sourceFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = `${directory}/${entry.name}`;
+    if (entry.isDirectory()) return sourceFiles(path);
+    return /\.(?:css|vue)$/.test(entry.name) ? [path] : [];
+  });
+}
+
 describe("global application header", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -27,7 +35,7 @@ describe("global application header", () => {
     expect(appSource).toContain("isLoginRoute");
     expect(appSource).toContain('class="auth-route"');
     expect(appSource).toContain('class="sidebar-account"');
-    expect(appSource).toContain(':collapsed="effectiveCollapsed"');
+    expect(appSource).toContain(':collapsed="userCollapsed"');
   });
 
   it("moves the brand into the sidebar and removes the standalone header", () => {
@@ -37,11 +45,11 @@ describe("global application header", () => {
     expect(appSource).not.toContain('class="page-subtitle"');
   });
 
-  it("uses a viewport-owned shell and collapses navigation before content becomes cramped", () => {
+  it("uses a viewport-owned shell and keeps manual navigation collapse", () => {
     expect(appSource).toContain('class="app-content-shell"');
     expect(appSource).toContain('class="app-main"');
     expect(appSource).toContain(':aria-label="item.label"');
-    expect(appSource).toContain("effectiveCollapsed");
+    expect(appSource).toContain("userCollapsed");
     expect(appSource).toContain("visiox.sidebar.collapsed");
     expect(appSource).toContain("收起侧边栏");
   });
@@ -94,26 +102,14 @@ describe("global application header", () => {
     expect(workbenchSource).toContain("border: 1px solid var(--workbench-border)");
   });
 
-  it("visually collapses the sidebar on narrow screens and keeps an explicit account focus ring", () => {
-    expect(stylesSource).toContain("@media (max-width: 720px)");
-    expect(stylesSource).toContain(".app-sidebar.mobile-expanded");
+  it("keeps manual sidebar collapse and an explicit account focus ring", () => {
+    expect(stylesSource).not.toContain(".app-sidebar.mobile-expanded");
     expect(stylesSource).toContain("flex-basis: 64px");
     expect(stylesSource).toContain("outline: 2px solid");
     expect(stylesSource).toContain("outline-offset:");
   });
 
-  it("starts truly collapsed on mobile and immediately expands as an overlay", async () => {
-    const listeners = new Set<(event: MediaQueryListEvent) => void>();
-    vi.stubGlobal("matchMedia", vi.fn(() => ({
-      matches: true,
-      media: "(max-width: 720px)",
-      onchange: null,
-      addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
-      removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
-      addListener: vi.fn(),
-      removeListener: vi.fn(),
-      dispatchEvent: vi.fn(),
-    })));
+  it("keeps sidebar state independent from viewport width", async () => {
     const router = createRouter({
       history: createMemoryHistory(),
       routes: [{ path: "/workbench", component: { template: "<div>workbench</div>" } }],
@@ -122,20 +118,15 @@ describe("global application header", () => {
     await router.isReady();
     const wrapper = mount(App, { global: { plugins: [createPinia(), router, ElementPlus] } });
 
+    expect(wrapper.get(".app-sidebar").classes()).not.toContain("collapsed");
+    expect(wrapper.getComponent(UserAccountMenu).props("collapsed")).toBe(false);
+    expect(wrapper.get(".sidebar-toggle").attributes("aria-label")).toBe("收起侧边栏");
+    expect(wrapper.findAllComponents({ name: "ElMenu" }).map((menu) => menu.props("collapse"))).toEqual([false, false]);
+
+    await wrapper.get(".sidebar-toggle").trigger("click");
     expect(wrapper.get(".app-sidebar").classes()).toContain("collapsed");
     expect(wrapper.getComponent(UserAccountMenu).props("collapsed")).toBe(true);
     expect(wrapper.get(".sidebar-toggle").attributes("aria-label")).toBe("展开侧边栏");
-    expect(wrapper.findAllComponents({ name: "ElMenu" }).map((menu) => menu.props("collapse"))).toEqual([true, true]);
-
-    await wrapper.get(".sidebar-toggle").trigger("click");
-    expect(wrapper.get(".app-sidebar").classes()).not.toContain("collapsed");
-    expect(wrapper.get(".app-sidebar").classes()).toContain("mobile-expanded");
-    expect(wrapper.getComponent(UserAccountMenu).props("collapsed")).toBe(false);
-    expect(wrapper.get(".sidebar-toggle").attributes("aria-label")).toBe("收起侧边栏");
-
-    for (const listener of listeners) listener({ matches: true } as MediaQueryListEvent);
-    await wrapper.vm.$nextTick();
-    expect(wrapper.get(".app-sidebar").classes()).toContain("collapsed");
   });
 
   it("defines shell containment and page overflow contracts for browser QA", () => {
@@ -144,8 +135,8 @@ describe("global application header", () => {
 
     expect(appSource).not.toContain('class="app-header"');
     expect(appSource).toContain('class="app-content-shell"');
-    expect(stylesSource).toMatch(/\.app-content-shell\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden/s);
-    expect(stylesSource).toMatch(/\.app-main\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*auto/s);
+    expect(stylesSource).toMatch(/\.app-content-shell\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*auto/s);
+    expect(stylesSource).toMatch(/\.app-main\s*\{[^}]*min-width:\s*var\(--visiox-desktop-canvas-min-width\);[^}]*overflow:\s*visible/s);
     expect(workbenchSource).toContain("@container workbench (max-width: 760px)");
     expect(workbenchSource).not.toMatch(/@media \(max-width:\s*1350px\)/);
     for (const ruleBody of workbenchRootRules) {
@@ -157,6 +148,30 @@ describe("global application header", () => {
     expect(auditLogSource).toContain("min-width: 980px");
     expect(auditLogSource).toContain('width="min(760px, calc(100vw - 32px))"');
     expect(stylesSource).toContain("width: min(var(--el-dialog-width, 50%), calc(100vw - 32px));");
+  });
+
+  it("keeps a stable desktop canvas when browser zoom reduces the CSS viewport", () => {
+    const rootRule = topLevelRuleDeclarations(stylesSource, ":root");
+
+    expect(rootRule?.get("--visiox-desktop-canvas-min-width")).toEqual(["1480px"]);
+    expect(appSource).not.toContain("matchMedia");
+    expect(appSource).not.toContain("isMobile");
+    expect(appSource).not.toContain("sidebar-scrim");
+    expect(stylesSource).toMatch(
+      /\.app-content-shell\s*\{[^}]*overflow:\s*auto/s,
+    );
+    expect(stylesSource).toMatch(
+      /\.app-main\s*\{[^}]*flex:\s*0 0 var\(--visiox-desktop-canvas-min-width\);[^}]*width:\s*var\(--visiox-desktop-canvas-min-width\);[^}]*min-width:\s*var\(--visiox-desktop-canvas-min-width\)/s,
+    );
+    expect(stylesSource).not.toContain("@media (max-width: 720px)");
+    expect(stylesSource).not.toContain("@media (max-width: 1180px)");
+
+    const viewportBreakpoints = sourceFiles("src").flatMap((file) => {
+      const source = readFileSync(file, "utf8");
+      return [...source.matchAll(/@media\s*\(\s*max-width\s*:\s*(?!0px)[^)]+\)/g)]
+        .map((match) => `${file}: ${match[0]}`);
+    });
+    expect(viewportBreakpoints).toEqual([]);
   });
 
   it.each([

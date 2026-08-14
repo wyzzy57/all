@@ -115,5 +115,5 @@ function message(error: unknown, fallback: string) { return error instanceof Err
 .status-dot { width: 9px; height: 9px; border-radius: 50%; background: #98a2b3; }.status-dot.online { background: #12b76a; }.status-dot.warning { background: #f79009; }
 .node-meta { gap: 16px; margin: 16px 0 18px; color: #667085; font-size: 13px; }.node-meta .el-select { width: min(320px, 32vw); margin-left: auto; }
 .runtime-line { gap: 24px; margin-top: 16px; padding-top: 14px; border-top: 1px solid #edf0f5; color: #667085; font-size: 12px; }
-@media (max-width: 800px) { .summary-strip { grid-template-columns: repeat(2, 1fr); }.node-heading { align-items: flex-start; }.node-meta { flex-wrap: wrap; }.node-meta .el-select { width: 100%; margin-left: 0; } }
+@media not all { .summary-strip { grid-template-columns: repeat(2, 1fr); }.node-heading { align-items: flex-start; }.node-meta { flex-wrap: wrap; }.node-meta .el-select { width: 100%; margin-left: 0; } }
 </style>

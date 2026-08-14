@@ -7,7 +7,7 @@ from typing import Any
 
 IMAGE_SIZE_ENV = "VISIOX_PADDLEX_IMAGE_SIZE"
 WORKERS_ENV = "VISIOX_PADDLEX_WORKERS"
-VISUALDL_DIR_ENV = "VISIOX_PADDLEX_VDL_DIR"
+EVAL_DIR_ENV = "VISIOX_PADDLEX_EVAL_DIR"
 
 
 def apply_runtime_config(
@@ -15,7 +15,7 @@ def apply_runtime_config(
     *,
     image_size: int,
     workers: int,
-    visualdl_dir: str,
+    eval_dir: str,
 ) -> None:
     config.update_num_workers(workers)
     config["eval_size"] = [image_size, image_size]
@@ -30,9 +30,7 @@ def apply_runtime_config(
         inputs_def = test_reader.get("inputs_def")
         if isinstance(inputs_def, dict) and "image_shape" in inputs_def:
             inputs_def["image_shape"] = [3, image_size, image_size]
-    config["use_vdl"] = True
-    config["vdl_log_dir"] = visualdl_dir
-    config["output_eval"] = str(PurePosixPath(visualdl_dir).parent)
+    config["output_eval"] = eval_dir
 
 
 def _set_reader_resize(
@@ -75,13 +73,13 @@ def _patch_detection_trainer() -> None:
 
     def update_config(self: Any) -> None:
         original(self)
-        visualdl_dir = os.environ[VISUALDL_DIR_ENV]
-        Path(visualdl_dir).mkdir(parents=True, exist_ok=True)
+        eval_dir = os.environ[EVAL_DIR_ENV]
+        Path(eval_dir).mkdir(parents=True, exist_ok=True)
         apply_runtime_config(
             self.pdx_config,
             image_size=_required_integer(IMAGE_SIZE_ENV),
             workers=_required_integer(WORKERS_ENV),
-            visualdl_dir=visualdl_dir,
+            eval_dir=eval_dir,
         )
 
     DetTrainer.update_config = update_config

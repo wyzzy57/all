@@ -731,7 +731,7 @@ function svgResultImage() {
   }
 }
 
-@media (max-width: 1100px) {
+@media not all {
   .experience-panel {
     grid-template-columns: 1fr;
   }

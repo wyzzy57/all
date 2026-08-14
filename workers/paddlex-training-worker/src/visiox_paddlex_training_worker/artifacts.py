@@ -76,6 +76,6 @@ def _artifact_role(relative: Path) -> str | None:
         return "evaluation_report"
     if relative.suffix.lower() in {".png", ".jpg", ".jpeg"}:
         return "visualization"
-    if "visualdl" in value or "vdlrecords" in relative.name.lower():
-        return "visualdl"
+    if "tfevents" in relative.name.lower():
+        return "tensorboard_event"
     return None

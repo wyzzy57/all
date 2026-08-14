@@ -80,7 +80,7 @@ dd {
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 520px) {
+@media not all {
   .activity-summary-list {
     grid-template-columns: minmax(0, 1fr);
   }

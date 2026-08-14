@@ -218,22 +218,12 @@ describe("native LLM observability components", () => {
           }],
           availability,
         },
-        artifacts: {
-          items: [
-            { path: "checkpoints/checkpoint-100/adapter_model.safetensors", size_bytes: 2048, sha256: "abc" },
-            { path: "trainer_state.json", size_bytes: 512, sha256: "def" },
-          ],
-          availability,
-        },
       },
     });
 
     expect(wrapper.get('[data-testid="analysis-finding-LOW_GPU_UTILIZATION"]').text()).toContain("Step 20 - 80");
     expect(wrapper.get('[data-testid="analysis-evidence-LOW_GPU_UTILIZATION"]').text()).toContain("14.2");
-    expect(wrapper.get('[data-testid="checkpoint-list"]').text()).toContain("adapter_model.safetensors");
-    expect(wrapper.get('[data-testid="artifact-list"]').text()).toContain("trainer_state.json");
-
-    await wrapper.get('[data-testid="artifact-checkpoints/checkpoint-100/adapter_model.safetensors"]').trigger("click");
-    expect(wrapper.emitted("open-artifact")?.[0]).toEqual([expect.objectContaining({ sha256: "abc" })]);
+    expect(wrapper.find('[data-testid="checkpoint-list"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="artifact-list"]').exists()).toBe(false);
   });
 });

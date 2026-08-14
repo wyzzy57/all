@@ -118,6 +118,6 @@ dd { margin: 5px 0 0; overflow: hidden; font-size: 13px; font-variant-numeric: t
 .metric-strip strong { font-size: 18px; font-variant-numeric: tabular-nums; }
 .external-actions { display: flex; justify-content: flex-end; gap: 14px; align-items: center; }
 .external-actions a { color: #1769e0; font-size: 13px; text-decoration: none; }
-@media (max-width: 860px) { .overview-grid { grid-template-columns: 1fr; } }
-@media (max-width: 560px) { .timing-grid { grid-template-columns: 1fr; } }
+@media not all { .overview-grid { grid-template-columns: 1fr; } }
+@media not all { .timing-grid { grid-template-columns: 1fr; } }
 </style>

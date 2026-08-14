@@ -106,5 +106,5 @@ function message(error: unknown, fallback: string) { return error instanceof Err
 .probe-panel { text-align: center; }.probe-panel .el-form-item { max-width: 420px; margin: 24px auto 0; text-align: left; }
 .probe-icon { margin-top: 22px; color: #2f7cf6; font-size: 38px; }.spinning { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-@media (max-width: 640px) { .form-grid { grid-template-columns: 1fr; } }
+@media not all { .form-grid { grid-template-columns: 1fr; } }
 </style>

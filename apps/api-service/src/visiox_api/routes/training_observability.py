@@ -318,13 +318,31 @@ def get_training_observability_artifacts(
     session: Session = Depends(get_training_observability_session),
     actor: User = Depends(get_current_user),
     service: TrainingObservabilityService = Depends(get_training_observability_service),
+    storage: ObjectStorageClient = Depends(get_training_observability_storage),
 ) -> ObservabilityArtifactsResponse:
     job = _get_training_job(session, actor, training_job_id)
     observability_job = _get_observability_attempt(session, job, attempt_id)
     pipeline = session.get(TrainingPipeline, job.pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
-    return ObservabilityArtifactsResponse.model_validate(_observability_adapter(service, pipeline).artifacts(observability_job))
+    listed = _observability_adapter(service, pipeline).artifacts(observability_job)
+    metrics = observability_job.metrics if isinstance(observability_job.metrics, dict) else {}
+    artifact_uris = metrics.get("artifacts") if isinstance(metrics.get("artifacts"), dict) else {}
+    weight_uris = metrics.get("weights") if isinstance(metrics.get("weights"), dict) else {}
+    for item in listed.get("items", []):
+        if not isinstance(item, dict) or item.get("size_bytes", 0):
+            continue
+        name = Path(str(item.get("path", ""))).name
+        uri = artifact_uris.get(name) or weight_uris.get(name)
+        location = _parse_minio_uri(uri)
+        if location is None:
+            continue
+        try:
+            item["size_bytes"] = storage.object_size(*location)
+        except Exception:
+            # Keep the artifact visible when storage metadata is temporarily unavailable.
+            pass
+    return ObservabilityArtifactsResponse.model_validate(listed)
 
 
 @router.get("/artifacts/{artifact_path:path}")
@@ -348,7 +366,12 @@ def download_training_observability_artifact(
     name = Path(artifact_path).name
     metrics = observability_job.metrics if isinstance(observability_job.metrics, dict) else {}
     artifact_uris = metrics.get("artifacts") if isinstance(metrics.get("artifacts"), dict) else {}
-    uri = metrics.get("adapter") if name == "adapter_model.safetensors" else artifact_uris.get(name)
+    weight_uris = metrics.get("weights") if isinstance(metrics.get("weights"), dict) else {}
+    uri = (
+        metrics.get("adapter")
+        if name == "adapter_model.safetensors"
+        else artifact_uris.get(name) or weight_uris.get(name)
+    )
     location = _parse_minio_uri(uri)
     if location is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Training artifact not found")

@@ -87,7 +87,6 @@ function summary(overrides: Record<string, unknown> = {}) {
     secondary_actions: [
       { source: "mlflow", url: "https://mlflow.example.test" },
       { source: "tensorboard", url: "https://tensorboard.example.test" },
-      { source: "visualdl", url: "https://visualdl.example.test" },
     ],
     availability: {
       mlflow: { available: false, reason: "offline" },
@@ -108,7 +107,7 @@ function mountView() {
         LlmTrainingMetrics: { props: ["response"], template: '<div data-testid="llm-metrics-stub">{{ Object.keys(response.series).join(",") }}</div>' },
         LlmTrainingResources: { props: ["response"], template: '<div data-testid="llm-resources-stub">{{ Object.keys(response.series).join(",") }}</div>' },
         LlmTrainingAnalysis: { props: ["analysis", "artifacts"], template: '<div data-testid="llm-analysis-stub">{{ analysis.findings.length }} / {{ artifacts.items.length }}</div>' },
-        PaddleXTrainingAnalysis: { props: ["series", "analysis", "artifacts", "visualdlUrl"], template: '<div data-testid="paddlex-analysis-stub">{{ Object.keys(series).join(",") }} / {{ visualdlUrl }}</div>' },
+        PaddleXTrainingAnalysis: { props: ["series", "analysis", "artifacts"], template: '<div data-testid="paddlex-analysis-stub">{{ Object.keys(series).join(",") }}</div>' },
         "el-dialog": {
           props: ["modelValue", "title"],
           template: '<section v-if="modelValue" class="el-dialog-stub"><h2>{{ title }}</h2><slot /><slot name="footer" /></section>',
@@ -191,7 +190,7 @@ describe("TrainingVisualizationView", () => {
     expect(wrapper.find('[data-testid="tab-histograms"]').exists()).toBe(false);
 
     await wrapper.get('[data-testid="advanced-menu-toggle"]').trigger("click");
-    expect(wrapper.get('[data-testid="open-visualdl"]').text()).toBe("VisualDL");
+    expect(wrapper.find('[data-testid="open-visualdl"]').exists()).toBe(false);
     await wrapper.get('[data-testid="open-tensorboard"]').trigger("click");
     expect(openSpy).toHaveBeenCalledWith(
       "https://tensorboard.example.test",
@@ -311,7 +310,7 @@ describe("TrainingVisualizationView", () => {
 
     await wrapper.get('[data-testid="tab-analysis"]').trigger("click");
     await flushPromises();
-    expect(wrapper.get('[data-testid="paddlex-analysis-stub"]').text()).toContain("https://visualdl.example.test");
+    expect(wrapper.get('[data-testid="paddlex-analysis-stub"]').text()).not.toContain("visualdl");
   });
 
   it("lists every framework artifact in the shared product tab and opens its download URL", async () => {

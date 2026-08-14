@@ -2,34 +2,18 @@
 import { computed } from "vue";
 
 import {
-  isCheckpointArtifact,
   unavailableSources,
   type LlmAnalysisResponse,
-  type LlmArtifact,
   type LlmArtifactsResponse,
 } from "./llmMetricCatalog";
 
 const props = defineProps<{
   analysis: LlmAnalysisResponse;
-  artifacts: LlmArtifactsResponse;
+  /** Kept for the shared view contract; artifacts render in the dedicated tab. */
+  artifacts?: LlmArtifactsResponse;
 }>();
 
-const emit = defineEmits<{ (event: "open-artifact", artifact: LlmArtifact): void }>();
-const degraded = computed(() => unavailableSources({ ...props.analysis.availability, ...props.artifacts.availability }));
-const checkpoints = computed(() => props.artifacts.items.filter((item) => isCheckpointArtifact(item.path)));
-const otherArtifacts = computed(() => props.artifacts.items.filter((item) => !isCheckpointArtifact(item.path)));
-
-function fileName(path: string) {
-  const parts = path.split("/");
-  return parts[parts.length - 1] || path;
-}
-
-function fileSize(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
-  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
-  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
-}
+const degraded = computed(() => unavailableSources(props.analysis.availability));
 
 function evidence(values: Record<string, number | null>) {
   return Object.entries(values).map(([key, value]) => `${key}: ${value ?? "-"}`).join(" · ");
@@ -65,7 +49,8 @@ function evidence(values: Record<string, number | null>) {
       <div v-else class="compact-empty">当前没有达到诊断阈值的异常证据。</div>
     </section>
 
-    <div class="artifact-grid">
+    <!-- Training files are presented in the dedicated 产物 tab. -->
+    <!--
       <section class="artifact-section">
         <header><h3>Checkpoints</h3><span>{{ checkpoints.length }}</span></header>
         <ul v-if="checkpoints.length" data-testid="checkpoint-list">
@@ -91,15 +76,15 @@ function evidence(values: Record<string, number | null>) {
         </ul>
         <div v-else class="compact-empty">暂无其他训练产物。</div>
       </section>
-    </div>
+    -->
   </section>
 </template>
 
 <style scoped>
 .llm-analysis { display: grid; gap: 20px; color: #172033; }
 .source-degradation { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 9px 12px; border: 1px solid #fde3b0; background: #fffbeb; color: #8a5a09; font-size: 12px; }
-.analysis-section, .artifact-section { border: 1px solid #dfe5ed; background: #fff; }
-.analysis-section > header, .artifact-section > header { display: flex; min-height: 48px; align-items: center; justify-content: space-between; gap: 16px; padding: 0 14px; border-bottom: 1px solid #edf0f4; }
+.analysis-section { border: 1px solid #dfe5ed; background: #fff; }
+.analysis-section > header { display: flex; min-height: 48px; align-items: center; justify-content: space-between; gap: 16px; padding: 0 14px; border-bottom: 1px solid #edf0f4; }
 h3 { margin: 0; font-size: 15px; }
 header span { color: #667085; font-size: 12px; }
 .finding-list { display: grid; gap: 10px; padding: 14px; }
@@ -114,15 +99,5 @@ header span { color: #667085; font-size: 12px; }
 .finding dt, .finding dd { margin: 0; font-size: 12px; }
 .finding dt { color: #667085; }
 .evidence { margin-top: 9px; color: #344054; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
-.artifact-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-.artifact-section ul { margin: 0; padding: 0; list-style: none; }
-.artifact-section li + li { border-top: 1px solid #edf0f4; }
-.artifact-section button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 16px; border: 0; background: transparent; padding: 12px 14px; color: inherit; cursor: pointer; text-align: left; }
-.artifact-section button:hover { background: #f7f9fc; }
-.artifact-section button > span:first-child { display: grid; min-width: 0; gap: 3px; }
-.artifact-section button strong, .artifact-section button small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.artifact-section button strong { font-size: 13px; }
-.artifact-section button small, .artifact-section button > span:last-child { color: #667085; font-size: 11px; }
 .compact-empty { padding: 22px 14px; color: #667085; font-size: 13px; }
-@media (max-width: 860px) { .artifact-grid { grid-template-columns: 1fr; } }
 </style>

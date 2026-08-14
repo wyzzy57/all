@@ -66,7 +66,6 @@ class FakeObservabilityService:
         return {
             "mlflow": {"available": not self.source_failed, "reason": "offline" if self.source_failed else None},
             "tensorboard": {"available": True, "reason": None},
-            "visualdl": {"available": False, "reason": "not configured"},
             "progress": {"available": True, "reason": None},
             "resources": {"available": True, "reason": None},
             "logs": {"available": True, "reason": None},
@@ -308,7 +307,6 @@ def test_observability_summary_returns_pipeline_job_and_availability(client, see
         "availability": {
             "mlflow": {"available": True, "reason": None},
             "tensorboard": {"available": True, "reason": None},
-            "visualdl": {"available": False, "reason": "not configured"},
             "progress": {"available": True, "reason": None},
             "resources": {"available": True, "reason": None},
             "logs": {"available": True, "reason": None},

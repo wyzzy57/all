@@ -8,11 +8,9 @@ import { buildPaddleXMetricGroups, type PaddleXScalarSeries } from "./paddlexMet
 const props = defineProps<{
   series: PaddleXScalarSeries;
   analysis: TrainingObservabilityAnalysis;
-  artifacts: TrainingObservabilityArtifacts;
-  visualdlUrl?: string;
+  /** Kept for the shared view contract; artifacts render in the dedicated tab. */
+  artifacts?: TrainingObservabilityArtifacts;
 }>();
-
-const emit = defineEmits<{ (event: "open-artifact", artifact: TrainingObservabilityArtifacts["items"][number]): void }>();
 const groups = computed(() => buildPaddleXMetricGroups(props.series));
 </script>
 
@@ -20,7 +18,6 @@ const groups = computed(() => buildPaddleXMetricGroups(props.series));
   <section class="paddlex-analysis" aria-label="PaddleX 训练分析">
     <header class="analysis-header">
       <div><strong>PaddleX 训练分析</strong><span>框架语义指标与评估产物</span></div>
-      <a v-if="visualdlUrl" :href="visualdlUrl" target="_blank" rel="noopener noreferrer" data-testid="paddlex-visualdl-link">VisualDL</a>
     </header>
     <section v-for="group in groups" :key="group.id" class="paddlex-group" :data-testid="`paddlex-group-${group.id}`">
       <header><strong>{{ group.title }}</strong></header>
@@ -31,6 +28,8 @@ const groups = computed(() => buildPaddleXMetricGroups(props.series));
         </article>
       </div>
     </section>
+    <!-- Training files are presented in the dedicated 产物 tab. -->
+    <!--
     <section class="paddlex-group">
       <header><strong>训练产物</strong></header>
       <div v-if="artifacts.items.length" class="artifact-list">
@@ -40,6 +39,7 @@ const groups = computed(() => buildPaddleXMetricGroups(props.series));
       </div>
       <el-empty v-else description="暂无训练产物" />
     </section>
+    -->
   </section>
 </template>
 
@@ -54,8 +54,5 @@ const groups = computed(() => buildPaddleXMetricGroups(props.series));
 .chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 14px; }
 .chart-cell { display: grid; min-width: 0; gap: 4px; border: 1px solid #e3e8ef; padding: 12px; }
 .chart-cell > strong { font-size: 13px; }
-.artifact-list { display: grid; }
-.artifact-list button { display: flex; justify-content: space-between; gap: 12px; width: 100%; padding: 11px 14px; border: 0; border-bottom: 1px solid #edf0f4; background: #fff; color: inherit; text-align: left; cursor: pointer; }
-.artifact-list button:hover { background: #f7f9fc; }
-@media (max-width: 760px) { .chart-grid { grid-template-columns: minmax(0, 1fr); } }
+@media not all { .chart-grid { grid-template-columns: minmax(0, 1fr); } }
 </style>
